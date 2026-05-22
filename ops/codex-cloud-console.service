@@ -11,6 +11,9 @@ Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=8787
 Environment=CODEX_CLOUD_ROOT=/home/ubuntu/codex-cloud
+Environment=HOME=/home/ubuntu
+Environment=CODEX_HOME=/home/ubuntu/.codex
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin
 ExecStart=/usr/bin/npm start
 Restart=on-failure
 RestartSec=5

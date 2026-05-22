@@ -298,6 +298,7 @@ async function getTimers() {
 
 async function getCodexStatus() {
   const result = await run("codex", ["login", "status"], { timeout: 8_000 });
+  const detail = result.stdout || result.stderr;
   if (!result.ok) {
     return {
       authenticated: true,
@@ -306,9 +307,9 @@ async function getCodexStatus() {
     };
   }
   return {
-    authenticated: /Logged in/i.test(result.stdout),
-    mode: /ChatGPT/i.test(result.stdout) ? "ChatGPT subscription" : "API key",
-    detail: result.stdout,
+    authenticated: /Logged in/i.test(detail),
+    mode: /ChatGPT/i.test(detail) ? "ChatGPT subscription" : "API key",
+    detail,
   };
 }
 
