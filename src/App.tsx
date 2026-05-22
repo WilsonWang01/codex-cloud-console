@@ -23,6 +23,7 @@ import {
   Sparkles,
   Terminal,
   Timer,
+  Trash2,
   Wifi,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -46,6 +47,12 @@ type ChatMessage = {
   mocked?: boolean;
   streaming?: boolean;
   status?: string;
+};
+
+type ChatHistoryResponse = {
+  ok: boolean;
+  repoId: string;
+  messages: ChatMessage[];
 };
 
 const fallbackRun = {
@@ -226,6 +233,7 @@ export function App() {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
+  const [isLoadingChatHistory, setIsLoadingChatHistory] = useState(false);
   const [fullLog, setFullLog] = useState<{ name: string; content: string; mocked?: boolean } | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -278,6 +286,54 @@ export function App() {
     const interval = window.setInterval(refresh, 45_000);
     return () => window.clearInterval(interval);
   }, [refresh]);
+
+  const loadChatHistory = useCallback(
+    async (repoId: string) => {
+      setIsLoadingChatHistory(true);
+      try {
+        const result = await api<ChatHistoryResponse>(`/api/chat/history?repoId=${encodeURIComponent(repoId)}`);
+        setChatMessages(result.messages || []);
+      } catch (error) {
+        setChatMessages([]);
+        pushEvent({
+          tone: "warn",
+          title: "会话加载",
+          body: error instanceof Error ? error.message : "无法读取云端会话历史",
+        });
+      } finally {
+        setIsLoadingChatHistory(false);
+      }
+    },
+    [pushEvent],
+  );
+
+  useEffect(() => {
+    loadChatHistory(selectedRepoId);
+  }, [loadChatHistory, selectedRepoId]);
+
+  const clearChatHistory = async () => {
+    if (busyAction === "chat") return;
+    setBusyAction("clear-chat");
+    try {
+      const result = await api<ChatHistoryResponse>(`/api/chat/history?repoId=${encodeURIComponent(selectedRepo.id)}`, {
+        method: "DELETE",
+      });
+      setChatMessages(result.messages || []);
+      pushEvent({
+        tone: "ok",
+        title: "会话清空",
+        body: `${selectedRepo.name} 的云端会话已清空`,
+      });
+    } catch (error) {
+      pushEvent({
+        tone: "warn",
+        title: "会话清空",
+        body: error instanceof Error ? error.message : "清空会话失败",
+      });
+    } finally {
+      setBusyAction(null);
+    }
+  };
 
   const runAction = async (key: string, title: string, action: () => Promise<{ output: string; mocked?: boolean }>) => {
     setBusyAction(key);
@@ -530,7 +586,9 @@ export function App() {
               input={chatInput}
               onInput={setChatInput}
               onSend={sendChat}
+              onClear={clearChatHistory}
               busy={busyAction === "chat"}
+              historyLoading={isLoadingChatHistory}
             />
             <aside className="right-rail">
               <CloudStatus status={status} />
@@ -914,7 +972,9 @@ function CloudChat({
   input,
   onInput,
   onSend,
+  onClear,
   busy,
+  historyLoading,
 }: {
   status: ConsoleStatus;
   repo: Repo;
@@ -924,7 +984,9 @@ function CloudChat({
   input: string;
   onInput: (value: string) => void;
   onSend: () => void;
+  onClear: () => void;
   busy: boolean;
+  historyLoading: boolean;
 }) {
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -976,6 +1038,17 @@ function CloudChat({
             </p>
           </div>
         </article>
+        {historyLoading && (
+          <article className="chat-bubble codex compact">
+            <span className="chat-avatar">
+              <Loader2 size={16} className="spin" />
+            </span>
+            <div>
+              <strong>云端 Codex</strong>
+              <p>正在加载会话...</p>
+            </div>
+          </article>
+        )}
         {messages.map((message) => (
           <article key={message.id} className={cx("chat-bubble", message.role, message.streaming && "streaming")}>
             <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
@@ -1021,6 +1094,9 @@ function CloudChat({
         <button className="primary-command send-button" onClick={onSend} disabled={busy || !input.trim()}>
           {busy ? <Loader2 size={17} className="spin" /> : <Send size={17} />}
           发送
+        </button>
+        <button className="icon-command clear-chat" onClick={onClear} disabled={busy || historyLoading || messages.length === 0} title="清空会话">
+          <Trash2 size={17} />
         </button>
       </div>
     </section>

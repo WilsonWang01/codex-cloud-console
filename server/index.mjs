@@ -12,8 +12,14 @@ const projectRoot = path.resolve(__dirname, "..");
 const cloudRoot = process.env.CODEX_CLOUD_ROOT || "/home/ubuntu/codex-cloud";
 const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "workspace");
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
+const stateRoot =
+  process.env.CODEX_STATE_ROOT ||
+  (process.env.NODE_ENV === "production" ? path.join(cloudRoot, "state") : path.join(projectRoot, ".codex-cloud-state"));
+const chatHistoryPath = path.join(stateRoot, "chat-history.json");
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
+const maxStoredChatMessages = 80;
+const maxPromptChatMessages = 18;
 
 const repos = [
   {
@@ -140,12 +146,86 @@ function run(command, args = [], options = {}) {
   });
 }
 
-function buildChatPrompt(repo, message) {
+function normalizeChatMessage(item) {
+  const role = item?.role === "user" ? "user" : "codex";
+  const text = String(item?.text || "").slice(0, 12000);
+  return {
+    id: String(item?.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+    role,
+    text,
+    time: String(item?.time || new Date().toISOString()),
+    mocked: Boolean(item?.mocked),
+  };
+}
+
+async function readChatStore() {
+  try {
+    const raw = await fs.readFile(chatHistoryPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      sessions: parsed?.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {},
+    };
+  } catch {
+    return { sessions: {} };
+  }
+}
+
+async function writeChatStore(store) {
+  await fs.mkdir(stateRoot, { recursive: true });
+  const tmpPath = `${chatHistoryPath}.${process.pid}.tmp`;
+  await fs.writeFile(tmpPath, `${JSON.stringify(store, null, 2)}\n`);
+  await fs.rename(tmpPath, chatHistoryPath);
+}
+
+async function getChatMessages(repoId) {
+  const store = await readChatStore();
+  return (store.sessions[repoId] || []).map(normalizeChatMessage).filter((item) => item.text);
+}
+
+async function saveChatMessages(repoId, messages) {
+  const store = await readChatStore();
+  store.sessions[repoId] = messages.map(normalizeChatMessage).filter((item) => item.text).slice(-maxStoredChatMessages);
+  await writeChatStore(store);
+  return store.sessions[repoId];
+}
+
+async function appendChatTurn(repoId, message, response, mocked = false) {
+  const current = await getChatMessages(repoId);
+  const now = new Date().toISOString();
+  return saveChatMessages(repoId, [
+    ...current,
+    { id: `${Date.now()}-user`, role: "user", text: message, time: now },
+    {
+      id: `${Date.now()}-codex`,
+      role: "codex",
+      text: response || "Codex completed without output.",
+      time: new Date().toISOString(),
+      mocked,
+    },
+  ]);
+}
+
+function formatChatHistory(messages) {
+  const recent = messages.slice(-maxPromptChatMessages);
+  if (!recent.length) return "无";
+  return recent
+    .map((item) => {
+      const speaker = item.role === "user" ? "用户" : "云端 Codex";
+      return `${speaker}: ${item.text}`;
+    })
+    .join("\n\n");
+}
+
+function buildChatPrompt(repo, message, history = []) {
   return [
     "你是运行在 EC2 上的云端 Codex 控制台助手。",
     `当前仓库: ${repo.name}`,
     `工作目录: ${repo.path}`,
+    "你会看到这个仓库对应控制台会话的最近历史。回答时要延续上下文，不要假装看不到前文。",
     "请直接回答用户问题。只有用户明确要求修改代码、运行命令或检查状态时才执行相应操作。",
+    "",
+    "最近会话历史:",
+    formatChatHistory(history),
     "",
     "用户消息:",
     message,
@@ -447,30 +527,46 @@ app.post("/api/repos/:id/pull", async (req, res) => {
   res.json({ ok: result.ok, output: result.stdout || result.stderr });
 });
 
+app.get("/api/chat/history", async (req, res) => {
+  const repo = repos.find((item) => item.id === req.query?.repoId) || repos[0];
+  res.json({ ok: true, repoId: repo.id, messages: await getChatMessages(repo.id) });
+});
+
+app.delete("/api/chat/history", async (req, res) => {
+  const repo = repos.find((item) => item.id === req.query?.repoId) || repos[0];
+  await saveChatMessages(repo.id, []);
+  res.json({ ok: true, repoId: repo.id, messages: [] });
+});
+
 app.post("/api/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = repos.find((item) => item.id === req.body?.repoId) || repos[0];
   const model = String(req.body?.model || "gpt-5.4-mini");
   const reasoning = String(req.body?.reasoning || "medium");
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
+  const history = await getChatMessages(repo.id);
 
   if (!(await exists(repo.path))) {
+    const output = `本地开发模式：会把这条消息发送给云端 Codex，并在 ${repo.name} 工作目录中执行。\n\n> ${message}`;
+    await appendChatTurn(repo.id, message, output, true);
     return res.json({
       ok: true,
       mocked: true,
-      output: `本地开发模式：会把这条消息发送给云端 Codex，并在 ${repo.name} 工作目录中执行。\n\n> ${message}`,
+      output,
     });
   }
 
   const result = await run(
     "codex",
     codexExecArgs(repo, model, reasoning),
-    { timeout: 180_000, input: buildChatPrompt(repo, message) },
+    { timeout: 180_000, input: buildChatPrompt(repo, message, history) },
   );
+  const output = result.stdout || result.stderr || "Codex completed without output.";
+  await appendChatTurn(repo.id, message, output, false);
 
   res.json({
     ok: result.ok,
-    output: result.stdout || result.stderr || "Codex completed without output.",
+    output,
     code: result.code,
   });
 });
@@ -481,6 +577,7 @@ app.post("/api/chat/stream", async (req, res) => {
   const model = String(req.body?.model || "gpt-5.4-mini");
   const reasoning = String(req.body?.reasoning || "medium");
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
+  const history = await getChatMessages(repo.id);
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -498,6 +595,7 @@ app.post("/api/chat/stream", async (req, res) => {
       writeSse(res, "delta", { text: chunk });
       await new Promise((resolve) => setTimeout(resolve, 220));
     }
+    await appendChatTurn(repo.id, message, chunks.join(""), true);
     writeSse(res, "done", { ok: true, code: 0, mocked: true });
     res.end();
     return;
@@ -540,15 +638,20 @@ app.post("/api/chat/stream", async (req, res) => {
     writeSse(res, "error", { message: error.message });
   });
 
-  child.on("close", (code) => {
+  child.on("close", async (code) => {
     closed = true;
     clearTimeout(timer);
     if (!stdout && stderr) writeSse(res, "delta", { text: stderr });
+    try {
+      await appendChatTurn(repo.id, message, stdout || stderr, false);
+    } catch (error) {
+      writeSse(res, "error", { message: `会话保存失败: ${error.message}` });
+    }
     writeSse(res, "done", { ok: code === 0, code });
     res.end();
   });
 
-  child.stdin.end(buildChatPrompt(repo, message));
+  child.stdin.end(buildChatPrompt(repo, message, history));
 });
 
 app.post("/api/automations/:id/run", async (req, res) => {
