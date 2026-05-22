@@ -140,6 +140,39 @@ function run(command, args = [], options = {}) {
   });
 }
 
+function buildChatPrompt(repo, message) {
+  return [
+    "你是运行在 EC2 上的云端 Codex 控制台助手。",
+    `当前仓库: ${repo.name}`,
+    `工作目录: ${repo.path}`,
+    "请直接回答用户问题。只有用户明确要求修改代码、运行命令或检查状态时才执行相应操作。",
+    "",
+    "用户消息:",
+    message,
+  ].join("\n");
+}
+
+function codexExecArgs(repo, model, reasoning) {
+  return [
+    "exec",
+    "--skip-git-repo-check",
+    "-C",
+    repo.path,
+    "-m",
+    model,
+    "-c",
+    `model_reasoning_effort=${reasoning}`,
+    "-s",
+    "workspace-write",
+    "-",
+  ];
+}
+
+function writeSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
 async function exists(target) {
   try {
     await fs.access(target);
@@ -429,32 +462,10 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
-  const prompt = [
-    "你是运行在 EC2 上的云端 Codex 控制台助手。",
-    `当前仓库: ${repo.name}`,
-    `工作目录: ${repo.path}`,
-    "请直接回答用户问题。只有用户明确要求修改代码、运行命令或检查状态时才执行相应操作。",
-    "",
-    "用户消息:",
-    message,
-  ].join("\n");
-
   const result = await run(
     "codex",
-    [
-      "exec",
-      "--skip-git-repo-check",
-      "-C",
-      repo.path,
-      "-m",
-      model,
-      "-c",
-      `model_reasoning_effort=${reasoning}`,
-      "-s",
-      "workspace-write",
-      "-",
-    ],
-    { timeout: 180_000, input: prompt },
+    codexExecArgs(repo, model, reasoning),
+    { timeout: 180_000, input: buildChatPrompt(repo, message) },
   );
 
   res.json({
@@ -462,6 +473,82 @@ app.post("/api/chat", async (req, res) => {
     output: result.stdout || result.stderr || "Codex completed without output.",
     code: result.code,
   });
+});
+
+app.post("/api/chat/stream", async (req, res) => {
+  const message = String(req.body?.message || "").trim();
+  const repo = repos.find((item) => item.id === req.body?.repoId) || repos[0];
+  const model = String(req.body?.model || "gpt-5.4-mini");
+  const reasoning = String(req.body?.reasoning || "medium");
+  if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  if (!(await exists(repo.path))) {
+    writeSse(res, "meta", { mocked: true, repo: repo.name });
+    const chunks = [
+      "本地开发模式：会把这条消息发送给云端 Codex，",
+      `并在 ${repo.name} 工作目录中执行。\n\n`,
+      `> ${message}`,
+    ];
+    for (const chunk of chunks) {
+      writeSse(res, "delta", { text: chunk });
+      await new Promise((resolve) => setTimeout(resolve, 220));
+    }
+    writeSse(res, "done", { ok: true, code: 0, mocked: true });
+    res.end();
+    return;
+  }
+
+  writeSse(res, "meta", { mocked: false, repo: repo.name });
+  writeSse(res, "status", { text: "已连接云端 Codex，正在启动 codex exec..." });
+
+  const child = spawn("codex", codexExecArgs(repo, model, reasoning), {
+    cwd: repo.path,
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let closed = false;
+
+  const timer = setTimeout(() => {
+    writeSse(res, "status", { text: "运行时间较长，已请求终止。" });
+    child.kill("SIGTERM");
+  }, 180_000);
+
+  req.on("close", () => {
+    if (!closed) child.kill("SIGTERM");
+  });
+
+  child.stdout.on("data", (chunk) => {
+    const text = chunk.toString();
+    stdout += text;
+    writeSse(res, "delta", { text });
+  });
+
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString();
+    stderr += text;
+    writeSse(res, "stderr", { text });
+  });
+
+  child.on("error", (error) => {
+    writeSse(res, "error", { message: error.message });
+  });
+
+  child.on("close", (code) => {
+    closed = true;
+    clearTimeout(timer);
+    if (!stdout && stderr) writeSse(res, "delta", { text: stderr });
+    writeSse(res, "done", { ok: code === 0, code });
+    res.end();
+  });
+
+  child.stdin.end(buildChatPrompt(repo, message));
 });
 
 app.post("/api/automations/:id/run", async (req, res) => {

@@ -25,7 +25,7 @@ import {
   Timer,
   Wifi,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Automation, ConsoleStatus, LogFile, Repo } from "./types";
 
 type RunEvent = {
@@ -44,6 +44,8 @@ type ChatMessage = {
   text: string;
   time: string;
   mocked?: boolean;
+  streaming?: boolean;
+  status?: string;
 };
 
 const fallbackRun = {
@@ -329,39 +331,116 @@ export function App() {
     const message = chatInput.trim();
     if (!message || busyAction) return;
     const now = new Date().toISOString();
+    const responseId = `${Date.now()}-codex`;
     setChatInput("");
     setChatMessages((current) => [
       ...current,
       { id: `${Date.now()}-user`, role: "user", text: message, time: now },
+      {
+        id: responseId,
+        role: "codex",
+        text: "",
+        time: new Date().toISOString(),
+        streaming: true,
+        status: "正在连接云端 Codex...",
+      },
     ]);
     setBusyAction("chat");
     try {
-      const result = await api<{ output: string; mocked?: boolean }>("/api/chat", {
+      const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: selectedRepo.id, message }),
       });
-      setChatMessages((current) => [
-        ...current,
-        {
-          id: `${Date.now()}-codex`,
-          role: "codex",
-          text: result.output || "Codex 没有返回内容。",
-          time: new Date().toISOString(),
-          mocked: result.mocked,
-        },
-      ]);
+      if (!response.ok || !response.body) {
+        throw new Error(await response.text());
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let mocked = false;
+      let collected = "";
+      let stderr = "";
+
+      const patchResponse = (patch: Partial<ChatMessage> | ((message: ChatMessage) => Partial<ChatMessage>)) => {
+        setChatMessages((current) =>
+          current.map((item) => {
+            if (item.id !== responseId) return item;
+            const nextPatch = typeof patch === "function" ? patch(item) : patch;
+            return { ...item, ...nextPatch };
+          }),
+        );
+      };
+
+      const handleFrame = (frame: string) => {
+        const lines = frame.split("\n");
+        const event = lines.find((line) => line.startsWith("event: "))?.slice(7) || "message";
+        const data = lines
+          .filter((line) => line.startsWith("data: "))
+          .map((line) => line.slice(6))
+          .join("\n");
+        const payload = data ? JSON.parse(data) : {};
+        if (event === "meta") {
+          mocked = Boolean(payload.mocked);
+          patchResponse({ mocked });
+          return;
+        }
+        if (event === "status") {
+          patchResponse({ status: String(payload.text || "") });
+          return;
+        }
+        if (event === "stderr") {
+          stderr += String(payload.text || "");
+          patchResponse({ status: "Codex 正在运行，收到运行日志..." });
+          return;
+        }
+        if (event === "delta") {
+          const text = String(payload.text || "");
+          collected += text;
+          patchResponse((item) => ({ text: `${item.text}${text}`, status: "正在生成..." }));
+          return;
+        }
+        if (event === "error") {
+          patchResponse({ text: String(payload.message || "云端 Codex 对话失败"), mocked: true, streaming: false });
+          return;
+        }
+        if (event === "done") {
+          const ok = Boolean(payload.ok);
+          patchResponse({
+            text: collected || stderr || (ok ? "Codex completed without output." : "云端 Codex 没有返回内容。"),
+            mocked,
+            streaming: false,
+            status: ok ? "完成" : `退出码 ${payload.code ?? "unknown"}`,
+          });
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() || "";
+        frames.filter(Boolean).forEach(handleFrame);
+        if (done) break;
+      }
+      if (buffer.trim()) handleFrame(buffer);
     } catch (error) {
-      setChatMessages((current) => [
-        ...current,
-        {
-          id: `${Date.now()}-error`,
-          role: "codex",
-          text: error instanceof Error ? error.message : "云端 Codex 对话失败",
-          time: new Date().toISOString(),
-          mocked: true,
-        },
-      ]);
+      setChatMessages((current) =>
+        current.map((item) =>
+          item.id === responseId
+            ? {
+                ...item,
+                role: "codex",
+                text: error instanceof Error ? error.message : "云端 Codex 对话失败",
+                time: new Date().toISOString(),
+                mocked: true,
+                streaming: false,
+                status: "失败",
+              }
+            : item,
+        ),
+      );
     } finally {
       setBusyAction(null);
     }
@@ -847,6 +926,12 @@ function CloudChat({
   onSend: () => void;
   busy: boolean;
 }) {
+  const endRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [messages, busy]);
+
   return (
     <section className="chat-panel wide-panel">
       <div className="thread-header">
@@ -892,18 +977,22 @@ function CloudChat({
           </div>
         </article>
         {messages.map((message) => (
-          <article key={message.id} className={cx("chat-bubble", message.role)}>
+          <article key={message.id} className={cx("chat-bubble", message.role, message.streaming && "streaming")}>
             <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
             <div>
               <strong>
                 {message.role === "user" ? "你" : message.mocked ? "Codex 模拟响应" : "云端 Codex"}
                 <small>{timeLabel(message.time)}</small>
               </strong>
-              <p>{message.text}</p>
+              <p>
+                {message.text || (message.streaming ? " " : "Codex 没有返回内容。")}
+                {message.streaming && <span className="stream-cursor" />}
+              </p>
+              {message.status && <em className="chat-status">{message.status}</em>}
             </div>
           </article>
         ))}
-        {busy && (
+        {busy && !messages.some((message) => message.streaming) && (
           <article className="chat-bubble codex">
             <span className="chat-avatar">
               <Loader2 size={16} className="spin" />
@@ -914,6 +1003,7 @@ function CloudChat({
             </div>
           </article>
         )}
+        <div ref={endRef} />
       </div>
 
       <div className="composer">

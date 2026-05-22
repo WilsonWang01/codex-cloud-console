@@ -709,6 +709,30 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.chat-bubble.streaming {
+  border-color: rgba(15, 127, 139, 0.26);
+  box-shadow: inset 3px 0 0 rgba(15, 159, 139, 0.78);
+}
+
+.chat-status {
+  display: inline-flex;
+  margin-top: 7px;
+  color: #70828f;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1.1em;
+  margin-left: 2px;
+  border-radius: 2px;
+  vertical-align: -0.18em;
+  background: #0f9f8b;
+  animation: blink 1s steps(2, start) infinite;
+}
+
 .chat-bubble code,
 .settings-copy code {
   padding: 2px 5px;
@@ -981,6 +1005,12 @@ pre {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
   }
 }
 
