@@ -1511,6 +1511,8 @@ function AgentTools({
                 ..
               </button>
             )}
+            {busyAction === "files" && <p className="empty-copy">正在读取目录...</p>}
+            {!busyAction && fileTree.length === 0 && <p className="empty-copy">这个目录暂时没有可显示的文件。</p>}
             {fileTree.map((entry) => (
               <button key={entry.path} onClick={() => onOpenFile(entry)}>
                 {entry.type === "directory" ? <FolderOpen size={15} /> : <FileText size={15} />}
