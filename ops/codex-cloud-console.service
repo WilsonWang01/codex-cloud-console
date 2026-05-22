@@ -1,0 +1,19 @@
+[Unit]
+Description=Codex Cloud Console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/codex-cloud/console
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Environment=CODEX_CLOUD_ROOT=/home/ubuntu/codex-cloud
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
