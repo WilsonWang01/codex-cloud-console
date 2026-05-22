@@ -32,4 +32,4 @@ npm run build
 bash ops/install-systemd.sh
 ```
 
-The systemd service listens on `127.0.0.1:8787` by default. Put Nginx, Caddy, or an SSH tunnel in front of it if you want browser access from outside the instance.
+The systemd service listens on `0.0.0.0:8787` by default. Restrict inbound access to your own IP in the EC2 security group. Put Nginx, Caddy, or an SSH tunnel in front of it if you want browser access from outside the instance.

@@ -8,7 +8,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/codex-cloud/console
 Environment=NODE_ENV=production
-Environment=HOST=127.0.0.1
+Environment=HOST=0.0.0.0
 Environment=PORT=8787
 Environment=CODEX_CLOUD_ROOT=/home/ubuntu/codex-cloud
 ExecStart=/usr/bin/npm start
