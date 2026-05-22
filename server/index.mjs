@@ -640,6 +640,20 @@ async function runShellCommand(repo, command) {
   return { ...result, cwd, mocked: cwd !== repo.path };
 }
 
+async function findBrowserExecutable() {
+  const candidates = [
+    process.env.CHROME_PATH,
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (await exists(candidate)) return candidate;
+  }
+  return null;
+}
+
 async function runBrowserCheck(url) {
   const target = String(url || "").trim();
   if (!/^https?:\/\//i.test(target)) {
@@ -647,7 +661,12 @@ async function runBrowserCheck(url) {
   }
   try {
     const { chromium } = await import("playwright");
-    const browser = await chromium.launch({ headless: true });
+    const executablePath = await findBrowserExecutable();
+    const browser = await chromium.launch({
+      headless: true,
+      executablePath: executablePath || undefined,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    });
     const page = await browser.newPage({ viewport: { width: 1280, height: 760 } });
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
@@ -664,6 +683,7 @@ async function runBrowserCheck(url) {
       status: response?.status() || 0,
       title,
       url: target,
+      executablePath: executablePath || "playwright-managed-chromium",
       errors: errors.slice(0, 12),
       screenshot: `data:image/png;base64,${screenshot.toString("base64")}`,
     };
