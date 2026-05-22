@@ -20,6 +20,7 @@ const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
 const maxStoredChatMessages = 80;
 const maxPromptChatMessages = 18;
+const maxStoredSessions = 24;
 
 const repos = [
   {
@@ -158,15 +159,62 @@ function normalizeChatMessage(item) {
   };
 }
 
+function sessionId() {
+  return `sess-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function sessionTitle(message = "") {
+  const title = String(message || "").replace(/\s+/g, " ").trim();
+  return title ? title.slice(0, 38) : "新会话";
+}
+
+function normalizeSession(item, repoId) {
+  const createdAt = String(item?.createdAt || new Date().toISOString());
+  const messages = Array.isArray(item?.messages) ? item.messages.map(normalizeChatMessage).filter((message) => message.text) : [];
+  return {
+    id: String(item?.id || sessionId()),
+    repoId: String(item?.repoId || repoId),
+    title: sessionTitle(item?.title || messages.find((message) => message.role === "user")?.text || "新会话"),
+    createdAt,
+    updatedAt: String(item?.updatedAt || messages.at(-1)?.time || createdAt),
+    messages: messages.slice(-maxStoredChatMessages),
+  };
+}
+
 async function readChatStore() {
   try {
     const raw = await fs.readFile(chatHistoryPath, "utf8");
     const parsed = JSON.parse(raw);
-    return {
-      sessions: parsed?.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {},
-    };
+    const sessions = {};
+    const activeByRepo = parsed?.activeByRepo && typeof parsed.activeByRepo === "object" ? parsed.activeByRepo : {};
+
+    if (parsed?.sessions && typeof parsed.sessions === "object") {
+      for (const [key, value] of Object.entries(parsed.sessions)) {
+        if (Array.isArray(value)) {
+          const migrated = normalizeSession(
+            {
+              id: `legacy-${key}`,
+              repoId: key,
+              title: value.find((message) => message?.role === "user")?.text || "默认会话",
+              messages: value,
+            },
+            key,
+          );
+          sessions[migrated.id] = migrated;
+          activeByRepo[key] ||= migrated.id;
+          continue;
+        }
+
+        const repoId = value?.repoId || key;
+        const normalized = normalizeSession(value, repoId);
+        sessions[normalized.id] = normalized;
+        activeByRepo[normalized.repoId] ||= normalized.id;
+      }
+    }
+
+    return { version: 2, activeByRepo, sessions };
   } catch {
-    return { sessions: {} };
+    return { version: 2, activeByRepo: {}, sessions: {} };
   }
 }
 
@@ -177,22 +225,67 @@ async function writeChatStore(store) {
   await fs.rename(tmpPath, chatHistoryPath);
 }
 
-async function getChatMessages(repoId) {
+async function ensureChatSession(repoId, sessionHint, title = "新会话") {
   const store = await readChatStore();
-  return (store.sessions[repoId] || []).map(normalizeChatMessage).filter((item) => item.text);
-}
+  const existing =
+    (sessionHint && store.sessions[sessionHint]?.repoId === repoId && store.sessions[sessionHint]) ||
+    (store.activeByRepo[repoId] && store.sessions[store.activeByRepo[repoId]]?.repoId === repoId && store.sessions[store.activeByRepo[repoId]]);
+  if (existing) {
+    store.activeByRepo[repoId] = existing.id;
+    await writeChatStore(store);
+    return existing;
+  }
 
-async function saveChatMessages(repoId, messages) {
-  const store = await readChatStore();
-  store.sessions[repoId] = messages.map(normalizeChatMessage).filter((item) => item.text).slice(-maxStoredChatMessages);
+  const next = normalizeSession({ id: sessionId(), repoId, title, messages: [] }, repoId);
+  store.sessions[next.id] = next;
+  store.activeByRepo[repoId] = next.id;
   await writeChatStore(store);
-  return store.sessions[repoId];
+  return next;
 }
 
-async function appendChatTurn(repoId, message, response, mocked = false) {
-  const current = await getChatMessages(repoId);
+async function getRepoSessions(repoId) {
+  const store = await readChatStore();
+  const items = Object.values(store.sessions)
+    .filter((item) => item.repoId === repoId)
+    .map((item) => ({
+      id: item.id,
+      repoId: item.repoId,
+      title: item.title,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      messageCount: item.messages.length,
+    }))
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .slice(0, maxStoredSessions);
+  return { sessions: items, activeSessionId: store.activeByRepo[repoId] || items[0]?.id || null };
+}
+
+async function getChatMessages(repoId, sessionHint) {
+  const session = await ensureChatSession(repoId, sessionHint);
+  return session.messages.map(normalizeChatMessage).filter((item) => item.text);
+}
+
+async function saveChatMessages(repoId, sessionHint, messages) {
+  const store = await readChatStore();
+  const session = await ensureChatSession(repoId, sessionHint);
+  const normalized = messages.map(normalizeChatMessage).filter((item) => item.text).slice(-maxStoredChatMessages);
+  const firstUser = normalized.find((item) => item.role === "user")?.text;
+  store.sessions[session.id] = {
+    ...session,
+    title: session.title === "新会话" && firstUser ? sessionTitle(firstUser) : session.title,
+    updatedAt: normalized.at(-1)?.time || new Date().toISOString(),
+    messages: normalized,
+  };
+  store.activeByRepo[repoId] = session.id;
+  await writeChatStore(store);
+  return store.sessions[session.id];
+}
+
+async function appendChatTurn(repoId, sessionHint, message, response, mocked = false) {
+  const session = await ensureChatSession(repoId, sessionHint, sessionTitle(message));
+  const current = session.messages || [];
   const now = new Date().toISOString();
-  return saveChatMessages(repoId, [
+  return saveChatMessages(repoId, session.id, [
     ...current,
     { id: `${Date.now()}-user`, role: "user", text: message, time: now },
     {
@@ -216,12 +309,13 @@ function formatChatHistory(messages) {
     .join("\n\n");
 }
 
-function buildChatPrompt(repo, message, history = []) {
+function buildChatPrompt(repo, session, message, history = []) {
   return [
     "你是运行在 EC2 上的云端 Codex 控制台助手。",
     `当前仓库: ${repo.name}`,
     `工作目录: ${repo.path}`,
-    "你会看到这个仓库对应控制台会话的最近历史。回答时要延续上下文，不要假装看不到前文。",
+    `当前会话: ${session?.title || "新会话"} (${session?.id || "none"})`,
+    "你会看到这个仓库对应控制台会话的最近历史。回答时要延续上下文，不要假装看不到前文。必要时可以基于历史中的用户偏好和已完成操作继续推进。",
     "请直接回答用户问题。只有用户明确要求修改代码、运行命令或检查状态时才执行相应操作。",
     "",
     "最近会话历史:",
@@ -498,6 +592,86 @@ async function getStatus() {
   };
 }
 
+function getRepoById(id) {
+  return repos.find((item) => item.id === id) || repos[0];
+}
+
+function resolveRepoPath(repo, relativePath = ".") {
+  const clean = String(relativePath || ".").replaceAll("\\", "/");
+  const target = path.resolve(repo.path, clean);
+  const root = path.resolve(repo.path);
+  if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+    throw new Error("Path escapes repository root");
+  }
+  return target;
+}
+
+async function listRepoFiles(repo, relativePath = ".") {
+  const target = resolveRepoPath(repo, relativePath);
+  if (!(await exists(target))) return { path: relativePath, entries: [] };
+  const entries = await fs.readdir(target, { withFileTypes: true });
+  const items = await Promise.all(
+    entries
+      .filter((entry) => ![".git", "node_modules", "dist", ".next", "build"].includes(entry.name))
+      .slice(0, 220)
+      .map(async (entry) => {
+        const entryPath = path.join(target, entry.name);
+        const stat = await fs.stat(entryPath).catch(() => null);
+        return {
+          name: entry.name,
+          path: path.relative(repo.path, entryPath) || ".",
+          type: entry.isDirectory() ? "directory" : "file",
+          size: stat?.size || 0,
+          updatedAt: stat?.mtime.toISOString() || null,
+        };
+      }),
+  );
+  return {
+    path: path.relative(repo.path, target) || ".",
+    entries: items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1)),
+  };
+}
+
+async function runShellCommand(repo, command) {
+  const script = String(command || "").trim();
+  if (!script) return { ok: false, code: 1, stdout: "", stderr: "Command is required" };
+  const cwd = (await exists(repo.path)) ? repo.path : projectRoot;
+  const result = await run("/bin/bash", ["-lc", script], { cwd, timeout: 120_000 });
+  return { ...result, cwd, mocked: cwd !== repo.path };
+}
+
+async function runBrowserCheck(url) {
+  const target = String(url || "").trim();
+  if (!/^https?:\/\//i.test(target)) {
+    return { ok: false, error: "URL must start with http:// or https://" };
+  }
+  try {
+    const { chromium } = await import("playwright");
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1280, height: 760 } });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    page.on("console", (message) => {
+      if (message.type() === "error") errors.push(message.text());
+    });
+    const response = await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(600);
+    const title = await page.title();
+    const screenshot = await page.screenshot({ type: "png", fullPage: false });
+    await browser.close();
+    return {
+      ok: Boolean(response?.ok()),
+      status: response?.status() || 0,
+      title,
+      url: target,
+      errors: errors.slice(0, 12),
+      screenshot: `data:image/png;base64,${screenshot.toString("base64")}`,
+    };
+  } catch (error) {
+    return { ok: false, url: target, error: error.message };
+  }
+}
+
 app.get("/api/status", async (_req, res) => {
   res.json(await getStatus());
 });
@@ -527,31 +701,88 @@ app.post("/api/repos/:id/pull", async (req, res) => {
   res.json({ ok: result.ok, output: result.stdout || result.stderr });
 });
 
+app.get("/api/chat/sessions", async (req, res) => {
+  const repo = getRepoById(req.query?.repoId);
+  const summary = await getRepoSessions(repo.id);
+  const active = await ensureChatSession(repo.id, String(req.query?.sessionId || summary.activeSessionId || ""));
+  res.json({
+    ok: true,
+    repoId: repo.id,
+    activeSessionId: active.id,
+    sessions: (await getRepoSessions(repo.id)).sessions,
+    messages: active.messages,
+  });
+});
+
+app.post("/api/chat/sessions", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId);
+  const store = await readChatStore();
+  const session = normalizeSession(
+    { id: sessionId(), repoId: repo.id, title: sessionTitle(req.body?.title || "新会话"), messages: [] },
+    repo.id,
+  );
+  store.sessions[session.id] = session;
+  store.activeByRepo[repo.id] = session.id;
+  await writeChatStore(store);
+  const summary = await getRepoSessions(repo.id);
+  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages: [] });
+});
+
+app.post("/api/chat/sessions/:id/select", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
+  const store = await readChatStore();
+  const session = store.sessions[req.params.id];
+  if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+  store.activeByRepo[repo.id] = session.id;
+  await writeChatStore(store);
+  const summary = await getRepoSessions(repo.id);
+  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages: session.messages });
+});
+
+app.delete("/api/chat/sessions/:id", async (req, res) => {
+  const repo = getRepoById(req.query?.repoId);
+  const store = await readChatStore();
+  const session = store.sessions[req.params.id];
+  if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+  delete store.sessions[req.params.id];
+  const remaining = Object.values(store.sessions)
+    .filter((item) => item.repoId === repo.id)
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  store.activeByRepo[repo.id] = remaining[0]?.id || "";
+  await writeChatStore(store);
+  const active = remaining[0] || (await ensureChatSession(repo.id));
+  const summary = await getRepoSessions(repo.id);
+  res.json({ ok: true, repoId: repo.id, activeSessionId: active.id, sessions: summary.sessions, messages: active.messages });
+});
+
 app.get("/api/chat/history", async (req, res) => {
-  const repo = repos.find((item) => item.id === req.query?.repoId) || repos[0];
-  res.json({ ok: true, repoId: repo.id, messages: await getChatMessages(repo.id) });
+  const repo = getRepoById(req.query?.repoId);
+  const session = await ensureChatSession(repo.id, String(req.query?.sessionId || ""));
+  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: (await getRepoSessions(repo.id)).sessions, messages: session.messages });
 });
 
 app.delete("/api/chat/history", async (req, res) => {
-  const repo = repos.find((item) => item.id === req.query?.repoId) || repos[0];
-  await saveChatMessages(repo.id, []);
-  res.json({ ok: true, repoId: repo.id, messages: [] });
+  const repo = getRepoById(req.query?.repoId);
+  const session = await saveChatMessages(repo.id, String(req.query?.sessionId || ""), []);
+  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, messages: [] });
 });
 
 app.post("/api/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
-  const repo = repos.find((item) => item.id === req.body?.repoId) || repos[0];
+  const repo = getRepoById(req.body?.repoId);
   const model = String(req.body?.model || "gpt-5.4-mini");
   const reasoning = String(req.body?.reasoning || "medium");
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
-  const history = await getChatMessages(repo.id);
+  const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
+  const history = session.messages;
 
   if (!(await exists(repo.path))) {
     const output = `本地开发模式：会把这条消息发送给云端 Codex，并在 ${repo.name} 工作目录中执行。\n\n> ${message}`;
-    await appendChatTurn(repo.id, message, output, true);
+    await appendChatTurn(repo.id, session.id, message, output, true);
     return res.json({
       ok: true,
       mocked: true,
+      sessionId: session.id,
       output,
     });
   }
@@ -559,13 +790,14 @@ app.post("/api/chat", async (req, res) => {
   const result = await run(
     "codex",
     codexExecArgs(repo, model, reasoning),
-    { timeout: 180_000, input: buildChatPrompt(repo, message, history) },
+    { timeout: 180_000, input: buildChatPrompt(repo, session, message, history) },
   );
   const output = result.stdout || result.stderr || "Codex completed without output.";
-  await appendChatTurn(repo.id, message, output, false);
+  await appendChatTurn(repo.id, session.id, message, output, false);
 
   res.json({
     ok: result.ok,
+    sessionId: session.id,
     output,
     code: result.code,
   });
@@ -573,11 +805,12 @@ app.post("/api/chat", async (req, res) => {
 
 app.post("/api/chat/stream", async (req, res) => {
   const message = String(req.body?.message || "").trim();
-  const repo = repos.find((item) => item.id === req.body?.repoId) || repos[0];
+  const repo = getRepoById(req.body?.repoId);
   const model = String(req.body?.model || "gpt-5.4-mini");
   const reasoning = String(req.body?.reasoning || "medium");
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
-  const history = await getChatMessages(repo.id);
+  const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
+  const history = session.messages;
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -585,7 +818,7 @@ app.post("/api/chat/stream", async (req, res) => {
   res.flushHeaders?.();
 
   if (!(await exists(repo.path))) {
-    writeSse(res, "meta", { mocked: true, repo: repo.name });
+    writeSse(res, "meta", { mocked: true, repo: repo.name, sessionId: session.id });
     const chunks = [
       "本地开发模式：会把这条消息发送给云端 Codex，",
       `并在 ${repo.name} 工作目录中执行。\n\n`,
@@ -595,13 +828,13 @@ app.post("/api/chat/stream", async (req, res) => {
       writeSse(res, "delta", { text: chunk });
       await new Promise((resolve) => setTimeout(resolve, 220));
     }
-    await appendChatTurn(repo.id, message, chunks.join(""), true);
-    writeSse(res, "done", { ok: true, code: 0, mocked: true });
+    await appendChatTurn(repo.id, session.id, message, chunks.join(""), true);
+    writeSse(res, "done", { ok: true, code: 0, mocked: true, sessionId: session.id });
     res.end();
     return;
   }
 
-  writeSse(res, "meta", { mocked: false, repo: repo.name });
+  writeSse(res, "meta", { mocked: false, repo: repo.name, sessionId: session.id });
   writeSse(res, "status", { text: "已连接云端 Codex，正在启动 codex exec..." });
 
   const child = spawn("codex", codexExecArgs(repo, model, reasoning), {
@@ -643,15 +876,72 @@ app.post("/api/chat/stream", async (req, res) => {
     clearTimeout(timer);
     if (!stdout && stderr) writeSse(res, "delta", { text: stderr });
     try {
-      await appendChatTurn(repo.id, message, stdout || stderr, false);
+      await appendChatTurn(repo.id, session.id, message, stdout || stderr, false);
     } catch (error) {
       writeSse(res, "error", { message: `会话保存失败: ${error.message}` });
     }
-    writeSse(res, "done", { ok: code === 0, code });
+    writeSse(res, "done", { ok: code === 0, code, sessionId: session.id });
     res.end();
   });
 
-  child.stdin.end(buildChatPrompt(repo, message, history));
+  child.stdin.end(buildChatPrompt(repo, session, message, history));
+});
+
+app.get("/api/files/tree", async (req, res) => {
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    res.json({ ok: true, repoId: repo.id, ...(await listRepoFiles(repo, req.query?.path || ".")) });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/files/read", async (req, res) => {
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    const filePath = resolveRepoPath(repo, req.query?.path || ".");
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) return res.status(400).json({ ok: false, error: "Path is not a file" });
+    if (stat.size > 512_000) return res.status(400).json({ ok: false, error: "File is larger than 512 KB" });
+    const content = await fs.readFile(filePath, "utf8");
+    res.json({
+      ok: true,
+      repoId: repo.id,
+      path: path.relative(repo.path, filePath),
+      size: stat.size,
+      updatedAt: stat.mtime.toISOString(),
+      content,
+    });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/files/write", async (req, res) => {
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const filePath = resolveRepoPath(repo, req.body?.path || ".");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, String(req.body?.content || ""));
+    const stat = await fs.stat(filePath);
+    res.json({ ok: true, repoId: repo.id, path: path.relative(repo.path, filePath), size: stat.size, updatedAt: stat.mtime.toISOString() });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/terminal/run", async (req, res) => {
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const result = await runShellCommand(repo, req.body?.command);
+    res.json({ ok: result.ok, repoId: repo.id, command: req.body?.command || "", ...result });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/browser/check", async (req, res) => {
+  res.json(await runBrowserCheck(req.body?.url));
 });
 
 app.post("/api/automations/:id/run", async (req, res) => {

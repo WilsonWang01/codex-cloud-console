@@ -6,14 +6,18 @@ import {
   Circle,
   Cloud,
   Code2,
+  FileText,
+  FolderOpen,
   GitBranch,
   GitPullRequestArrow,
+  Globe2,
   HardDrive,
   History,
   Loader2,
   MessageSquare,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Search,
   Send,
@@ -37,7 +41,7 @@ type RunEvent = {
   body: string;
 };
 
-type ActiveView = "automations" | "console" | "logs" | "settings";
+type ActiveView = "automations" | "console" | "agent" | "logs" | "settings";
 
 type ChatMessage = {
   id: string;
@@ -52,7 +56,59 @@ type ChatMessage = {
 type ChatHistoryResponse = {
   ok: boolean;
   repoId: string;
+  activeSessionId: string;
+  sessions: ChatSession[];
   messages: ChatMessage[];
+};
+
+type ChatSession = {
+  id: string;
+  repoId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+};
+
+type AgentFileEntry = {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  size: number;
+  updatedAt: string | null;
+};
+
+type AgentFileTree = {
+  ok: boolean;
+  repoId: string;
+  path: string;
+  entries: AgentFileEntry[];
+};
+
+type AgentFileRead = {
+  ok: boolean;
+  repoId: string;
+  path: string;
+  size: number;
+  updatedAt: string;
+  content: string;
+};
+
+type TerminalResult = {
+  ok: boolean;
+  code: number;
+  stdout: string;
+  stderr: string;
+};
+
+type BrowserResult = {
+  ok: boolean;
+  status?: number;
+  title?: string;
+  url?: string;
+  errors?: string[];
+  screenshot?: string;
+  error?: string;
 };
 
 const fallbackRun = {
@@ -232,8 +288,18 @@ export function App() {
   const [activeView, setActiveView] = useState<ActiveView>("automations");
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
   const [chatInput, setChatInput] = useState("");
   const [isLoadingChatHistory, setIsLoadingChatHistory] = useState(false);
+  const [filePath, setFilePath] = useState(".");
+  const [fileTree, setFileTree] = useState<AgentFileEntry[]>([]);
+  const [selectedFile, setSelectedFile] = useState<AgentFileRead | null>(null);
+  const [fileDraft, setFileDraft] = useState("");
+  const [terminalCommand, setTerminalCommand] = useState("git status --short --branch");
+  const [terminalResult, setTerminalResult] = useState<TerminalResult | null>(null);
+  const [browserUrl, setBrowserUrl] = useState("http://54.199.2.92:8787/");
+  const [browserResult, setBrowserResult] = useState<BrowserResult | null>(null);
   const [fullLog, setFullLog] = useState<{ name: string; content: string; mocked?: boolean } | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -288,12 +354,18 @@ export function App() {
   }, [refresh]);
 
   const loadChatHistory = useCallback(
-    async (repoId: string) => {
+    async (repoId: string, sessionId?: string) => {
       setIsLoadingChatHistory(true);
       try {
-        const result = await api<ChatHistoryResponse>(`/api/chat/history?repoId=${encodeURIComponent(repoId)}`);
+        const params = new URLSearchParams({ repoId });
+        if (sessionId) params.set("sessionId", sessionId);
+        const result = await api<ChatHistoryResponse>(`/api/chat/sessions?${params.toString()}`);
+        setChatSessions(result.sessions || []);
+        setActiveSessionId(result.activeSessionId || "");
         setChatMessages(result.messages || []);
       } catch (error) {
+        setChatSessions([]);
+        setActiveSessionId("");
         setChatMessages([]);
         pushEvent({
           tone: "warn",
@@ -311,13 +383,72 @@ export function App() {
     loadChatHistory(selectedRepoId);
   }, [loadChatHistory, selectedRepoId]);
 
+  const newChatSession = async () => {
+    if (busyAction === "chat") return;
+    setBusyAction("new-session");
+    try {
+      const result = await api<ChatHistoryResponse>("/api/chat/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId: selectedRepo.id, title: "新会话" }),
+      });
+      setChatSessions(result.sessions || []);
+      setActiveSessionId(result.activeSessionId || "");
+      setChatMessages(result.messages || []);
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "新建会话", body: error instanceof Error ? error.message : "新建会话失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const selectChatSession = async (sessionId: string) => {
+    if (!sessionId || sessionId === activeSessionId || busyAction === "chat") return;
+    setBusyAction("select-session");
+    try {
+      const result = await api<ChatHistoryResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId: selectedRepo.id }),
+      });
+      setChatSessions(result.sessions || []);
+      setActiveSessionId(result.activeSessionId || "");
+      setChatMessages(result.messages || []);
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "切换会话", body: error instanceof Error ? error.message : "切换会话失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const deleteChatSession = async (sessionId: string) => {
+    if (!sessionId || busyAction === "chat") return;
+    setBusyAction("delete-session");
+    try {
+      const result = await api<ChatHistoryResponse>(
+        `/api/chat/sessions/${encodeURIComponent(sessionId)}?repoId=${encodeURIComponent(selectedRepo.id)}`,
+        { method: "DELETE" },
+      );
+      setChatSessions(result.sessions || []);
+      setActiveSessionId(result.activeSessionId || "");
+      setChatMessages(result.messages || []);
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "删除会话", body: error instanceof Error ? error.message : "删除会话失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const clearChatHistory = async () => {
     if (busyAction === "chat") return;
     setBusyAction("clear-chat");
     try {
-      const result = await api<ChatHistoryResponse>(`/api/chat/history?repoId=${encodeURIComponent(selectedRepo.id)}`, {
-        method: "DELETE",
-      });
+      const params = new URLSearchParams({ repoId: selectedRepo.id });
+      if (activeSessionId) params.set("sessionId", activeSessionId);
+      const result = await api<ChatHistoryResponse>(`/api/chat/history?${params.toString()}`, { method: "DELETE" });
+      setChatSessions((current) =>
+        current.map((session) => (session.id === result.activeSessionId ? { ...session, messageCount: 0, updatedAt: new Date().toISOString() } : session)),
+      );
       setChatMessages(result.messages || []);
       pushEvent({
         tone: "ok",
@@ -383,6 +514,100 @@ export function App() {
     return haystack.includes(query.toLowerCase());
   });
 
+  const loadFileTree = useCallback(
+    async (nextPath = filePath) => {
+      setBusyAction("files");
+      try {
+        const params = new URLSearchParams({ repoId: selectedRepo.id, path: nextPath || "." });
+        const result = await api<AgentFileTree>(`/api/files/tree?${params.toString()}`);
+        setFilePath(result.path || ".");
+        setFileTree(result.entries || []);
+      } catch (error) {
+        pushEvent({ tone: "warn", title: "文件列表", body: error instanceof Error ? error.message : "读取文件列表失败" });
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [filePath, pushEvent, selectedRepo.id],
+  );
+
+  useEffect(() => {
+    if (activeView === "agent") loadFileTree(".");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, selectedRepoId]);
+
+  const openAgentFile = async (entry: AgentFileEntry) => {
+    if (entry.type === "directory") {
+      await loadFileTree(entry.path);
+      return;
+    }
+    setBusyAction("file-read");
+    try {
+      const params = new URLSearchParams({ repoId: selectedRepo.id, path: entry.path });
+      const result = await api<AgentFileRead>(`/api/files/read?${params.toString()}`);
+      setSelectedFile(result);
+      setFileDraft(result.content);
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "文件读取", body: error instanceof Error ? error.message : "读取文件失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const saveAgentFile = async () => {
+    if (!selectedFile) return;
+    setBusyAction("file-write");
+    try {
+      const result = await api<AgentFileRead>("/api/files/write", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId: selectedRepo.id, path: selectedFile.path, content: fileDraft }),
+      });
+      setSelectedFile({ ...selectedFile, ...result, content: fileDraft });
+      pushEvent({ tone: "ok", title: "文件保存", body: `${result.path} 已写入云端工作区` });
+      await refresh();
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "文件保存", body: error instanceof Error ? error.message : "保存文件失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const runTerminalCommand = async () => {
+    setBusyAction("terminal");
+    try {
+      const result = await api<TerminalResult>("/api/terminal/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId: selectedRepo.id, command: terminalCommand }),
+      });
+      setTerminalResult(result);
+      pushEvent({ tone: result.ok ? "ok" : "warn", title: "终端执行", body: terminalCommand });
+      await refresh();
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "终端执行", body: error instanceof Error ? error.message : "命令执行失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const runBrowserCheck = async () => {
+    setBusyAction("browser");
+    try {
+      const result = await api<BrowserResult>("/api/browser/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: browserUrl }),
+      });
+      setBrowserResult(result);
+      pushEvent({ tone: result.ok ? "ok" : "warn", title: "浏览器验证", body: result.title || result.error || browserUrl });
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "浏览器验证", body: error instanceof Error ? error.message : "浏览器验证失败" });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const sendChat = async () => {
     const message = chatInput.trim();
     if (!message || busyAction) return;
@@ -406,7 +631,7 @@ export function App() {
       const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId: selectedRepo.id, message }),
+        body: JSON.stringify({ repoId: selectedRepo.id, sessionId: activeSessionId, message }),
       });
       if (!response.ok || !response.body) {
         throw new Error(await response.text());
@@ -439,6 +664,7 @@ export function App() {
         const payload = data ? JSON.parse(data) : {};
         if (event === "meta") {
           mocked = Boolean(payload.mocked);
+          if (payload.sessionId) setActiveSessionId(String(payload.sessionId));
           patchResponse({ mocked });
           return;
         }
@@ -481,6 +707,7 @@ export function App() {
         if (done) break;
       }
       if (buffer.trim()) handleFrame(buffer);
+      await loadChatHistory(selectedRepo.id, activeSessionId);
     } catch (error) {
       setChatMessages((current) =>
         current.map((item) =>
@@ -582,6 +809,11 @@ export function App() {
               repo={selectedRepo}
               selectedRepoId={selectedRepoId}
               onSelectRepo={setSelectedRepoId}
+              sessions={chatSessions}
+              activeSessionId={activeSessionId}
+              onNewSession={newChatSession}
+              onSelectSession={selectChatSession}
+              onDeleteSession={deleteChatSession}
               messages={chatMessages}
               input={chatInput}
               onInput={setChatInput}
@@ -589,6 +821,40 @@ export function App() {
               onClear={clearChatHistory}
               busy={busyAction === "chat"}
               historyLoading={isLoadingChatHistory}
+            />
+            <aside className="right-rail">
+              <CloudStatus status={status} />
+              <RepoCard repo={selectedRepo} />
+              <LogCard logs={status.logs} automation={selectedAutomation} />
+            </aside>
+          </div>
+        )}
+
+        {activeView === "agent" && (
+          <div className="content-grid">
+            <AgentTools
+              status={status}
+              repo={selectedRepo}
+              selectedRepoId={selectedRepoId}
+              onSelectRepo={setSelectedRepoId}
+              filePath={filePath}
+              fileTree={fileTree}
+              selectedFile={selectedFile}
+              fileDraft={fileDraft}
+              terminalCommand={terminalCommand}
+              terminalResult={terminalResult}
+              browserUrl={browserUrl}
+              browserResult={browserResult}
+              busyAction={busyAction}
+              onFilePath={setFilePath}
+              onFileDraft={setFileDraft}
+              onBrowserUrl={setBrowserUrl}
+              onTerminalCommand={setTerminalCommand}
+              onLoadTree={loadFileTree}
+              onOpenFile={openAgentFile}
+              onSaveFile={saveAgentFile}
+              onRunTerminal={runTerminalCommand}
+              onRunBrowser={runBrowserCheck}
             />
             <aside className="right-rail">
               <CloudStatus status={status} />
@@ -658,6 +924,10 @@ function Sidebar({
         <button className={cx("nav-item", activeView === "console" && "active")} onClick={() => onSelectView("console")}>
           <Terminal size={18} />
           <span>控制台</span>
+        </button>
+        <button className={cx("nav-item", activeView === "agent" && "active")} onClick={() => onSelectView("agent")}>
+          <SlidersHorizontal size={18} />
+          <span>Agent</span>
         </button>
         <button className={cx("nav-item", activeView === "logs" && "active")} onClick={() => onSelectView("logs")}>
           <History size={18} />
@@ -968,6 +1238,11 @@ function CloudChat({
   repo,
   selectedRepoId,
   onSelectRepo,
+  sessions,
+  activeSessionId,
+  onNewSession,
+  onSelectSession,
+  onDeleteSession,
   messages,
   input,
   onInput,
@@ -980,6 +1255,11 @@ function CloudChat({
   repo: Repo;
   selectedRepoId: string;
   onSelectRepo: (id: string) => void;
+  sessions: ChatSession[];
+  activeSessionId: string;
+  onNewSession: () => void;
+  onSelectSession: (id: string) => void;
+  onDeleteSession: (id: string) => void;
   messages: ChatMessage[];
   input: string;
   onInput: (value: string) => void;
@@ -1023,6 +1303,34 @@ function CloudChat({
             {item.name}
           </button>
         ))}
+      </div>
+
+      <div className="session-strip" aria-label="会话">
+        <button className="command-button" onClick={onNewSession} disabled={busy}>
+          <Plus size={16} />
+          新会话
+        </button>
+        <div className="session-list">
+          {sessions.map((session) => (
+            <button
+              key={session.id}
+              className={cx("session-chip", session.id === activeSessionId && "selected")}
+              onClick={() => onSelectSession(session.id)}
+              disabled={busy}
+            >
+              <span>{session.title}</span>
+              <small>{session.messageCount}</small>
+            </button>
+          ))}
+        </div>
+        <button
+          className="icon-command"
+          onClick={() => onDeleteSession(activeSessionId)}
+          disabled={busy || sessions.length <= 1 || !activeSessionId}
+          title="删除当前会话"
+        >
+          <Trash2 size={16} />
+        </button>
       </div>
 
       <div className="chat-window">
@@ -1101,6 +1409,190 @@ function CloudChat({
       </div>
     </section>
   );
+}
+
+function AgentTools({
+  status,
+  repo,
+  selectedRepoId,
+  onSelectRepo,
+  filePath,
+  fileTree,
+  selectedFile,
+  fileDraft,
+  terminalCommand,
+  terminalResult,
+  browserUrl,
+  browserResult,
+  busyAction,
+  onFilePath,
+  onFileDraft,
+  onBrowserUrl,
+  onTerminalCommand,
+  onLoadTree,
+  onOpenFile,
+  onSaveFile,
+  onRunTerminal,
+  onRunBrowser,
+}: {
+  status: ConsoleStatus;
+  repo: Repo;
+  selectedRepoId: string;
+  onSelectRepo: (id: string) => void;
+  filePath: string;
+  fileTree: AgentFileEntry[];
+  selectedFile: AgentFileRead | null;
+  fileDraft: string;
+  terminalCommand: string;
+  terminalResult: TerminalResult | null;
+  browserUrl: string;
+  browserResult: BrowserResult | null;
+  busyAction: string | null;
+  onFilePath: (value: string) => void;
+  onFileDraft: (value: string) => void;
+  onBrowserUrl: (value: string) => void;
+  onTerminalCommand: (value: string) => void;
+  onLoadTree: (path?: string) => void;
+  onOpenFile: (entry: AgentFileEntry) => void;
+  onSaveFile: () => void;
+  onRunTerminal: () => void;
+  onRunBrowser: () => void;
+}) {
+  return (
+    <section className="agent-panel wide-panel">
+      <div className="thread-header">
+        <div className="thread-title">
+          <div className="thread-avatar">
+            <SlidersHorizontal size={19} />
+          </div>
+          <div>
+            <p className="eyebrow">Agent Surface</p>
+            <h2>远端文件、终端与浏览器</h2>
+          </div>
+        </div>
+        <span className={cx("status-pill", status.localMode ? "warn" : "ok")}>
+          <Cloud size={15} />
+          {status.localMode ? "本地模拟" : "EC2 在线"}
+        </span>
+      </div>
+
+      <div className="repo-switcher" aria-label="选择工作目录">
+        {status.repos.map((item) => (
+          <button
+            key={item.id}
+            className={cx("repo-choice", selectedRepoId === item.id && "selected")}
+            onClick={() => onSelectRepo(item.id)}
+          >
+            <span className={cx("repo-dot", item.accent)} />
+            {item.name}
+          </button>
+        ))}
+      </div>
+
+      <div className="agent-grid">
+        <section className="agent-card files-card">
+          <div className="mini-header">
+            <div>
+              <p className="eyebrow">Files</p>
+              <h3>{repo.name}</h3>
+            </div>
+            <button className="command-button" onClick={() => onLoadTree(filePath)} disabled={busyAction === "files"}>
+              {busyAction === "files" ? <Loader2 size={16} className="spin" /> : <FolderOpen size={16} />}
+              打开
+            </button>
+          </div>
+          <div className="path-row">
+            <input value={filePath} onChange={(event) => onFilePath(event.target.value)} />
+          </div>
+          <div className="file-list">
+            {filePath !== "." && (
+              <button onClick={() => onLoadTree(pathParent(filePath))}>
+                <FolderOpen size={15} />
+                ..
+              </button>
+            )}
+            {fileTree.map((entry) => (
+              <button key={entry.path} onClick={() => onOpenFile(entry)}>
+                {entry.type === "directory" ? <FolderOpen size={15} /> : <FileText size={15} />}
+                <span>{entry.name}</span>
+                <small>{entry.type === "file" ? formatBytes(entry.size) : "dir"}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="agent-card file-editor-card">
+          <div className="mini-header">
+            <div>
+              <p className="eyebrow">Editor</p>
+              <h3>{selectedFile?.path || "未选择文件"}</h3>
+            </div>
+            <button className="primary-command" onClick={onSaveFile} disabled={!selectedFile || busyAction === "file-write"}>
+              {busyAction === "file-write" ? <Loader2 size={16} className="spin" /> : <FileText size={16} />}
+              保存
+            </button>
+          </div>
+          <textarea
+            value={fileDraft}
+            onChange={(event) => onFileDraft(event.target.value)}
+            placeholder="选择一个文件后可以查看和编辑云端工作区内容"
+          />
+        </section>
+
+        <section className="agent-card terminal-card">
+          <div className="mini-header">
+            <div>
+              <p className="eyebrow">Terminal</p>
+              <h3>{repo.path}</h3>
+            </div>
+            <button className="primary-command" onClick={onRunTerminal} disabled={busyAction === "terminal" || !terminalCommand.trim()}>
+              {busyAction === "terminal" ? <Loader2 size={16} className="spin" /> : <Terminal size={16} />}
+              运行
+            </button>
+          </div>
+          <textarea value={terminalCommand} onChange={(event) => onTerminalCommand(event.target.value)} />
+          <pre>{terminalResult ? `$ ${terminalCommand}\n\n${terminalResult.stdout || ""}${terminalResult.stderr ? `\n${terminalResult.stderr}` : ""}` : "等待运行命令..."}</pre>
+        </section>
+
+        <section className="agent-card browser-card">
+          <div className="mini-header">
+            <div>
+              <p className="eyebrow">Browser</p>
+              <h3>Playwright 验证</h3>
+            </div>
+            <button className="primary-command" onClick={onRunBrowser} disabled={busyAction === "browser" || !browserUrl.trim()}>
+              {busyAction === "browser" ? <Loader2 size={16} className="spin" /> : <Globe2 size={16} />}
+              检查
+            </button>
+          </div>
+          <input value={browserUrl} onChange={(event) => onBrowserUrl(event.target.value)} />
+          {browserResult ? (
+            <div className="browser-result">
+              <p className={cx("repo-state", browserResult.ok ? "ok" : "warn")}>
+                {browserResult.ok ? `HTTP ${browserResult.status} · ${browserResult.title || "loaded"}` : browserResult.error || "检查失败"}
+              </p>
+              {Boolean(browserResult.errors?.length) && <pre>{browserResult.errors?.join("\n")}</pre>}
+              {browserResult.screenshot && <img src={browserResult.screenshot} alt="Browser check screenshot" />}
+            </div>
+          ) : (
+            <p className="empty-copy">运行后会展示标题、控制台错误和截图。</p>
+          )}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function pathParent(value: string) {
+  const parts = value.split("/").filter(Boolean);
+  parts.pop();
+  return parts.join("/") || ".";
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function LogsView({ logs }: { logs: LogFile[] }) {
