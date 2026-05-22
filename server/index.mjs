@@ -460,6 +460,7 @@ async function getLogForAutomation(automation) {
 function inferExitCode(content) {
   const exitMatch = content.match(/(?:EXIT|exit code|code)[ =:]+(\d+)/i);
   if (exitMatch) return exitMatch[1];
+  if (/\[[^\]]+\]\s+finished job=/i.test(content)) return "0";
   if (/failed|error|traceback|exception/i.test(content)) return "non-zero?";
   if (/completed|CLOUD_PULL_DONE|migrated-runner-ok/i.test(content)) return "0";
   return "unknown";
