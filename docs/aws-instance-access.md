@@ -1,44 +1,44 @@
-# AWS Instance Access Runbook
+# AWS 实例登录与恢复手册
 
-This runbook records the stable access paths for the Codex Cloud EC2 instance so a new Codex session can recover access without rediscovering the setup.
+这份手册记录云端 Codex EC2 实例的稳定登录方式。之后即使新会话忘了上下文，也可以按这里恢复访问，不需要重新排查一遍。
 
-## Target Instance
+## 目标实例
 
-- Purpose: Codex Cloud Console and scheduled Codex jobs
-- Region: `ap-northeast-1` (Tokyo)
-- Instance ID: `i-0ef9c3f3745c1b665`
-- Public IPv4: `54.199.2.92`
-- Private IPv4: `172.31.7.169`
-- VPC: `vpc-0f07766a08d6f876e`
-- Subnet: `subnet-09ee30d7f42788c6f`
-- Availability Zone: `ap-northeast-1c`
-- Instance security group: `sg-05abf23930b93274d`
-- Cloud app: `http://54.199.2.92:8787/`
-- Local SSH key: `~/.ssh/codex_cloud_ec2_ed25519`
-- Normal local SSH alias: `codex-cloud`
+- 用途：云端 Codex 控制台和定时 Codex 任务
+- 区域：`ap-northeast-1`，东京
+- 实例 ID：`i-0ef9c3f3745c1b665`
+- 公网 IPv4：`54.199.2.92`
+- 私网 IPv4：`172.31.7.169`
+- VPC：`vpc-0f07766a08d6f876e`
+- 子网：`subnet-09ee30d7f42788c6f`
+- 可用区：`ap-northeast-1c`
+- 实例安全组：`sg-05abf23930b93274d`
+- 云端控制台：`http://54.199.2.92:8787/`
+- 本地 SSH 私钥：`~/.ssh/codex_cloud_ec2_ed25519`
+- 普通公网 SSH alias：`codex-cloud`
 
-## Why We Added Fallbacks
+## 为什么要加备用登录方式
 
-The instance-side SSH key and `sshd` were verified as healthy, but the local VPN path can break plain public SSH. The observed symptom was unusual: `nc` from the Mac reported arbitrary ports on `54.199.2.92` as connected, while SSH on port 22 closed during key exchange. Treat that as local VPN/proxy TCP interception, not an EC2 `sshd` failure.
+实例侧的 SSH key 和 `sshd` 已确认正常，但本机 VPN 线路可能破坏公网 SSH。之前出现过一个很反常的现象：Mac 上 `nc` 扫 `54.199.2.92` 的任意端口都显示 connected，但 SSH 22 在 key exchange 阶段直接断开。这更像本地 VPN/代理在劫持或伪造 TCP 状态，不是 EC2 的 `sshd` 坏了。
 
-Use access methods in this order:
+以后优先按这个顺序登录：
 
-1. `codex-cloud-ssm` through AWS Systems Manager Session Manager.
-2. `codex-cloud-eice` through EC2 Instance Connect Endpoint.
-3. `codex-cloud` plain public SSH, only when the current network path is clean.
+1. `codex-cloud-ssm`：走 AWS Systems Manager Session Manager。
+2. `codex-cloud-eice`：走 EC2 Instance Connect Endpoint。
+3. `codex-cloud`：普通公网 SSH，只在当前网络线路正常时使用。
 
-## Method 1: SSM Session Manager
+## 方法一：SSM Session Manager
 
-SSM is the most stable path for VPN changes because the instance opens outbound HTTPS to AWS Systems Manager and does not require inbound SSH from the Mac.
+SSM 是最推荐的稳定入口。它不依赖入站 SSH，实例主动通过 HTTPS 连接 AWS Systems Manager，所以本机 VPN 换线路时一般不影响。
 
-AWS resources:
+AWS 资源：
 
-- IAM role: `codex-cloud-ssm-role`
-- Instance profile: `codex-cloud-ssm-profile`
-- Attached managed policy: `arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`
-- Verified on 2026-05-23: SSM reports `i-0ef9c3f3745c1b665 Online`, agent `3.3.4121.0`, platform `Ubuntu`.
+- IAM Role：`codex-cloud-ssm-role`
+- Instance Profile：`codex-cloud-ssm-profile`
+- 已挂托管策略：`arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`
+- 2026-05-23 已验证：SSM 显示 `i-0ef9c3f3745c1b665 Online`，agent 版本 `3.3.4121.0`，平台 `Ubuntu`。
 
-Check SSM registration from AWS CloudShell or any configured AWS CLI:
+在 AWS CloudShell 或已配置凭证的本机 AWS CLI 里检查 SSM 注册状态：
 
 ```bash
 aws ssm describe-instance-information \
@@ -48,7 +48,7 @@ aws ssm describe-instance-information \
   --output table
 ```
 
-Start a shell:
+直接打开 SSM shell：
 
 ```bash
 aws ssm start-session \
@@ -56,7 +56,7 @@ aws ssm start-session \
   --target i-0ef9c3f3745c1b665
 ```
 
-Optional local SSH-compatible alias in `~/.ssh/config`:
+本机 `~/.ssh/config` 里已经配置了类似下面的 SSH alias：
 
 ```sshconfig
 Host codex-cloud-ssm
@@ -67,32 +67,32 @@ Host codex-cloud-ssm
   ProxyCommand sh -c 'aws ssm start-session --region ap-northeast-1 --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p'
 ```
 
-Then connect with:
+使用方式：
 
 ```bash
 ssh codex-cloud-ssm
 ```
 
-Local prerequisites:
+本机依赖：
 
 ```bash
 brew install awscli session-manager-plugin
 aws configure sso
 ```
 
-Use the AWS account `476405982853` and region `ap-northeast-1`. Do not store access keys in this repo.
+AWS 账号是 `476405982853`，默认区域用 `ap-northeast-1`。不要把 AWS access key 或 secret 写进这个仓库。
 
-Note: Homebrew can install `awscli` without prompting, but the `session-manager-plugin` cask may ask for the macOS sudo password because it installs a package. If non-interactive install fails, rerun `brew install session-manager-plugin` in a local terminal and enter the Mac password.
+注意：`awscli` 已经在本机装好；`session-manager-plugin` 的 Homebrew cask 需要 macOS sudo 密码，因为它要安装系统 pkg。非交互环境无法输入密码，如果后续 `ssh codex-cloud-ssm` 提示缺插件，在本机终端手动运行一次 `brew install session-manager-plugin` 并输入 Mac 密码即可。
 
-### SSM Troubleshooting
+### SSM 常见问题
 
-- Empty `describe-instance-information`: wait 2-5 minutes after attaching the IAM profile, then check that `amazon-ssm-agent` is installed and running on the instance.
-- `TargetNotConnected`: agent is installed but cannot reach AWS SSM endpoints, or the IAM profile has not propagated.
-- `session-manager-plugin not found`: install the local plugin with Homebrew.
-- `AccessDeniedException`: the AWS identity lacks `ssm:StartSession` or related permissions.
-- SSH over SSM fails but `start-session` works: use the plain SSM shell, then repair `sshd` or `authorized_keys` from inside.
+- `describe-instance-information` 没有实例：刚挂 IAM profile 后等 2-5 分钟，再检查实例内 `amazon-ssm-agent` 是否安装并运行。
+- `TargetNotConnected`：agent 已安装但无法连到 AWS SSM endpoint，或者 IAM profile 还没完全传播。
+- 提示 `session-manager-plugin not found`：本机安装 `session-manager-plugin`。
+- `AccessDeniedException`：当前 AWS 身份没有 `ssm:StartSession` 等权限。
+- SSM shell 能进但 SSH over SSM 失败：先用普通 SSM shell 进实例，再修 `sshd` 或 `authorized_keys`。
 
-Instance-side agent repair command:
+实例内修复 agent 的命令：
 
 ```bash
 if command -v snap >/dev/null 2>&1; then
@@ -106,24 +106,24 @@ sudo systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service 2>/de
 systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service amazon-ssm-agent.service --no-pager
 ```
 
-## Method 2: EC2 Instance Connect Endpoint
+## 方法二：EC2 Instance Connect Endpoint
 
-EIC Endpoint is the second stable path. It creates an AWS-managed private tunnel into the VPC, so SSH does not depend on the instance public IP path.
+EIC Endpoint 是第二条稳定入口。它在 AWS 控制面创建一个进入 VPC 的托管私有隧道，SSH 不依赖实例公网 IP 的 22 端口路径。
 
-AWS resources:
+AWS 资源：
 
-- Endpoint ID: `eice-05d40adaef160d38f`
-- Endpoint security group: `sg-0b557ee89c2c40c54`
-- Endpoint subnet: `subnet-09ee30d7f42788c6f`
-- Endpoint VPC: `vpc-0f07766a08d6f876e`
-- Verified on 2026-05-23: endpoint reached `create-complete`, CloudShell connected through EIC to `ip-172-31-7-169`, and used it to restart `amazon-ssm-agent`.
+- Endpoint ID：`eice-05d40adaef160d38f`
+- Endpoint 安全组：`sg-0b557ee89c2c40c54`
+- Endpoint 子网：`subnet-09ee30d7f42788c6f`
+- Endpoint VPC：`vpc-0f07766a08d6f876e`
+- 2026-05-23 已验证：endpoint 已进入 `create-complete`，CloudShell 已通过 EIC 连到 `ip-172-31-7-169`，并用它重启了 `amazon-ssm-agent`。
 
-Security group rules that matter:
+关键安全组规则：
 
-- Instance SG `sg-05abf23930b93274d`: inbound TCP `22` from endpoint SG `sg-0b557ee89c2c40c54`.
-- Endpoint SG `sg-0b557ee89c2c40c54`: outbound TCP `22` to instance SG `sg-05abf23930b93274d`.
+- 实例安全组 `sg-05abf23930b93274d`：允许 TCP `22` 入站来源为 endpoint 安全组 `sg-0b557ee89c2c40c54`。
+- Endpoint 安全组 `sg-0b557ee89c2c40c54`：允许 TCP `22` 出站到实例安全组 `sg-05abf23930b93274d`。
 
-Check endpoint state:
+检查 endpoint 状态：
 
 ```bash
 aws ec2 describe-instance-connect-endpoints \
@@ -133,7 +133,7 @@ aws ec2 describe-instance-connect-endpoints \
   --output table
 ```
 
-Connect with AWS CLI v2:
+用 AWS CLI v2 连接：
 
 ```bash
 aws ec2-instance-connect ssh \
@@ -145,7 +145,7 @@ aws ec2-instance-connect ssh \
   --eice-options endpointId=eice-05d40adaef160d38f
 ```
 
-Optional local SSH alias:
+本机 `~/.ssh/config` 里已经配置了类似下面的 SSH alias：
 
 ```sshconfig
 Host codex-cloud-eice
@@ -156,30 +156,30 @@ Host codex-cloud-eice
   ProxyCommand sh -c 'aws ec2-instance-connect open-tunnel --region ap-northeast-1 --instance-id %h --instance-connect-endpoint-id eice-05d40adaef160d38f'
 ```
 
-Then connect with:
+使用方式：
 
 ```bash
 ssh codex-cloud-eice
 ```
 
-### EIC Endpoint Troubleshooting
+### EIC Endpoint 常见问题
 
-- Endpoint state is `create-in-progress`: wait until it becomes `create-complete`.
-- `aws ec2-instance-connect ssh` says the `ssh` subcommand is unknown: install or upgrade AWS CLI v2.
-- Authentication fails: make sure `~/.ssh/codex_cloud_ec2_ed25519` matches the public key in `~ubuntu/.ssh/authorized_keys`, or use `aws ec2-instance-connect send-ssh-public-key` to push a temporary key.
-- Connection times out: recheck the two security group rules above.
-- Endpoint exists in the wrong subnet: recreate it in the same VPC/subnet path as the target instance, or specify the correct endpoint ID.
-- IAM failure: the AWS identity needs EIC permissions such as `ec2-instance-connect:OpenTunnel` and `ec2-instance-connect:SendSSHPublicKey`.
+- Endpoint 状态是 `create-in-progress`：等它变成 `create-complete`。
+- `aws ec2-instance-connect ssh` 提示没有 `ssh` 子命令：安装或升级 AWS CLI v2。
+- 认证失败：确认 `~/.ssh/codex_cloud_ec2_ed25519` 对应的公钥在 `~ubuntu/.ssh/authorized_keys`，或者用 `aws ec2-instance-connect send-ssh-public-key` 临时推送公钥。
+- 连接超时：重点检查上面的两条安全组规则。
+- Endpoint 建在错误子网：在目标实例所在 VPC/子网路径下重建，或命令里指定正确 endpoint ID。
+- IAM 报错：当前 AWS 身份需要 EIC 相关权限，例如 `ec2-instance-connect:OpenTunnel` 和 `ec2-instance-connect:SendSSHPublicKey`。
 
-## Method 3: Plain Public SSH
+## 方法三：普通公网 SSH
 
-Fast path when the local network is clean:
+当前网络线路正常时可以直接用：
 
 ```bash
 ssh codex-cloud
 ```
 
-Expected local config:
+本机配置应类似：
 
 ```sshconfig
 Host codex-cloud
@@ -192,18 +192,18 @@ Host codex-cloud
   StrictHostKeyChecking accept-new
 ```
 
-If this fails with `kex_exchange_identification: Connection closed by remote host`, switch VPN routes or use SSM/EIC. If `nc` says random unused ports are open on `54.199.2.92`, assume the local VPN/proxy is spoofing TCP state.
+如果报 `kex_exchange_identification: Connection closed by remote host`，优先切换 VPN/直连，或者直接用 SSM/EIC。若 `nc` 显示 `54.199.2.92` 上很多随机未开放端口都能 connected，基本可以判断是本机 VPN/代理在伪造 TCP 状态。
 
-## Recovery Checklist
+## 恢复检查清单
 
-1. Try `ssh codex-cloud-ssm`.
-2. If SSM is not online, try `ssh codex-cloud-eice`.
-3. If EIC is not available, open AWS CloudShell in `ap-northeast-1` and run the SSM/EIC check commands above.
-4. If both managed paths fail, use the Cloud app terminal at `http://54.199.2.92:8787/` if the browser can still reach it.
-5. Only debug instance `sshd` after verifying the local network is not spoofing arbitrary TCP ports.
+1. 先试 `ssh codex-cloud-ssm`。
+2. 如果 SSM 不在线，试 `ssh codex-cloud-eice`。
+3. 如果 EIC 也不可用，打开 AWS CloudShell，区域选 `ap-northeast-1`，运行上面的 SSM/EIC 检查命令。
+4. 如果两条 AWS 托管通道都失败，但浏览器还能访问云端控制台，可以用 `http://54.199.2.92:8787/` 里的终端能力做临时修复。
+5. 只有在确认本机网络没有伪造 TCP 状态后，再去排查实例 `sshd`。
 
-## Source Notes
+## 资料依据
 
-- AWS Systems Manager Session Manager is documented by AWS as a managed shell that does not require opening inbound ports, bastion hosts, or SSH key management.
-- AWS EC2 Instance Connect Endpoint is documented by AWS as a way to connect to instances through private IP without requiring a bastion host or direct VPC internet connectivity.
-- AWS CLI v2 provides `aws ec2-instance-connect ssh` and `aws ec2-instance-connect open-tunnel` for EIC Endpoint connections.
+- AWS Systems Manager Session Manager：AWS 官方文档说明它可以在不开放入站端口、不维护 bastion、不管理 SSH key 的情况下管理实例。
+- AWS EC2 Instance Connect Endpoint：AWS 官方文档说明它可以通过私网 IP 连接实例，不要求 bastion，也不要求 VPC 具备直接公网连通。
+- AWS CLI v2：提供 `aws ec2-instance-connect ssh` 和 `aws ec2-instance-connect open-tunnel` 用于 EIC Endpoint 连接。
