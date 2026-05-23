@@ -68,6 +68,10 @@ type ChatSession = {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  codexSessionId?: string | null;
+  model?: string | null;
+  reasoning?: string | null;
+  sandbox?: string | null;
 };
 
 type AgentFileEntry = {
@@ -285,7 +289,7 @@ export function App() {
   const [status, setStatus] = useState<ConsoleStatus>(fallbackStatus);
   const [selectedAutomationId, setSelectedAutomationId] = useState("invest-daily-update");
   const [selectedRepoId, setSelectedRepoId] = useState("invest-dashboard");
-  const [activeView, setActiveView] = useState<ActiveView>("automations");
+  const [activeView, setActiveView] = useState<ActiveView>("console");
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -643,6 +647,7 @@ export function App() {
       let mocked = false;
       let collected = "";
       let stderr = "";
+      let streamSessionId = activeSessionId;
 
       const patchResponse = (patch: Partial<ChatMessage> | ((message: ChatMessage) => Partial<ChatMessage>)) => {
         setChatMessages((current) =>
@@ -664,8 +669,18 @@ export function App() {
         const payload = data ? JSON.parse(data) : {};
         if (event === "meta") {
           mocked = Boolean(payload.mocked);
-          if (payload.sessionId) setActiveSessionId(String(payload.sessionId));
+          if (payload.sessionId) {
+            streamSessionId = String(payload.sessionId);
+            setActiveSessionId(streamSessionId);
+          }
           patchResponse({ mocked });
+          return;
+        }
+        if (event === "session") {
+          const codexSessionId = payload.codexSessionId ? String(payload.codexSessionId) : "";
+          if (codexSessionId) {
+            patchResponse({ status: `Codex CLI 会话 ${codexSessionId.slice(0, 8)} 已建立` });
+          }
           return;
         }
         if (event === "status") {
@@ -689,6 +704,10 @@ export function App() {
         }
         if (event === "done") {
           const ok = Boolean(payload.ok);
+          if (payload.sessionId) {
+            streamSessionId = String(payload.sessionId);
+            setActiveSessionId(streamSessionId);
+          }
           patchResponse({
             text: collected || stderr || (ok ? "Codex completed without output." : "云端 Codex 没有返回内容。"),
             mocked,
@@ -707,7 +726,7 @@ export function App() {
         if (done) break;
       }
       if (buffer.trim()) handleFrame(buffer);
-      await loadChatHistory(selectedRepo.id, activeSessionId);
+      await loadChatHistory(selectedRepo.id, streamSessionId);
     } catch (error) {
       setChatMessages((current) =>
         current.map((item) =>
@@ -1269,6 +1288,7 @@ function CloudChat({
   historyLoading: boolean;
 }) {
   const endRef = useRef<HTMLDivElement | null>(null);
+  const activeSession = sessions.find((session) => session.id === activeSessionId);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
@@ -1283,13 +1303,19 @@ function CloudChat({
           </div>
           <div>
             <p className="eyebrow">Cloud Codex</p>
-            <h2>和云端 Codex 对话</h2>
+            <h2>云端 Codex CLI</h2>
           </div>
         </div>
-        <span className={cx("status-pill", status.localMode ? "warn" : "ok")}>
-          <Cloud size={15} />
-          {status.localMode ? "本地模拟" : "EC2 在线"}
-        </span>
+        <div className="thread-actions">
+          <span className={cx("status-pill", status.localMode ? "warn" : "ok")}>
+            <Cloud size={15} />
+            {status.localMode ? "本地模拟" : "EC2 在线"}
+          </span>
+          <span className="status-pill">
+            <Terminal size={15} />
+            完整 CLI
+          </span>
+        </div>
       </div>
 
       <div className="repo-switcher" aria-label="选择工作目录">
@@ -1333,6 +1359,16 @@ function CloudChat({
         </button>
       </div>
 
+      <div className="runtime-strip" aria-label="底层运行时">
+        <span>
+          <Terminal size={14} />
+          {activeSession?.codexSessionId ? `CLI ${activeSession.codexSessionId.slice(0, 8)}` : "等待建立 CLI 会话"}
+        </span>
+        <span>{activeSession?.model || "gpt-5.4-mini"}</span>
+        <span>reasoning {activeSession?.reasoning || "medium"}</span>
+        <span>{activeSession?.sandbox || "danger-full-access"}</span>
+      </div>
+
       <div className="chat-window">
         <article className="chat-bubble codex">
           <span className="chat-avatar">
@@ -1341,8 +1377,7 @@ function CloudChat({
           <div>
             <strong>云端 Codex</strong>
             <p>
-              当前工作目录是 <code>{repo.path}</code>。你可以让我检查仓库、运行更新、解释日志、修改代码，或直接问 research
-              任务的状态。
+              当前工作目录是 <code>{repo.path}</code>。这条线程会绑定一个真实 Codex CLI session，后续消息会恢复同一段上下文继续执行。
             </p>
           </div>
         </article>
@@ -1380,7 +1415,7 @@ function CloudChat({
             </span>
             <div>
               <strong>云端 Codex</strong>
-              <p>正在运行 codex exec...</p>
+              <p>正在运行完整 Codex CLI...</p>
             </div>
           </article>
         )}
@@ -1397,7 +1432,7 @@ function CloudChat({
               onSend();
             }
           }}
-          placeholder="问云端 Codex：检查当前仓库状态 / 看最近一次日志 / 帮我跑一次宏观刷新..."
+          placeholder="问云端 Codex：继续上一个任务 / 检查仓库状态 / 跑一次宏观刷新 / 用浏览器验证页面..."
         />
         <button className="primary-command send-button" onClick={onSend} disabled={busy || !input.trim()}>
           {busy ? <Loader2 size={17} className="spin" /> : <Send size={17} />}

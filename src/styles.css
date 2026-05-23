@@ -1789,6 +1789,27 @@ h3 {
   background: var(--surface);
 }
 
+.runtime-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.runtime-strip span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-strong);
+  background: var(--surface);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .chat-window {
   min-height: 0;
   max-height: none;

@@ -64,3 +64,10 @@ export type ConsoleStatus = {
   logs: LogFile[];
   events: Array<{ tone: "ok" | "warn" | "info"; text: string }>;
 };
+
+export type ChatSessionRuntime = {
+  codexSessionId?: string | null;
+  model?: string | null;
+  reasoning?: string | null;
+  sandbox?: string | null;
+};

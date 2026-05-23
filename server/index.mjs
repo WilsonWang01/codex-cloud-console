@@ -21,6 +21,7 @@ const host = process.env.HOST || "127.0.0.1";
 const maxStoredChatMessages = 80;
 const maxPromptChatMessages = 18;
 const maxStoredSessions = 24;
+const codexTurnTimeoutMs = Number(process.env.CODEX_TURN_TIMEOUT_MS || 900_000);
 
 const repos = [
   {
@@ -178,6 +179,10 @@ function normalizeSession(item, repoId) {
     createdAt,
     updatedAt: String(item?.updatedAt || messages.at(-1)?.time || createdAt),
     messages: messages.slice(-maxStoredChatMessages),
+    codexSessionId: item?.codexSessionId ? String(item.codexSessionId) : null,
+    model: item?.model ? String(item.model) : null,
+    reasoning: item?.reasoning ? String(item.reasoning) : null,
+    sandbox: item?.sandbox ? String(item.sandbox) : null,
   };
 }
 
@@ -254,6 +259,10 @@ async function getRepoSessions(repoId) {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       messageCount: item.messages.length,
+      codexSessionId: item.codexSessionId || null,
+      model: item.model || null,
+      reasoning: item.reasoning || null,
+      sandbox: item.sandbox || null,
     }))
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
     .slice(0, maxStoredSessions);
@@ -279,6 +288,23 @@ async function saveChatMessages(repoId, sessionHint, messages) {
   store.activeByRepo[repoId] = session.id;
   await writeChatStore(store);
   return store.sessions[session.id];
+}
+
+async function updateSessionRuntime(repoId, sessionId, runtime = {}) {
+  const store = await readChatStore();
+  const session = store.sessions[sessionId];
+  if (!session || session.repoId !== repoId) return null;
+  store.sessions[sessionId] = normalizeSession(
+    {
+      ...session,
+      ...runtime,
+      updatedAt: new Date().toISOString(),
+    },
+    repoId,
+  );
+  store.activeByRepo[repoId] = sessionId;
+  await writeChatStore(store);
+  return store.sessions[sessionId];
 }
 
 async function appendChatTurn(repoId, sessionHint, message, response, mocked = false) {
@@ -309,37 +335,42 @@ function formatChatHistory(messages) {
     .join("\n\n");
 }
 
-function buildChatPrompt(repo, session, message, history = []) {
+function buildChatPrompt(repo, session, message) {
+  if (session?.codexSessionId) return message;
   return [
-    "你是运行在 EC2 上的云端 Codex 控制台助手。",
+    "你是运行在 EC2 上的云端 Codex CLI。这个网页只是 Codex CLI 的远程控制台外壳。",
     `当前仓库: ${repo.name}`,
     `工作目录: ${repo.path}`,
-    `当前会话: ${session?.title || "新会话"} (${session?.id || "none"})`,
-    "你会看到这个仓库对应控制台会话的最近历史。回答时要延续上下文，不要假装看不到前文。必要时可以基于历史中的用户偏好和已完成操作继续推进。",
-    "请直接回答用户问题。只有用户明确要求修改代码、运行命令或检查状态时才执行相应操作。",
-    "",
-    "最近会话历史:",
-    formatChatHistory(history),
+    "请像完整 Codex 一样工作：可以读写文件、运行终端命令、使用浏览器验证、解释日志、修复代码并持续验证。用户没有明确要求只讨论时，优先直接推进任务。",
     "",
     "用户消息:",
     message,
   ].join("\n");
 }
 
-function codexExecArgs(repo, model, reasoning) {
-  return [
+function parseCodexSessionId(output = "") {
+  const match = String(output).match(/(?:session\s*id|session_id)\s*[:=]\s*([0-9a-f]{8,}(?:-[0-9a-f]{4,}){3,})/i);
+  return match?.[1] || null;
+}
+
+function codexExecArgs(repo, session, model, reasoning) {
+  const args = [
     "exec",
     "--skip-git-repo-check",
+    "--dangerously-bypass-approvals-and-sandbox",
     "-C",
     repo.path,
     "-m",
     model,
     "-c",
     `model_reasoning_effort=${reasoning}`,
-    "-s",
-    "workspace-write",
-    "-",
   ];
+  if (session?.codexSessionId) {
+    args.push("resume", session.codexSessionId, "-");
+  } else {
+    args.push("-");
+  }
+  return args;
 }
 
 function writeSse(res, event, data) {
@@ -795,7 +826,6 @@ app.post("/api/chat", async (req, res) => {
   const reasoning = String(req.body?.reasoning || "medium");
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
-  const history = session.messages;
 
   if (!(await exists(repo.path))) {
     const output = `本地开发模式：会把这条消息发送给云端 Codex，并在 ${repo.name} 工作目录中执行。\n\n> ${message}`;
@@ -810,15 +840,25 @@ app.post("/api/chat", async (req, res) => {
 
   const result = await run(
     "codex",
-    codexExecArgs(repo, model, reasoning),
-    { timeout: 180_000, input: buildChatPrompt(repo, session, message, history) },
+    codexExecArgs(repo, session, model, reasoning),
+    { timeout: codexTurnTimeoutMs, input: buildChatPrompt(repo, session, message) },
   );
   const output = result.stdout || result.stderr || "Codex completed without output.";
+  const codexSessionId = session.codexSessionId || parseCodexSessionId(`${result.stderr}\n${result.stdout}`);
   await appendChatTurn(repo.id, session.id, message, output, false);
+  if (codexSessionId) {
+    await updateSessionRuntime(repo.id, session.id, {
+      codexSessionId,
+      model,
+      reasoning,
+      sandbox: "danger-full-access",
+    });
+  }
 
   res.json({
     ok: result.ok,
     sessionId: session.id,
+    codexSessionId,
     output,
     code: result.code,
   });
@@ -831,7 +871,6 @@ app.post("/api/chat/stream", async (req, res) => {
   const reasoning = String(req.body?.reasoning || "medium");
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
-  const history = session.messages;
 
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -855,10 +894,12 @@ app.post("/api/chat/stream", async (req, res) => {
     return;
   }
 
-  writeSse(res, "meta", { mocked: false, repo: repo.name, sessionId: session.id });
-  writeSse(res, "status", { text: "已连接云端 Codex，正在启动 codex exec..." });
+  writeSse(res, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null });
+  writeSse(res, "status", {
+    text: session.codexSessionId ? "已连接云端 Codex，正在恢复完整 CLI 会话..." : "已连接云端 Codex，正在启动完整 CLI 会话...",
+  });
 
-  const child = spawn("codex", codexExecArgs(repo, model, reasoning), {
+  const child = spawn("codex", codexExecArgs(repo, session, model, reasoning), {
     cwd: repo.path,
     env: process.env,
     stdio: ["pipe", "pipe", "pipe"],
@@ -866,11 +907,20 @@ app.post("/api/chat/stream", async (req, res) => {
   let stdout = "";
   let stderr = "";
   let closed = false;
+  let codexSessionId = session.codexSessionId || null;
 
   const timer = setTimeout(() => {
     writeSse(res, "status", { text: "运行时间较长，已请求终止。" });
     child.kill("SIGTERM");
-  }, 180_000);
+  }, codexTurnTimeoutMs);
+
+  const captureSessionId = (text) => {
+    if (codexSessionId) return;
+    const parsed = parseCodexSessionId(text);
+    if (!parsed) return;
+    codexSessionId = parsed;
+    writeSse(res, "session", { codexSessionId });
+  };
 
   req.on("close", () => {
     if (!closed) child.kill("SIGTERM");
@@ -879,12 +929,14 @@ app.post("/api/chat/stream", async (req, res) => {
   child.stdout.on("data", (chunk) => {
     const text = chunk.toString();
     stdout += text;
+    captureSessionId(text);
     writeSse(res, "delta", { text });
   });
 
   child.stderr.on("data", (chunk) => {
     const text = chunk.toString();
     stderr += text;
+    captureSessionId(text);
     writeSse(res, "stderr", { text });
   });
 
@@ -898,14 +950,22 @@ app.post("/api/chat/stream", async (req, res) => {
     if (!stdout && stderr) writeSse(res, "delta", { text: stderr });
     try {
       await appendChatTurn(repo.id, session.id, message, stdout || stderr, false);
+      if (codexSessionId) {
+        await updateSessionRuntime(repo.id, session.id, {
+          codexSessionId,
+          model,
+          reasoning,
+          sandbox: "danger-full-access",
+        });
+      }
     } catch (error) {
       writeSse(res, "error", { message: `会话保存失败: ${error.message}` });
     }
-    writeSse(res, "done", { ok: code === 0, code, sessionId: session.id });
+    writeSse(res, "done", { ok: code === 0, code, sessionId: session.id, codexSessionId });
     res.end();
   });
 
-  child.stdin.end(buildChatPrompt(repo, session, message, history));
+  child.stdin.end(buildChatPrompt(repo, session, message));
 });
 
 app.get("/api/files/tree", async (req, res) => {
