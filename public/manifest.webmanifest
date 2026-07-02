@@ -1,0 +1,18 @@
+{
+  "name": "Codex Cloud",
+  "short_name": "Codex",
+  "description": "云端 Codex 会话与自动化控制台",
+  "start_url": "/#/inbox",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#edf7fb",
+  "theme_color": "#edf7fb",
+  "icons": [
+    {
+      "src": "/codex-cloud.svg",
+      "sizes": "128x128",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

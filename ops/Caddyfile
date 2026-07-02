@@ -1,0 +1,22 @@
+{
+	email {$CODEX_CLOUD_CADDY_EMAIL}
+}
+
+http://{$CODEX_CLOUD_PUBLIC_IP} {
+  encode gzip
+  route {
+    @probe path /__proxy_probe
+    handle @probe {
+      respond {"ok":true} 200
+    }
+    redir https://{$CODEX_CLOUD_HTTPS_HOST}{uri} permanent
+  }
+}
+
+{$CODEX_CLOUD_HTTPS_HOST} {
+	encode zstd gzip
+	basicauth {
+		{$CODEX_CLOUD_BASIC_USER} {$CODEX_CLOUD_BASIC_HASH}
+	}
+	reverse_proxy 127.0.0.1:8787
+}

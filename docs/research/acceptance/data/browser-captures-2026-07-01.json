@@ -1,0 +1,106 @@
+[
+  {
+    "name": "01-inbox-desktop",
+    "file": "/Users/xiaoxin/Documents/codex_cloud/docs/research/acceptance/screenshots/01-inbox-desktop.png",
+    "state": {
+      "innerWidth": 1440,
+      "loading": [
+        "正在读取",
+        "读取中",
+        "连接中"
+      ],
+      "overflowX": false,
+      "overflows": [],
+      "scrollWidth": 1440,
+      "textSample": "Codex\nCloud\n收件箱\n...\n自动化\n4\n新对话\nAgent\n日志\n设置\n\n项目\n\ninvest-dashboard\nmacro-control-dashboard\nmemory-export-tracker\n对话\n正在读取会话...\nChatGPT subscription\n已登录\n连接中\nap-northeast-1\n刷新\n\n收件箱\n\n需要关注\n...\n未读\n...\n运行中\n...\n账户\n...\n改动\n操作\n\n待处理\n\n下一步\n读取中\n\n正在读取收件箱。\n\n最近任务\n0 条\n项目状态\n工作区干净",
+      "title": "Codex Cloud Console",
+      "url": "http://127.0.0.1:18787/?acceptance=1782918487630#/inbox",
+      "visibleBad": []
+    }
+  },
+  {
+    "name": "02-project-desktop",
+    "file": "/Users/xiaoxin/Documents/codex_cloud/docs/research/acceptance/screenshots/02-project-desktop.png",
+    "state": {
+      "innerWidth": 1440,
+      "loading": [
+        "正在读取",
+        "正在加载"
+      ],
+      "overflowX": false,
+      "overflows": [],
+      "scrollWidth": 1440,
+      "textSample": "Codex\nCloud\n收件箱\n...\n自动化\n4\n新对话\nAgent\n日志\n设置\n\n项目\n\ninvest-dashboard\nmacro-control-dashboard\nmemory-export-tracker\n对话\n正在读取会话...\nChatGPT subscription\n已登录\n刷新\n\n云端会话\n\n云端 Codex\n云端 Codex 在线\ninvest-dashboard\n新对话\n正在加载\n云端 Codex\n\n正在加载会话...\n\n/\n全权限\nGPT-5.5\n中",
+      "title": "Codex Cloud Console",
+      "url": "http://127.0.0.1:18787/?acceptance=1782918568425#/project/invest-dashboard",
+      "visibleBad": []
+    }
+  },
+  {
+    "name": "03-settings-desktop",
+    "file": "/Users/xiaoxin/Documents/codex_cloud/docs/research/acceptance/screenshots/03-settings-desktop.png",
+    "state": {
+      "innerWidth": 1440,
+      "loading": [
+        "正在读取"
+      ],
+      "overflowX": false,
+      "overflows": [],
+      "scrollWidth": 1440,
+      "textSample": "Codex\nCloud\n收件箱\n...\n自动化\n4\n新对话\nAgent\n日志\n设置\n\n项目\n\ninvest-dashboard\nmacro-control-dashboard\nmemory-export-tracker\n对话\n13\n当前\n1\n你能看到项目中的其他对话记录吗？还是只能看到当前的对话，也就是之前没有消息\n会话 019e62ea · 36 条消息 · 23:09:39\n最近\n4\n你好\n会话 019e95ad · 10:51:10\n你好吗\n会话 019e9403 · 03:02:10\n请读取上传文件路径中的文件，只回复文件内容，不要解释。 上传文件路径: -\n会话 019e63ee · 18:57:29\n请读取附件，只回复其中的标记，不要解释。\n会话 019e63e9 · 18:52:36\n显示更多 8\nChatGPT subscription\n已登录\n云端 Codex 在线\nap-northeast-1\n刷新\n\n设置\n\n控制台设置\n刷新\n云端工作区\n已连接\n公网 IP\n13.231.3.21\n私网 IP\n172.31.7.169\nCodex 认证\nChatGPT subscription\nCodex 诊断\n运行诊断\n\n检查 Codex CLI 版本、登录状态、云端协议、会话列表和 MCP/plugin/skills 等能力。\n\nCodex 账号\n重新登录\n退出\n未知账号 · ChatGPT subscription\n等待云端 Codex 能力探测。\n额度 正在读取\nMCP 服务器\n刷新\n正在读取云端 MCP 状态。\n云端实时事件\n暂无推送事件\n等待云端 Codex 推送 MCP、Skills、App 或模型状态变化。\n外部通知\n立即检查\n测试\n\n跨设备通知尚未配置。启用任一通知通道后，云端会把未读待处理项去重发送到外部设备。\n\n通用通知\n未配置\n未启用\nSlack 通知\n未配置\n未启用\nTelegram 通知\n未配置\n未启用\n已发送记录：0\n最近检查：尚未检查\n最近发送：尚未发送\n浏览器通知\n订阅本机\n测试\n\n云端还没有可用的后台通知密钥，浏览器通知暂不能订阅。\n\n入口\n本地安全入口\n浏览器能力\n后台通知可用\n通知权限\n已拒绝\n后台订阅\n订阅时创建\n后台通知密钥\n未配置\n未启用\n当前浏览器\n已拒绝\n未启用\n设备\n0 个订阅\n等待发送\n当前入口：本地安全入口\n最近测试：尚未测试\n云端控制接口\n\n会话、仓库同步、自动化和状态刷新都已连接到云端控制层。\n\n查看接口详情\n云端状态\n实例\ncodex-cloud-worker\n规格\nt3.small\n公网\n13.231.3.21\nCodex\nChatGPT subscription\n云端 Codex\n在线\n运行中\n0\n仓库\ninvest-dashboard\nWilsonWang01/invest-dashbo",
+      "title": "Codex Cloud Console",
+      "url": "http://127.0.0.1:18787/?acceptance=1782918575578#/settings",
+      "visibleBad": []
+    }
+  },
+  {
+    "name": "04-automation-desktop",
+    "file": "/Users/xiaoxin/Documents/codex_cloud/docs/research/acceptance/screenshots/04-automation-desktop.png",
+    "state": {
+      "innerWidth": 1440,
+      "loading": [
+        "正在读取"
+      ],
+      "overflowX": false,
+      "overflows": [],
+      "scrollWidth": 1440,
+      "textSample": "Codex\nCloud\n收件箱\n...\n自动化\n4\n新对话\nAgent\n日志\n设置\n\n项目\n\ninvest-dashboard\nmacro-control-dashboard\nmemory-export-tracker\n对话\n正在读取会话...\nChatGPT subscription\n已登录\n云端 Codex 在线\nap-northeast-1\n刷新\n\n云端任务\n\n自动化\n投资监控每日更新\ninvest-dashboard · gpt-5.5 · 高\n今天 09:30\n投资监控每日完成度检查\ninvest-dashboard · gpt-5.5 · 中\n今天 09:50\n每日宏观看板数据与解读刷新\nmacro-control-dashboard · gpt-5.4-mini · 低\n今天 18:30\nUpdate Korea memory export dashboard data\nmemory-export-tracker · gpt-5.4-mini · 低\n明天 00:38\n\n自动化会话\n\n投资监控每日更新\n同步\n暂停\nCodex 运行\n启用\ngpt-5.5 · 高\n工作日 09:30\n后台任务\n系统定时器已配置\n仓库\ninvest-dashboard\n运行方式\n云端 Codex · 隔离工作区\n下次运行\n今天 09:30\n\n运行记录\n\n任务运行\n隔离工作区\n\n还没有云端自动化运行记录。\n\n外部触发\n\n自动运行入口\n云端\n独立运行\n复制\n在新的隔离工作区运行一次任务\n云端入口已就绪\n查看命令\n继续会话\n复制\n绑定已有云端会话继续推进\n继续入口已就绪\n查看命令\n更多触发方式\n生成可复制配置，外部平台负责调度。\n\n生产环境需要配置访问令牌；复制配置时会包含标准鉴权方式。\n\n最近状态\n\n最近运行状态\n正常\n运行状态\n空闲\n故障状态\n空闲\n退出结果\n成功\n日志更新\n07/01 23:09\nmemory-export-refresh-latest.log\n查看完整日志\n云端拉取完成\n定时器等待下一次运行\n云端 Codex\n\n工作区 项目工作区 · invest-dashboard\n\n定时器已启用\n\n系统定时器 · 工作日 09:30\n\n云端状态\n实例\ncodex-cloud-worker\n规格\nt3.small\n公网\n13.231.3.21\nCodex\nChatGPT subscription\n云端 Codex\n在线\n运行中\n0\n仓库\ninvest-dashboard\nWilsonWang01/invest-dashboard\nmain\n7415506\n\n存在未提交改动\n\nRefresh dashboard research workflow",
+      "title": "Codex Cloud Console",
+      "url": "http://127.0.0.1:18787/?acceptance=1782918582299#/automations/invest-dashboard/invest-daily-update",
+      "visibleBad": []
+    }
+  },
+  {
+    "name": "05-inbox-mobile",
+    "file": "/Users/xiaoxin/Documents/codex_cloud/docs/research/acceptance/screenshots/05-inbox-mobile.png",
+    "state": {
+      "innerWidth": 390,
+      "loading": [
+        "正在读取",
+        "读取中"
+      ],
+      "overflowX": false,
+      "overflows": [],
+      "scrollWidth": 390,
+      "textSample": "云端 Codex 在线\nap-northeast-1\n刷新\n\n收件箱\n\n需要关注\n...\n未读\n...\n运行中\n...\n账户\n...\n改动\n操作\n\n待处理\n\n下一步\n读取中\n\n正在读取收件箱。\n\n最近任务\n0 条\n项目状态\n2 个有改动",
+      "title": "Codex Cloud Console",
+      "url": "http://127.0.0.1:18787/?acceptance=1782918588653#/inbox",
+      "visibleBad": []
+    }
+  },
+  {
+    "name": "06-project-mobile",
+    "file": "/Users/xiaoxin/Documents/codex_cloud/docs/research/acceptance/screenshots/06-project-mobile.png",
+    "state": {
+      "innerWidth": 390,
+      "loading": [],
+      "overflowX": false,
+      "overflows": [],
+      "scrollWidth": 390,
+      "textSample": "刷新\n云端 Codex\n云端 Codex 在线\ninvest-dashboard\n你能看到项目中的其他对话记录吗？还是只能看到当前的对话，也就是之前没有消息\n会话 019e62ea · 36 条消息 · 23:10:00\n你\n16:22:14\n\n只回复 CLOUD_APP_SERVER_SMOKE_OK，不要执行命令。\n\n云端 Codex\n16:22:14\n\nCLOUD_APP_SERVER_SMOKE_OK\n\n详情\n你\n13:17:02\n\n请把“更新股吧数据并同步线上 dashboard”的流程同步到云端 Codex CLI / 本项目自动化里，按今天实际跑通的方式固化，不要只做单票烟测。\n\n目标：以后云端 Codex 执行股吧刷新时，线上 Cloudflare dashboard 的 guba_date/guba_updated_at 必须更新到当天，而不是只更新本地 SQLite 或只采集 raw input。\n\n请在云端工作区完成以下改造/记录：\n\n使用云端环境变量，不要在代码或聊天里写死 token：\n\n云端同步地址=<redacted>\n云端同步 Token=<redacted>\n\n股吧刷新标准流程应是：\n\ncd .（如果云端实际路径不同，以当前项目根目录为准）\nPYTHONPATH=src python3 -m invest_dashboard.cli init-db\nPYTHONPATH=src python3 -m invest_dashboard.cli pull-cloud-watchlist\n抓取股吧帖子并生成 Codex 标注结果，最终必须 upsert 到 source='eastmoney.guba.codex_v1'\nPYTHONPATH=src python3 -m invest_dashboard.cli sync-cloud\n读取 https://invest-dashboard-api.wanghuaxin32-quant.workers.dev/api/dashboard 验证 rows=24、with_guba=23、guba_dates 包含当天日期。\n\n关键修正：如果 collect-guba-posts-for-codex / r.jina.ai 很慢或卡住，必须使用已存在的直连开关： INVEST_DASHBOARD_GUBA_DIRECT=1 PYTHONPATH=src python3 -m invest_dashboard.cli update-guba-sentiment --limit 80 这个会写 source='eastmoney.guba.keyword_v1'。但 dashboard 查询的是 source='eastmoney.guba.codex_v1'，所以不能停在 keyword",
+      "title": "Codex Cloud Console",
+      "url": "http://127.0.0.1:18787/?acceptance=1782918596042#/project/invest-dashboard/thread/019e62ea-1d1c-7840-af55-0dd4768f41df",
+      "visibleBad": []
+    }
+  }
+]

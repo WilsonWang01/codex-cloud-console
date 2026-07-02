@@ -7,19 +7,20 @@
 - 用途：云端 Codex 控制台和定时 Codex 任务
 - 区域：`ap-northeast-1`，东京
 - 实例 ID：`i-0ef9c3f3745c1b665`
-- 公网 IPv4：`54.199.2.92`
+- Elastic IP / 公网 IPv4：`13.231.3.21`
 - 私网 IPv4：`172.31.7.169`
 - VPC：`vpc-0f07766a08d6f876e`
 - 子网：`subnet-09ee30d7f42788c6f`
 - 可用区：`ap-northeast-1c`
 - 实例安全组：`sg-05abf23930b93274d`
-- 云端控制台：`http://54.199.2.92:8787/`
+- 固定 HTTPS 控制台：`https://13.231.3.21.sslip.io/`
+- 本地控制台代理：`http://127.0.0.1:18787/`
 - 本地 SSH 私钥：`~/.ssh/codex_cloud_ec2_ed25519`
 - 普通公网 SSH alias：`codex-cloud`
 
 ## 为什么要加备用登录方式
 
-实例侧的 SSH key 和 `sshd` 已确认正常，但本机 VPN 线路可能破坏公网 SSH。之前出现过一个很反常的现象：Mac 上 `nc` 扫 `54.199.2.92` 的任意端口都显示 connected，但 SSH 22 在 key exchange 阶段直接断开。这更像本地 VPN/代理在劫持或伪造 TCP 状态，不是 EC2 的 `sshd` 坏了。
+实例侧的 SSH key 和 `sshd` 已确认正常，但本机 VPN 线路可能破坏公网 SSH。之前出现过一个很反常的现象：Mac 上 `nc` 扫旧公网 IP 的任意端口都显示 connected，但 SSH 22 在 key exchange 阶段直接断开。这更像本地 VPN/代理在劫持或伪造 TCP 状态，不是 EC2 的 `sshd` 坏了。
 
 以后优先按这个顺序登录：
 
@@ -183,7 +184,7 @@ ssh codex-cloud
 
 ```sshconfig
 Host codex-cloud
-  HostName 54.199.2.92
+  HostName 13.231.3.21
   User ubuntu
   IdentityFile ~/.ssh/codex_cloud_ec2_ed25519
   IdentitiesOnly yes
@@ -192,14 +193,14 @@ Host codex-cloud
   StrictHostKeyChecking accept-new
 ```
 
-如果报 `kex_exchange_identification: Connection closed by remote host`，优先切换 VPN/直连，或者直接用 SSM/EIC。若 `nc` 显示 `54.199.2.92` 上很多随机未开放端口都能 connected，基本可以判断是本机 VPN/代理在伪造 TCP 状态。
+如果报 `kex_exchange_identification: Connection closed by remote host`，优先切换 VPN/直连，或者直接用 SSM/EIC。若 `nc` 显示公网 IP 上很多随机未开放端口都能 connected，基本可以判断是本机 VPN/代理在伪造 TCP 状态。
 
 ## 恢复检查清单
 
 1. 先试 `ssh codex-cloud-ssm`。
 2. 如果 SSM 不在线，试 `ssh codex-cloud-eice`。
 3. 如果 EIC 也不可用，打开 AWS CloudShell，区域选 `ap-northeast-1`，运行上面的 SSM/EIC 检查命令。
-4. 如果两条 AWS 托管通道都失败，但浏览器还能访问云端控制台，可以用 `http://54.199.2.92:8787/` 里的终端能力做临时修复。
+4. 如果两条 AWS 托管通道都失败，但浏览器还能访问云端控制台，可以用 `http://127.0.0.1:18787/` 或 `https://13.231.3.21.sslip.io/` 里的终端能力做临时修复。
 5. 只有在确认本机网络没有伪造 TCP 状态后，再去排查实例 `sshd`。
 
 ## 资料依据

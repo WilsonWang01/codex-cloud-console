@@ -1,0 +1,126 @@
+{
+  "startedAt": "2026-07-01T17:37:06.985Z",
+  "sessionId": "sess-mr2ct1mx-d0d48bca",
+  "steps": [
+    {
+      "path": "/api/codex/thread-goal",
+      "status": 200,
+      "ok": true,
+      "ms": 1631,
+      "json": {
+        "ok": true,
+        "goal": {
+          "threadId": "019f1ebd-b272-78f0-a699-ea43601022a9",
+          "objective": "验收临时 goal，可清除",
+          "status": "active",
+          "tokenBudget": 8000,
+          "tokensUsed": 0,
+          "timeUsedSeconds": 0,
+          "createdAt": 1782927428,
+          "updatedAt": 1782927428
+        }
+      },
+      "text": "{\"ok\":true,\"goal\":{\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"objective\":\"验收临时 goal，可清除\",\"status\":\"active\",\"tokenBudget\":8000,\"tokensUsed\":0,\"timeUsedSeconds\":0,\"createdAt\":1782927428,\"updatedAt\":1782927428}}"
+    },
+    {
+      "path": "/api/codex/thread-state?repoId=invest-dashboard&sessionId=sess-mr2ct1mx-d0d48bca",
+      "status": 200,
+      "ok": true,
+      "ms": 8754,
+      "json": {
+        "ok": true,
+        "error": null,
+        "goal": {
+          "threadId": "019f1ebd-b272-78f0-a699-ea43601022a9",
+          "objective": "验收临时 goal，可清除",
+          "status": "complete",
+          "tokenBudget": 8000,
+          "tokensUsed": 0,
+          "timeUsedSeconds": 4,
+          "createdAt": 1782927428,
+          "updatedAt": 1782927432
+        },
+        "tokenUsage": null,
+        "config": {
+          "modelContextWindow": null,
+          "autoCompactTokenLimit": 190000,
+          "autoCompactTokenLimitScope": "total",
+          "compactPrompt": null
+        },
+        "threadId": "019f1ebd-b272-78f0-a699-ea43601022a9",
+        "runtime": {
+          "model": "gpt-5.5",
+          "reasoning": "medium",
+          "sandbox": "danger-full-access",
+          "approval": "never",
+          "search": true
+        },
+        "repoId": "invest-dashboard",
+        "sessionId": "sess-mr2ct1mx-d0d48bca"
+      },
+      "text": "{\"ok\":true,\"error\":null,\"goal\":{\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"objective\":\"验收临时 goal，可清除\",\"status\":\"complete\",\"tokenBudget\":8000,\"tokensUsed\":0,\"timeUsedSeconds\":4,\"createdAt\":1782927428,\"updatedAt\":1782927432},\"tokenUsage\":null,\"config\":{\"modelContextWindow\":null,\"autoCompactTokenLimit\":190000,\"autoCompactTokenLimitScope\":\"total\",\"compactPrompt\":null},\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"runtime\":{\"model\":\"gpt-5.5\",\"reasoning\":\"medium\",\"sandbox\":\"danger-full-ac"
+    },
+    {
+      "path": "/api/codex/thread-goal?repoId=invest-dashboard&sessionId=sess-mr2ct1mx-d0d48bca",
+      "status": 200,
+      "ok": true,
+      "ms": 1743,
+      "json": {
+        "ok": true,
+        "goal": null
+      },
+      "text": "{\"ok\":true,\"goal\":null}"
+    },
+    {
+      "path": "/api/codex/thread-state?repoId=invest-dashboard&sessionId=sess-mr2ct1mx-d0d48bca",
+      "status": 200,
+      "ok": true,
+      "ms": 255,
+      "json": {
+        "ok": true,
+        "error": null,
+        "goal": null,
+        "tokenUsage": null,
+        "config": {
+          "modelContextWindow": null,
+          "autoCompactTokenLimit": 190000,
+          "autoCompactTokenLimitScope": "total",
+          "compactPrompt": null
+        },
+        "threadId": "019f1ebd-b272-78f0-a699-ea43601022a9",
+        "runtime": {
+          "model": "gpt-5.5",
+          "reasoning": "medium",
+          "sandbox": "danger-full-access",
+          "approval": "never",
+          "search": true
+        },
+        "repoId": "invest-dashboard",
+        "sessionId": "sess-mr2ct1mx-d0d48bca"
+      },
+      "text": "{\"ok\":true,\"error\":null,\"goal\":null,\"tokenUsage\":null,\"config\":{\"modelContextWindow\":null,\"autoCompactTokenLimit\":190000,\"autoCompactTokenLimitScope\":\"total\",\"compactPrompt\":null},\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"runtime\":{\"model\":\"gpt-5.5\",\"reasoning\":\"medium\",\"sandbox\":\"danger-full-access\",\"approval\":\"never\",\"search\":true},\"repoId\":\"invest-dashboard\",\"sessionId\":\"sess-mr2ct1mx-d0d48bca\"}"
+    },
+    {
+      "path": "/api/codex/thread-compact/stream",
+      "status": 200,
+      "ok": true,
+      "ms": 9705,
+      "events": [
+        "event: meta\ndata: {\"repoId\":\"invest-dashboard\",\"sessionId\":\"sess-mr2ct1mx-d0d48bca\",\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"jobId\":\"compact-mr2cypb0-d364ae\"}",
+        "event: status\ndata: {\"text\":\"正在连接云端 Codex...\"}",
+        "event: status\ndata: {\"text\":\"已恢复云端会话\"}",
+        "event: status\ndata: {\"text\":\"已恢复云端会话，正在启动上下文压缩...\"}",
+        "event: tokenUsage\ndata: {\"tokenUsage\":{\"total\":{\"totalTokens\":56496,\"inputTokens\":56368,\"cachedInputTokens\":28800,\"outputTokens\":128,\"reasoningOutputTokens\":70},\"last\":{\"totalTokens\":19353,\"inputTokens\":19326,\"cachedInputTokens\":18816,\"outputTokens\":27,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}",
+        "event: goal\ndata: {\"goal\":null}",
+        "event: status\ndata: {\"text\":\"正在压缩上下文...\"}",
+        "event: status\ndata: {\"text\":\"Codex 正在处理...\"}",
+        "event: status\ndata: {\"text\":\"Codex 正在生成压缩摘要...\"}",
+        "event: tokenUsage\ndata: {\"tokenUsage\":{\"total\":{\"totalTokens\":56496,\"inputTokens\":56368,\"cachedInputTokens\":28800,\"outputTokens\":128,\"reasoningOutputTokens\":70},\"last\":{\"totalTokens\":5671,\"inputTokens\":0,\"cachedInputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}",
+        "event: status\ndata: {\"text\":\"压缩摘要已生成，正在写回会话...\"}",
+        "event: done\ndata: {\"ok\":true,\"code\":0,\"sessionId\":\"sess-mr2ct1mx-d0d48bca\",\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"compactedAt\":\"2026-07-01T17:37:28.813Z\",\"error\":null,\"tokenUsage\":{\"total\":{\"totalTokens\":56496,\"inputTokens\":56368,\"cachedInputTokens\":28800,\"outputTokens\":128,\"reasoningOutputTokens\":70},\"last\":{\"totalTokens\":5671,\"inputTokens\":0,\"cachedInputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}"
+      ],
+      "textSample": "event: meta\ndata: {\"repoId\":\"invest-dashboard\",\"sessionId\":\"sess-mr2ct1mx-d0d48bca\",\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"jobId\":\"compact-mr2cypb0-d364ae\"}\n\nevent: status\ndata: {\"text\":\"正在连接云端 Codex...\"}\n\nevent: status\ndata: {\"text\":\"已恢复云端会话\"}\n\nevent: status\ndata: {\"text\":\"已恢复云端会话，正在启动上下文压缩...\"}\n\nevent: tokenUsage\ndata: {\"tokenUsage\":{\"total\":{\"totalTokens\":56496,\"inputTokens\":56368,\"cachedInputTokens\":28800,\"outputTokens\":128,\"reasoningOutputTokens\":70},\"last\":{\"totalTokens\":19353,\"inputTokens\":19326,\"cachedInputTokens\":18816,\"outputTokens\":27,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}\n\nevent: goal\ndata: {\"goal\":null}\n\nevent: status\ndata: {\"text\":\"正在压缩上下文...\"}\n\nevent: status\ndata: {\"text\":\"Codex 正在处理...\"}\n\nevent: status\ndata: {\"text\":\"Codex 正在生成压缩摘要...\"}\n\nevent: tokenUsage\ndata: {\"tokenUsage\":{\"total\":{\"totalTokens\":56496,\"inputTokens\":56368,\"cachedInputTokens\":28800,\"outputTokens\":128,\"reasoningOutputTokens\":70},\"last\":{\"totalTokens\":5671,\"inputTokens\":0,\"cachedInputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}\n\nevent: status\ndata: {\"text\":\"压缩摘要已生成，正在写回会话...\"}\n\nevent: done\ndata: {\"ok\":true,\"code\":0,\"sessionId\":\"sess-mr2ct1mx-d0d48bca\",\"threadId\":\"019f1ebd-b272-78f0-a699-ea43601022a9\",\"compactedAt\":\"2026-07-01T17:37:28.813Z\",\"error\":null,\"tokenUsage\":{\"total\":{\"totalTokens\":56496,\"inputTokens\":56368,\"cachedInputTokens\":28800,\"outputTokens\":128,\"reasoningOutputTokens\":70},\"last\":{\"totalTokens\":5671,\"inputTokens\":0,\"cachedInputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}\n\n"
+    }
+  ],
+  "finishedAt": "2026-07-01T17:37:29.074Z"
+}
