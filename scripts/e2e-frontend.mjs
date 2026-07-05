@@ -389,6 +389,16 @@ async function verifyUploadAndPaste(page, fixtures) {
   await inspectPage(page, "desktop upload and paste");
 }
 
+async function cleanupActiveDraftSession() {
+  const result = await fetchText(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}`);
+  if (!result.ok) throw new Error(`cleanup sessions read failed with HTTP ${result.status}: ${result.text.slice(0, 500)}`);
+  const data = parseJson(result, "cleanup sessions");
+  const active = Array.isArray(data?.sessions) ? data.sessions.find((session) => session.id === data.activeSessionId) : null;
+  if (!active || active.codexSessionId || active.threadId || active.source === "app-server") return;
+  const deleted = await fetchText(`/api/chat/sessions/${encodeURIComponent(active.id)}?repoId=${encodeURIComponent(repoId)}`, { method: "DELETE" });
+  if (!deleted.ok) throw new Error(`cleanup draft session failed with HTTP ${deleted.status}: ${deleted.text.slice(0, 500)}`);
+}
+
 async function verifyRealTurn(page) {
   const marker = `FRONTEND_E2E_OK_${safeName(runId).slice(0, 18)}`;
   const textarea = page.locator(".composer-shell textarea");
@@ -543,6 +553,12 @@ try {
 } finally {
   await context.tracing.stop({ path: tracePath }).catch(() => null);
   await browser.close().catch(() => null);
+  await cleanupActiveDraftSession().catch((error) => {
+    if (!fatalError) {
+      fatalError = error;
+      steps.push({ name: "cleanup draft session", ok: false, ms: 0, error: error.message || String(error) });
+    }
+  });
 }
 
 const report = {
