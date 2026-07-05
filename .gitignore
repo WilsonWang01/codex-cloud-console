@@ -5,3 +5,5 @@ dist/
 .env
 .env.*
 .codex-cloud-state/
+.codex-cloud-local/
+docs/research/acceptance/frontend-e2e/

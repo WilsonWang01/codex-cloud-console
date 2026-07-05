@@ -13,6 +13,7 @@ Environment=PORT=8787
 Environment=CODEX_CLOUD_ROOT=/home/ubuntu/codex-cloud
 Environment=HOME=/home/ubuntu
 Environment=CODEX_HOME=/home/ubuntu/.codex
+Environment=CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS=120000
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin
 ExecStart=/usr/bin/npm start
 Restart=on-failure

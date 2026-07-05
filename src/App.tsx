@@ -450,6 +450,7 @@ type CodexAppStatus = {
   authoritative?: boolean;
   partial?: boolean;
   failedCriticalKeys?: string[];
+  capabilityWarnings?: Array<{ key: string; error?: string | null }>;
   account?: { email?: string; planType?: string; type?: string } | null;
   rateLimits?: {
     primary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
@@ -9245,7 +9246,13 @@ function CloudChat({
                   <strong>{attachment.name}</strong>
                   <small>{formatBytes(attachment.size)}</small>
                 </span>
-                <button type="button" onClick={() => onRemoveAttachment(index)} disabled={busy}>
+                <button
+                  type="button"
+                  onClick={() => onRemoveAttachment(index)}
+                  disabled={busy}
+                  title={`移除 ${attachment.name}`}
+                  aria-label={`移除附件 ${attachment.name}`}
+                >
                   <X size={13} />
                 </button>
               </span>

@@ -41,6 +41,7 @@ export class CodexAppServerClient extends EventEmitter {
     args = ["app-server", "--listen", "stdio://"],
     clientInfo = { name: "codex_cloud_console", title: "Codex Cloud Console", version: "0.1.0" },
     onServerRequest = () => null,
+    initializeTimeoutMs = Number(process.env.CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS || 90_000),
   }) {
     super();
     this.cwd = cwd;
@@ -49,6 +50,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.args = args;
     this.clientInfo = clientInfo;
     this.onServerRequest = onServerRequest;
+    this.initializeTimeoutMs = initializeTimeoutMs;
     this.child = null;
     this.buffer = "";
     this.stderr = "";
@@ -94,8 +96,12 @@ export class CodexAppServerClient extends EventEmitter {
     this.readyPromise = new Promise((resolve, reject) => {
       this.sendRequest("initialize", {
         clientInfo: this.clientInfo,
-        capabilities: { experimentalApi: true },
-      }, 20_000, { bypassReady: true })
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+          optOutNotificationMethods: [],
+        },
+      }, this.initializeTimeoutMs, { bypassReady: true })
         .then((result) => {
           this.sendNotification("initialized", {});
           this.emit("ready", result);

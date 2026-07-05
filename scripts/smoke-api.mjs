@@ -336,12 +336,29 @@ const threadStateResult = await fetchText(`/api/codex/thread-state?repoId=${enco
 if (!threadStateResult.ok) throw new Error(`/api/codex/thread-state failed with HTTP ${threadStateResult.status}: ${threadStateResult.text.slice(0, 500)}`);
 assertNoProxyFallback(threadStateResult, "thread state capability");
 assertNoDegradedPayload(threadStateResult, "thread state capability");
-const threadState = parseJson(threadStateResult, "thread state capability");
+let threadState = parseJson(threadStateResult, "thread state capability");
 if (threadState?.ok !== true) throw new Error(`/api/codex/thread-state is not ok: ${threadStateResult.text.slice(0, 1000)}`);
 if (threadState?.source !== "app-server" || threadState?.authoritative !== true) {
   throw new Error(`/api/codex/thread-state is not authoritative app-server state: ${threadStateResult.text.slice(0, 1000)}`);
 }
 assertRuntimeShape(threadState.runtime, "thread state");
+if (!threadState.tokenUsage) {
+  const sessionsResult = await fetchText(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}&sync=1`);
+  if (!sessionsResult.ok) throw new Error(`token usage session lookup failed with HTTP ${sessionsResult.status}: ${sessionsResult.text.slice(0, 500)}`);
+  assertNoProxyFallback(sessionsResult, "token usage session lookup");
+  assertNoDegradedPayload(sessionsResult, "token usage session lookup");
+  const sessionsData = parseJson(sessionsResult, "token usage session lookup");
+  const tokenSession = (Array.isArray(sessionsData?.sessions) ? sessionsData.sessions : []).find((session) => session?.tokenUsage?.modelContextWindow);
+  if (tokenSession?.id) {
+    const tokenThreadStateResult = await fetchText(`/api/codex/thread-state?repoId=${encodeURIComponent(repoId)}&sessionId=${encodeURIComponent(tokenSession.id)}`);
+    if (!tokenThreadStateResult.ok) {
+      throw new Error(`token usage thread-state failed with HTTP ${tokenThreadStateResult.status}: ${tokenThreadStateResult.text.slice(0, 500)}`);
+    }
+    assertNoProxyFallback(tokenThreadStateResult, "token usage thread state");
+    assertNoDegradedPayload(tokenThreadStateResult, "token usage thread state");
+    threadState = parseJson(tokenThreadStateResult, "token usage thread state");
+  }
+}
 assertTokenUsageShape(threadState.tokenUsage, "thread state");
 if (!threadState.threadId) throw new Error(`/api/codex/thread-state missing threadId: ${threadStateResult.text.slice(0, 1000)}`);
 checks.push({ label: "thread state capability", ms: threadStateResult.ms, cache: threadStateResult.cache, fallback: threadStateResult.fallback });

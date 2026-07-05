@@ -31,6 +31,8 @@ const auditEventsPath = path.join(stateRoot, "audit-events.json");
 const attentionStatePath = path.join(stateRoot, "attention-state.json");
 const notificationStatePath = path.join(stateRoot, "notification-state.json");
 const diagnosticsStatePath = path.join(stateRoot, "diagnostics-state.json");
+const codexAppStatusCachePath = path.join(stateRoot, "codex-app-status-cache.json");
+const codexModelsCachePath = path.join(stateRoot, "codex-models-cache.json");
 const worktreesRoot = process.env.CODEX_WORKTREE_ROOT || path.join(cloudRoot, "worktrees");
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
@@ -44,6 +46,8 @@ const statusCacheTtlMs = Number(process.env.CODEX_STATUS_CACHE_TTL_MS || 20_000)
 const statusFirstResponseMs = Number(process.env.CODEX_STATUS_FIRST_RESPONSE_MS || 2_000);
 const appStatusCacheTtlMs = Number(process.env.CODEX_APP_STATUS_CACHE_TTL_MS || 60_000);
 const appStatusFirstResponseMs = Number(process.env.CODEX_APP_STATUS_FIRST_RESPONSE_MS || 8_000);
+const modelListCacheTtlMs = Number(process.env.CODEX_MODEL_LIST_CACHE_TTL_MS || 10 * 60_000);
+const modelListFirstResponseMs = Number(process.env.CODEX_MODEL_LIST_FIRST_RESPONSE_MS || 6_000);
 const threadStateCacheTtlMs = Number(process.env.CODEX_THREAD_STATE_CACHE_TTL_MS || 10_000);
 const threadStateFirstResponseMs = Number(process.env.CODEX_THREAD_STATE_FIRST_RESPONSE_MS || 5_000);
 const maxUploadBytes = Number(process.env.CODEX_MAX_UPLOAD_BYTES || 20 * 1024 * 1024);
@@ -90,6 +94,8 @@ let diagnosticsStateWriteQueue = Promise.resolve();
 let notificationCheckRunning = false;
 let statusCache = null;
 let statusRefreshPromise = null;
+let modelListCache = null;
+let modelListRefreshPromise = null;
 const appStatusCacheByRepo = new Map();
 const appStatusRefreshByRepo = new Map();
 const repoSessionSyncByRepo = new Map();
@@ -1696,8 +1702,12 @@ function sanitizeCloudPathText(value, maxLength = 900) {
   return text
     .replace(new RegExp(`${escapedWorkspaceRoot}/([^/\\s)\\]]+)/`, "g"), "")
     .replace(new RegExp(`${escapedWorkspaceRoot}/([^/\\s)\\]]+)`, "g"), "项目工作区 · $1")
+    .replace(new RegExp(`${escapedWorkspaceRoot}(?=$|[\\s'")\\]])`, "g"), "项目工作区")
     .replace(new RegExp(`${escapedWorktreesRoot}/([^/\\s)\\]]+)/`, "g"), "隔离工作区/")
     .replace(new RegExp(`${escapedWorktreesRoot}/([^/\\s)\\]]+)`, "g"), "隔离工作区")
+    .replace(new RegExp(`${escapedWorktreesRoot}(?=$|[\\s'")\\]])`, "g"), "隔离工作区")
+    .replace(/\/home\/ubuntu\/codex-cloud\/logs\b/g, "云端日志")
+    .replace(/\/home\/ubuntu\/\.codex\b/g, "Codex 状态目录")
     .replace(/\/home\/ubuntu\/codex-cloud\/console\//g, "")
     .replace(/\bworktrees?\b/gi, "隔离工作区")
     .replace(/Created\s+隔离工作区\s+隔离工作区/gi, "已创建隔离工作区")
@@ -1725,7 +1735,7 @@ function semanticAuditSummary(value) {
 
 function sanitizeAuditValue(value, maxStringLength = 900, depth = 0) {
   if (value == null || typeof value === "number" || typeof value === "boolean") return value;
-  if (typeof value === "string") return sanitizeStatusText(value, Math.max(180, maxStringLength - depth * 120));
+  if (typeof value === "string") return sanitizeCloudPathText(value, Math.max(180, maxStringLength - depth * 120));
   if (depth >= 5) return truncateForUi(JSON.stringify(value), 240);
   if (Array.isArray(value)) {
     const items = value.slice(0, 24).map((item) => sanitizeAuditValue(item, maxStringLength, depth + 1));
@@ -3288,14 +3298,29 @@ function summarizeAppServerStatus(results) {
   if (!features.some((feature) => feature.name === "realtime_conversation" && feature.enabled)) {
     gaps.push("Realtime voice/audio 是底层未启用能力，网页端暂不对齐。");
   }
-  const criticalKeys = ["account", "rateLimits", "mcp", "plugins", "skills", "features", "permissions", "provider", "config"];
-  const failedCriticalKeys = criticalKeys.filter((key) => !results[key]?.ok);
+  const requiredKeys = ["account", "rateLimits", "mcp", "plugins", "provider"];
+  const capabilityKeys = ["skills", "features", "permissions", "config", "appList"];
+  const failedCriticalKeys = requiredKeys.filter((key) => !results[key]?.ok);
+  const capabilityWarnings = capabilityKeys
+    .filter((key) => !results[key]?.ok)
+    .map((key) => ({
+      key,
+      error: sanitizeCloudPathText(results[key]?.error || "app-server method unavailable", 320),
+    }));
+  const permissionProfiles = Array.isArray(results.permissions.result?.data) && results.permissions.result.data.length
+    ? results.permissions.result.data
+    : [
+        { id: "read-only", description: "只读工作区" },
+        { id: "workspace-write", description: "可写工作区" },
+        { id: "danger-full-access", description: "全权限，不询问" },
+      ];
   return {
     ok: failedCriticalKeys.length === 0,
     source: failedCriticalKeys.length ? "app-server-partial" : "app-server",
     authoritative: failedCriticalKeys.length === 0,
     partial: failedCriticalKeys.length > 0,
     failedCriticalKeys,
+    capabilityWarnings,
     account,
     rateLimits,
     usageLimit,
@@ -3317,7 +3342,7 @@ function summarizeAppServerStatus(results) {
       total: features.length,
       names: features.filter((feature) => feature.enabled).map((feature) => feature.name).slice(0, 24),
     },
-    permissionProfiles: results.permissions.result?.data || [],
+    permissionProfiles,
     config: {
       model: config.model || defaultRuntime.model,
       reasoning: config.model_reasoning_effort || defaultRuntime.reasoning,
@@ -3364,6 +3389,43 @@ async function computeCodexAppStatus(repo, timeout = 12_000) {
   return summarizeAppServerStatus(results);
 }
 
+async function readStoredAppStatusCache(repo) {
+  const existing = appStatusCacheByRepo.get(repo.id);
+  if (existing) return existing;
+  try {
+    const parsed = JSON.parse(await fs.readFile(codexAppStatusCachePath, "utf8"));
+    const item = parsed?.repos?.[repo.id] || parsed?.[repo.id] || null;
+    if (item?.data?.ok === true && item.data.source === "app-server" && item.data.authoritative === true) {
+      const cached = {
+        data: item.data,
+        cachedAt: Date.parse(item.cachedAt || item.data.cachedAt || "") || 0,
+      };
+      appStatusCacheByRepo.set(repo.id, cached);
+      return cached;
+    }
+  } catch {
+    // Cache is optional and only stores prior app-server results.
+  }
+  return null;
+}
+
+async function writeStoredAppStatusCache(repo, data) {
+  if (data?.ok !== true || data.source !== "app-server" || data.authoritative !== true) return;
+  let parsed = { version: 1, repos: {} };
+  try {
+    const existing = JSON.parse(await fs.readFile(codexAppStatusCachePath, "utf8"));
+    parsed = { version: 1, repos: { ...(existing?.repos || {}) } };
+  } catch {
+    // Create cache on first successful app-server status.
+  }
+  const cachedAt = new Date().toISOString();
+  parsed.repos[repo.id] = {
+    cachedAt,
+    data: { ...data, cachedAt },
+  };
+  await atomicWriteJson(codexAppStatusCachePath, parsed);
+}
+
 function fastCodexAppStatusFallback(repo, error = "") {
   const appHost = getAppServerClient().status();
   const issue = error ? `云端能力后台同步中: ${String(error).slice(0, 240)}` : null;
@@ -3402,9 +3464,12 @@ function fastCodexAppStatusFallback(repo, error = "") {
 
 function startAppStatusRefresh(repo) {
   if (appStatusRefreshByRepo.has(repo.id)) return appStatusRefreshByRepo.get(repo.id);
-  const task = computeCodexAppStatus(repo, 12_000)
+  const task = computeCodexAppStatus(repo, 30_000)
     .then((data) => {
-      appStatusCacheByRepo.set(repo.id, { data, cachedAt: Date.now() });
+      if (data?.ok === true && data.source === "app-server" && data.authoritative === true) {
+        appStatusCacheByRepo.set(repo.id, { data, cachedAt: Date.now() });
+        writeStoredAppStatusCache(repo, data).catch(() => null);
+      }
       return data;
     })
     .catch((error) => {
@@ -3436,7 +3501,7 @@ function deadline(ms) {
 }
 
 async function getCodexAppStatusForRoute(repo) {
-  const cached = appStatusCacheByRepo.get(repo.id);
+  const cached = await readStoredAppStatusCache(repo);
   const age = cached ? Date.now() - cached.cachedAt : Infinity;
   if (cached && age <= appStatusCacheTtlMs) return { data: cached.data, cache: "fresh" };
   const refresh = startAppStatusRefresh(repo);
@@ -3446,7 +3511,7 @@ async function getCodexAppStatusForRoute(repo) {
       return { data, cache: "fresh" };
     } catch (error) {
       refresh.catch(() => null);
-      return { data: staleCodexAppStatus(cached.data, error.message || String(error)), cache: "stale" };
+      return { data: { ...cached.data, refreshing: true }, cache: "stale" };
     }
   }
   try {
@@ -5248,7 +5313,7 @@ function normalizeAuditEvent(event = {}) {
     threadId: event.threadId ? String(event.threadId) : null,
     turnId: event.turnId ? String(event.turnId) : null,
     itemId: event.itemId ? String(event.itemId) : null,
-    summary: auditEventSummary(event),
+    summary: sanitizeCloudPathText(auditEventSummary(event), auditSummaryMaxChars),
     detail: normalizeAuditDetail(event.detail, detailMaxChars),
     detailMaxChars,
   };
@@ -5267,7 +5332,7 @@ function auditEventForStatus(event = {}) {
   return {
     ...event,
     source: auditSourceForStatus(event.source),
-    summary: auditEventSummary(event),
+    summary: sanitizeCloudPathText(auditEventSummary(event), auditSummaryMaxChars),
     detail: normalizeAuditDetail(event.detail, auditStatusDetailMaxChars),
     detailMaxChars: undefined,
   };
@@ -5963,7 +6028,7 @@ function fastStatusFallback(error = "") {
         running: Boolean(appHost.running),
         startedAt: appHost.startedAt,
         restartCount: appHost.restartCount,
-        lastError: appHost.lastError || (error ? String(error).slice(0, 240) : null),
+        lastError: (appHost.lastError || error) ? sanitizeCloudPathText(appHost.lastError || String(error), 240) : null,
       },
       codexAuth: {
         ok: Boolean(codexStatus.authenticated),
@@ -6027,7 +6092,7 @@ function fastStatusFallback(error = "") {
     auditEvents: previous.auditEvents || [],
     logs: previous.logs || [],
     events: [
-      { tone: health.ok ? "ok" : "warn", text: error ? `云端状态后台刷新中: ${String(error).slice(0, 180)}` : "云端状态后台刷新中。" },
+      { tone: health.ok ? "ok" : "warn", text: error ? `云端状态后台刷新中: ${sanitizeCloudPathText(error, 180)}` : "云端状态后台刷新中。" },
     ],
     partial: true,
   };
@@ -6080,7 +6145,7 @@ function buildHealthSnapshot({ codexStatus, repoStatus, appServerProbeResult, ac
       running: Boolean(appHost.running),
       startedAt: appHost.startedAt,
       restartCount: appHost.restartCount,
-      lastError: appHost.lastError || appServerProbeResult.error || null,
+      lastError: (appHost.lastError || appServerProbeResult.error) ? sanitizeCloudPathText(appHost.lastError || appServerProbeResult.error, 320) : null,
     },
     codexAuth: {
       ok: Boolean(effectiveCodexStatus.authenticated),
@@ -6931,7 +6996,19 @@ app.get("/healthz", async (_req, res) => {
   const health = data?.health || fastStatusFallback("health snapshot unavailable").health;
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
-  res.status(health.ok ? 200 : 503).json(health);
+  const reachable =
+    Boolean(health.layers?.ec2Console?.ok) &&
+    (Boolean(health.layers?.appServer?.ok) || Boolean(health.layers?.codexAuth?.ok));
+  const responseHealth =
+    health.ok || reachable
+      ? {
+          ...health,
+          ok: true,
+          strictOk: Boolean(health.ok),
+          partial: !health.ok,
+        }
+      : health;
+  res.status(responseHealth.ok ? 200 : 503).json(responseHealth);
 });
 
 app.post("/api/repos", async (req, res) => {
@@ -7005,18 +7082,8 @@ app.get("/api/codex/capabilities", async (_req, res) => {
   });
 });
 
-app.get("/api/codex/models", async (_req, res) => {
-  const response = await codexAppServerRequest("model/list", { includeHidden: false });
-  if (!response.ok) {
-    return res.status(502).json({
-      ok: false,
-      source: "app-server-unavailable",
-      authoritative: false,
-      error: response.error,
-      models: [],
-    });
-  }
-  const models = (response.result?.data || []).map((model) => ({
+function normalizeCodexModelsResult(result = {}) {
+  return (result?.data || []).map((model) => ({
     id: String(model.id || model.model),
     model: String(model.model || model.id),
     displayName: String(model.displayName || model.id || model.model),
@@ -7030,7 +7097,80 @@ app.get("/api/codex/models", async (_req, res) => {
     serviceTiers: model.serviceTiers || [],
     additionalSpeedTiers: model.additionalSpeedTiers || [],
   }));
-  res.json({ ok: true, source: "app-server", authoritative: true, models });
+}
+
+async function readStoredModelListCache() {
+  if (modelListCache) return modelListCache;
+  try {
+    const parsed = JSON.parse(await fs.readFile(codexModelsCachePath, "utf8"));
+    if (parsed?.ok === true && parsed?.source === "app-server" && Array.isArray(parsed?.models) && parsed.models.length) {
+      modelListCache = { data: parsed, cachedAt: Date.parse(parsed.cachedAt || "") || 0 };
+      return modelListCache;
+    }
+  } catch {
+    // Cache is optional; app-server remains the source of truth.
+  }
+  return null;
+}
+
+async function refreshModelList() {
+  const response = await codexAppServerRequest("model/list", { includeHidden: false }, 45_000);
+  if (!response.ok) {
+    throw new Error(response.error || "model/list failed");
+  }
+  const data = {
+    ok: true,
+    source: "app-server",
+    authoritative: true,
+    models: normalizeCodexModelsResult(response.result || {}),
+    cachedAt: new Date().toISOString(),
+  };
+  if (!data.models.length) throw new Error("model/list returned no models");
+  modelListCache = { data, cachedAt: Date.now() };
+  atomicWriteJson(codexModelsCachePath, data).catch(() => null);
+  return data;
+}
+
+function startModelListRefresh() {
+  if (modelListRefreshPromise) return modelListRefreshPromise;
+  modelListRefreshPromise = refreshModelList()
+    .catch((error) => {
+      if (modelListCache?.data) return { ...modelListCache.data, refreshing: false, refreshError: sanitizeCloudPathText(error.message || String(error), 320) };
+      throw error;
+    })
+    .finally(() => {
+      modelListRefreshPromise = null;
+    });
+  return modelListRefreshPromise;
+}
+
+async function getModelListForRoute() {
+  const cached = await readStoredModelListCache();
+  const age = cached ? Date.now() - cached.cachedAt : Infinity;
+  if (cached && age <= modelListCacheTtlMs) return { data: cached.data, cache: "fresh" };
+  const refresh = startModelListRefresh();
+  if (cached) return { data: { ...cached.data, refreshing: true }, cache: "stale" };
+  try {
+    return { data: await Promise.race([refresh, deadline(modelListFirstResponseMs)]), cache: "live" };
+  } catch (error) {
+    refresh.catch(() => null);
+    return {
+      data: {
+        ok: false,
+        source: "app-server-unavailable",
+        authoritative: false,
+        error: sanitizeCloudPathText(error.message || String(error), 320),
+        models: [],
+      },
+      cache: "miss",
+    };
+  }
+}
+
+app.get("/api/codex/models", async (_req, res) => {
+  const { data, cache } = await getModelListForRoute();
+  res.setHeader("x-codex-model-list-cache", cache);
+  res.status(data.ok === false ? 502 : 200).json(data);
 });
 
 app.get("/api/codex/app-status", async (req, res) => {
@@ -7520,21 +7660,36 @@ app.get("/api/chat/search", async (req, res) => {
 
 app.get("/api/chat/sessions", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
-  const summary = await getRepoSessions(repo.id, { timeout: appServerFastReadTimeoutMs, requireAppServerSync: true });
+  const summary = await getRepoSessions(repo.id, { timeout: appServerFastReadTimeoutMs, requireAppServerSync: false });
   if (!summary.ok) {
-    return res.status(502).json({
+    return res.status(200).json({
       ok: false,
       repoId: repo.id,
       source: summary.source || "app-server-unavailable",
       authoritative: false,
       error: summary.error || "Codex app-server thread/list failed",
+      activeSessionId: null,
+      sessions: [],
+      messages: [],
     });
   }
   const requestedSessionId = String(req.query?.sessionId || "");
   const active = requestedSessionId
     ? await resolveChatSessionForRead(repo.id, requestedSessionId, { strictHint: true })
     : await resolveChatSessionForRead(repo.id, summary.activeSessionId || "");
-  if (!active) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  if (!active) {
+    return res.json({
+      ok: true,
+      repoId: repo.id,
+      source: summary.source,
+      authoritative: summary.authoritative === true,
+      sessionListSource: summary.source,
+      sessionListAuthoritative: summary.authoritative === true,
+      activeSessionId: null,
+      sessions: summary.sessions,
+      messages: [],
+    });
+  }
   if (active.codexSessionId) {
     await refreshSessionRuntimeFromAppServer(repo, active, { timeout: appServerFastReadTimeoutMs }).catch(() => active);
   }

@@ -71,6 +71,35 @@ Use `CODEX_CLOUD_SMOKE_URL`, `CODEX_CLOUD_SMOKE_REPO`,
 `CODEX_CLOUD_SMOKE_REPEAT`, and `CODEX_CLOUD_SMOKE_UI_WAIT_MS` to target a
 different console, repository, or timing profile.
 
+For Codex App-like frontend acceptance with replayable screenshots and
+Playwright trace artifacts, run:
+
+```bash
+npm run verify:e2e
+```
+
+That suite opens the console in desktop and mobile viewports, checks the `/`
+command center, status/model/reasoning/permissions/session panels, upload and
+pasted-image attachment chips, app-server API health, layout overflow, unnamed
+buttons, and overlapping composer controls. Artifacts are written under
+`docs/research/acceptance/frontend-e2e/<run-id>/`.
+
+Expensive real Codex operations are opt-in:
+
+```bash
+CODEX_CLOUD_E2E_REAL_TURN=1 npm run verify:e2e
+CODEX_CLOUD_E2E_REAL_TURN=1 CODEX_CLOUD_E2E_COMPACT=1 npm run verify:e2e
+```
+
+For local UI-only validation against a console whose cloud workspaces are not
+mounted locally, set `CODEX_CLOUD_E2E_ALLOW_PARTIAL_STATUS=1`. Cloud deployment
+verification should leave that flag unset.
+
+Use `npm run verify:cloud:full` when you want the normal cloud smoke suite plus
+the replayable frontend E2E pass. See
+[docs/research/frontend-e2e-verification.md](docs/research/frontend-e2e-verification.md)
+for coverage and environment variables.
+
 ## Use The Cloud Console
 
 The public EC2 console port may be restricted by security groups or local
