@@ -4,12 +4,15 @@ import { chromium } from "playwright";
 
 const baseUrl = new URL(process.env.CODEX_CLOUD_SMOKE_URL || process.env.CODEX_CLOUD_CONSOLE_URL || "http://127.0.0.1:18787/");
 const waitMs = Math.max(1_000, Number(process.env.CODEX_CLOUD_SMOKE_UI_WAIT_MS || 10_000));
+const allowLoading = process.env.CODEX_CLOUD_SMOKE_UI_ALLOW_LOADING === "1";
 const badNeedles = [
   "连接断开",
   "Local mock",
   "本地模拟",
   "模拟响应",
   "模拟日志",
+  "Preparing 隔离工作区 (detached HEAD",
+  "云端 Codex exited (SIGTERM)",
   "/bin/bash -lc",
   "app-server-command",
   "/home/ubuntu/codex-cloud/worktrees",
@@ -84,7 +87,7 @@ async function inspectPage(page, needles) {
       overflowX: document.documentElement.scrollWidth > window.innerWidth + 2,
       overflows,
       unnamedButtons,
-      loading: ["正在读取", "读取中", "正在加载"].filter((needle) => text.includes(needle)),
+      loading: ["正在读取", "读取中", "正在加载", "同步中", "同步会话中", "同步收件箱中", "等待云端状态同步"].filter((needle) => text.includes(needle)),
       sample: text.slice(0, 600),
     };
   }, needles);
@@ -172,8 +175,8 @@ const failures = results.filter(
     item.overflows.length ||
     item.unnamedButtons?.length ||
     (item.slashCommand && (!item.slashCommand.ok || item.slashCommand.badText?.length || item.slashCommand.overflowX || item.slashCommand.rect?.inViewport === false)) ||
-    item.loading.length,
+    (!allowLoading && item.loading.length),
 );
 
-console.log(JSON.stringify({ ok: failures.length === 0, baseUrl: baseUrl.href, waitMs, results }, null, 2));
+console.log(JSON.stringify({ ok: failures.length === 0, baseUrl: baseUrl.href, waitMs, allowLoading, results }, null, 2));
 if (failures.length) process.exit(1);

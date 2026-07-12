@@ -187,7 +187,7 @@ async function repeatEndpoint(pathname, label) {
 
 const checks = [];
 
-checks.push(await assertJson("/healthz", (data) => data?.ok === true, "healthz"));
+checks.push(await assertJson("/healthz", (data) => data?.ok === true && data?.strictOk !== false && data?.partial !== true, "healthz", { attempts: 10 }));
 const statusResult = await fetchText("/api/status");
 if (!statusResult.ok) throw new Error(`/api/status failed with HTTP ${statusResult.status}: ${statusResult.text.slice(0, 500)}`);
 assertNoProxyFallback(statusResult, "status");
@@ -233,10 +233,35 @@ checks.push(await assertJson(`/api/codex/app-status?repoId=${encodeURIComponent(
 }, "codex app status", { attempts: 5 }));
 
 checks.push(await repeatEndpoint(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}`, "chat sessions"));
+const sessionSnapshot = await assertJsonRequest(
+  `/api/chat/sessions?repoId=${encodeURIComponent(repoId)}&sync=1`,
+  {},
+  (data) => data?.ok === true && data?.source === "app-server" && data?.authoritative === true,
+  "chat sessions authoritative snapshot",
+);
+checks.push({ label: sessionSnapshot.label, ms: sessionSnapshot.ms, cache: sessionSnapshot.cache, fallback: sessionSnapshot.fallback });
+const initialSessions = Array.isArray(sessionSnapshot.data?.sessions) ? sessionSnapshot.data.sessions : [];
+const initialActiveSession = initialSessions.find((session) => session.id === sessionSnapshot.data?.activeSessionId) || null;
+const hasAppServerThread = Boolean(initialActiveSession?.threadId || initialActiveSession?.codexSessionId);
+
 checks.push(await repeatEndpoint(`/api/chat/active?repoId=${encodeURIComponent(repoId)}`, "chat active"));
 checks.push(await repeatEndpoint(`/api/codex/thread-state?repoId=${encodeURIComponent(repoId)}`, "thread state"));
 
 checks.push(await assertJson(`/api/chat/active?repoId=${encodeURIComponent(repoId)}`, (data) => {
+  if (!hasAppServerThread) {
+    return (
+      data?.ok === true &&
+      data?.source === "app-server" &&
+      data?.authoritative === true &&
+      data?.partial === false &&
+      data?.sessionId === null &&
+      data?.threadId === null &&
+      data?.threadState?.source === "app-server" &&
+      data?.threadState?.authoritative === true &&
+      data?.threadState?.partial === false &&
+      data?.threadState?.threadId === null
+    );
+  }
   return (
     data?.ok === true &&
     data?.source === "app-server" &&
@@ -250,6 +275,7 @@ checks.push(await assertJson(`/api/chat/active?repoId=${encodeURIComponent(repoI
 }, "chat active includes authoritative app-server thread state", { attempts: 3 }));
 
 checks.push(await assertJson(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}&sync=1`, (data) => {
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
   const active = Array.isArray(data?.sessions) ? data.sessions.find((session) => session.id === data.activeSessionId) : null;
   return (
     data?.ok === true &&
@@ -257,27 +283,49 @@ checks.push(await assertJson(`/api/chat/sessions?repoId=${encodeURIComponent(rep
     data?.authoritative === true &&
     data?.sessionListSource === "app-server" &&
     data?.sessionListAuthoritative === true &&
-    active?.source === "app-server" &&
-    Boolean(active?.threadId || active?.codexSessionId)
+    (hasAppServerThread
+      ? active?.source === "app-server" && Boolean(active?.threadId || active?.codexSessionId)
+      : data?.activeSessionId === null && sessions.length === 0)
   );
-}, "chat sessions active app-server source", { attempts: 3 }));
+}, "chat sessions use authoritative app-server state", { attempts: 3 }));
 
 checks.push(await assertJson(`/api/chat/history?repoId=${encodeURIComponent(repoId)}`, (data) => {
-  const active = Array.isArray(data?.sessions) ? data.sessions.find((session) => session.id === data.activeSessionId) : null;
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+  const active = sessions.find((session) => session.id === data.activeSessionId) || null;
   const messages = Array.isArray(data?.messages) ? data.messages : [];
+  const officialMessages = messages.every(
+    (message) => message?.mocked !== true && message?.messageType !== "threadReadError" && message?.source !== "app-server-unavailable",
+  );
+  if (hasAppServerThread) return data?.ok === true && active?.source === "app-server" && officialMessages;
   return (
     data?.ok === true &&
-    active?.source === "app-server" &&
-    messages.length > 0 &&
-    messages.every((message) => message?.mocked !== true && message?.messageType !== "threadReadError" && message?.source !== "app-server-unavailable")
+    data?.source === "app-server" &&
+    data?.authoritative === true &&
+    data?.activeSessionId === null &&
+    sessions.length === 0 &&
+    messages.length === 0
   );
 }, "chat history uses official app-server thread messages", { attempts: 3 }));
 
 checks.push(await assertJson("/api/automations/runs", (data) => {
   const runs = Array.isArray(data?.runs) ? data.runs : [];
   const threadRuns = runs.filter((run) => run.threadId);
-  const verifiedRuns = threadRuns.filter((run) => run.threadVerified === true && String(run.stateSource || "").includes("app-server-thread"));
-  return data?.ok === true && data?.source === "local-run-store+app-server-thread-verification" && threadRuns.length > 0 && verifiedRuns.length > 0;
+  const verificationLimit = Number(data?.verification?.limit || 0);
+  const expectedVerifiedCount = Math.min(verificationLimit, threadRuns.length);
+  const verificationWindow = threadRuns.slice(0, expectedVerifiedCount);
+  const verificationWindowIsAuthoritative = verificationWindow.every(
+    (run) => run.threadVerified === true && String(run.stateSource || "").includes("app-server-thread"),
+  );
+  const allRunsDeclareVerificationState = runs.every(
+    (run) => typeof run.threadVerified === "boolean" && String(run.stateSource || "").startsWith("local-run-store"),
+  );
+  return (
+    data?.ok === true &&
+    data?.source === "local-run-store+app-server-thread-verification" &&
+    data?.verification?.verifiedCount >= expectedVerifiedCount &&
+    verificationWindowIsAuthoritative &&
+    allRunsDeclareVerificationState
+  );
 }, "automation runs include app-server thread verification", { attempts: 3 }));
 
 const draftCreate = await assertJsonRequest(
@@ -296,6 +344,7 @@ const draftCreate = await assertJsonRequest(
 checks.push({ label: draftCreate.label, ms: draftCreate.ms, cache: draftCreate.cache, fallback: draftCreate.fallback });
 
 checks.push(await assertJson(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}&sync=1`, (data) => {
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
   const active = Array.isArray(data?.sessions) ? data.sessions.find((session) => session.id === data.activeSessionId) : null;
   return (
     data?.ok === true &&
@@ -303,10 +352,11 @@ checks.push(await assertJson(`/api/chat/sessions?repoId=${encodeURIComponent(rep
     data?.authoritative === true &&
     data?.sessionListSource === "app-server" &&
     data?.sessionListAuthoritative === true &&
-    active?.source === "app-server" &&
-    Boolean(active?.threadId || active?.codexSessionId)
+    (hasAppServerThread
+      ? active?.source === "app-server" && Boolean(active?.threadId || active?.codexSessionId)
+      : data?.activeSessionId === null && sessions.length === 0)
   );
-}, "empty local draft does not replace app-server active session", { attempts: 3 }));
+}, "empty local draft reconciles to authoritative app-server state", { attempts: 3 }));
 
 const missingSessionId = "missing-session-id-for-smoke";
 checks.push(await assertStatus(`/api/chat/active?repoId=${encodeURIComponent(repoId)}&sessionId=${encodeURIComponent(missingSessionId)}`, 404, "missing session active"));
@@ -342,7 +392,7 @@ if (threadState?.source !== "app-server" || threadState?.authoritative !== true)
   throw new Error(`/api/codex/thread-state is not authoritative app-server state: ${threadStateResult.text.slice(0, 1000)}`);
 }
 assertRuntimeShape(threadState.runtime, "thread state");
-if (!threadState.tokenUsage) {
+if (hasAppServerThread && !threadState.tokenUsage) {
   const sessionsResult = await fetchText(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}&sync=1`);
   if (!sessionsResult.ok) throw new Error(`token usage session lookup failed with HTTP ${sessionsResult.status}: ${sessionsResult.text.slice(0, 500)}`);
   assertNoProxyFallback(sessionsResult, "token usage session lookup");
@@ -359,8 +409,12 @@ if (!threadState.tokenUsage) {
     threadState = parseJson(tokenThreadStateResult, "token usage thread state");
   }
 }
-assertTokenUsageShape(threadState.tokenUsage, "thread state");
-if (!threadState.threadId) throw new Error(`/api/codex/thread-state missing threadId: ${threadStateResult.text.slice(0, 1000)}`);
+if (hasAppServerThread) {
+  assertTokenUsageShape(threadState.tokenUsage, "thread state");
+  if (!threadState.threadId) throw new Error(`/api/codex/thread-state missing threadId: ${threadStateResult.text.slice(0, 1000)}`);
+} else if (threadState.threadId !== null || threadState.partial !== false) {
+  throw new Error(`/api/codex/thread-state did not return an authoritative empty state: ${threadStateResult.text.slice(0, 1000)}`);
+}
 checks.push({ label: "thread state capability", ms: threadStateResult.ms, cache: threadStateResult.cache, fallback: threadStateResult.fallback });
 
 checks.push(await assertJson(`/api/files/tree?repoId=${encodeURIComponent(repoId)}&path=.`, (data) => {
@@ -372,62 +426,105 @@ checks.push(await assertJson(`/api/files/search?repoId=${encodeURIComponent(repo
   return data?.ok === true && data?.fallback === false && ["app-server", "app-server-fuzzy"].includes(data?.source);
 }, "files search app-server source"));
 
-const uploadContent = `codex-cloud app-server upload smoke ${new Date().toISOString()}\n`;
-const uploadCheck = await assertJsonRequest(
-  "/api/uploads",
-  {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      repoId,
-      files: [
+const cleanupPaths = [];
+const requiredDeletedPaths = new Set();
+let fileSmokeError = null;
+let cleanupError = null;
+try {
+  const uploadContent = `codex-cloud app-server upload smoke ${new Date().toISOString()}\n`;
+  let uploadedPath = "";
+  const uploadCheck = await assertJsonRequest(
+    "/api/uploads",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repoId,
+        files: [
+          {
+            name: "smoke-api-upload.txt",
+            dataUrl: `data:text/plain;base64,${Buffer.from(uploadContent, "utf8").toString("base64")}`,
+          },
+        ],
+      }),
+    },
+    (data) => {
+      uploadedPath = String(data?.files?.[0]?.path || "");
+      if (uploadedPath && !cleanupPaths.includes(uploadedPath)) cleanupPaths.push(uploadedPath);
+      return data?.ok === true && data?.files?.[0]?.source === "app-server" && Boolean(uploadedPath);
+    },
+    "upload app-server source",
+  );
+  requiredDeletedPaths.add(uploadedPath);
+  checks.push({ label: uploadCheck.label, ms: uploadCheck.ms, cache: uploadCheck.cache, fallback: uploadCheck.fallback });
+
+  checks.push(await assertJson(`/api/files/read?repoId=${encodeURIComponent(repoId)}&path=${encodeURIComponent(uploadedPath)}`, (data) => {
+    return data?.ok === true && data?.source === "app-server" && data?.content === uploadContent;
+  }, "uploaded file read app-server source"));
+
+  const blobResult = await fetchText(`/api/files/blob?repoId=${encodeURIComponent(repoId)}&path=${encodeURIComponent(uploadedPath)}`, {
+    headers: { accept: "*/*" },
+  });
+  if (!blobResult.ok) throw new Error(`uploaded file blob failed with HTTP ${blobResult.status}: ${blobResult.text.slice(0, 500)}`);
+  assertNoProxyFallback(blobResult, "uploaded file blob app-server source");
+  assertNoDegradedPayload(blobResult, "uploaded file blob app-server source");
+  if (blobResult.headers?.["x-codex-source"] !== "app-server") {
+    throw new Error(`uploaded file blob did not use app-server source: ${JSON.stringify(blobResult.headers).slice(0, 500)}`);
+  }
+  if (blobResult.text !== uploadContent) {
+    throw new Error("uploaded file blob content did not match uploaded content");
+  }
+  checks.push({ label: "uploaded file blob app-server source", ms: blobResult.ms, cache: blobResult.cache, fallback: blobResult.fallback });
+
+  const writeContent = `codex-cloud app-server write smoke ${new Date().toISOString()}\n`;
+  const writePath = `.codex-cloud/uploads/smoke-api-write-${Date.now().toString(36)}.txt`;
+  cleanupPaths.push(writePath);
+  const writeCheck = await assertJsonRequest(
+    "/api/files/write",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId, path: writePath, content: writeContent }),
+    },
+    (data) => data?.ok === true && data?.source === "app-server" && data?.path === writePath,
+    "file write app-server source",
+  );
+  requiredDeletedPaths.add(writePath);
+  checks.push({ label: writeCheck.label, ms: writeCheck.ms, cache: writeCheck.cache, fallback: writeCheck.fallback });
+
+  checks.push(await assertJson(`/api/files/read?repoId=${encodeURIComponent(repoId)}&path=${encodeURIComponent(writePath)}`, (data) => {
+    return data?.ok === true && data?.source === "app-server" && data?.content === writeContent;
+  }, "written file read app-server source"));
+} catch (error) {
+  fileSmokeError = error;
+} finally {
+  if (cleanupPaths.length) {
+    try {
+      const cleanupCheck = await assertJsonRequest(
+        "/api/uploads",
         {
-          name: "smoke-api-upload.txt",
-          dataUrl: `data:text/plain;base64,${Buffer.from(uploadContent, "utf8").toString("base64")}`,
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ repoId, paths: cleanupPaths }),
         },
-      ],
-    }),
-  },
-  (data) => data?.ok === true && data?.files?.[0]?.source === "app-server" && Boolean(data?.files?.[0]?.path),
-  "upload app-server source",
-);
-const uploadedPath = uploadCheck.data.files[0].path;
-checks.push({ label: uploadCheck.label, ms: uploadCheck.ms, cache: uploadCheck.cache, fallback: uploadCheck.fallback });
-
-checks.push(await assertJson(`/api/files/read?repoId=${encodeURIComponent(repoId)}&path=${encodeURIComponent(uploadedPath)}`, (data) => {
-  return data?.ok === true && data?.source === "app-server" && data?.content === uploadContent;
-}, "uploaded file read app-server source"));
-
-const blobResult = await fetchText(`/api/files/blob?repoId=${encodeURIComponent(repoId)}&path=${encodeURIComponent(uploadedPath)}`, {
-  headers: { accept: "*/*" },
-});
-if (!blobResult.ok) throw new Error(`uploaded file blob failed with HTTP ${blobResult.status}: ${blobResult.text.slice(0, 500)}`);
-assertNoProxyFallback(blobResult, "uploaded file blob app-server source");
-assertNoDegradedPayload(blobResult, "uploaded file blob app-server source");
-if (blobResult.headers?.["x-codex-source"] !== "app-server") {
-  throw new Error(`uploaded file blob did not use app-server source: ${JSON.stringify(blobResult.headers).slice(0, 500)}`);
+        (data) => {
+          const deleted = new Set(Array.isArray(data?.deleted) ? data.deleted : []);
+          const errors = Array.isArray(data?.errors) ? data.errors : [];
+          return data?.ok === true && errors.length === 0 && [...requiredDeletedPaths].every((filePath) => deleted.has(filePath));
+        },
+        "smoke file cleanup",
+      );
+      checks.push({ label: cleanupCheck.label, ms: cleanupCheck.ms, cache: cleanupCheck.cache, fallback: cleanupCheck.fallback });
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
 }
-if (blobResult.text !== uploadContent) {
-  throw new Error("uploaded file blob content did not match uploaded content");
+
+if (fileSmokeError) {
+  const cleanupSuffix = cleanupError ? `; cleanup also failed: ${cleanupError.message}` : "";
+  throw new Error(`${fileSmokeError.message}${cleanupSuffix}`);
 }
-checks.push({ label: "uploaded file blob app-server source", ms: blobResult.ms, cache: blobResult.cache, fallback: blobResult.fallback });
-
-const writeContent = `codex-cloud app-server write smoke ${new Date().toISOString()}\n`;
-const writePath = `.codex-cloud/uploads/smoke-api-write-${Date.now().toString(36)}.txt`;
-const writeCheck = await assertJsonRequest(
-  "/api/files/write",
-  {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ repoId, path: writePath, content: writeContent }),
-  },
-  (data) => data?.ok === true && data?.source === "app-server" && data?.path === writePath,
-  "file write app-server source",
-);
-checks.push({ label: writeCheck.label, ms: writeCheck.ms, cache: writeCheck.cache, fallback: writeCheck.fallback });
-
-checks.push(await assertJson(`/api/files/read?repoId=${encodeURIComponent(repoId)}&path=${encodeURIComponent(writePath)}`, (data) => {
-  return data?.ok === true && data?.source === "app-server" && data?.content === writeContent;
-}, "written file read app-server source"));
+if (cleanupError) throw cleanupError;
 
 console.log(JSON.stringify({ ok: true, baseUrl: baseUrl.href, repoId, repeat, checks }, null, 2));

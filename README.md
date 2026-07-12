@@ -37,10 +37,14 @@ Recommended EC2 install path:
 ```bash
 mkdir -p /home/ubuntu/codex-cloud/console
 cd /home/ubuntu/codex-cloud/console
-npm install
-npm run build
 bash ops/install-systemd.sh
 ```
+
+The installer validates the environment first, builds with `npm ci` in a new
+`/home/ubuntu/codex-cloud/releases/console/<release-id>` directory, atomically
+switches `/home/ubuntu/codex-cloud/console-current`, and rolls back the symlink
+if the service does not pass its API health check. Existing releases and all
+workspace/state directories are retained.
 
 The systemd service listens on `127.0.0.1:8787` by default. Browser access should go through the fixed HTTPS Caddy entrypoint or the local `127.0.0.1:18787` proxy. Do not expose the raw console port directly in the EC2 security group.
 
@@ -50,7 +54,13 @@ The systemd service listens on `127.0.0.1:8787` by default. Browser access shoul
 
 ## Verification
 
-Run the full local/cloud smoke suite after changing the app-server bridge,
+Run the isolated build and regression suite first:
+
+```bash
+npm run verify:local
+```
+
+Then run the live cloud smoke suite after changing the app-server bridge,
 session UI, proxy, upload, automation, or status read model:
 
 ```bash
@@ -144,12 +154,17 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.codex.cloud-console-pr
 ## Automation Triggers
 
 Scheduled timers, manual runs, webhooks, and heartbeats all enter the same
-app-server `AutomationRun` pipeline. For external callers, set
-`CODEX_CLOUD_WEBHOOK_TOKEN` on the cloud service and call:
+app-server `AutomationRun` pipeline. For external callers, configure
+`CODEX_CLOUD_WEBHOOK_TOKEN` and `CODEX_CLOUD_PUBLIC_ORIGIN` in
+`/etc/codex-cloud-console.env`. Production webhook and heartbeat calls fail
+closed when the token is missing. Caddy exempts only these two token-protected
+routes from console Basic Auth, so external callers send the automation token
+with `x-codex-cloud-token` and a stable idempotency key:
 
 ```bash
 curl -X POST "$CODEX_CLOUD_URL/api/automations/invest-daily-update/webhook" \
-  -H "Authorization: Bearer $CODEX_CLOUD_WEBHOOK_TOKEN" \
+  -H "x-codex-cloud-token: $CODEX_CLOUD_WEBHOOK_TOKEN" \
+  -H "Idempotency-Key: invest-daily-$(date +%F)" \
   -H "Content-Type: application/json" \
   -d '{"runner":"app-server","worktree":true}'
 ```

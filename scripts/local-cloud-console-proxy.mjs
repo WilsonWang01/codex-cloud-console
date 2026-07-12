@@ -15,6 +15,10 @@ const credentialsPath =
   `${process.env.HOME}/.codex/cloud-console-https-credentials`;
 const cachePath = process.env.CODEX_CLOUD_CONSOLE_CACHE || `${process.env.HOME}/.codex/cloud-console-proxy-cache.json`;
 const proxyFreshCacheTtlMs = Number(process.env.CODEX_CLOUD_CONSOLE_FRESH_CACHE_TTL_MS || 8_000);
+const proxyHeaderTimeoutMs = Math.max(500, Number(process.env.CODEX_CLOUD_CONSOLE_HEADER_TIMEOUT_MS || 15_000));
+const proxyHealthHeaderTimeoutMs = Math.max(500, Number(process.env.CODEX_CLOUD_CONSOLE_HEALTH_TIMEOUT_MS || 8_000));
+const proxyBufferedIdleTimeoutMs = Math.max(1_000, Number(process.env.CODEX_CLOUD_CONSOLE_BUFFER_IDLE_TIMEOUT_MS || 20_000));
+const proxyGetRetryLimit = Math.min(3, Math.max(0, Number(process.env.CODEX_CLOUD_CONSOLE_GET_RETRY_LIMIT || 1)));
 
 function isIpv4Address(value) {
   const parts = String(value || "").split(".");
@@ -75,6 +79,7 @@ const contentTypes = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -90,10 +95,35 @@ function upstreamHostname(targetUrl) {
 }
 
 function localStaticPath(requestPath) {
-  const pathname = decodeURIComponent((requestPath || "/").split("?")[0]);
-  if (pathname === "/" || pathname === "/index.html") return path.join(distRoot, "index.html");
-  if (pathname.startsWith("/assets/")) return path.join(distRoot, pathname);
-  return null;
+  let pathname;
+  try {
+    pathname = decodeURIComponent((requestPath || "/").split("?")[0]);
+  } catch {
+    return null;
+  }
+  if (pathname === "/") pathname = "/index.html";
+  if (pathname.includes("\0")) return null;
+  const filePath = path.resolve(distRoot, `.${pathname}`);
+  if (filePath === distRoot || !filePath.startsWith(`${distRoot}${path.sep}`)) return null;
+  try {
+    const rootPath = fs.realpathSync(distRoot);
+    const fileInfo = fs.lstatSync(filePath);
+    if (fileInfo.isSymbolicLink() || !fileInfo.isFile()) return null;
+    const realPath = fs.realpathSync(filePath);
+    if (realPath !== rootPath && !realPath.startsWith(`${rootPath}${path.sep}`)) return null;
+    return realPath;
+  } catch {
+    return null;
+  }
+}
+
+function hasMalformedPathEncoding(requestPath) {
+  try {
+    decodeURIComponent((requestPath || "/").split("?")[0]);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function loadResponseCache() {
@@ -128,8 +158,6 @@ function cachedResponseFor(targetUrl) {
 
 function isCacheableApi(targetUrl) {
   return [
-    "/healthz",
-    "/api/status",
     "/api/notifications/external/status",
     "/api/notifications/push/status",
   ].includes(targetUrl.pathname);
@@ -412,7 +440,7 @@ async function handleLocalOAuthRelay(req, res) {
 
 function sendLocalFile(clientSocket, requestPath, method) {
   const filePath = localStaticPath(requestPath);
-  if (!filePath || !filePath.startsWith(distRoot)) return false;
+  if (!filePath) return false;
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile()) return false;
@@ -431,7 +459,9 @@ function sendLocalFile(clientSocket, requestPath, method) {
     if (method === "HEAD") {
       clientSocket.end();
     } else {
-      fs.createReadStream(filePath).pipe(clientSocket);
+      const stream = fs.createReadStream(filePath);
+      stream.on("error", () => clientSocket.destroy());
+      stream.pipe(clientSocket);
     }
     return true;
   } catch {
@@ -441,7 +471,7 @@ function sendLocalFile(clientSocket, requestPath, method) {
 
 function sendLocalFileResponse(req, res) {
   const filePath = localStaticPath(req.url || "/");
-  if (!filePath || !filePath.startsWith(distRoot)) return false;
+  if (!filePath) return false;
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile()) return false;
@@ -455,7 +485,12 @@ function sendLocalFileResponse(req, res) {
     if (req.method === "HEAD") {
       safeEnd(res);
     } else {
-      fs.createReadStream(filePath).pipe(res);
+      const stream = fs.createReadStream(filePath);
+      stream.on("error", (error) => {
+        if (!res.headersSent) sendPlainError(res, 404, "Static file is no longer available\n");
+        else res.destroy(error);
+      });
+      stream.pipe(res);
     }
     return true;
   } catch {
@@ -465,6 +500,10 @@ function sendLocalFileResponse(req, res) {
 
 function createHttpProxy() {
   return http.createServer((req, res) => {
+    if (hasMalformedPathEncoding(req.url || "/")) {
+      sendPlainError(res, 400, "Malformed URL encoding\n");
+      return;
+    }
     if ((req.url || "").startsWith("/api/local/mcp-oauth-relay/start")) {
       handleLocalOAuthRelay(req, res);
       return;
@@ -472,7 +511,13 @@ function createHttpProxy() {
 
     if ((req.method === "GET" || req.method === "HEAD") && sendLocalFileResponse(req, res)) return;
 
-    const targetUrl = new URL(req.url || "/", credentials.target);
+    let targetUrl;
+    try {
+      targetUrl = new URL(req.url || "/", credentials.target);
+    } catch {
+      sendPlainError(res, 400, "Invalid request URL\n");
+      return;
+    }
     const requestId = proxyRequestId();
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
@@ -490,6 +535,8 @@ function createHttpProxy() {
       targetUrl.pathname.includes("job-events") ||
       String(req.headers.accept || "").includes("text/event-stream");
     const shouldBufferResponse = canRetry && !isStreamingRequest;
+    const isHealthRequest = targetUrl.pathname === "/healthz" || targetUrl.pathname === "/api/status";
+    const maxRetries = isHealthRequest ? 0 : proxyGetRetryLimit;
     let completed = false;
 
     if (canServeFreshCacheImmediately(req, targetUrl, isStreamingRequest)) {
@@ -506,7 +553,7 @@ function createHttpProxy() {
       const responseTimer = setTimeout(() => {
         if (responded) return;
         upstream?.destroy(new Error("upstream did not send headers in time"));
-      }, 25_000);
+      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : proxyHeaderTimeoutMs);
 
       upstream = transport.request(
         {
@@ -527,11 +574,14 @@ function createHttpProxy() {
           responded = true;
           clearTimeout(responseTimer);
           if (shouldBufferResponse) {
+            upstreamRes.setTimeout(proxyBufferedIdleTimeoutMs, () => {
+              upstreamRes.destroy(new Error("upstream response body timed out"));
+            });
             const chunks = [];
             let bytes = 0;
             const retryBuffered = () => {
               if (completed || res.headersSent || res.destroyed) return false;
-              if (attempt < 3) {
+              if (attempt < maxRetries) {
                 setTimeout(() => proxyRequest(attempt + 1), 200 * (attempt + 1));
                 return true;
               }
@@ -580,7 +630,7 @@ function createHttpProxy() {
       upstream.on("error", (error) => {
         clearTimeout(responseTimer);
         if (completed || res.destroyed) return;
-        if (canRetry && !responded && !res.headersSent && attempt < 3 && isTransientProxyError(error)) {
+        if (canRetry && !responded && !res.headersSent && attempt < maxRetries && isTransientProxyError(error)) {
           setTimeout(() => proxyRequest(attempt + 1), 200 * (attempt + 1));
           return;
         }
@@ -605,6 +655,11 @@ function createHttpProxy() {
 }
 
 const server = createHttpProxy();
+
+server.on("clientError", (_error, socket) => {
+  if (!socket.writable) return;
+  socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+});
 
 server.listen(port, host, () => {
   console.log(`Codex Cloud Console local http proxy ready: http://${host}:${port}/ -> ${credentials.target.href}`);

@@ -15,8 +15,20 @@ http://{$CODEX_CLOUD_PUBLIC_IP} {
 
 {$CODEX_CLOUD_HTTPS_HOST} {
 	encode zstd gzip
-	basicauth {
-		{$CODEX_CLOUD_BASIC_USER} {$CODEX_CLOUD_BASIC_HASH}
+	header {
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data: blob: https:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
 	}
-	reverse_proxy 127.0.0.1:8787
+	@automation_trigger path_regexp automation_trigger ^/api/automations/[^/]+/(webhook|heartbeat)$
+	handle @automation_trigger {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		basicauth {
+			{$CODEX_CLOUD_BASIC_USER} {$CODEX_CLOUD_BASIC_HASH}
+		}
+		reverse_proxy 127.0.0.1:8787
+	}
 }

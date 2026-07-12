@@ -13,12 +13,15 @@ import { normalizeAppServerThreadMessages } from "./app-server-normalizers.mjs";
 import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mjs";
 
 const app = express();
-app.use(express.json({ limit: process.env.CODEX_UPLOAD_JSON_LIMIT || "32mb" }));
+app.set("trust proxy", "loopback");
 const server = http.createServer(app);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
-const cloudRoot = process.env.CODEX_CLOUD_ROOT || "/home/ubuntu/codex-cloud";
+const defaultCloudRoot = process.platform === "linux" && process.env.NODE_ENV === "production"
+  ? "/home/ubuntu/codex-cloud"
+  : path.join(projectRoot, ".codex-cloud-local");
+const cloudRoot = process.env.CODEX_CLOUD_ROOT || defaultCloudRoot;
 const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "workspace");
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
 const stateRoot =
@@ -36,6 +39,27 @@ const codexModelsCachePath = path.join(stateRoot, "codex-models-cache.json");
 const worktreesRoot = process.env.CODEX_WORKTREE_ROOT || path.join(cloudRoot, "worktrees");
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
+const publicIp = process.env.CODEX_PUBLIC_IP || "13.231.3.21";
+const publicOrigin = String(
+  process.env.CODEX_CLOUD_PUBLIC_ORIGIN ||
+    `https://${process.env.CODEX_CLOUD_HTTPS_HOST || `${publicIp}.sslip.io`}`,
+).replace(/\/+$/, "");
+
+app.use((req, res, next) => {
+  res.setHeader("Content-Security-Policy", "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data: blob: https:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (/^\/api\/automations\/[^/]+\/(webhook|heartbeat)$/.test(req.path)) return next();
+  const origin = String(req.get("origin") || "").replace(/\/+$/, "");
+  const localOrigin = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(origin);
+  if ((origin && origin !== publicOrigin && !localOrigin) || req.get("sec-fetch-site") === "cross-site") {
+    return res.status(403).json({ ok: false, error: "Cross-site mutation request rejected" });
+  }
+  return next();
+});
+app.use(express.json({ limit: process.env.CODEX_UPLOAD_JSON_LIMIT || "32mb" }));
 const maxStoredChatMessages = 80;
 const maxPromptChatMessages = 18;
 const maxStoredSessions = Number(process.env.CODEX_MAX_SESSIONS || 120);
@@ -102,8 +126,20 @@ const repoSessionSyncByRepo = new Map();
 const threadSummaryRefreshByKey = new Map();
 const threadStateCacheByKey = new Map();
 const threadStateRefreshByKey = new Map();
+const threadStateRevisionByKey = new Map();
 const automationThreadVerificationById = new Map();
 const automationThreadVerificationTtlMs = Number(process.env.CODEX_AUTOMATION_THREAD_VERIFY_TTL_MS || 30_000);
+const automationThreadVerificationDefaultLimit = Math.min(
+  Math.max(Number(process.env.CODEX_AUTOMATION_THREAD_VERIFY_LIMIT || 12), 0),
+  50,
+);
+const automationTriggerRateWindowMs = Number(process.env.CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS || 60_000);
+const automationTriggerRateMax = Number(process.env.CODEX_AUTOMATION_TRIGGER_RATE_MAX || 12);
+const automationTriggerIdempotencyTtlMs = Number(process.env.CODEX_AUTOMATION_IDEMPOTENCY_TTL_MS || 24 * 60 * 60 * 1000);
+const automationTriggerRateByKey = new Map();
+const automationTriggerIdempotency = new Map();
+const configuredOwnerEntries = Number(process.env.CODEX_OWNER_INDEX_MAX || 5_000);
+const maxOwnerEntries = Number.isFinite(configuredOwnerEntries) ? Math.max(500, configuredOwnerEntries) : 5_000;
 
 const repos = [
   {
@@ -275,18 +311,12 @@ function normalizeCustomRepo(item, index = 0) {
 }
 
 async function readCustomRepos() {
-  try {
-    const raw = await fs.readFile(customReposPath, "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed?.repos) ? parsed.repos.map(normalizeCustomRepo).filter((repo) => repo.id) : [];
-  } catch {
-    return [];
-  }
+  const parsed = await readJsonState(customReposPath, { repos: [] });
+  return Array.isArray(parsed?.repos) ? parsed.repos.map(normalizeCustomRepo).filter((repo) => repo.id) : [];
 }
 
 async function writeCustomRepos(customRepos) {
-  await fs.mkdir(stateRoot, { recursive: true });
-  await fs.writeFile(customReposPath, `${JSON.stringify({ repos: customRepos }, null, 2)}\n`);
+  await atomicWriteJson(customReposPath, { repos: customRepos });
 }
 
 async function loadCustomRepos() {
@@ -350,6 +380,12 @@ function normalizeChatMessage(item) {
   if (item?.turnId) normalized.turnId = String(item.turnId);
   if (typeof item?.turnIndex === "number") normalized.turnIndex = item.turnIndex;
   if (item?.details && typeof item.details === "object") normalized.details = item.details;
+  if (Array.isArray(item?.attachments)) {
+    normalized.attachments = item.attachments
+      .slice(0, maxUploadFiles)
+      .map(normalizeDraftAttachment)
+      .filter((attachment) => attachment.path || attachment.absolutePath);
+  }
   return normalized;
 }
 
@@ -380,6 +416,7 @@ function normalizeSession(item, repoId) {
     sandbox: item?.sandbox ? String(item.sandbox) : null,
     approval: item?.approval ? String(item.approval) : null,
     search: typeof item?.search === "boolean" ? item.search : null,
+    pendingTurnRuntime: normalizePendingTurnRuntime(item?.pendingTurnRuntime, item),
     tokenUsage: normalizeTokenUsage(item?.tokenUsage),
     goal: item?.goal && typeof item.goal === "object" ? item.goal : null,
     compactedAt: item?.compactedAt ? String(item.compactedAt) : null,
@@ -425,12 +462,16 @@ function isEmptyDraftSession(session = {}) {
   return !session.codexSessionId && messageCount === 0 && !hasDraftContent && (!title || title === "新会话" || title === "新对话");
 }
 
+function isLocalDraftSession(session = {}) {
+  return !session.codexSessionId;
+}
+
 function chooseRepoActiveSessionId(store, repoId, options = {}) {
   const activeId = String(store.activeByRepo?.[repoId] || "");
   const active = activeId ? store.sessions?.[activeId] : null;
   if (active?.repoId === repoId) {
     if (active.codexSessionId) return active.id;
-    if (options.preserveLocalActive || !isEmptyDraftSession(active)) return active.id;
+    if (options.preserveLocalActive || options.allowLocalActive) return active.id;
   }
 
   const appServerActive = Object.values(store.sessions || {})
@@ -438,12 +479,12 @@ function chooseRepoActiveSessionId(store, repoId, options = {}) {
     .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())[0];
   if (appServerActive) return appServerActive.id;
 
-  if (active?.repoId === repoId) return active.id;
+  if (active?.repoId === repoId && (options.preserveLocalActive || options.allowLocalActive)) return active.id;
 
   const latestLocal = Object.values(store.sessions || {})
     .filter((session) => session.repoId === repoId)
     .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())[0];
-  return latestLocal?.id || "";
+  return options.allowLocalActive ? latestLocal?.id || "" : "";
 }
 
 function compactEmptyDraftSessions(store, repoId, keepSessionId = "") {
@@ -522,8 +563,36 @@ function uniqueTempPath(targetPath) {
 async function atomicWriteJson(filePath, value) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tmpPath = uniqueTempPath(filePath);
-  await fs.writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`);
+  const handle = await fs.open(tmpPath, "w", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fs.copyFile(filePath, `${filePath}.bak`);
+    await fs.chmod(`${filePath}.bak`, 0o600);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      await fs.rm(tmpPath, { force: true }).catch(() => null);
+      throw error;
+    }
+  }
   await fs.rename(tmpPath, filePath);
+}
+
+async function readJsonState(filePath, emptyValue) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return typeof emptyValue === "function" ? emptyValue() : structuredClone(emptyValue);
+    const stateError = new Error(`State file is unreadable or invalid: ${path.basename(filePath)}: ${error.message}`);
+    stateError.statusCode = 500;
+    stateError.source = "state-store-invalid";
+    stateError.cause = error;
+    throw stateError;
+  }
 }
 
 function enqueueWrite(queueName, task) {
@@ -566,6 +635,35 @@ function normalizeRuntime(input = {}, session = {}) {
   };
 }
 
+function normalizePendingTurnRuntime(value, session = {}) {
+  if (!value || typeof value !== "object") return null;
+  const runtime = normalizeRuntime(value, session);
+  return {
+    model: runtime.model,
+    reasoning: runtime.reasoning,
+    updatedAt: value.updatedAt ? String(value.updatedAt) : new Date().toISOString(),
+  };
+}
+
+function pendingTurnRuntimeApplied(pending = null, runtime = {}) {
+  if (!pending) return true;
+  return pending.model === runtime.model && pending.reasoning === runtime.reasoning;
+}
+
+function mergeAppServerRuntimeWithPending(session = {}, appServerRuntime = {}, options = {}) {
+  const pending = normalizePendingTurnRuntime(session.pendingTurnRuntime, session);
+  if (!pending || (options.clearPending && pendingTurnRuntimeApplied(pending, appServerRuntime))) {
+    return { ...appServerRuntime, pendingTurnRuntime: null };
+  }
+  return {
+    ...appServerRuntime,
+    model: pending.model,
+    reasoning: pending.reasoning,
+    search: typeof session.search === "boolean" ? session.search : appServerRuntime.search,
+    pendingTurnRuntime: pending,
+  };
+}
+
 function normalizeApprovalPolicy(value, fallback = defaultRuntime.approval) {
   if (typeof value === "string") return choice(value, allowedApproval, fallback);
   if (value && typeof value === "object" && value.granular) return "on-request";
@@ -596,70 +694,67 @@ async function refreshSessionRuntimeFromAppServer(repo, session, options = {}) {
   if (!session?.codexSessionId) return session;
   const response = await codexAppServerRequest("thread/resume", { threadId: session.codexSessionId, cwd: repo.path }, options.timeout || 20_000);
   if (!response.ok) return session;
-  const runtime = runtimeFromAppServerSettings(response.result || {}, session);
+  const appServerRuntime = runtimeFromAppServerSettings(response.result || {}, session);
+  const runtime = mergeAppServerRuntimeWithPending(session, appServerRuntime);
   return (await updateSessionRuntime(repo.id, session.id, runtime, { makeActive: false })) || session;
 }
 
 async function readChatStore() {
-  try {
-    const raw = await fs.readFile(chatHistoryPath, "utf8");
-    const parsed = JSON.parse(raw);
-    const sessions = {};
-    const activeByRepo = parsed?.activeByRepo && typeof parsed.activeByRepo === "object" ? parsed.activeByRepo : {};
+  const parsed = await readJsonState(chatHistoryPath, { version: 2, activeByRepo: {}, sessions: {} });
+  const sessions = {};
+  const activeByRepo = parsed?.activeByRepo && typeof parsed.activeByRepo === "object" ? parsed.activeByRepo : {};
 
-    if (parsed?.sessions && typeof parsed.sessions === "object") {
-      for (const [key, value] of Object.entries(parsed.sessions)) {
-        if (Array.isArray(value)) {
-          const migrated = normalizeSession(
-            {
-              id: `legacy-${key}`,
-              repoId: key,
-              title: value.find((message) => message?.role === "user")?.text || "默认会话",
-              messages: value,
-            },
-            key,
-          );
-          sessions[migrated.id] = migrated;
-          activeByRepo[key] ||= migrated.id;
-          continue;
-        }
-
-        const repoId = value?.repoId || key;
-        const normalized = normalizeSession(value, repoId);
-        sessions[normalized.id] = normalized;
-        activeByRepo[normalized.repoId] ||= normalized.id;
+  if (parsed?.sessions && typeof parsed.sessions === "object") {
+    for (const [key, value] of Object.entries(parsed.sessions)) {
+      if (Array.isArray(value)) {
+        const migrated = normalizeSession(
+          {
+            id: `legacy-${key}`,
+            repoId: key,
+            title: value.find((message) => message?.role === "user")?.text || "默认会话",
+            messages: value,
+          },
+          key,
+        );
+        sessions[migrated.id] = migrated;
+        activeByRepo[key] ||= migrated.id;
+        continue;
       }
-    }
 
-    return { version: 2, activeByRepo, sessions };
-  } catch {
-    return { version: 2, activeByRepo: {}, sessions: {} };
+      const repoId = value?.repoId || key;
+      const normalized = normalizeSession(value, repoId);
+      sessions[normalized.id] = normalized;
+      activeByRepo[normalized.repoId] ||= normalized.id;
+    }
   }
+
+  return { version: 2, activeByRepo, sessions };
 }
 
-async function writeChatStore(store) {
+async function mutateChatStore(mutator) {
   return enqueueWrite("chat", async () => {
-    const current = await readChatStore();
-    const deletedSessionIds = Array.isArray(store.__deletedSessionIds) ? store.__deletedSessionIds.map(String) : [];
-    const sessions = { ...current.sessions, ...(store.sessions || {}) };
-    for (const id of deletedSessionIds) delete sessions[id];
-    const merged = {
-      version: 2,
-      activeByRepo: { ...current.activeByRepo, ...(store.activeByRepo || {}) },
-      sessions,
-    };
-    await atomicWriteJson(chatHistoryPath, merged);
+    const store = await readChatStore();
+    const result = await mutator(store);
+    await atomicWriteJson(chatHistoryPath, { version: 2, activeByRepo: store.activeByRepo, sessions: store.sessions });
+    return result;
+  });
+}
+
+async function activateStoredSession(repoId, sessionId, keepSessionId = "") {
+  return mutateChatStore((store) => {
+    const session = store.sessions[sessionId];
+    if (!session || session.repoId !== repoId) return null;
+    store.activeByRepo[repoId] = session.id;
+    compactEmptyDraftSessions(store, repoId, keepSessionId);
+    return session;
   });
 }
 
 async function ensureChatSession(repoId, sessionHint, title = "新会话") {
-  const store = await readChatStore();
+  let store = await readChatStore();
   const hinted = findStoredSessionByHint(store, repoId, sessionHint);
   if (hinted) {
-    store.activeByRepo[repoId] = hinted.id;
-    compactEmptyDraftSessions(store, repoId, isEmptyDraftSession(hinted) ? hinted.id : "");
-    await writeChatStore(store);
-    return hinted;
+    return (await activateStoredSession(repoId, hinted.id, isEmptyDraftSession(hinted) ? hinted.id : "")) || hinted;
   }
 
   if (shouldResolveAppThreadHint(sessionHint)) {
@@ -673,31 +768,39 @@ async function ensureChatSession(repoId, sessionHint, title = "新会话") {
     ? store.sessions[chosenActiveId]
     : null;
   if (!sessionHint && active) {
-    store.activeByRepo[repoId] = active.id;
-    compactEmptyDraftSessions(store, repoId, isEmptyDraftSession(active) ? active.id : "");
-    await writeChatStore(store);
-    return active;
+    return (await activateStoredSession(repoId, active.id, isEmptyDraftSession(active) ? active.id : "")) || active;
   }
 
   const next = normalizeSession({ id: sessionId(), repoId, title, messages: [] }, repoId);
-  store.sessions[next.id] = next;
-  store.activeByRepo[repoId] = next.id;
-  compactEmptyDraftSessions(store, repoId, next.id);
-  await writeChatStore(store);
-  return next;
+  return mutateChatStore((current) => {
+    const concurrent = findStoredSessionByHint(current, repoId, sessionHint);
+    if (concurrent) {
+      current.activeByRepo[repoId] = concurrent.id;
+      return concurrent;
+    }
+    if (!sessionHint) {
+      const activeId = chooseRepoActiveSessionId(current, repoId, { allowLocalActive: true });
+      const concurrentActive = activeId ? current.sessions[activeId] : null;
+      if (concurrentActive) {
+        current.activeByRepo[repoId] = concurrentActive.id;
+        return concurrentActive;
+      }
+    }
+    current.sessions[next.id] = next;
+    current.activeByRepo[repoId] = next.id;
+    compactEmptyDraftSessions(current, repoId, next.id);
+    return next;
+  });
 }
 
 async function resolveChatSessionForRead(repoId, sessionHint = "", options = {}) {
   const hint = String(sessionHint || "").trim();
   if (!hint) return ensureChatSession(repoId, "");
 
-  const store = await readChatStore();
+  let store = await readChatStore();
   const hinted = findStoredSessionByHint(store, repoId, hint);
   if (hinted) {
-    store.activeByRepo[repoId] = hinted.id;
-    compactEmptyDraftSessions(store, repoId, isEmptyDraftSession(hinted) ? hinted.id : "");
-    await writeChatStore(store);
-    return hinted;
+    return (await activateStoredSession(repoId, hinted.id, isEmptyDraftSession(hinted) ? hinted.id : "")) || hinted;
   }
 
   if (shouldResolveAppThreadHint(hint)) {
@@ -713,19 +816,14 @@ async function resolveChatSessionForRead(repoId, sessionHint = "", options = {})
     ? store.sessions[chosenActiveId]
     : null;
   if (active) {
-    store.activeByRepo[repoId] = active.id;
-    compactEmptyDraftSessions(store, repoId, isEmptyDraftSession(active) ? active.id : "");
-    await writeChatStore(store);
-    return active;
+    return (await activateStoredSession(repoId, active.id, isEmptyDraftSession(active) ? active.id : "")) || active;
   }
 
   const latest = Object.values(store.sessions)
     .filter((session) => session.repoId === repoId)
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
   if (latest) {
-    store.activeByRepo[repoId] = latest.id;
-    await writeChatStore(store);
-    return latest;
+    return (await activateStoredSession(repoId, latest.id)) || latest;
   }
 
   return ensureChatSession(repoId, "");
@@ -733,17 +831,36 @@ async function resolveChatSessionForRead(repoId, sessionHint = "", options = {})
 
 async function resolveChatSessionForRequest(repoId, rawSessionId = "") {
   const sessionHint = String(rawSessionId || "").trim();
-  return resolveChatSessionForRead(repoId, sessionHint, { strictHint: Boolean(sessionHint) });
+  if (sessionHint) return resolveChatSessionForRead(repoId, sessionHint, { strictHint: true });
+
+  const store = await readChatStore();
+  const activeId = chooseRepoActiveSessionId(store, repoId, { allowLocalActive: true });
+  return activeId && store.sessions[activeId]?.repoId === repoId ? store.sessions[activeId] : null;
+}
+
+async function resolveSyncedChatSessionForRequest(repo, rawSessionId = "") {
+  const requestedSessionId = String(rawSessionId || "").trim();
+  let session = await resolveChatSessionForRequest(repo.id, requestedSessionId);
+  if (session || requestedSessionId) return { session, summary: null, requestedSessionId };
+
+  const summary = await getRepoSessions(repo.id, {
+    timeout: appServerFastReadTimeoutMs,
+    requireAppServerSync: true,
+  });
+  if (summary.ok && summary.authoritative === true && summary.activeSessionId) {
+    session = await resolveChatSessionForRequest(repo.id, summary.activeSessionId);
+  }
+  return { session, summary, requestedSessionId };
 }
 
 async function createStoredChatSession(repoId, title = "新会话", { makeActive = true } = {}) {
-  const store = await readChatStore();
   const next = normalizeSession({ id: sessionId(), repoId, title, messages: [] }, repoId);
-  store.sessions[next.id] = next;
-  if (makeActive) store.activeByRepo[repoId] = next.id;
-  if (makeActive) compactEmptyDraftSessions(store, repoId, next.id);
-  await writeChatStore(store);
-  return next;
+  return mutateChatStore((store) => {
+    store.sessions[next.id] = next;
+    if (makeActive) store.activeByRepo[repoId] = next.id;
+    if (makeActive) compactEmptyDraftSessions(store, repoId, next.id);
+    return next;
+  });
 }
 
 function appThreadTime(value) {
@@ -831,37 +948,38 @@ async function findStoredSessionByThreadId(threadId) {
 
 async function patchStoredThreadSession(threadId, patch = {}, options = {}) {
   if (!threadId) return null;
-  const { store, session } = await findStoredSessionByThreadId(threadId);
-  if (!session) return null;
-  const updated = normalizeSession(
-    {
-      ...session,
-      ...patch,
-      codexSessionId: threadId,
-      updatedAt: patch.updatedAt || new Date().toISOString(),
-    },
-    session.repoId,
-  );
-  store.sessions[session.id] = updated;
-  if (options.makeActive) store.activeByRepo[session.repoId] = session.id;
-  await writeChatStore(store);
-  return sessionSummary(updated);
+  return mutateChatStore((store) => {
+    const session = Object.values(store.sessions || {}).find((item) => item.codexSessionId === threadId) || null;
+    if (!session) return null;
+    const updated = normalizeSession(
+      {
+        ...session,
+        ...patch,
+        codexSessionId: threadId,
+        updatedAt: patch.updatedAt || new Date().toISOString(),
+      },
+      session.repoId,
+    );
+    store.sessions[session.id] = updated;
+    if (options.makeActive) store.activeByRepo[session.repoId] = session.id;
+    return sessionSummary(updated);
+  });
 }
 
 async function removeStoredThreadSession(threadId) {
   if (!threadId) return null;
-  const { store, session } = await findStoredSessionByThreadId(threadId);
-  if (!session) return null;
-  delete store.sessions[session.id];
-  store.__deletedSessionIds = [session.id];
-  if (store.activeByRepo[session.repoId] === session.id) {
-    const replacement = Object.values(store.sessions || {})
-      .filter((item) => item.repoId === session.repoId)
-      .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())[0];
-    store.activeByRepo[session.repoId] = replacement?.id || "";
-  }
-  await writeChatStore(store);
-  return sessionSummary(session);
+  return mutateChatStore((store) => {
+    const session = Object.values(store.sessions || {}).find((item) => item.codexSessionId === threadId) || null;
+    if (!session) return null;
+    delete store.sessions[session.id];
+    if (store.activeByRepo[session.repoId] === session.id) {
+      const replacement = Object.values(store.sessions || {})
+        .filter((item) => item.repoId === session.repoId)
+        .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())[0];
+      store.activeByRepo[session.repoId] = replacement?.id || "";
+    }
+    return sessionSummary(session);
+  });
 }
 
 async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
@@ -869,12 +987,12 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
   if (!threadId) return null;
   const repo = repoForThreadNotification(thread, routeOwner);
   if (!repo) return null;
-  const store = await readChatStore();
-  const ownerSession =
-    routeOwner?.sessionId && store.sessions[routeOwner.sessionId]?.repoId === repo.id
-      ? store.sessions[routeOwner.sessionId]
-      : null;
-  if (ownerSession && (!ownerSession.codexSessionId || ownerSession.codexSessionId === threadId)) {
+  const updatedOwner = await mutateChatStore((store) => {
+    const ownerSession =
+      routeOwner?.sessionId && store.sessions[routeOwner.sessionId]?.repoId === repo.id
+        ? store.sessions[routeOwner.sessionId]
+        : null;
+    if (!ownerSession || (ownerSession.codexSessionId && ownerSession.codexSessionId !== threadId)) return null;
     const updated = normalizeSession(
       {
         ...ownerSession,
@@ -886,9 +1004,9 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
       repo.id,
     );
     store.sessions[ownerSession.id] = updated;
-    await writeChatStore(store);
     return sessionSummary(updated);
-  }
+  });
+  if (updatedOwner) return updatedOwner;
   const [summary] = await upsertAppServerThreads(repo, [thread], { pruneMissing: false });
   return summary || null;
 }
@@ -900,13 +1018,6 @@ async function importAppServerThreadSession(repo, threadId, title = "新会话")
   const returnedThread = response.result?.thread || response.result?.data?.thread || response.result?.data || {};
   const returnedThreadId = String(returnedThread?.id || response.result?.threadId || "").trim();
   if (returnedThreadId && returnedThreadId !== threadId) return null;
-  const store = await readChatStore();
-  const existing = findStoredSessionByHint(store, repo.id, threadId);
-  if (existing) {
-    store.activeByRepo[repo.id] = existing.id;
-    await writeChatStore(store);
-    return existing;
-  }
   const thread = returnedThread;
   const runtime = runtimeFromAppServerSettings(response.result || {}, {});
   const imported = normalizeSession(
@@ -922,10 +1033,16 @@ async function importAppServerThreadSession(repo, threadId, title = "新会话")
     },
     repo.id,
   );
-  store.sessions[imported.id] = imported;
-  store.activeByRepo[repo.id] = imported.id;
-  await writeChatStore(store);
-  return imported;
+  return mutateChatStore((store) => {
+    const existing = findStoredSessionByHint(store, repo.id, threadId);
+    if (existing) {
+      store.activeByRepo[repo.id] = existing.id;
+      return existing;
+    }
+    store.sessions[imported.id] = imported;
+    store.activeByRepo[repo.id] = imported.id;
+    return imported;
+  });
 }
 
 async function listAppServerThreads(repo, options = {}) {
@@ -957,7 +1074,7 @@ async function listAppServerThreads(repo, options = {}) {
 }
 
 function sessionSummary(item) {
-  const isDraft = isEmptyDraftSession(item);
+  const isDraft = isLocalDraftSession(item);
   const storedMessageCount = Number(item.messageCount || 0);
   const messageCount = Math.max(Array.isArray(item.messages) ? item.messages.length : 0, Number.isFinite(storedMessageCount) ? storedMessageCount : 0);
   return {
@@ -976,6 +1093,7 @@ function sessionSummary(item) {
     sandbox: item.sandbox || null,
     approval: item.approval || null,
     search: typeof item.search === "boolean" ? item.search : null,
+    runtimePending: Boolean(item.pendingTurnRuntime),
     tokenUsage: item.tokenUsage || null,
     goal: item.goal || null,
     compactedAt: item.compactedAt || null,
@@ -984,17 +1102,13 @@ function sessionSummary(item) {
 }
 
 async function upsertAppServerThreads(repo, threads, options = {}) {
-  const store = await readChatStore();
-  let changed = false;
-  const deletedSessionIds = [];
+  return mutateChatStore((store) => {
   const listedThreadIds = new Set((threads || []).map((thread) => String(thread?.id || "")).filter(Boolean));
   if (options.pruneMissing) {
     for (const session of Object.values(store.sessions)) {
       if (session.repoId !== repo.id || !session.codexSessionId) continue;
       if (listedThreadIds.has(session.codexSessionId)) continue;
       delete store.sessions[session.id];
-      deletedSessionIds.push(session.id);
-      changed = true;
     }
   }
   const mergedSessions = [];
@@ -1013,6 +1127,12 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
     const hasOfficialName = Boolean(String(thread.name || thread.title || "").trim());
     const threadMessageCount = Number(thread.messageCount ?? thread.message_count ?? 0);
     const threadTokenUsage = normalizeTokenUsage(thread.tokenUsage || thread.token_usage);
+    const threadRuntime = {
+      model: thread.model || existing?.model || defaultRuntime.model,
+      reasoning: thread.reasoningEffort || thread.reasoning_effort || existing?.reasoning || defaultRuntime.reasoning,
+    };
+    const pendingTurnRuntime = normalizePendingTurnRuntime(existing?.pendingTurnRuntime, existing || {});
+    const keepPendingTurnRuntime = pendingTurnRuntime;
     const merged = normalizeSession(
       {
         ...(existing || {}),
@@ -1022,10 +1142,11 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
         createdAt: appThreadTime(thread.createdAt || thread.created_at),
         updatedAt: appThreadTime(thread.updatedAt || thread.updated_at || thread.createdAt || thread.created_at),
         codexSessionId: threadId,
-        model: thread.model || existing?.model || null,
-        reasoning: thread.reasoningEffort || thread.reasoning_effort || existing?.reasoning || null,
+        model: keepPendingTurnRuntime?.model || threadRuntime.model,
+        reasoning: keepPendingTurnRuntime?.reasoning || threadRuntime.reasoning,
         sandbox: thread.sandboxPolicy || thread.sandbox_policy || existing?.sandbox || null,
         approval: thread.approvalMode || thread.approval_mode || existing?.approval || null,
+        pendingTurnRuntime: keepPendingTurnRuntime,
         messages: existing?.messages || [],
         messageCount: Math.max(
           Number(existing?.messageCount || 0),
@@ -1042,18 +1163,15 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
     store.sessions[sessionId] = merged;
     mergedSessions.push(merged);
     if (!store.activeByRepo[repo.id]) store.activeByRepo[repo.id] = sessionId;
-    changed = true;
   }
   if (!store.activeByRepo[repo.id] || !store.sessions[store.activeByRepo[repo.id]]) {
     const active = Object.values(store.sessions)
       .filter((session) => session.repoId === repo.id)
       .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
     store.activeByRepo[repo.id] = active?.id || "";
-    changed = true;
   }
-  if (deletedSessionIds.length) store.__deletedSessionIds = deletedSessionIds;
-  if (changed) await writeChatStore(store);
   return mergedSessions.map(sessionSummary);
+  });
 }
 
 async function syncAppServerThreads(repo, options = {}) {
@@ -1085,43 +1203,54 @@ async function getRepoSessions(repoId, options = {}) {
     if (!listed.ok) {
       syncError = listed.error || "app-server thread/list failed";
       source = "app-server-unavailable";
-      if (options.requireAppServerSync && !allowLocalFallback) {
-        return {
-          ok: false,
-          source,
-          authoritative: false,
-          error: syncError,
-          sessions: [],
-          activeSessionId: null,
-        };
-      }
     } else {
       source = "app-server";
       authoritative = true;
     }
   }
-  const store = await readChatStore();
-  const activeId = chooseRepoActiveSessionId(store, repoId, options);
-  if (activeId && store.activeByRepo[repoId] !== activeId) {
-    store.activeByRepo[repoId] = activeId;
-    await writeChatStore(store);
+  let store = await readChatStore();
+  if (syncError) {
+    const items = Object.values(store.sessions)
+      .filter((item) => item.repoId === repoId)
+      .map(sessionSummary)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+      .slice(0, maxStoredSessions);
+    const storedActiveId = String(store.activeByRepo?.[repoId] || "");
+    const storedActive = storedActiveId && store.sessions[storedActiveId]?.repoId === repoId ? storedActiveId : null;
+    return {
+      ok: Boolean(allowLocalFallback && !options.requireAppServerSync),
+      source,
+      authoritative: false,
+      error: syncError,
+      sessions: items,
+      activeSessionId: storedActive,
+    };
   }
+  const activeId = chooseRepoActiveSessionId(store, repoId, options);
+  const needsActiveUpdate = Boolean(activeId && store.activeByRepo[repoId] !== activeId);
   const active = activeId ? store.sessions[activeId] : null;
-  const keepDraftId = active && isEmptyDraftSession(active) ? active.id : "";
-  const deletedDrafts = compactEmptyDraftSessions(store, repoId, keepDraftId);
-  if (deletedDrafts.length) await writeChatStore(store);
+  const keepDraftId = authoritative && active && isEmptyDraftSession(active) ? active.id : "";
+  if (needsActiveUpdate || authoritative) {
+    await mutateChatStore((current) => {
+      if (activeId && current.sessions[activeId]?.repoId === repoId) current.activeByRepo[repoId] = activeId;
+      if (authoritative) compactEmptyDraftSessions(current, repoId, keepDraftId);
+    });
+    store = await readChatStore();
+  }
   const items = Object.values(store.sessions)
     .filter((item) => item.repoId === repoId)
     .map(sessionSummary)
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
     .slice(0, maxStoredSessions);
+  const returnedActiveId = chooseRepoActiveSessionId(store, repoId, options);
+  const allowLocalActive = options.preserveLocalActive || options.allowLocalActive;
   return {
     ok: true,
     source,
     authoritative,
     error: syncError,
     sessions: items,
-    activeSessionId: chooseRepoActiveSessionId(store, repoId, options) || items[0]?.id || null,
+    activeSessionId: returnedActiveId || (allowLocalActive ? items[0]?.id || null : null),
   };
 }
 
@@ -1295,36 +1424,38 @@ async function getChatMessages(repoId, sessionHint, options = {}) {
 }
 
 async function saveChatMessages(repoId, sessionHint, messages) {
-  const store = await readChatStore();
   const session = await ensureChatSession(repoId, sessionHint);
   const normalized = messages.map(normalizeChatMessage).filter((item) => item.text).slice(-maxStoredChatMessages);
   const firstUser = normalized.find((item) => item.role === "user")?.text;
-  store.sessions[session.id] = {
-    ...session,
-    title: session.title === "新会话" && firstUser ? sessionTitle(firstUser) : session.title,
-    updatedAt: normalized.at(-1)?.time || new Date().toISOString(),
-    messages: normalized,
-  };
-  store.activeByRepo[repoId] = session.id;
-  await writeChatStore(store);
-  return store.sessions[session.id];
+  return mutateChatStore((store) => {
+    const current = store.sessions[session.id];
+    if (!current || current.repoId !== repoId) throw new Error("Session disappeared while saving messages");
+    store.sessions[session.id] = normalizeSession({
+      ...current,
+      title: current.title === "新会话" && firstUser ? sessionTitle(firstUser) : current.title,
+      updatedAt: normalized.at(-1)?.time || new Date().toISOString(),
+      messages: normalized,
+    }, repoId);
+    store.activeByRepo[repoId] = session.id;
+    return store.sessions[session.id];
+  });
 }
 
 async function updateSessionRuntime(repoId, sessionId, runtime = {}, { makeActive = true } = {}) {
-  const store = await readChatStore();
-  const session = store.sessions[sessionId];
-  if (!session || session.repoId !== repoId) return null;
-  store.sessions[sessionId] = normalizeSession(
-    {
-      ...session,
-      ...runtime,
-      updatedAt: new Date().toISOString(),
-    },
-    repoId,
-  );
-  if (makeActive) store.activeByRepo[repoId] = sessionId;
-  await writeChatStore(store);
-  return store.sessions[sessionId];
+  return mutateChatStore((store) => {
+    const session = store.sessions[sessionId];
+    if (!session || session.repoId !== repoId) return null;
+    store.sessions[sessionId] = normalizeSession(
+      {
+        ...session,
+        ...runtime,
+        updatedAt: new Date().toISOString(),
+      },
+      repoId,
+    );
+    if (makeActive) store.activeByRepo[repoId] = sessionId;
+    return store.sessions[sessionId];
+  });
 }
 
 async function appendChatTurn(repoId, sessionHint, message, response, mocked = false) {
@@ -1499,6 +1630,7 @@ function countTextLines(value) {
 const auditSummaryMaxChars = 260;
 const auditDetailMaxChars = 1800;
 const auditStatusDetailMaxChars = 900;
+const interruptedAutomationArchiveText = "控制台维护期间中断，已自动归档";
 const automationRunPromptPreviewChars = 520;
 const commandOutputMaxChars = 5000;
 const commandAuditDetailMaxChars = 7200;
@@ -1677,7 +1809,10 @@ function commandSummaryLabel(script) {
 
 function sanitizeStatusText(value, maxLength = 900) {
   return truncateForUi(String(value || ""), maxLength)
-    .replace(/Console restarted while (?:Codex app-server|app-server|云端 Codex|云端)?\s*automation was running/gi, "控制台重启时云端自动化仍在运行")
+    .replace(
+      /Console restarted while (?:Codex app-server|app-server|云端 Codex|云端)?\s*automation was running|控制台重启时云端自动化仍在运行/gi,
+      interruptedAutomationArchiveText,
+    )
     .replace(/INVEST_DASHBOARD_CLOUD_SYNC_TOKEN\s*=\s*[A-Za-z0-9_./+=-]+/gi, "云端同步 Token=<redacted>")
     .replace(/INVEST_DASHBOARD_CLOUD_BASE_URL\s*=\s*([^\s`'"]+)/gi, "云端同步地址=$1")
     .replace(/Codex app-server/gi, "云端 Codex")
@@ -2188,9 +2323,22 @@ function ownerFromParams(params = {}) {
 }
 
 function rememberOwner({ threadId, turnId, itemId }, owner) {
-  if (threadId) threadOwners.set(threadId, owner);
-  if (turnId) turnOwners.set(turnId, { ...owner, threadId });
-  if (itemId) itemOwners.set(itemId, { ...owner, threadId, turnId });
+  if (threadId) rememberBoundedOwner(threadOwners, threadId, owner);
+  if (turnId) rememberBoundedOwner(turnOwners, turnId, { ...owner, threadId });
+  if (itemId) rememberBoundedOwner(itemOwners, itemId, { ...owner, threadId, turnId });
+}
+
+function rememberBoundedOwner(store, key, value) {
+  if (store.has(key)) store.delete(key);
+  store.set(key, value);
+  while (store.size > maxOwnerEntries) store.delete(store.keys().next().value);
+}
+
+function clearJobOwners(job) {
+  if (job.turnId && turnOwners.get(job.turnId)?.sessionId === job.sessionId) turnOwners.delete(job.turnId);
+  for (const itemId of job.itemIds || []) {
+    if (itemOwners.get(itemId)?.sessionId === job.sessionId) itemOwners.delete(itemId);
+  }
 }
 
 function findTurnJob(params = {}) {
@@ -2347,6 +2495,7 @@ function createServerJob(kind, repo, session, runtime) {
     latestTokenUsage: session.tokenUsage || null,
     latestGoal: session.goal || null,
     completed: false,
+    finishing: false,
     ok: null,
     code: null,
     error: null,
@@ -2358,9 +2507,26 @@ function createServerJob(kind, repo, session, runtime) {
       resolvePromise = resolve;
     }),
     makeSessionActive: true,
+    cancelRequested: false,
   };
   job.resolve = resolvePromise;
   return job;
+}
+
+function armTurnJobTimeout(job) {
+  job.timeoutTimer = setTimeout(() => {
+    if (job.completed) return;
+    job.cancelRequested = true;
+    const interrupt = job.threadId && job.turnId
+      ? getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
+      : Promise.resolve();
+    interrupt.finally(() => {
+      finishTurnJob(job, false, 124, `Codex turn timed out after ${Math.round(codexTurnTimeoutMs / 1000)} seconds`).catch((error) => {
+        emitJobEvent(job, "error", { message: error.message || "Codex turn timeout cleanup failed" });
+      });
+    });
+  }, codexTurnTimeoutMs);
+  job.timeoutTimer.unref?.();
 }
 
 async function resolveThreadForJob(job) {
@@ -2395,15 +2561,37 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   job.message = message;
   job.storedMessage = storedMessage;
   activeTurns.set(key, job);
+  armTurnJobTimeout(job);
   emitJobEvent(job, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null, jobId: job.id });
   emitJobEvent(job, "status", { text: session.codexSessionId ? "已连接 Codex app-server，正在恢复 thread..." : "已连接 Codex app-server，正在启动 thread..." });
 
   (async () => {
     try {
       await resolveThreadForJob(job);
+      if (job.completed) return;
+      if (job.cancelRequested) {
+        await getAppServerClient().request("thread/archive", { threadId: job.threadId }, 20_000).catch(() => null);
+        await finishTurnJob(job, false, 130, "Turn cancelled before start");
+        return;
+      }
       const result = await getAppServerClient().request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments), 30_000);
       job.turnId = result?.turn?.id || null;
+      if (job.completed) {
+        if (job.threadId && job.turnId) {
+          await getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+        }
+        return;
+      }
+      await updateSessionRuntime(
+        repo.id,
+        session.id,
+        { ...runtime, pendingTurnRuntime: null },
+        { makeActive: job.makeSessionActive !== false },
+      );
       rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
+      if (job.cancelRequested && job.threadId && job.turnId) {
+        await getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+      }
       emitJobEvent(job, "status", { text: job.turnId ? `已启动 turn ${job.turnId.slice(0, 8)}` : "已启动 app-server turn" });
     } catch (error) {
       await finishTurnJob(job, false, 1, error.message || "Codex app-server turn/start failed");
@@ -2421,12 +2609,14 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
   job.message = "Codex review";
   job.storedMessage = `/review ${target.type || "uncommittedChanges"}`;
   activeTurns.set(key, job);
+  armTurnJobTimeout(job);
   emitJobEvent(job, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null, jobId: job.id, mode: "review" });
   emitJobEvent(job, "status", { text: "已连接 Codex app-server，正在启动官方 review..." });
 
   (async () => {
     try {
       await resolveThreadForJob(job);
+      if (job.completed) return;
       const result = await getAppServerClient().request(
         "review/start",
         {
@@ -2437,6 +2627,12 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
         30_000,
       );
       job.turnId = result?.turn?.id || result?.reviewTurnId || null;
+      if (job.completed) {
+        if (job.threadId && job.turnId) {
+          await getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+        }
+        return;
+      }
       if (result?.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
       rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
       emitJobEvent(job, "status", { text: result?.reviewThreadId ? `已启动 detached review ${String(result.reviewThreadId).slice(0, 8)}` : "已启动官方 review" });
@@ -2448,15 +2644,15 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
 }
 
 async function finishTurnJob(job, ok, code = 0, error = null) {
-  if (job.completed) return;
-  job.completed = true;
+  if (job.completed || job.finishing) return;
+  job.finishing = true;
+  if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
   job.ok = ok;
   job.code = code;
   job.error = error;
   await persistJobToolAudits(job).catch((auditError) => {
     emitJobEvent(job, "error", { message: `命令审计保存失败: ${auditError.message}` });
   });
-  activeTurns.delete(job.key);
   try {
     if (job.threadId) {
       await updateSessionRuntime(job.repoId, job.sessionId, {
@@ -2475,6 +2671,10 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   } catch (saveError) {
     emitJobEvent(job, "error", { message: `会话保存失败: ${saveError.message}` });
   }
+  job.completed = true;
+  job.finishing = false;
+  if (activeTurns.get(job.key) === job) activeTurns.delete(job.key);
+  clearJobOwners(job);
   emitJobEvent(job, "done", { ok, code, sessionId: job.sessionId, codexSessionId: job.threadId, turnId: job.turnId, error });
   job.resolve?.({ ok, code, error });
 }
@@ -2623,9 +2823,12 @@ function handleAppServerNotification(rpcMessage) {
     const routeOwner = job ? { repoId: job.repoId, sessionId: job.sessionId } : owner.threadId ? threadOwners.get(owner.threadId) : null;
     const runtime = runtimeFromAppServerSettings(params, job?.runtime || {});
     if (routeOwner) {
-      updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, runtime, { makeActive: false }).catch((error) => {
-        if (job) emitJobEvent(job, "error", { message: `设置同步失败: ${error.message}` });
-      });
+      findStoredSessionByThreadId(owner.threadId || job?.threadId || "")
+        .then(({ session }) => mergeAppServerRuntimeWithPending(session || {}, runtime, { clearPending: Boolean(job) }))
+        .then((mergedRuntime) => updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, mergedRuntime, { makeActive: false }))
+        .catch((error) => {
+          if (job) emitJobEvent(job, "error", { message: `设置同步失败: ${error.message}` });
+        });
     }
     if (job) emitJobEvent(job, "status", { text: `设置已同步: ${runtime.model} · ${runtime.reasoning}` });
     return;
@@ -3711,13 +3914,9 @@ function normalizeDiagnosticsSnapshot(value = {}) {
 }
 
 async function readDiagnosticsState() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(diagnosticsStatePath, "utf8"));
-    const latest = normalizeDiagnosticsSnapshot(parsed?.latest || parsed);
-    return { version: 1, latest };
-  } catch {
-    return { version: 1, latest: null };
-  }
+  const parsed = await readJsonState(diagnosticsStatePath, { version: 1, latest: null });
+  const latest = normalizeDiagnosticsSnapshot(parsed?.latest || parsed);
+  return { version: 1, latest };
 }
 
 async function writeDiagnosticsState(store) {
@@ -3864,6 +4063,21 @@ function fastThreadStateFallback(session = {}, error = "") {
   };
 }
 
+function authoritativeEmptyThreadState(repoId) {
+  return {
+    ok: true,
+    source: "app-server",
+    authoritative: true,
+    error: null,
+    goal: null,
+    tokenUsage: null,
+    config: cachedConfigForThreadState({ repoId }),
+    threadId: null,
+    runtime: normalizeRuntime({}, {}),
+    partial: false,
+  };
+}
+
 function staleThreadState(data = {}, error = "") {
   return {
     ...data,
@@ -3878,6 +4092,7 @@ function staleThreadState(data = {}, error = "") {
 
 function patchThreadStateCache(session = {}, patch = {}) {
   const key = threadStateCacheKey(session);
+  threadStateRevisionByKey.set(key, (threadStateRevisionByKey.get(key) || 0) + 1);
   const cached = threadStateCacheByKey.get(key);
   const base = cached?.data || fastThreadStateFallback(session);
   threadStateCacheByKey.set(key, {
@@ -3899,9 +4114,12 @@ function patchThreadStateCache(session = {}, patch = {}) {
 function startThreadStateRefresh(session, options = {}) {
   const key = threadStateCacheKey(session);
   if (threadStateRefreshByKey.has(key)) return threadStateRefreshByKey.get(key);
+  const revision = threadStateRevisionByKey.get(key) || 0;
   const task = computeThreadState(session, options)
     .then((data) => {
-      threadStateCacheByKey.set(key, { data, cachedAt: Date.now() });
+      if ((threadStateRevisionByKey.get(key) || 0) === revision) {
+        threadStateCacheByKey.set(key, { data, cachedAt: Date.now() });
+      }
       return data;
     })
     .catch((error) => {
@@ -4051,13 +4269,9 @@ function normalizeAutomationRun(run = {}) {
 }
 
 async function readAutomationRuns() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(automationRunsPath, "utf8"));
-    const runs = Array.isArray(parsed?.runs) ? parsed.runs.map(normalizeAutomationRun) : [];
-    return { version: 1, runs };
-  } catch {
-    return { version: 1, runs: [] };
-  }
+  const parsed = await readJsonState(automationRunsPath, { version: 1, runs: [] });
+  const runs = Array.isArray(parsed?.runs) ? parsed.runs.map(normalizeAutomationRun) : [];
+  return { version: 1, runs };
 }
 
 async function writeAutomationRuns(store) {
@@ -4181,7 +4395,7 @@ function automationRunInterruptedByConsoleRestart(run = {}) {
   const text = [run.error, run.summary, ...(Array.isArray(run.events) ? run.events.map((event) => event?.text || "") : [])]
     .filter(Boolean)
     .join("\n");
-  return /控制台重启时云端自动化仍在运行|Console restarted while .*automation was running/i.test(text);
+  return text.includes(interruptedAutomationArchiveText) || /控制台重启时云端自动化仍在运行|Console restarted while .*automation was running/i.test(text);
 }
 
 function isStaleAutomationFailure(run = {}) {
@@ -4246,6 +4460,8 @@ function isNoisyAuditAttentionEvent(event = {}) {
   const detail = String(event.detail || "");
   const text = `${type}\n${summary}\n${detail}`;
   if (/Skill descriptions were shortened to fit the 2% skills context budget/i.test(text)) return true;
+  if (/^(?:Codex app-server|云端 Codex) exited (?:\(SIGTERM\)|with code 0)$/i.test(summary)) return true;
+  if (/^mcp-startup$/i.test(type) && /not logged in|需要登录|登录失效/i.test(text)) return true;
   if (/^shell (completed|failed):/i.test(summary) || /^shell:/i.test(summary)) {
     return !codexUsageLimitFromSources(summary, detail);
   }
@@ -4436,6 +4652,12 @@ function stripCodexAuthProblemText(text = "") {
 
 function runAttentionError(run = {}, auditEvents = []) {
   const direct = String(run.error || "").trim();
+  if (/^Preparing (?:隔离工作区|worktree) \(detached HEAD\b/i.test(direct)) {
+    return "隔离工作区准备未完成，请查看任务日志后重试。";
+  }
+  if (/^Reconnecting\.\.\.\s*\d+\/\d+/i.test(direct)) {
+    return "云端 Codex 连接中断，重连未完成；请打开对话查看详情或重新运行。";
+  }
   if (direct && !isGenericAppServerErrorText(direct)) return sanitizeStatusText(direct, 520);
   const audit = auditEvents.find(
     (event) =>
@@ -4716,6 +4938,7 @@ function buildAttentionSummary({ repoStatus = [], runs = [], auditEvents = [], c
     });
   }
   let auditIssueCount = 0;
+  const seenAuditIssueKeys = new Set();
   for (const event of auditIssues) {
     if (event.threadId && automationThreadIds.has(event.threadId)) continue;
     if (!event.threadId && automationErrorSummaries.has(event.summary)) continue;
@@ -4737,6 +4960,9 @@ function buildAttentionSummary({ repoStatus = [], runs = [], auditEvents = [], c
       }
       continue;
     }
+    const auditIssueKey = `${event.type || ""}:${event.summary || ""}`;
+    if (seenAuditIssueKeys.has(auditIssueKey)) continue;
+    seenAuditIssueKeys.add(auditIssueKey);
     const eventText = `${event.type || ""} ${event.summary || ""}`;
     const isRequestLike = /approval|elicitation|request/i.test(eventText);
     const canOpenThread = Boolean(event.repoId && (event.sessionId || event.threadId));
@@ -4800,18 +5026,14 @@ function normalizeAttentionAcknowledgement(value = {}) {
 }
 
 async function readAttentionState() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(attentionStatePath, "utf8"));
-    const acknowledged = {};
-    const source = parsed?.acknowledged && typeof parsed.acknowledged === "object" ? Object.values(parsed.acknowledged) : [];
-    for (const item of source) {
-      const normalized = normalizeAttentionAcknowledgement(item);
-      if (normalized) acknowledged[normalized.id] = normalized;
-    }
-    return { version: 1, acknowledged };
-  } catch {
-    return { version: 1, acknowledged: {} };
+  const parsed = await readJsonState(attentionStatePath, { version: 1, acknowledged: {} });
+  const acknowledged = {};
+  const source = parsed?.acknowledged && typeof parsed.acknowledged === "object" ? Object.values(parsed.acknowledged) : [];
+  for (const item of source) {
+    const normalized = normalizeAttentionAcknowledgement(item);
+    if (normalized) acknowledged[normalized.id] = normalized;
   }
+  return { version: 1, acknowledged };
 }
 
 async function writeAttentionState(store) {
@@ -5103,25 +5325,28 @@ function normalizeNotificationDelivery(value = {}) {
 }
 
 async function readNotificationState() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(notificationStatePath, "utf8"));
-    const delivered = {};
-    const source = parsed?.delivered && typeof parsed.delivered === "object" ? Object.values(parsed.delivered) : [];
-    for (const item of source) {
-      const normalized = normalizeNotificationDelivery(item);
-      if (normalized) delivered[normalized.itemId] = normalized;
-    }
-    return {
-      version: 1,
-      delivered,
-      push: normalizePushState(parsed?.push || {}),
-      lastCheckAt: parsed?.lastCheckAt || null,
-      lastSentAt: parsed?.lastSentAt || null,
-      lastError: parsed?.lastError || null,
-    };
-  } catch {
-    return { version: 1, delivered: {}, push: normalizePushState({}), lastCheckAt: null, lastSentAt: null, lastError: null };
+  const parsed = await readJsonState(notificationStatePath, {
+    version: 1,
+    delivered: {},
+    push: {},
+    lastCheckAt: null,
+    lastSentAt: null,
+    lastError: null,
+  });
+  const delivered = {};
+  const source = parsed?.delivered && typeof parsed.delivered === "object" ? Object.values(parsed.delivered) : [];
+  for (const item of source) {
+    const normalized = normalizeNotificationDelivery(item);
+    if (normalized) delivered[normalized.itemId] = normalized;
   }
+  return {
+    version: 1,
+    delivered,
+    push: normalizePushState(parsed?.push || {}),
+    lastCheckAt: parsed?.lastCheckAt || null,
+    lastSentAt: parsed?.lastSentAt || null,
+    lastError: parsed?.lastError || null,
+  };
 }
 
 async function writeNotificationState(store) {
@@ -5339,13 +5564,9 @@ function auditEventForStatus(event = {}) {
 }
 
 async function readAuditEvents() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(auditEventsPath, "utf8"));
-    const events = Array.isArray(parsed?.events) ? parsed.events.map(normalizeAuditEvent) : [];
-    return { version: 1, events };
-  } catch {
-    return { version: 1, events: [] };
-  }
+  const parsed = await readJsonState(auditEventsPath, { version: 1, events: [] });
+  const events = Array.isArray(parsed?.events) ? parsed.events.map(normalizeAuditEvent) : [];
+  return { version: 1, events };
 }
 
 async function writeAuditEvents(store) {
@@ -5477,34 +5698,56 @@ async function auditTimelineMessagesForSession(repoId, session, existingIds = ne
   return [...records.values()].map(normalizeChatMessage).filter((item) => item.text);
 }
 
-function extractBearerToken(req) {
-  const auth = String(req.get("authorization") || "");
-  const match = auth.match(/^Bearer\s+(.+)$/i);
-  return match ? match[1].trim() : "";
-}
-
-function isLoopbackRequest(req) {
-  const raw = String(req.ip || req.socket?.remoteAddress || "");
-  return raw === "127.0.0.1" || raw === "::1" || raw === "::ffff:127.0.0.1";
-}
-
 function validateAutomationTrigger(req) {
   const expected = String(process.env.CODEX_CLOUD_WEBHOOK_TOKEN || process.env.AUTOMATION_WEBHOOK_TOKEN || "").trim();
-  const provided = String(req.get("x-codex-cloud-token") || req.query?.token || req.body?.token || extractBearerToken(req) || "").trim();
-  if (expected) return provided && provided === expected;
-  return process.env.NODE_ENV !== "production" || isLoopbackRequest(req);
+  const provided = String(req.get("x-codex-cloud-token") || "").trim();
+  if (expected) {
+    const providedBytes = Buffer.from(provided);
+    const expectedBytes = Buffer.from(expected);
+    return providedBytes.length === expectedBytes.length && crypto.timingSafeEqual(providedBytes, expectedBytes);
+  }
+  if (process.env.NODE_ENV === "production") return false;
+  return true;
+}
+
+function automationTriggerClientKey(req, automationId) {
+  return `${String(req.ip || req.socket?.remoteAddress || "unknown")}:${automationId}`;
+}
+
+function consumeAutomationTriggerRate(req, automationId) {
+  const now = Date.now();
+  const key = automationTriggerClientKey(req, automationId);
+  const recent = (automationTriggerRateByKey.get(key) || []).filter((time) => now - time < automationTriggerRateWindowMs);
+  if (recent.length >= automationTriggerRateMax) {
+    const retryAfterMs = Math.max(1_000, automationTriggerRateWindowMs - (now - recent[0]));
+    automationTriggerRateByKey.set(key, recent);
+    return { ok: false, retryAfterMs };
+  }
+  recent.push(now);
+  automationTriggerRateByKey.set(key, recent);
+  return { ok: true, retryAfterMs: 0 };
+}
+
+function automationTriggerIdempotencyKey(req, automationId, trigger) {
+  const raw = String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim();
+  if (!raw) return { key: "", error: null };
+  if (!/^[A-Za-z0-9._:-]{8,160}$/.test(raw)) {
+    return { key: "", error: "Idempotency-Key must be 8-160 characters using letters, numbers, dot, underscore, colon, or dash" };
+  }
+  return { key: `${automationId}:${trigger}:${raw}`, error: null };
+}
+
+function pruneAutomationTriggerIdempotency(now = Date.now()) {
+  for (const [key, entry] of automationTriggerIdempotency.entries()) {
+    if (entry.expiresAt <= now) automationTriggerIdempotency.delete(key);
+  }
 }
 
 function automationTriggerOptions(req, trigger) {
   return {
     trigger,
     prompt: req.body?.prompt,
-    model: req.body?.model,
-    reasoning: req.body?.reasoning,
-    sandbox: req.body?.sandbox,
-    approval: req.body?.approval,
     sessionId: req.body?.sessionId,
-    search: typeof req.body?.search === "boolean" ? req.body.search : undefined,
     worktree: req.body?.worktree !== false,
   };
 }
@@ -5745,6 +5988,7 @@ async function getLogs() {
       },
     ];
   }
+  const resolvedLogsRoot = await fs.realpath(logsRoot).catch(() => path.resolve(logsRoot));
   const entries = await fs.readdir(logsRoot, { withFileTypes: true });
   const files = await Promise.all(
     entries
@@ -5752,19 +5996,29 @@ async function getLogs() {
       .slice(-40)
       .map(async (entry) => {
         const filePath = path.join(logsRoot, entry.name);
-        const stat = await fs.stat(filePath);
-        const content = await fs.readFile(filePath, "utf8").catch(() => "");
-        return {
-          id: entry.name,
-          job: entry.name.replace(/-\d{8}.+$/, "").replace("-latest.log", ""),
-          name: entry.name,
-          size: stat.size,
-          updatedAt: stat.mtime.toISOString(),
-          tail: semanticLogTail(compactLines(content, 1), stat.mtime),
-        };
+        try {
+          const resolvedPath = await fs.realpath(filePath);
+          if (resolvedPath !== resolvedLogsRoot && !resolvedPath.startsWith(`${resolvedLogsRoot}${path.sep}`)) return null;
+          const stat = await fs.stat(resolvedPath);
+          if (!stat.isFile()) return null;
+          const content = await fs.readFile(resolvedPath, "utf8").catch(() => "");
+          return {
+            id: entry.name,
+            job: entry.name.replace(/-\d{8}.+$/, "").replace("-latest.log", ""),
+            name: entry.name,
+            size: stat.size,
+            updatedAt: stat.mtime.toISOString(),
+            tail: semanticLogTail(compactLines(content, 1), stat.mtime),
+          };
+        } catch {
+          return null;
+        }
       }),
   );
-  return files.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)).slice(0, 4);
+  return files
+    .filter(Boolean)
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .slice(0, 4);
 }
 
 function expiredUsageLimitHistoryText() {
@@ -5879,7 +6133,8 @@ async function verifyAutomationRunThread(run = {}) {
 }
 
 async function verifyAutomationRunThreads(runs = [], options = {}) {
-  const limit = Math.max(0, Number(options.limit || 12));
+  const requestedLimit = options.limit ?? automationThreadVerificationDefaultLimit;
+  const limit = Math.min(Math.max(Number(requestedLimit) || 0, 0), 50);
   const selectedIds = new Set(
     runs
       .filter((run) => run.threadId)
@@ -5887,7 +6142,26 @@ async function verifyAutomationRunThreads(runs = [], options = {}) {
       .map((run) => run.id),
   );
   const verified = await Promise.all(
-    runs.map((run) => (selectedIds.has(run.id) ? verifyAutomationRunThread(run).catch(() => run) : run)),
+    runs.map((run) => {
+      if (selectedIds.has(run.id)) {
+        return verifyAutomationRunThread(run).catch((error) => ({
+          ...run,
+          stateSource: "local-run-store",
+          threadVerified: false,
+          threadVerification: {
+            source: "app-server-unavailable",
+            threadId: run.threadId,
+            error: compactSingleLine(error?.message || "thread/read failed", 320),
+          },
+        }));
+      }
+      return {
+        ...run,
+        stateSource: "local-run-store",
+        threadVerified: false,
+        threadVerification: null,
+      };
+    }),
   );
   return verified;
 }
@@ -5962,12 +6236,21 @@ async function getStatus({ applyAttentionState = true } = {}) {
   return {
     generatedAt: new Date().toISOString(),
     localMode,
+    publicConfig: {
+      publicOrigin,
+      webhook: {
+        tokenConfigured: Boolean(String(process.env.CODEX_CLOUD_WEBHOOK_TOKEN || process.env.AUTOMATION_WEBHOOK_TOKEN || "").trim()),
+        tokenHeader: "x-codex-cloud-token",
+        idempotencyHeader: "Idempotency-Key",
+        basicAuthRequired: false,
+      },
+    },
     instance: {
       name: hostname.stdout || "codex-cloud-worker",
       region: process.env.AWS_REGION || "ap-northeast-1",
-      publicIp: process.env.CODEX_PUBLIC_IP || "13.231.3.21",
+      publicIp,
       privateIp: process.env.CODEX_PRIVATE_IP || "172.31.7.169",
-      type: process.env.CODEX_INSTANCE_TYPE || "t3.small",
+      type: process.env.CODEX_INSTANCE_TYPE || "t3.micro",
       root: cloudRoot,
     },
     health,
@@ -6020,7 +6303,7 @@ function fastStatusFallback(error = "") {
     source: "app-server-fast-status",
   };
   const health = {
-    ok: Boolean(appHost.running && codexStatus.authenticated && repoStatus.every((repo) => repo.present)),
+    ok: false,
     layers: {
       ec2Console: { ok: true, port, host, time: now },
       appServer: {
@@ -6028,7 +6311,7 @@ function fastStatusFallback(error = "") {
         running: Boolean(appHost.running),
         startedAt: appHost.startedAt,
         restartCount: appHost.restartCount,
-        lastError: (appHost.lastError || error) ? sanitizeCloudPathText(appHost.lastError || String(error), 240) : null,
+        lastError: appHost.lastError ? sanitizeCloudPathText(appHost.lastError, 240) : null,
       },
       codexAuth: {
         ok: Boolean(codexStatus.authenticated),
@@ -6047,12 +6330,21 @@ function fastStatusFallback(error = "") {
   return {
     generatedAt: now,
     localMode: false,
+    publicConfig: previous.publicConfig || {
+      publicOrigin,
+      webhook: {
+        tokenConfigured: Boolean(String(process.env.CODEX_CLOUD_WEBHOOK_TOKEN || process.env.AUTOMATION_WEBHOOK_TOKEN || "").trim()),
+        tokenHeader: "x-codex-cloud-token",
+        idempotencyHeader: "Idempotency-Key",
+        basicAuthRequired: false,
+      },
+    },
     instance: previous.instance || {
       name: "codex-cloud-worker",
       region: process.env.AWS_REGION || "ap-northeast-1",
-      publicIp: process.env.CODEX_PUBLIC_IP || "13.231.3.21",
+      publicIp,
       privateIp: process.env.CODEX_PRIVATE_IP || "172.31.7.169",
-      type: process.env.CODEX_INSTANCE_TYPE || "t3.small",
+      type: process.env.CODEX_INSTANCE_TYPE || "t3.micro",
       root: cloudRoot,
     },
     health,
@@ -6145,7 +6437,11 @@ function buildHealthSnapshot({ codexStatus, repoStatus, appServerProbeResult, ac
       running: Boolean(appHost.running),
       startedAt: appHost.startedAt,
       restartCount: appHost.restartCount,
-      lastError: (appHost.lastError || appServerProbeResult.error) ? sanitizeCloudPathText(appHost.lastError || appServerProbeResult.error, 320) : null,
+      lastError: appServerProbeResult.ok
+        ? null
+        : (appHost.lastError || appServerProbeResult.error)
+          ? sanitizeCloudPathText(appHost.lastError || appServerProbeResult.error, 320)
+          : null,
     },
     codexAuth: {
       ok: Boolean(effectiveCodexStatus.authenticated),
@@ -6165,7 +6461,13 @@ function buildHealthSnapshot({ codexStatus, repoStatus, appServerProbeResult, ac
 }
 
 function getRepoById(id) {
-  return repos.find((item) => item.id === id) || repos[0];
+  const repoId = String(id || "").trim();
+  const repo = repos.find((item) => item.id === repoId);
+  if (repo) return repo;
+  const error = new Error(repoId ? `Unknown repository: ${repoId}` : "repoId is required");
+  error.statusCode = repoId ? 404 : 400;
+  error.source = "invalid-repository";
+  throw error;
 }
 
 function shellQuote(value) {
@@ -6373,6 +6675,50 @@ function attachmentMimeForPath(filePath) {
 function isUploadedAttachmentPath(repo, filePath) {
   const relativePath = path.relative(repo.path, filePath).replaceAll("\\", "/");
   return relativePath === ".codex-cloud/uploads" || relativePath.startsWith(".codex-cloud/uploads/");
+}
+
+function uploadedAttachmentAbsolutePath(repo, attachment = {}) {
+  const candidates = [attachment.absolutePath, attachment.path].map((value) => String(value || "").trim()).filter(Boolean);
+  for (const candidate of candidates) {
+    let target;
+    try {
+      target = path.isAbsolute(candidate) ? path.resolve(candidate) : resolveRepoPath(repo, candidate);
+    } catch {
+      continue;
+    }
+    if (isUploadedAttachmentPath(repo, target)) return target;
+  }
+  return null;
+}
+
+function sessionUploadedAttachmentPaths(repo, session = {}) {
+  const attachments = [
+    ...(Array.isArray(session?.draft?.attachments) ? session.draft.attachments : []),
+    ...(Array.isArray(session?.messages) ? session.messages.flatMap((message) => message?.attachments || []) : []),
+  ];
+  return new Set(attachments.map((attachment) => uploadedAttachmentAbsolutePath(repo, attachment)).filter(Boolean));
+}
+
+async function cleanupSessionUploadFiles(repo, session, store) {
+  const owned = sessionUploadedAttachmentPaths(repo, session);
+  const referencedElsewhere = new Set();
+  for (const other of Object.values(store.sessions || {})) {
+    if (other.id === session.id || other.repoId !== repo.id) continue;
+    for (const filePath of sessionUploadedAttachmentPaths(repo, other)) referencedElsewhere.add(filePath);
+  }
+  const deleted = [];
+  const errors = [];
+  for (const filePath of owned) {
+    if (referencedElsewhere.has(filePath)) continue;
+    try {
+      await fs.unlink(filePath);
+      deleted.push(path.relative(repo.path, filePath));
+      await fs.rmdir(path.dirname(filePath)).catch(() => null);
+    } catch (error) {
+      if (error?.code !== "ENOENT") errors.push(`${path.relative(repo.path, filePath)}: ${error.message}`);
+    }
+  }
+  return { deleted, errors };
 }
 
 function parseDataUrl(dataUrl = "") {
@@ -7000,15 +7346,13 @@ app.get("/healthz", async (_req, res) => {
     Boolean(health.layers?.ec2Console?.ok) &&
     (Boolean(health.layers?.appServer?.ok) || Boolean(health.layers?.codexAuth?.ok));
   const responseHealth =
-    health.ok || reachable
-      ? {
-          ...health,
-          ok: true,
-          strictOk: Boolean(health.ok),
-          partial: !health.ok,
-        }
-      : health;
-  res.status(responseHealth.ok ? 200 : 503).json(responseHealth);
+    {
+      ...health,
+      ok: Boolean(health.ok),
+      strictOk: Boolean(health.ok),
+      partial: !health.ok && reachable,
+    };
+  res.status(responseHealth.strictOk ? 200 : 503).json(responseHealth);
 });
 
 app.post("/api/repos", async (req, res) => {
@@ -7255,8 +7599,23 @@ app.get("/api/codex/app-host/status", (_req, res) => {
 
 app.get("/api/codex/thread-state", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
-  const session = await resolveChatSessionForRequest(repo.id, req.query?.sessionId);
-  if (!session) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  const resolved = await resolveSyncedChatSessionForRequest(repo, req.query?.sessionId);
+  const { session, summary, requestedSessionId } = resolved;
+  if (!session && requestedSessionId) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  if (!session && (!summary?.ok || summary.authoritative !== true)) {
+    return res.status(503).json({
+      ok: false,
+      repoId: repo.id,
+      source: summary?.source || "app-server-unavailable",
+      authoritative: false,
+      partial: true,
+      error: summary?.error || "Codex app-server thread/list failed",
+    });
+  }
+  if (!session) {
+    res.setHeader("x-codex-thread-state-cache", "live");
+    return res.json({ ...authoritativeEmptyThreadState(repo.id), repoId: repo.id, sessionId: null });
+  }
   const state = await getThreadState(session, { timeout: appServerFastReadTimeoutMs });
   res.setHeader("x-codex-thread-state-cache", state.partial ? "partial" : state.refreshing ? "stale" : state.cached ? "fresh" : "live");
   res.status(state.ok === false ? 503 : 200).json({ ...state, repoId: repo.id, sessionId: session.id });
@@ -7438,7 +7797,6 @@ app.post("/api/codex/thread-fork", async (req, res) => {
   const thread = response.result?.thread || response.result?.data || response.result || {};
   const threadId = thread.id || response.result?.threadId;
   if (!threadId) return res.status(500).json({ ok: false, error: "thread/fork did not return a thread id", raw: response.result });
-  const store = await readChatStore();
   const forkSession = normalizeSession(
     {
       id: sessionId(),
@@ -7456,9 +7814,10 @@ app.post("/api/codex/thread-fork", async (req, res) => {
     },
     repo.id,
   );
-  store.sessions[forkSession.id] = forkSession;
-  store.activeByRepo[repo.id] = forkSession.id;
-  await writeChatStore(store);
+  await mutateChatStore((current) => {
+    current.sessions[forkSession.id] = forkSession;
+    current.activeByRepo[repo.id] = forkSession.id;
+  });
   const messages = await getChatMessages(repo.id, forkSession.id, { timeout: appServerFastReadTimeoutMs });
   const summary = await getRepoSessions(repo.id, { sync: false });
   res.json({ ok: true, repoId: repo.id, activeSessionId: forkSession.id, threadId: String(threadId), sessions: summary.sessions, messages });
@@ -7470,14 +7829,13 @@ app.post("/api/codex/thread-archive", async (req, res) => {
   if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "当前会话还没有 app-server thread。" });
   const response = await codexAppServerRequest("thread/archive", { threadId: session.codexSessionId }, 20_000);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
-  const store = await readChatStore();
-  delete store.sessions[session.id];
-  store.__deletedSessionIds = [session.id];
-  const remaining = Object.values(store.sessions)
-    .filter((item) => item.repoId === repo.id)
-    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  store.activeByRepo[repo.id] = remaining[0]?.id || "";
-  await writeChatStore(store);
+  await mutateChatStore((store) => {
+    delete store.sessions[session.id];
+    const remaining = Object.values(store.sessions)
+      .filter((item) => item.repoId === repo.id)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    store.activeByRepo[repo.id] = remaining[0]?.id || "";
+  });
   const summary = await getRepoSessions(repo.id, { sync: false });
   const active = summary.activeSessionId
     ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
@@ -7661,22 +8019,59 @@ app.get("/api/chat/search", async (req, res) => {
 app.get("/api/chat/sessions", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
   const summary = await getRepoSessions(repo.id, { timeout: appServerFastReadTimeoutMs, requireAppServerSync: false });
+  const requestedSessionId = String(req.query?.sessionId || "");
   if (!summary.ok) {
-    return res.status(200).json({
+    if (requestedSessionId) {
+      const store = await readChatStore();
+      const requested = findStoredSessionByHint(store, repo.id, requestedSessionId);
+      if (requested && !requested.codexSessionId) {
+        return res.json({
+          ok: true,
+          degraded: true,
+          repoId: repo.id,
+          source: "local-draft",
+          authoritative: false,
+          sessionListSource: summary.source || "app-server-unavailable",
+          sessionListAuthoritative: false,
+          activeSessionId: requested.id,
+          sessions: summary.sessions,
+          messages: requested.messages || [],
+          error: summary.error || "Codex app-server thread/list failed",
+        });
+      }
+    }
+    return res.status(503).json({
       ok: false,
+      degraded: true,
       repoId: repo.id,
       source: summary.source || "app-server-unavailable",
       authoritative: false,
       error: summary.error || "Codex app-server thread/list failed",
-      activeSessionId: null,
-      sessions: [],
+      activeSessionId: summary.activeSessionId,
+      sessions: summary.sessions,
       messages: [],
     });
   }
-  const requestedSessionId = String(req.query?.sessionId || "");
+  if (!requestedSessionId && summary.authoritative !== true) {
+    return res.status(503).json({
+      ok: false,
+      degraded: true,
+      repoId: repo.id,
+      source: summary.source,
+      authoritative: false,
+      sessionListSource: summary.source,
+      sessionListAuthoritative: false,
+      activeSessionId: summary.activeSessionId,
+      sessions: summary.sessions,
+      messages: [],
+      error: summary.error || "Codex app-server thread/list failed",
+    });
+  }
   const active = requestedSessionId
     ? await resolveChatSessionForRead(repo.id, requestedSessionId, { strictHint: true })
-    : await resolveChatSessionForRead(repo.id, summary.activeSessionId || "");
+    : summary.activeSessionId
+      ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
+      : null;
   if (!active) {
     return res.json({
       ok: true,
@@ -7711,25 +8106,28 @@ app.get("/api/chat/sessions", async (req, res) => {
 
 app.post("/api/chat/sessions", async (req, res) => {
   const repo = getRepoById(req.body?.repoId);
-  const store = await readChatStore();
   const session = normalizeSession(
     { id: sessionId(), repoId: repo.id, title: sessionTitle(req.body?.title || "新会话"), messages: [] },
     repo.id,
   );
-  store.sessions[session.id] = session;
-  store.activeByRepo[repo.id] = session.id;
-  await writeChatStore(store);
+  await mutateChatStore((store) => {
+    store.sessions[session.id] = session;
+    store.activeByRepo[repo.id] = session.id;
+    compactEmptyDraftSessions(store, repo.id, session.id);
+  });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true });
   res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages: [] });
 });
 
 app.post("/api/chat/sessions/:id/select", async (req, res) => {
   const repo = getRepoById(req.body?.repoId || req.query?.repoId);
-  const store = await readChatStore();
-  const session = store.sessions[req.params.id];
+  const session = await mutateChatStore((store) => {
+    const selected = store.sessions[req.params.id];
+    if (!selected || selected.repoId !== repo.id) return null;
+    store.activeByRepo[repo.id] = selected.id;
+    return selected;
+  });
   if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
-  store.activeByRepo[repo.id] = session.id;
-  await writeChatStore(store);
   if (session.codexSessionId) await refreshSessionRuntimeFromAppServer(repo, session, { timeout: appServerFastReadTimeoutMs });
   const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: !session.codexSessionId });
@@ -7743,8 +8141,28 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
   if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
 
   const requestedRuntime = normalizeRuntime(req.body, session);
+  const storedRuntime = normalizeRuntime({}, session);
+  const turnRuntimeChanged =
+    requestedRuntime.model !== storedRuntime.model || requestedRuntime.reasoning !== storedRuntime.reasoning;
+  const modelList = await getModelListForRoute();
+  const availableModels = Array.isArray(modelList.data?.models) ? modelList.data.models : [];
+  const selectedModel = availableModels.find((model) => model.id === requestedRuntime.model);
+  if (availableModels.length && !selectedModel) {
+    return res.status(400).json({ ok: false, error: `Unknown Codex model: ${requestedRuntime.model}` });
+  }
+  if (
+    selectedModel?.supportedReasoningEfforts?.length &&
+    !selectedModel.supportedReasoningEfforts.includes(requestedRuntime.reasoning)
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: `${requestedRuntime.model} does not support reasoning effort ${requestedRuntime.reasoning}`,
+    });
+  }
   let runtime = requestedRuntime;
   let appServerSynced = false;
+  let appServerRuntime = null;
+  let pendingTurnRuntime = null;
   let thread = null;
 
   if (session.codexSessionId) {
@@ -7765,11 +8183,27 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
     }
     appServerSynced = true;
     thread = response.result?.thread || null;
-    runtime = runtimeFromAppServerSettings(response.result || {}, requestedRuntime);
+    appServerRuntime = runtimeFromAppServerSettings(response.result || {}, requestedRuntime);
+    if (turnRuntimeChanged || session.pendingTurnRuntime) {
+      pendingTurnRuntime = {
+        model: requestedRuntime.model,
+        reasoning: requestedRuntime.reasoning,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    runtime = requestedRuntime;
     rememberOwner({ threadId: session.codexSessionId }, { repoId: repo.id, sessionId: session.id });
   }
 
-  const updated = await updateSessionRuntime(repo.id, session.id, runtime, { makeActive: req.body?.makeActive !== false });
+  const updated = await updateSessionRuntime(
+    repo.id,
+    session.id,
+    { ...runtime, pendingTurnRuntime },
+    { makeActive: req.body?.makeActive !== false },
+  );
+  if (updated) {
+    patchThreadStateCache(updated, { runtime: normalizeRuntime({}, updated) });
+  }
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: req.body?.makeActive !== false && !session.codexSessionId });
   res.json({
     ok: true,
@@ -7780,6 +8214,8 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
     sessions: summary.sessions,
     activeSessionId: summary.activeSessionId,
     appServerSynced,
+    appServerRuntime,
+    appliesOnNextTurn: Boolean(pendingTurnRuntime),
     thread,
   });
 });
@@ -7794,29 +8230,33 @@ app.get("/api/chat/sessions/:id/draft", async (req, res) => {
 
 app.patch("/api/chat/sessions/:id/draft", async (req, res) => {
   const repo = getRepoById(req.body?.repoId || req.query?.repoId);
-  const store = await readChatStore();
-  const session = findStoredSessionByHint(store, repo.id, req.params.id);
-  if (!session) return res.status(404).json({ ok: false, error: "Unknown session" });
   const draft = normalizeChatDraft({
     input: req.body?.input || "",
     attachments: Array.isArray(req.body?.attachments) ? req.body.attachments : [],
     updatedAt: new Date().toISOString(),
   });
-  const updated = normalizeSession({ ...session, draft, updatedAt: session.updatedAt || new Date().toISOString() }, repo.id);
-  store.sessions[updated.id] = updated;
-  await writeChatStore(store);
+  const updated = await mutateChatStore((store) => {
+    const session = findStoredSessionByHint(store, repo.id, req.params.id);
+    if (!session) return null;
+    const next = normalizeSession({ ...session, draft, updatedAt: session.updatedAt || new Date().toISOString() }, repo.id);
+    store.sessions[next.id] = next;
+    return next;
+  });
+  if (!updated) return res.status(404).json({ ok: false, error: "Unknown session" });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true });
   res.json({ ok: true, repoId: repo.id, sessionId: updated.id, draft: updated.draft, sessions: summary.sessions });
 });
 
 app.delete("/api/chat/sessions/:id/draft", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
-  const store = await readChatStore();
-  const session = findStoredSessionByHint(store, repo.id, req.params.id);
-  if (!session) return res.status(404).json({ ok: false, error: "Unknown session" });
-  const updated = normalizeSession({ ...session, draft: { input: "", attachments: [], updatedAt: null } }, repo.id);
-  store.sessions[updated.id] = updated;
-  await writeChatStore(store);
+  const updated = await mutateChatStore((store) => {
+    const session = findStoredSessionByHint(store, repo.id, req.params.id);
+    if (!session) return null;
+    const next = normalizeSession({ ...session, draft: { input: "", attachments: [], updatedAt: null } }, repo.id);
+    store.sessions[next.id] = next;
+    return next;
+  });
+  if (!updated) return res.status(404).json({ ok: false, error: "Unknown session" });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true });
   res.json({ ok: true, repoId: repo.id, sessionId: updated.id, draft: updated.draft, sessions: summary.sessions });
 });
@@ -7826,32 +8266,89 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
   const store = await readChatStore();
   const session = store.sessions[req.params.id];
   if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+  const activeTurn = activeTurns.get(makeSessionKey(repo.id, session.id));
+  const activeCompact = activeCompactions.get(makeSessionKey(repo.id, session.id));
+  if (activeTurn || activeCompact) {
+    if (String(req.query?.force || "") !== "1") {
+      return res.status(409).json({ ok: false, error: "Session has an active Codex job; interrupt it before deletion" });
+    }
+    if (activeCompact) {
+      return res.status(409).json({ ok: false, error: "Active compaction cannot be deleted safely; wait for it to finish" });
+    }
+    activeTurn.cancelRequested = true;
+    if (activeTurn.threadId && activeTurn.turnId) {
+      await getAppServerClient()
+        .request("turn/interrupt", { threadId: activeTurn.threadId, turnId: activeTurn.turnId }, 20_000)
+        .catch(() => null);
+    }
+    await Promise.race([activeTurn.promise, new Promise((resolve) => setTimeout(resolve, 10_000))]);
+    if (!activeTurn.completed) {
+      return res.status(409).json({ ok: false, error: "Session cancellation is still pending; retry deletion shortly" });
+    }
+  }
   let archived = false;
   if (session.codexSessionId) {
     const response = await codexAppServerRequest("thread/archive", { threadId: session.codexSessionId }, 20_000);
     if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
     archived = true;
   }
-  const previousActiveId = store.activeByRepo[repo.id] || "";
-  delete store.sessions[req.params.id];
-  store.__deletedSessionIds = [req.params.id];
-  const remaining = Object.values(store.sessions)
-    .filter((item) => item.repoId === repo.id)
-    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  store.activeByRepo[repo.id] = previousActiveId && store.sessions[previousActiveId] ? previousActiveId : remaining[0]?.id || "";
-  await writeChatStore(store);
-  const summary = await getRepoSessions(repo.id, { sync: false });
+  const uploadCleanup = await cleanupSessionUploadFiles(repo, session, store);
+  await mutateChatStore((current) => {
+    const currentSession = current.sessions[req.params.id];
+    if (!currentSession || currentSession.repoId !== repo.id) return;
+    const previousActiveId = current.activeByRepo[repo.id] || "";
+    delete current.sessions[req.params.id];
+    const remaining = Object.values(current.sessions)
+      .filter((item) => item.repoId === repo.id)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    current.activeByRepo[repo.id] = previousActiveId && current.sessions[previousActiveId] ? previousActiveId : remaining[0]?.id || "";
+  });
+  const summary = await getRepoSessions(repo.id, { sync: false, allowLocalActive: true });
   const active = summary.activeSessionId
     ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
-    : await ensureChatSession(repo.id);
+    : null;
   const messages = active ? await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs }) : [];
-  res.json({ ok: true, repoId: repo.id, activeSessionId: active?.id || summary.activeSessionId || "", sessions: summary.sessions, messages, archived });
+  res.json({
+    ok: true,
+    repoId: repo.id,
+    deletedSessionId: session.id,
+    activeSessionId: active?.id || summary.activeSessionId || "",
+    sessions: summary.sessions,
+    messages,
+    archived,
+    uploadCleanup,
+  });
 });
 
 app.get("/api/chat/history", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
-  const session = await resolveChatSessionForRequest(repo.id, req.query?.sessionId);
-  if (!session) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  const resolved = await resolveSyncedChatSessionForRequest(repo, req.query?.sessionId);
+  const { session, summary, requestedSessionId } = resolved;
+  if (!session && requestedSessionId) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  if (!session && (!summary?.ok || summary.authoritative !== true)) {
+    return res.status(503).json({
+      ok: false,
+      degraded: true,
+      repoId: repo.id,
+      source: summary?.source || "app-server-unavailable",
+      authoritative: false,
+      error: summary?.error || "Codex app-server thread/list failed",
+      activeSessionId: null,
+      sessions: summary?.sessions || [],
+      messages: [],
+    });
+  }
+  if (!session) {
+    return res.json({
+      ok: true,
+      repoId: repo.id,
+      source: "app-server",
+      authoritative: true,
+      activeSessionId: null,
+      sessions: summary.sessions,
+      messages: [],
+    });
+  }
   const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
   res.json({
     ok: true,
@@ -7864,8 +8361,39 @@ app.get("/api/chat/history", async (req, res) => {
 
 app.get("/api/chat/active", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
-  const session = await resolveChatSessionForRequest(repo.id, req.query?.sessionId);
-  if (!session) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  const resolved = await resolveSyncedChatSessionForRequest(repo, req.query?.sessionId);
+  const { session, summary, requestedSessionId } = resolved;
+  if (!session && requestedSessionId) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
+  if (!session && (!summary?.ok || summary.authoritative !== true)) {
+    return res.status(503).json({
+      ok: false,
+      degraded: true,
+      repoId: repo.id,
+      source: summary?.source || "app-server-unavailable",
+      authoritative: false,
+      partial: true,
+      error: summary?.error || "Codex app-server thread/list failed",
+      sessionId: null,
+      threadId: null,
+      threadState: null,
+      turn: null,
+      compact: null,
+    });
+  }
+  if (!session) {
+    return res.json({
+      ok: true,
+      repoId: repo.id,
+      sessionId: null,
+      threadId: null,
+      source: "app-server",
+      authoritative: true,
+      partial: false,
+      threadState: authoritativeEmptyThreadState(repo.id),
+      turn: null,
+      compact: null,
+    });
+  }
   const key = makeSessionKey(repo.id, session.id);
   const turn = activeTurns.get(key);
   const compact = activeCompactions.get(key);
@@ -7956,15 +8484,7 @@ app.delete("/api/chat/history", async (req, res) => {
     });
   }
   const cleared = await saveChatMessages(repo.id, session.id, []);
-  const store = await readChatStore();
-  store.sessions[cleared.id] = normalizeSession(
-    {
-      ...cleared,
-      draft: { input: "", attachments: [], updatedAt: null },
-    },
-    repo.id,
-  );
-  await writeChatStore(store);
+  await updateSessionRuntime(repo.id, cleared.id, { draft: { input: "", attachments: [], updatedAt: null } });
   res.json({ ok: true, repoId: repo.id, activeSessionId: cleared.id, sessions: (await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true })).sessions, messages: [] });
 });
 
@@ -8027,6 +8547,28 @@ app.post("/api/uploads", async (req, res) => {
   } catch (error) {
     res.status(400).json({ ok: false, error: error.message });
   }
+});
+
+app.delete("/api/uploads", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
+  const requested = Array.isArray(req.body?.paths) ? req.body.paths.slice(0, 32) : [];
+  if (!requested.length) return res.status(400).json({ ok: false, error: "No upload paths supplied" });
+  const deleted = [];
+  const errors = [];
+  for (const relativePath of requested) {
+    let target;
+    try {
+      target = resolveRepoPath(repo, relativePath);
+      if (!isUploadedAttachmentPath(repo, target)) throw new Error("Path is outside the upload directory");
+      await fs.unlink(target);
+      deleted.push(path.relative(repo.path, target));
+      await fs.rmdir(path.dirname(target)).catch(() => null);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      errors.push(`${String(relativePath)}: ${error.message}`);
+    }
+  }
+  res.status(errors.length ? 500 : 200).json({ ok: errors.length === 0, repoId: repo.id, deleted, errors });
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -8405,7 +8947,13 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 cliTerminalServer.on("connection", (ws, _request, url) => {
-  const repo = getRepoById(url.searchParams.get("repoId"));
+  let repo;
+  try {
+    repo = getRepoById(url.searchParams.get("repoId"));
+  } catch (error) {
+    ws.close(1008, error.message || "Invalid repository");
+    return;
+  }
   const cols = Number(url.searchParams.get("cols") || 120);
   const rows = Number(url.searchParams.get("rows") || 36);
   const cwd = repo.path;
@@ -8485,6 +9033,10 @@ app.get("/api/automations/runs", async (req, res) => {
   const repoId = req.query?.repoId ? String(req.query.repoId) : "";
   const automationId = req.query?.automationId ? String(req.query.automationId) : "";
   const status = req.query?.status ? String(req.query.status) : "";
+  const requestedVerificationLimit = Number(req.query?.verifyLimit);
+  const verificationLimit = Number.isFinite(requestedVerificationLimit)
+    ? Math.min(Math.max(requestedVerificationLimit, 0), 50)
+    : automationThreadVerificationDefaultLimit;
   const runs = await verifyAutomationRunThreads(store.runs
     .map(summarizeAutomationRun)
     .map((run) => enrichAutomationRunForStatus(run, auditEvents))
@@ -8493,8 +9045,21 @@ app.get("/api/automations/runs", async (req, res) => {
       if (automationId && run.automationId !== automationId) return false;
       if (status && run.status !== status) return false;
       return true;
-    }));
-  res.json({ ok: true, source: "local-run-store+app-server-thread-verification", runs, activeRunIds: [...activeAutomationRuns.keys()] });
+    }), { limit: verificationLimit });
+  const threadRuns = runs.filter((run) => run.threadId);
+  const verifiedCount = threadRuns.filter((run) => run.threadVerified === true).length;
+  res.json({
+    ok: true,
+    source: "local-run-store+app-server-thread-verification",
+    verification: {
+      limit: verificationLimit,
+      threadRunCount: threadRuns.length,
+      verifiedCount,
+      complete: verifiedCount === threadRuns.length,
+    },
+    runs,
+    activeRunIds: [...activeAutomationRuns.keys()],
+  });
 });
 
 app.get("/api/automations/inbox", async (_req, res) => {
@@ -8511,14 +9076,51 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
     return res.status(401).json({
       ok: false,
       error: "Automation trigger token is required",
-      hint: "Set CODEX_CLOUD_WEBHOOK_TOKEN and send it as Bearer token, x-codex-cloud-token, or ?token=.",
+      hint: "Set CODEX_CLOUD_WEBHOOK_TOKEN and send it as x-codex-cloud-token.",
     });
   }
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
+  const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger);
+  if (idempotency.error) return res.status(400).json({ ok: false, error: idempotency.error });
+  pruneAutomationTriggerIdempotency();
+  const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
+  if (existing) {
+    try {
+      const payload = existing.payload || await existing.promise;
+      return res.json({ ...payload, deduplicated: true });
+    } catch {
+      automationTriggerIdempotency.delete(idempotency.key);
+    }
+  }
+  const rate = consumeAutomationTriggerRate(req, automation.id);
+  if (!rate.ok) {
+    res.setHeader("Retry-After", String(Math.ceil(rate.retryAfterMs / 1000)));
+    return res.status(429).json({ ok: false, error: "Automation trigger rate limit exceeded", retryAfterMs: rate.retryAfterMs });
+  }
   const repo = getRepoById(automation.repoId);
+  const runPromise = startAppServerAutomationRun(automation, repo, automationTriggerOptions(req, trigger)).then((runRecord) => ({
+    ok: true,
+    run: runRecord,
+    output: `${automation.name}: ${trigger} app-server run started`,
+  }));
+  if (idempotency.key) {
+    automationTriggerIdempotency.set(idempotency.key, {
+      promise: runPromise,
+      payload: null,
+      expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
+    });
+  }
   try {
-    const runRecord = await startAppServerAutomationRun(automation, repo, automationTriggerOptions(req, trigger));
+    const payload = await runPromise;
+    const runRecord = payload.run;
+    if (idempotency.key) {
+      automationTriggerIdempotency.set(idempotency.key, {
+        promise: Promise.resolve(payload),
+        payload,
+        expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
+      });
+    }
     appendAuditEvent({
       source: "automation",
       type: "automation-trigger",
@@ -8528,18 +9130,19 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
       summary: `${trigger}: ${automation.id}`,
       detail: jsonDetail({ runId: runRecord.id, automationId: automation.id, trigger, worktreePolicy: runRecord.worktreePolicy }),
     }).catch(() => null);
-    return res.json({ ok: true, run: runRecord, output: `${automation.name}: ${trigger} app-server run started` });
+    return res.json(payload);
   } catch (error) {
+    if (idempotency.key) automationTriggerIdempotency.delete(idempotency.key);
     return res.status(500).json({ ok: false, error: error.message, output: error.message });
   }
 }
 
 app.post("/api/automations/:id/webhook", (req, res) => {
-  handleAutomationTriggerRequest(req, res, "webhook");
+  return handleAutomationTriggerRequest(req, res, "webhook");
 });
 
 app.post("/api/automations/:id/heartbeat", (req, res) => {
-  handleAutomationTriggerRequest(req, res, "heartbeat");
+  return handleAutomationTriggerRequest(req, res, "heartbeat");
 });
 
 app.post("/api/automations/:id/run", async (req, res) => {
@@ -8608,9 +9211,24 @@ app.post("/api/automations/:id/:mode", async (req, res) => {
   res.json({ ok: true, output: `${automation.timer} ${action}d` });
 });
 
+app.use("/api", (req, res) => {
+  res.status(404).json({ ok: false, error: `Unknown API route: ${req.method} ${req.path}` });
+});
+
 app.use(express.static(path.join(projectRoot, "dist")));
 app.get(/.*/, (_req, res) => {
   res.sendFile(path.join(projectRoot, "dist", "index.html"));
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  const statusCode = Number(error?.statusCode || error?.status || 500);
+  res.status(statusCode >= 400 && statusCode <= 599 ? statusCode : 500).json({
+    ok: false,
+    error: error?.message || "Internal server error",
+    ...(error?.source ? { source: error.source } : {}),
+    path: req.path,
+  });
 });
 
 await reconcileStaleAutomationRuns().catch((error) => {

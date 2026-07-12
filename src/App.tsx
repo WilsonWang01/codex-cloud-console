@@ -114,6 +114,10 @@ type ChatHistoryResponse = {
   sessions: ChatSession[];
   messages: ChatMessage[];
   archived?: boolean;
+  source?: string;
+  authoritative?: boolean;
+  degraded?: boolean;
+  error?: string;
 };
 
 type ChatRuntimeResponse = {
@@ -125,6 +129,8 @@ type ChatRuntimeResponse = {
   session?: ChatSession | null;
   sessions?: ChatSession[];
   appServerSynced?: boolean;
+  appServerRuntime?: ChatRuntime | null;
+  appliesOnNextTurn?: boolean;
 };
 
 type ChatSearchResponse = {
@@ -162,6 +168,7 @@ type ChatSession = {
   tokenUsage?: ThreadTokenUsage | null;
   goal?: ThreadGoal | null;
   compactedAt?: string | null;
+  runtimePending?: boolean;
   draft?: ChatDraft | null;
 };
 
@@ -637,6 +644,15 @@ const fallbackRun = {
 const fallbackStatus: ConsoleStatus = {
   generatedAt: new Date().toISOString(),
   localMode: false,
+  publicConfig: {
+    publicOrigin: "https://13.231.3.21.sslip.io",
+    webhook: {
+      tokenConfigured: false,
+      tokenHeader: "x-codex-cloud-token",
+      idempotencyHeader: "Idempotency-Key",
+      basicAuthRequired: false,
+    },
+  },
   health: {
     ok: false,
     layers: {
@@ -898,13 +914,31 @@ function apiErrorMessage(data: unknown, fallback: string) {
   return fallback;
 }
 
+function nonJsonResponseError(text: string, status: number, fallback = "请求失败") {
+  const compact = String(text || "").replace(/\s+/g, " ").trim();
+  if (!compact || /<!doctype\s+html|<html[\s>]/i.test(compact)) return `${fallback}（HTTP ${status}）`;
+  return compact.slice(0, 500);
+}
+
+async function responseFailureMessage(response: Response, fallback = "请求失败") {
+  const text = await response.text();
+  if (text) {
+    try {
+      return apiErrorMessage(JSON.parse(text), `${fallback}（HTTP ${response.status}）`);
+    } catch {
+      return nonJsonResponseError(text, response.status, fallback);
+    }
+  }
+  return `${fallback}（HTTP ${response.status}）`;
+}
+
 async function parseJsonResponse(response: Response) {
   const text = await response.text();
   if (!text) return null;
   try {
     return JSON.parse(text) as unknown;
   } catch {
-    if (!response.ok) throw new Error(text);
+    if (!response.ok) throw new Error(nonJsonResponseError(text, response.status));
     throw new Error(`API returned non-JSON response: ${text.slice(0, 200)}`);
   }
 }
@@ -1425,7 +1459,7 @@ function connectionFromStatus(status: ConsoleStatus): CloudConnection {
   if (statusIsPending(status)) return "checking";
   if (status.localMode) return "local";
   if (!status.health) return "cloud";
-  if (status.health.ok) return "cloud";
+  if (status.health.ok && status.health.strictOk !== false && !status.health.partial) return "cloud";
   if (status.health.layers.ec2Console?.ok) return "degraded";
   return "offline";
 }
@@ -1486,6 +1520,13 @@ function connectionState(status: ConsoleStatus, cloudConnection: CloudConnection
   if (cloudConnection === "offline") return { label: "连接断开", tone: "warn" as const, detail: "本地入口无法连接云端 console" };
   if (statusIsPending(status)) return { label: "同步中", tone: "warn" as const, detail: "云端分层状态后台同步中" };
   if (cloudConnection === "local") return { label: "本地开发", tone: "warn" as const, detail: "当前使用本地开发快照" };
+  if (health?.partial || health?.strictOk === false) {
+    return {
+      label: "云端 Codex 降级",
+      tone: "warn" as const,
+      detail: health.layers.appServer?.lastError || "入口可达，但核心能力未通过严格健康检查",
+    };
+  }
   if (health && !health.layers.appServer?.ok) {
     return {
 	      label: "云端 Codex 异常",
@@ -1734,11 +1775,6 @@ function shortDate(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
-}
-
-function shortDateSafe(value?: string | null) {
-  if (!value) return "未知";
-  return shortDate(value);
 }
 
 function formatTokenCount(value?: number | null) {
@@ -3031,6 +3067,7 @@ export function App() {
   const [autoCompactLimit, setAutoCompactLimit] = useState("160000");
   const [autoCompactScope, setAutoCompactScope] = useState("body_after_prefix");
   const [isLoadingChatHistory, setIsLoadingChatHistory] = useState(false);
+  const [chatHistoryError, setChatHistoryError] = useState("");
   const [filePath, setFilePath] = useState(".");
   const [fileTree, setFileTree] = useState<AgentFileEntry[]>([]);
   const [selectedFile, setSelectedFile] = useState<AgentFileRead | null>(null);
@@ -3069,6 +3106,8 @@ export function App() {
   const chatLoadSeq = useRef(0);
   const globalSearchSeq = useRef(0);
   const runtimePersistSeq = useRef(0);
+  const threadStateLoadSeq = useRef(0);
+  const codexAppStatusLoadSeq = useRef(0);
   const draftPersistSeq = useRef(0);
   const hydratedDraftRef = useRef<{ key: string; snapshot: string } | null>(null);
   const chatRuntimeRef = useRef<ChatRuntime>(defaultChatRuntime);
@@ -3140,6 +3179,7 @@ export function App() {
       setReviewPrContext(null);
       setChatInput("");
       setChatAttachments([]);
+      setChatHistoryError("");
       hydratedDraftRef.current = null;
     }
     selectedRepoIdRef.current = repoId;
@@ -3461,23 +3501,27 @@ export function App() {
   }, [loadCodexModels]);
 
   const loadCodexAppStatus = useCallback(async () => {
+    const repoId = selectedRepoIdRef.current;
+    const requestSeq = ++codexAppStatusLoadSeq.current;
     if (!codexAppStatusLoadedRef.current) setCodexAppStatusLoading(true);
     try {
-      const params = new URLSearchParams({ repoId: selectedRepoIdRef.current });
+      const params = new URLSearchParams({ repoId });
       const nextStatus = await api<CodexAppStatus>(`/api/codex/app-status?${params.toString()}`);
+      if (requestSeq !== codexAppStatusLoadSeq.current || selectedRepoIdRef.current !== repoId) return;
       if (!nextStatus.ok || nextStatus.source !== "app-server" || nextStatus.authoritative !== true) {
         throw new Error(nextStatus.gaps?.[0] || nextStatus.auth?.issue || "云端 Codex 能力状态不是 app-server 权威响应");
       }
       codexAppStatusLoadedRef.current = true;
       setCodexAppStatus(nextStatus);
     } catch (error) {
+      if (requestSeq !== codexAppStatusLoadSeq.current || selectedRepoIdRef.current !== repoId) return;
       setCodexAppStatus((current) => ({
         ...current,
         ok: false,
         gaps: [error instanceof Error ? error.message : "无法读取云端 Codex 能力状态"],
       }));
     } finally {
-      setCodexAppStatusLoading(false);
+      if (requestSeq === codexAppStatusLoadSeq.current && selectedRepoIdRef.current === repoId) setCodexAppStatusLoading(false);
     }
   }, []);
 
@@ -3621,9 +3665,17 @@ export function App() {
   const loadThreadState = useCallback(
     async (sessionId = activeSessionId) => {
       if (!sessionId) return;
+      const repoId = selectedRepo.id;
+      const requestSeq = ++threadStateLoadSeq.current;
+      const runtimeSeq = runtimePersistSeq.current;
       try {
-        const params = new URLSearchParams({ repoId: selectedRepo.id, sessionId });
+        const params = new URLSearchParams({ repoId, sessionId });
         const result = await apiWithRetry<ThreadStateResponse>(`/api/codex/thread-state?${params.toString()}`, undefined, 3);
+        if (
+          requestSeq !== threadStateLoadSeq.current ||
+          selectedRepoIdRef.current !== repoId ||
+          activeSessionIdRef.current !== sessionId
+        ) return;
         if (!result.ok || result.source !== "app-server" || result.authoritative !== true) {
           throw new Error(result.error || "当前 thread-state 不是 app-server 权威响应");
         }
@@ -3631,7 +3683,7 @@ export function App() {
         setGoalDraft(result.goal?.objective || "");
         setGoalBudgetDraft(result.goal?.tokenBudget ? String(result.goal.tokenBudget) : "");
         setThreadTokenUsage(result.tokenUsage || null);
-        if (result.runtime) {
+        if (result.runtime && runtimeSeq === runtimePersistSeq.current) {
           setChatRuntime((current) => ({ ...current, ...result.runtime }));
           setChatSessions((current) =>
             current.map((session) => (session.id === sessionId ? { ...session, ...result.runtime } : session)),
@@ -3642,6 +3694,11 @@ export function App() {
         setAutoCompactLimit(String(limit || 160000));
         setAutoCompactScope(result.config?.autoCompactTokenLimitScope || "body_after_prefix");
       } catch (error) {
+        if (
+          requestSeq !== threadStateLoadSeq.current ||
+          selectedRepoIdRef.current !== repoId ||
+          activeSessionIdRef.current !== sessionId
+        ) return;
         setThreadGoal(activeChatSession?.goal || null);
         setThreadTokenUsage(activeChatSession?.tokenUsage || null);
       }
@@ -3673,6 +3730,13 @@ export function App() {
           setChatSessions((current) => current.map((session) => (session.id === sessionId ? { ...session, ...result.session } : session)));
         } else {
           setChatSessions((current) => current.map((session) => (session.id === sessionId ? { ...session, ...nextRuntime } : session)));
+        }
+        if (result.appliesOnNextTurn) {
+          pushEvent({
+            tone: "ok",
+            title: "模型已选择",
+            body: `${nextRuntime.model} · ${reasoningLabel(nextRuntime.reasoning)}，从下一条消息开始生效。`,
+          });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "runtime 设置保存失败";
@@ -3709,6 +3773,9 @@ export function App() {
         if (sessionId) params.set("sessionId", sessionId);
         const result = await apiWithRetry<ChatHistoryResponse>(`/api/chat/sessions?${params.toString()}`, undefined, 5);
         if (requestSeq !== chatLoadSeq.current || selectedRepoIdRef.current !== repoId || result.repoId !== repoId) return;
+        if (result.degraded && !sessionId) {
+          throw new Error(result.error || "云端会话暂时不可用；已保留当前消息，稍后将自动重试");
+        }
         const nextSessions = result.sessions || [];
         const nextActiveSessionId = result.activeSessionId || "";
         const repo =
@@ -3727,8 +3794,10 @@ export function App() {
         setChatMessages(result.messages || []);
         setChatInput(draft.input);
         setChatAttachments(draft.attachments);
+        setChatHistoryError(result.degraded ? result.error || "当前仅显示本地草稿，云端会话暂时不可用" : "");
       } catch (error) {
         if (requestSeq !== chatLoadSeq.current) return;
+        setChatHistoryError(error instanceof Error ? error.message : "无法读取云端会话历史");
         pushEvent({
           tone: "warn",
           title: "会话加载",
@@ -3743,6 +3812,7 @@ export function App() {
 
   useEffect(() => {
     const routedSessionId = pendingRouteSession?.repoId === selectedRepoId ? pendingRouteSession.sessionId : "";
+    if (!routedSessionId && activeSessionIdRef.current) return;
     void loadChatHistory(selectedRepoId, routedSessionId || undefined).finally(() => {
       if (routedSessionId) {
         pendingRouteSessionRef.current = null;
@@ -3889,7 +3959,7 @@ export function App() {
       try {
         const params = new URLSearchParams({ repoId, sessionId, kind });
         const response = await fetch(`/api/chat/job-events?${params.toString()}`);
-        if (!response.ok || !response.body) throw new Error(await response.text());
+        if (!response.ok || !response.body) throw new Error(await responseFailureMessage(response, "无法恢复云端任务事件"));
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -4339,7 +4409,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: chatRepoId, sessionId: compactSessionId, ...chatRuntime }),
       });
-      if (!response.ok || !response.body) throw new Error(await response.text());
+      if (!response.ok || !response.body) throw new Error(await responseFailureMessage(response, "无法启动上下文压缩"));
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -4837,7 +4907,7 @@ export function App() {
         body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, message, attachments: attachmentPayload(attachments), ...chatRuntime }),
       });
       if (!response.ok || !response.body) {
-        throw new Error(await response.text());
+        throw new Error(await responseFailureMessage(response, "云端 Codex 对话失败"));
       }
       if (!usingOverride) {
         await api<ChatDraftResponse>(
@@ -5041,7 +5111,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, targetType: "uncommittedChanges", delivery: "inline", ...chatRuntime }),
       });
-      if (!response.ok || !response.body) throw new Error(await response.text());
+      if (!response.ok || !response.body) throw new Error(await responseFailureMessage(response, "无法启动 Codex Review"));
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -5510,8 +5580,6 @@ export function App() {
               status={status}
               cloudConnection={cloudConnection}
               repo={selectedRepo}
-              selectedRepoId={selectedRepoId}
-              onSelectRepo={selectRepo}
               sessions={chatSessions}
               activeSessionId={activeSessionId}
               onNewSession={newChatSession}
@@ -5572,6 +5640,7 @@ export function App() {
               codexAccountBusy={codexAccountBusy}
               mcpLoginBusy={mcpLoginBusy}
               historyLoading={isLoadingChatHistory}
+              historyError={chatHistoryError}
             />
           </div>
         )}
@@ -6882,7 +6951,7 @@ function RunThread({
       </div>
 
       <AutomationRunsPanel runs={runs} onOpenRun={onOpenRun} />
-      <AutomationWebhookPanel automation={automation} />
+      <AutomationWebhookPanel automation={automation} status={status} />
       <RunLogPanel automation={automation} onOpenLog={onOpenLog} />
 
       <div className="conversation">
@@ -6951,17 +7020,18 @@ function AutomationRunsPanel({ runs, onOpenRun }: { runs: AutomationRun[]; onOpe
   );
 }
 
-function AutomationWebhookPanel({ automation }: { automation: Automation }) {
+function AutomationWebhookPanel({ automation, status }: { automation: Automation; status: ConsoleStatus }) {
   const [copied, setCopied] = useState("");
   const [guide, setGuide] = useState<"curl" | "systemd" | "github" | "cloudflare">("curl");
   const [openSnippet, setOpenSnippet] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
-  const origin = typeof window !== "undefined" ? window.location.origin : "https://13.231.3.21.sslip.io";
+  const origin = status.publicConfig?.publicOrigin || `https://${status.instance.publicIp}.sslip.io`;
+  const webhookConfigured = Boolean(status.publicConfig?.webhook.tokenConfigured);
   const webhookUrl = `${origin}/api/automations/${automation.id}/webhook`;
   const heartbeatUrl = `${origin}/api/automations/${automation.id}/heartbeat`;
   const payload = JSON.stringify({ prompt: automation.name, worktree: true });
-  const webhookCurl = `curl -X POST '${webhookUrl}' \\\n  -H 'Authorization: Bearer $CODEX_CLOUD_WEBHOOK_TOKEN' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"prompt\":\"${automation.name}\",\"worktree\":true}'`;
-  const heartbeatCurl = `curl -X POST '${heartbeatUrl}' \\\n  -H 'Authorization: Bearer $CODEX_CLOUD_WEBHOOK_TOKEN' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"sessionId\":\"<cloud-session-id>\",\"prompt\":\"继续检查这个任务\"}'`;
+  const webhookCurl = `curl -X POST '${webhookUrl}' \\\n  -H 'x-codex-cloud-token: $CODEX_CLOUD_WEBHOOK_TOKEN' \\\n  -H 'Idempotency-Key: <unique-request-id>' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"prompt\":\"${automation.name}\",\"worktree\":true}'`;
+  const heartbeatCurl = `curl -X POST '${heartbeatUrl}' \\\n  -H 'x-codex-cloud-token: $CODEX_CLOUD_WEBHOOK_TOKEN' \\\n  -H 'Idempotency-Key: <unique-request-id>' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"sessionId\":\"<cloud-session-id>\",\"prompt\":\"继续检查这个任务\"}'`;
   const systemdName = `codex-webhook-${automation.id}`;
   const systemdSnippet = `[Unit]
 Description=Codex Cloud webhook ${automation.id}
@@ -6970,7 +7040,8 @@ Description=Codex Cloud webhook ${automation.id}
 Type=oneshot
 EnvironmentFile=/etc/codex-cloud-webhook.env
 ExecStart=/usr/bin/curl -fsS -X POST '${webhookUrl}' \\
-  -H 'Authorization: Bearer \${CODEX_CLOUD_WEBHOOK_TOKEN}' \\
+  -H 'x-codex-cloud-token: \${CODEX_CLOUD_WEBHOOK_TOKEN}' \\
+  -H 'Idempotency-Key: systemd-${automation.id}-\${INVOCATION_ID}' \\
   -H 'Content-Type: application/json' \\
   -d '${payload}'
 
@@ -6998,7 +7069,8 @@ jobs:
       - name: Trigger Codex Cloud
         run: |
           curl -fsS -X POST '${webhookUrl}' \\
-            -H 'Authorization: Bearer \${{ secrets.CODEX_CLOUD_WEBHOOK_TOKEN }}' \\
+            -H 'x-codex-cloud-token: \${{ secrets.CODEX_CLOUD_WEBHOOK_TOKEN }}' \\
+            -H 'Idempotency-Key: github-\${{ github.run_id }}-\${{ github.run_attempt }}' \\
             -H 'Content-Type: application/json' \\
             -d '${payload}'`;
   const cloudflareSnippet = `export default {
@@ -7006,7 +7078,8 @@ jobs:
     ctx.waitUntil(fetch('${webhookUrl}', {
       method: 'POST',
       headers: {
-        'Authorization': \`Bearer \${env.CODEX_CLOUD_WEBHOOK_TOKEN}\`,
+        'x-codex-cloud-token': env.CODEX_CLOUD_WEBHOOK_TOKEN,
+        'Idempotency-Key': \`cloudflare-\${event.scheduledTime}\`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(${payload})
@@ -7041,7 +7114,7 @@ jobs:
           <p className="eyebrow">外部触发</p>
           <h3>自动运行入口</h3>
         </div>
-        <span className="run-badge ok">云端</span>
+        <span className={cx("run-badge", webhookConfigured ? "ok" : "warn")}>{webhookConfigured ? "已配置" : "待配置"}</span>
       </div>
       <div className="webhook-grid">
         <article>
@@ -7053,7 +7126,7 @@ jobs:
             </button>
           </div>
           <small>在新的隔离工作区运行一次任务</small>
-          <code>云端入口已就绪</code>
+          <code>{webhookConfigured ? origin : "需要配置 webhook token"}</code>
           <details className="webhook-snippet" onToggle={(event) => setOpenSnippet(event.currentTarget.open ? "webhook" : "")}>
             <summary>查看命令</summary>
             {openSnippet === "webhook" && <pre>{webhookCurl}</pre>}
@@ -7068,7 +7141,7 @@ jobs:
             </button>
           </div>
           <small>绑定已有云端会话继续推进</small>
-          <code>继续入口已就绪</code>
+          <code>{webhookConfigured ? origin : "需要配置 webhook token"}</code>
           <details className="webhook-snippet" onToggle={(event) => setOpenSnippet(event.currentTarget.open ? "heartbeat" : "")}>
             <summary>查看命令</summary>
             {openSnippet === "heartbeat" && <pre>{heartbeatCurl}</pre>}
@@ -7101,7 +7174,7 @@ jobs:
         </div>
         {wizardOpen && <pre>{guideSnippets[guide]}</pre>}
       </details>
-      <p className="muted-line">生产环境需要配置访问令牌；复制配置时会包含标准鉴权方式。</p>
+      <p className="muted-line">外部入口仅接受专用 token header，并支持幂等键与速率限制。</p>
     </section>
   );
 }
@@ -7688,8 +7761,6 @@ function CloudChat({
   status,
   cloudConnection,
   repo,
-  selectedRepoId,
-  onSelectRepo,
   sessions,
   activeSessionId,
   onNewSession,
@@ -7750,12 +7821,11 @@ function CloudChat({
   codexAccountBusy,
   mcpLoginBusy,
   historyLoading,
+  historyError,
 }: {
   status: ConsoleStatus;
   cloudConnection: CloudConnection;
   repo: Repo;
-  selectedRepoId: string;
-  onSelectRepo: (id: string) => void;
   sessions: ChatSession[];
   activeSessionId: string;
   onNewSession: () => void;
@@ -7816,6 +7886,7 @@ function CloudChat({
   codexAccountBusy: "login" | "cancel" | "logout" | null;
   mcpLoginBusy: string | null;
   historyLoading: boolean;
+  historyError: string;
 }) {
   const endRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -7829,7 +7900,6 @@ function CloudChat({
   const [reviewWorkspaceView, setReviewWorkspaceView] = useState<ReviewWorkspaceView>("unstaged");
   const [reviewBaseBranch, setReviewBaseBranch] = useState("");
   const [reviewSummary, setReviewSummary] = useState<ReviewSummary | null>(null);
-  const [reviewSummaryLoading, setReviewSummaryLoading] = useState(false);
   const [reviewSnapshot, setReviewSnapshot] = useState<ReviewSnapshot | null>(null);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState("");
@@ -7881,11 +7951,12 @@ function CloudChat({
   const showFooterContext = Boolean(tokenUsage?.modelContextWindow || compactStatus?.running || compactStatus?.ok === false);
   const reviewChangeHint = activeReviewSummary
     ? `${reviewFileCount} 个文件变更 · +${activeReviewSummary.addedLineCount} / -${activeReviewSummary.removedLineCount}`
-    : reviewSummaryLoading
-      ? "同步变更摘要中"
-      : "查看当前工作区改动";
+    : "查看当前工作区改动";
   const canUseThreadControls = Boolean(activeSession?.codexSessionId);
-  const connection = connectionState(status, cloudConnection);
+  const baseConnection = connectionState(status, cloudConnection);
+  const connection = historyError
+    ? { label: "会话服务降级", tone: "warn" as const, detail: historyError }
+    : baseConnection;
   const attention = getAttentionSummary(status);
   const activeAccountLogin = appStatus.accountLogin?.active || null;
   const latestAccountLogin = appStatus.accountLogin?.latest || null;
@@ -8564,7 +8635,13 @@ function CloudChat({
             </button>
           </form>
         ) : (
-          <button className="session-current" onClick={() => setActivePanel("sessions")} type="button" title={`${activeSessionTitle} · ${activeSessionSubtitle}`}>
+          <button
+            className="session-current"
+            data-session-id={activeSessionId}
+            onClick={() => setActivePanel("sessions")}
+            type="button"
+            title={`${activeSessionTitle} · ${activeSessionSubtitle}`}
+          >
             <span className="session-current-copy">
               <strong>{activeSessionTitle}</strong>
               <small>{activeSessionSubtitle}</small>
@@ -8589,6 +8666,13 @@ function CloudChat({
           </button>
         </div>
       </div>
+
+      {historyError && (
+        <div className="chat-degraded-banner" role="alert">
+          <Cloud size={15} />
+          <span>{historyError}</span>
+        </div>
+      )}
 
       <div className="chat-window">
         {historyLoading && messages.length === 0 && (
@@ -8835,7 +8919,7 @@ function CloudChat({
                 summary={activeReviewSummary || null}
                 snapshot={reviewSnapshot}
                 loading={reviewLoading}
-                summaryLoading={reviewSummaryLoading}
+                summaryLoading={false}
                 error={reviewError}
                 actionBusy={reviewActionBusy}
                 prContext={reviewPrContext}
@@ -8914,7 +8998,11 @@ function CloudChat({
                   </strong>
                   <span>服务</span>
                   <strong>
-                    {appStatus.appHost?.running ? "云端 Codex 在线" : "云端 Codex 未运行"}
+                    {appStatus.appHost?.running && appStatus.authoritative !== false && !appStatus.partial && !appStatus.appHost.lastError
+                      ? "云端 Codex 在线"
+                      : appStatus.appHost?.running
+                        ? "云端 Codex 降级"
+                        : "云端 Codex 未运行"}
                     {appStatus.appHost?.restartCount ? ` · 重启 ${appStatus.appHost.restartCount}` : ""}
                   </strong>
                   <span>工具</span>
@@ -10300,172 +10388,6 @@ function RepoCard({ repo }: { repo: Repo }) {
       </div>
       <p className={cx("repo-state", repo.dirty ? "warn" : "ok")}>{repo.dirty ? "存在未提交改动" : "工作区干净"}</p>
       <p className="last-commit">{repo.lastCommit}</p>
-    </section>
-  );
-}
-
-function SessionContextRail({
-  status,
-  repo,
-  session,
-  tokenUsage,
-  compactStatus,
-  autoCompactEnabled,
-  autoCompactLimit,
-  logs,
-  automation,
-  onOpenInbox,
-  onOpenLogs,
-  notificationsEnabled,
-  notificationPermission,
-  onToggleNotifications,
-}: {
-  status: ConsoleStatus;
-  repo: Repo;
-  session: ChatSession | null;
-  tokenUsage: ThreadTokenUsage | null;
-  compactStatus: CompactStatus | null;
-  autoCompactEnabled: boolean;
-  autoCompactLimit: string;
-  logs: LogFile[];
-  automation: Automation;
-  onOpenInbox: () => void;
-  onOpenLogs: () => void;
-  notificationsEnabled: boolean;
-  notificationPermission: string;
-  onToggleNotifications: () => void;
-}) {
-  const relevant = logs.find((log) => log.job.includes(automation.id)) || logs[0];
-  const count = attentionCount(status);
-  const percent = contextPercent(tokenUsage);
-  const state = contextTone(tokenUsage, compactStatus);
-  const compactLabel = compactStatus?.running
-    ? compactStatus.text
-    : compactStatus?.ok === false
-      ? compactStatus.error || "压缩失败"
-      : session?.compactedAt
-        ? timeLabel(session.compactedAt)
-        : autoCompactEnabled
-          ? `自动 ${formatTokenCount(Number(autoCompactLimit || 0))}`
-          : "未压缩";
-  return (
-    <section className="rail-card session-context-card">
-      <div className="rail-card-header">
-        <h3>上下文</h3>
-        <span className={cx("mini-dot", status.codex.authenticated && "ok")} />
-      </div>
-
-      <button className={cx("session-attention-button", count > 0 && "active")} type="button" onClick={onOpenInbox}>
-        <span>
-          <CheckCircle2 size={16} />
-          待处理
-        </span>
-        <strong>{count}</strong>
-      </button>
-
-      <button className={cx("session-attention-button", "notify-button", notificationsEnabled && "enabled")} type="button" onClick={onToggleNotifications}>
-        <span>
-          <Bell size={16} />
-          {notificationLabel(notificationsEnabled, notificationPermission)}
-        </span>
-        <strong>{notificationsEnabled ? "ON" : "OFF"}</strong>
-      </button>
-
-      <div className={cx("rail-context-meter", state)}>
-        <div>
-          <span>上下文</span>
-          <strong>{tokenUsage?.modelContextWindow ? `${percent}%` : "--"}</strong>
-        </div>
-        <div className="meter-track">
-          <span style={{ width: `${Math.max(percent, tokenUsage ? 2 : 0)}%` }} />
-        </div>
-        <small>{contextUsageDetail(tokenUsage)}</small>
-      </div>
-
-      <dl className="detail-list compact-context">
-        <div>
-          <dt>项目</dt>
-          <dd>{repo.name}</dd>
-        </div>
-        <div>
-          <dt>分支</dt>
-          <dd>{repo.branch}</dd>
-        </div>
-        <div>
-          <dt>Codex</dt>
-          <dd>{status.codex.mode}</dd>
-        </div>
-        <div>
-          <dt>状态</dt>
-          <dd>{repo.dirty ? "有改动" : "干净"}</dd>
-        </div>
-        <div>
-          <dt>压缩</dt>
-          <dd>{compactLabel}</dd>
-        </div>
-      </dl>
-
-      <details className="context-details">
-        <summary>云端状态</summary>
-        <dl className="detail-list compact-context">
-          <div>
-            <dt>实例</dt>
-            <dd>{status.instance.name}</dd>
-          </div>
-          <div>
-            <dt>规格</dt>
-            <dd>{status.instance.type}</dd>
-          </div>
-          <div>
-            <dt>公网</dt>
-            <dd>{status.instance.publicIp}</dd>
-          </div>
-        </dl>
-      </details>
-
-      <details className="context-details">
-        <summary>最近日志</summary>
-        {relevant ? (
-          <>
-            <div className="log-title">
-              <strong>{relevant.name}</strong>
-              <span>{shortDate(relevant.updatedAt)}</span>
-            </div>
-            <pre>{relevant.tail.slice(-8).join("\n")}</pre>
-            <button className="text-button compact" type="button" onClick={onOpenLogs}>
-              查看全部日志
-            </button>
-          </>
-        ) : (
-          <p className="empty-copy">暂无日志</p>
-        )}
-      </details>
-    </section>
-  );
-}
-
-function AutomationInboxCard({ runs }: { runs?: ConsoleStatus["automationInbox"] }) {
-  const inbox = runs || { needsAttention: [], active: [], recent: [], archived: [] };
-  return (
-    <section className="rail-card automation-inbox-card">
-      <div className="rail-card-header">
-        <h3>Automation inbox</h3>
-        <Activity size={16} />
-      </div>
-      <div className="inbox-counts">
-        <span className="warn-text">Needs {inbox.needsAttention.length}</span>
-        <span>Active {inbox.active.length}</span>
-        <span>Recent {inbox.recent.length}</span>
-      </div>
-      {[...inbox.needsAttention, ...inbox.active, ...inbox.recent].slice(0, 4).map((run) => (
-        <div className="inbox-run" key={run.id}>
-          <strong>{run.name}</strong>
-          <span>{run.status} · {timeLabel(run.updatedAt)}</span>
-        </div>
-      ))}
-      {inbox.needsAttention.length + inbox.active.length + inbox.recent.length === 0 && (
-        <p className="empty-copy">还没有云端自动化运行。</p>
-      )}
     </section>
   );
 }

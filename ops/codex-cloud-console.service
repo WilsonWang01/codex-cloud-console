@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/codex-cloud/console
+WorkingDirectory=/home/ubuntu/codex-cloud/console-current
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=8787
@@ -15,7 +15,8 @@ Environment=HOME=/home/ubuntu
 Environment=CODEX_HOME=/home/ubuntu/.codex
 Environment=CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS=120000
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin
-ExecStart=/usr/bin/npm start
+EnvironmentFile=-/etc/codex-cloud-console.env
+ExecStart=/usr/bin/node server/index.mjs
 Restart=on-failure
 RestartSec=5
 

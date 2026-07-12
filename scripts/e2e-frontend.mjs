@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +35,8 @@ const badChromeNeedles = [
   "模拟响应",
   "模拟日志",
   "Cloud console proxy error",
+  "Preparing 隔离工作区 (detached HEAD",
+  "云端 Codex exited (SIGTERM)",
   "app-server-command",
   "detached-worktree",
   "repo-cwd",
@@ -51,6 +54,10 @@ const badDomNeedles = [
 const steps = [];
 const screenshots = [];
 const consoleErrors = [];
+const failedResponses = [];
+let testSessionId = "";
+let testSessionTitle = "";
+let testUploadPaths = [];
 
 function pageUrl(hash) {
   const url = new URL(baseUrl.href);
@@ -123,8 +130,11 @@ async function apiJson(pathname, label, predicate = null, options = {}) {
 }
 
 async function writeFixtureFiles() {
-  const uploadPath = path.join(fixtureDir, "frontend-e2e-upload.txt");
-  const imagePath = path.join(fixtureDir, "frontend-e2e-paste.png");
+  const suffix = crypto.createHash("sha256").update(String(runId)).digest("hex").slice(0, 16);
+  const uploadName = `frontend-e2e-upload-${suffix}.txt`;
+  const imageName = `frontend-e2e-paste-${suffix}.png`;
+  const uploadPath = path.join(fixtureDir, uploadName);
+  const imagePath = path.join(fixtureDir, imageName);
   await fs.writeFile(uploadPath, `frontend e2e upload ${runId}\n`, "utf8");
   await fs.writeFile(
     imagePath,
@@ -133,7 +143,7 @@ async function writeFixtureFiles() {
       "base64",
     ),
   );
-  return { uploadPath, imagePath };
+  return { uploadPath, uploadName, imagePath, imageName };
 }
 
 async function capture(page, name, options = {}) {
@@ -310,15 +320,15 @@ async function closePanel(page) {
   if (await button.count()) await button.click();
 }
 
-async function pasteImageIntoComposer(page, imagePath) {
+async function pasteImageIntoComposer(page, imagePath, imageName) {
   const bytes = await fs.readFile(imagePath);
   await page.locator(".composer-shell textarea").focus();
   await page.evaluate(
-    ({ base64 }) => {
+    ({ base64, name }) => {
       const binary = atob(base64);
       const array = new Uint8Array(binary.length);
       for (let index = 0; index < binary.length; index += 1) array[index] = binary.charCodeAt(index);
-      const file = new File([array], "frontend-e2e-paste.png", { type: "image/png" });
+      const file = new File([array], name, { type: "image/png" });
       const dataTransfer = new DataTransfer();
       dataTransfer.items.add(file);
       const textarea = document.querySelector(".composer-shell textarea");
@@ -326,7 +336,7 @@ async function pasteImageIntoComposer(page, imagePath) {
       Object.defineProperty(event, "clipboardData", { value: dataTransfer });
       textarea?.dispatchEvent(event);
     },
-    { base64: bytes.toString("base64") },
+    { base64: bytes.toString("base64"), name: imageName },
   );
 }
 
@@ -378,25 +388,78 @@ async function verifyPanels(page) {
   await closePanel(page);
 }
 
-async function verifyUploadAndPaste(page, fixtures) {
-  await page.locator('.app-session-strip .session-actions button[title="新会话"]').click();
-  await page.waitForTimeout(500);
-  await page.locator('input[type="file"].hidden-file-input').setInputFiles(fixtures.uploadPath);
-  await page.locator(".attachment-chip", { hasText: "frontend-e2e-upload.txt" }).waitFor({ state: "visible", timeout: 30_000 });
-  await pasteImageIntoComposer(page, fixtures.imagePath);
-  await page.locator(".attachment-chip.image", { hasText: "frontend-e2e-paste.png" }).waitFor({ state: "visible", timeout: 30_000 });
-  await capture(page, "desktop-upload-and-paste-attachments");
-  await inspectPage(page, "desktop upload and paste");
+async function createTestSession(page) {
+  testSessionTitle = `E2E ${crypto.createHash("sha256").update(String(runId)).digest("hex").slice(0, 12)}`;
+  const created = await apiJson(
+    "/api/chat/sessions",
+    "create isolated e2e session",
+    (data) => data?.ok === true && Boolean(data?.activeSessionId),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId, title: testSessionTitle }),
+    },
+  );
+  testSessionId = String(created.data.activeSessionId);
+  await page.goto(pageUrl(`#/project/${repoId}/thread/${encodeURIComponent(testSessionId)}`), { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await waitForShell(page);
+  await page.waitForFunction(
+    ({ sessionId }) =>
+      window.location.hash.includes(encodeURIComponent(sessionId)) &&
+      document.querySelector(".session-current")?.getAttribute("data-session-id") === sessionId,
+    { sessionId: testSessionId },
+    { timeout: 30_000 },
+  );
+  if (await page.locator(".attachment-chip").count()) throw new Error("isolated e2e session inherited attachment chips");
+  return testSessionId;
 }
 
-async function cleanupActiveDraftSession() {
-  const result = await fetchText(`/api/chat/sessions?repoId=${encodeURIComponent(repoId)}`);
-  if (!result.ok) throw new Error(`cleanup sessions read failed with HTTP ${result.status}: ${result.text.slice(0, 500)}`);
-  const data = parseJson(result, "cleanup sessions");
-  const active = Array.isArray(data?.sessions) ? data.sessions.find((session) => session.id === data.activeSessionId) : null;
-  if (!active || active.codexSessionId || active.threadId || active.source === "app-server") return;
-  const deleted = await fetchText(`/api/chat/sessions/${encodeURIComponent(active.id)}?repoId=${encodeURIComponent(repoId)}`, { method: "DELETE" });
+async function verifyUploadAndPaste(page, fixtures) {
+  await createTestSession(page);
+  const textUploadResponse = page.waitForResponse(
+    (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/api/uploads",
+    { timeout: 30_000 },
+  );
+  await page.locator('input[type="file"].hidden-file-input').setInputFiles(fixtures.uploadPath);
+  const textUpload = await (await textUploadResponse).json();
+  await page.locator(".attachment-chip", { hasText: fixtures.uploadName }).waitFor({ state: "visible", timeout: 30_000 });
+  const imageUploadResponse = page.waitForResponse(
+    (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/api/uploads",
+    { timeout: 30_000 },
+  );
+  await pasteImageIntoComposer(page, fixtures.imagePath, fixtures.imageName);
+  const imageUpload = await (await imageUploadResponse).json();
+  await page.locator(".attachment-chip.image", { hasText: fixtures.imageName }).waitFor({ state: "visible", timeout: 30_000 });
+  const attachments = [...(textUpload.files || []), ...(imageUpload.files || [])];
+  testUploadPaths = attachments.map((attachment) => String(attachment.path || "")).filter(Boolean);
+  const draft = await apiJson(
+    `/api/chat/sessions/${encodeURIComponent(testSessionId)}/draft`,
+    "persisted e2e attachment draft",
+    (data) => data?.ok === true && data?.sessionId === testSessionId && Array.isArray(data?.draft?.attachments) && data.draft.attachments.length >= 2,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId, input: "", attachments }),
+    },
+  );
+  await capture(page, "desktop-upload-and-paste-attachments");
+  await inspectPage(page, "desktop upload and paste");
+  return { sessionId: testSessionId, attachmentCount: draft.data.draft.attachments.length };
+}
+
+async function cleanupTestSession() {
+  if (!testSessionId) return { skipped: true };
+  const deleted = await fetchText(`/api/chat/sessions/${encodeURIComponent(testSessionId)}?repoId=${encodeURIComponent(repoId)}&force=1`, { method: "DELETE" });
   if (!deleted.ok) throw new Error(`cleanup draft session failed with HTTP ${deleted.status}: ${deleted.text.slice(0, 500)}`);
+  const data = parseJson(deleted, "cleanup e2e session");
+  if (data?.deletedSessionId !== testSessionId) throw new Error(`cleanup deleted unexpected session: ${data?.deletedSessionId || "none"}`);
+  if (Array.isArray(data?.uploadCleanup?.errors) && data.uploadCleanup.errors.length) {
+    throw new Error(`cleanup upload files failed: ${data.uploadCleanup.errors.join("; ")}`);
+  }
+  const deletedUploads = Array.isArray(data?.uploadCleanup?.deleted) ? data.uploadCleanup.deleted : [];
+  const missingDeletes = testUploadPaths.filter((filePath) => !deletedUploads.includes(filePath));
+  if (missingDeletes.length) throw new Error(`cleanup did not delete e2e uploads: ${missingDeletes.join(", ")}`);
+  return { sessionId: testSessionId, deletedUploads };
 }
 
 async function verifyRealTurn(page) {
@@ -404,7 +467,7 @@ async function verifyRealTurn(page) {
   const textarea = page.locator(".composer-shell textarea");
   await textarea.fill(`只回复 ${marker}，不要执行命令，不要读取附件。`);
   await page.locator(".send-button").click();
-  await page.getByText(marker).waitFor({ state: "visible", timeout: turnTimeoutMs });
+  await page.locator(".chat-bubble.codex", { hasText: marker }).waitFor({ state: "visible", timeout: turnTimeoutMs });
   await capture(page, "desktop-real-turn-complete");
   const active = await apiJson(`/api/chat/active?repoId=${encodeURIComponent(repoId)}`, "chat active after real turn", (data) => data?.ok === true && data?.source === "app-server" && Boolean(data?.threadId));
   const thread = await apiJson(
@@ -504,6 +567,10 @@ page.on("pageerror", (error) => consoleErrors.push(String(error.message || error
 page.on("console", (message) => {
   if (message.type() === "error") consoleErrors.push(message.text());
 });
+page.on("response", (response) => {
+  if (response.status() < 400) return;
+  failedResponses.push({ method: response.request().method(), status: response.status(), url: response.url() });
+});
 
 let fatalError = null;
 try {
@@ -518,7 +585,34 @@ try {
     const status = await apiJson("/api/status", "status", statusHealthyEnough);
     const models = await apiJson("/api/codex/models", "codex models", (data) => data?.ok === true && data?.source === "app-server" && Array.isArray(data?.models) && data.models.length > 0);
     const appStatus = await apiJson(`/api/codex/app-status?repoId=${encodeURIComponent(repoId)}`, "codex app status", (data) => data?.ok === true && data?.source === "app-server" && data?.authoritative === true);
-    return { healthMs: health.ms, statusMs: status.ms, modelCount: models.data.models.length, appStatusMs: appStatus.ms, partialAllowed: allowPartialStatus };
+    if (runRealTurn && appStatus.data.usageLimit) {
+      throw new Error(`real turn blocked by Codex usage limit: ${appStatus.data.usageLimit.message || appStatus.data.usageLimit.code || "usage limit reached"}`);
+    }
+    const sessions = await apiJson(
+      `/api/chat/sessions?repoId=${encodeURIComponent(repoId)}&sync=1`,
+      "authoritative chat sessions",
+      (data) => data?.ok === true && data?.source === "app-server" && data?.authoritative === true && Array.isArray(data?.sessions),
+    );
+    if (sessions.data.activeSessionId) {
+      await apiJson(
+        `/api/chat/active?repoId=${encodeURIComponent(repoId)}&sessionId=${encodeURIComponent(sessions.data.activeSessionId)}`,
+        "authoritative active chat session",
+        (data) => data?.ok === true && data?.source === "app-server" && data?.authoritative === true,
+      );
+      await apiJson(
+        `/api/codex/thread-state?repoId=${encodeURIComponent(repoId)}&sessionId=${encodeURIComponent(sessions.data.activeSessionId)}&sync=1`,
+        "authoritative thread state",
+        (data) => data?.ok === true && data?.source === "app-server" && data?.authoritative === true,
+      );
+    }
+    return {
+      healthMs: health.ms,
+      statusMs: status.ms,
+      modelCount: models.data.models.length,
+      appStatusMs: appStatus.ms,
+      sessionCount: sessions.data.sessions.length,
+      partialAllowed: allowPartialStatus,
+    };
   });
 
   await runStep("desktop project render", async () => {
@@ -553,12 +647,14 @@ try {
 } finally {
   await context.tracing.stop({ path: tracePath }).catch(() => null);
   await browser.close().catch(() => null);
-  await cleanupActiveDraftSession().catch((error) => {
-    if (!fatalError) {
-      fatalError = error;
-      steps.push({ name: "cleanup draft session", ok: false, ms: 0, error: error.message || String(error) });
-    }
-  });
+  const cleanupStartedAt = Date.now();
+  try {
+    const cleanup = await cleanupTestSession();
+    steps.push({ name: "cleanup e2e session and uploads", ok: true, ms: Date.now() - cleanupStartedAt, result: cleanup });
+  } catch (error) {
+    steps.push({ name: "cleanup e2e session and uploads", ok: false, ms: Date.now() - cleanupStartedAt, error: error.message || String(error) });
+    if (!fatalError) fatalError = error;
+  }
 }
 
 const report = {
@@ -573,6 +669,7 @@ const report = {
   screenshots,
   steps,
   consoleErrors,
+  failedResponses,
   error: fatalError ? fatalError.message || String(fatalError) : null,
 };
 

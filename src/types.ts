@@ -248,8 +248,19 @@ export type LogFile = {
 export type ConsoleStatus = {
   generatedAt: string;
   localMode: boolean;
+  publicConfig?: {
+    publicOrigin: string;
+    webhook: {
+      tokenConfigured: boolean;
+      tokenHeader: string;
+      idempotencyHeader: string;
+      basicAuthRequired: boolean;
+    };
+  };
   health?: {
     ok: boolean;
+    strictOk?: boolean;
+    partial?: boolean;
     layers: {
       ec2Console: {
         ok: boolean;
@@ -321,4 +332,5 @@ export type ChatSessionRuntime = {
   sandbox?: string | null;
   approval?: string | null;
   search?: boolean | null;
+  runtimePending?: boolean;
 };

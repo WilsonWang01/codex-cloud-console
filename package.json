@@ -12,10 +12,12 @@
     "codex:schema": "node scripts/update-codex-app-server-schema.mjs",
     "codex:schema:check": "node scripts/update-codex-app-server-schema.mjs --check",
     "verify:normalizers": "node scripts/smoke-normalizers.mjs",
+    "verify:regressions": "node scripts/verify-regressions.mjs",
     "verify:api": "node scripts/smoke-api.mjs",
     "verify:ui": "node scripts/smoke-ui.mjs",
     "verify:e2e": "node scripts/e2e-frontend.mjs",
-    "verify:cloud": "npm run codex:schema:check && npm run verify:normalizers && npm run build && npm run verify:api && npm run verify:ui",
+    "verify:local": "npm run codex:schema:check && npm run verify:normalizers && npm run build && npm run verify:regressions",
+    "verify:cloud": "npm run verify:local && npm run verify:api && npm run verify:ui",
     "verify:cloud:full": "npm run verify:cloud && npm run verify:e2e",
     "cloud:console": "bash scripts/open-cloud-console.sh",
     "cloud:console:install": "bash scripts/install-cloud-console-agent.sh"

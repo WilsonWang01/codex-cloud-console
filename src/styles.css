@@ -5227,6 +5227,25 @@ h3 {
   align-items: center;
 }
 
+.chat-degraded-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: -4px 0 10px;
+  padding: 9px 11px;
+  border: 1px solid rgba(166, 103, 20, 0.28);
+  border-radius: 6px;
+  color: #70450f;
+  background: #fff8e8;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.chat-degraded-banner svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
 .session-current {
   display: flex;
   align-items: center;
