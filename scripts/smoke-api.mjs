@@ -206,6 +206,7 @@ checks.push(await assertJson("/api/codex/models", (data) => {
     data?.source === "app-server" &&
     data?.authoritative === true &&
     models.length > 0 &&
+    models.some((model) => model.id === "gpt-5.6-sol") &&
     defaultModel?.id &&
     Array.isArray(defaultModel.supportedReasoningEfforts) &&
     defaultModel.supportedReasoningEfforts.includes("medium") &&

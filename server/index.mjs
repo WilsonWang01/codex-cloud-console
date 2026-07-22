@@ -90,7 +90,7 @@ const defaultRuntime = {
   approval: "never",
   search: true,
 };
-const allowedReasoning = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const allowedReasoning = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const allowedSandbox = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const allowedApproval = new Set(["untrusted", "on-failure", "on-request", "never"]);
 const pushSubject = process.env.CODEX_CLOUD_PUSH_SUBJECT || process.env.WEB_PUSH_SUBJECT || "mailto:codex-cloud@example.invalid";
@@ -7488,16 +7488,30 @@ function startModelListRefresh() {
   return modelListRefreshPromise;
 }
 
-async function getModelListForRoute() {
+async function getModelListForRoute(options = {}) {
+  const forceRefresh = options.forceRefresh === true;
   const cached = await readStoredModelListCache();
   const age = cached ? Date.now() - cached.cachedAt : Infinity;
-  if (cached && age <= modelListCacheTtlMs) return { data: cached.data, cache: "fresh" };
+  if (!forceRefresh && cached && age <= modelListCacheTtlMs) return { data: cached.data, cache: "fresh" };
   const refresh = startModelListRefresh();
-  if (cached) return { data: { ...cached.data, refreshing: true }, cache: "stale" };
   try {
-    return { data: await Promise.race([refresh, deadline(modelListFirstResponseMs)]), cache: "live" };
+    return {
+      data: await Promise.race([refresh, deadline(modelListFirstResponseMs)]),
+      cache: cached ? "refreshed" : "live",
+    };
   } catch (error) {
     refresh.catch(() => null);
+    if (cached) {
+      return {
+        data: {
+          ...cached.data,
+          stale: true,
+          refreshing: true,
+          refreshError: sanitizeCloudPathText(error.message || String(error), 320),
+        },
+        cache: "stale",
+      };
+    }
     return {
       data: {
         ok: false,
@@ -7511,8 +7525,9 @@ async function getModelListForRoute() {
   }
 }
 
-app.get("/api/codex/models", async (_req, res) => {
-  const { data, cache } = await getModelListForRoute();
+app.get("/api/codex/models", async (req, res) => {
+  const forceRefresh = req.query?.refresh === "1" || req.query?.sync === "1";
+  const { data, cache } = await getModelListForRoute({ forceRefresh });
   res.setHeader("x-codex-model-list-cache", cache);
   res.status(data.ok === false ? 502 : 200).json(data);
 });

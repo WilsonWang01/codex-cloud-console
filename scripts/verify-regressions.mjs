@@ -87,6 +87,31 @@ input.on("line", (line) => {
   if (!message.id) return;
   const send = (payload, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(payload) + "\\n"), delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
+  if (message.method === "model/list") return send({
+    id: message.id,
+    result: {
+      data: [
+        {
+          id: "gpt-5.6-sol",
+          model: "gpt-5.6-sol",
+          displayName: "GPT-5.6-Sol",
+          isDefault: true,
+          defaultReasoningEffort: "low",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort })),
+          inputModalities: ["text", "image"],
+        },
+        {
+          id: "gpt-5.5",
+          model: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: false,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort })),
+          inputModalities: ["text", "image"],
+        },
+      ],
+    },
+  });
   if (message.method === "thread/list") {
     const cwd = Array.isArray(message.params?.cwd) ? message.params.cwd.join(" ") : "";
     if (cwd.includes("macro-control-dashboard")) return send({ id: message.id, result: { data: [], nextCursor: null } });
@@ -174,6 +199,26 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   await fs.mkdir(emptyRepoRoot, { recursive: true });
   await fs.mkdir(stateRoot, { recursive: true });
   await fs.writeFile(
+    path.join(stateRoot, "codex-models-cache.json"),
+    JSON.stringify({
+      ok: true,
+      source: "app-server",
+      authoritative: true,
+      cachedAt: "2026-01-01T00:00:00.000Z",
+      models: [
+        {
+          id: "gpt-5.5",
+          model: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+          inputModalities: ["text", "image"],
+        },
+      ],
+    }),
+  );
+  await fs.writeFile(
     path.join(stateRoot, "audit-events.json"),
     JSON.stringify({
       version: 1,
@@ -237,6 +282,12 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       (statusData?.attention?.items || []).some((item) => String(item.title || "").includes("exited (SIGTERM)")),
       false,
     );
+    const models = await jsonRequest(baseUrl, "/api/codex/models");
+    assert.equal(models.response.status, 200);
+    assert.equal(models.response.headers.get("x-codex-model-list-cache"), "refreshed");
+    assert.equal(models.data.models[0].id, "gpt-5.6-sol");
+    assert.ok(models.data.models[0].supportedReasoningEfforts.includes("max"));
+    assert.ok(models.data.models[0].supportedReasoningEfforts.includes("ultra"));
     const created = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -303,6 +354,21 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(pendingThreadState.response.status, 200);
     assert.equal(pendingThreadState.data.runtime.model, "gpt-5.5");
     assert.equal(pendingThreadState.data.runtime.reasoning, "high");
+    const gpt56RuntimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repoId: "invest-dashboard",
+        model: "gpt-5.6-sol",
+        reasoning: "max",
+        sandbox: "danger-full-access",
+        approval: "never",
+        search: true,
+      }),
+    });
+    assert.equal(gpt56RuntimePatch.response.status, 200);
+    assert.equal(gpt56RuntimePatch.data.runtime.model, "gpt-5.6-sol");
+    assert.equal(gpt56RuntimePatch.data.runtime.reasoning, "max");
 
     const timedOutTurn = await fetch(new URL("/api/chat/stream", baseUrl), {
       method: "POST",

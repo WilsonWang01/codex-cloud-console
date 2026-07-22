@@ -219,7 +219,7 @@ type ActiveJobsResponse = {
   compact: ActiveJob | null;
 };
 
-const runtimeReasoning = ["low", "medium", "high", "xhigh"];
+const runtimeReasoning = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const defaultChatRuntime: ChatRuntime = {
   model: "gpt-5.5",
   reasoning: "medium",
@@ -246,6 +246,8 @@ type CodexModelsResponse = {
   ok: boolean;
   source?: string;
   authoritative?: boolean;
+  stale?: boolean;
+  refreshing?: boolean;
   error?: string;
   models: CodexModelOption[];
 };
@@ -3475,9 +3477,9 @@ export function App() {
     }
   }, [diagnosticsBusy, pushEvent]);
 
-  const loadCodexModels = useCallback(async () => {
+  const loadCodexModels = useCallback(async (forceRefresh = false) => {
     try {
-      const result = await api<CodexModelsResponse>("/api/codex/models");
+      const result = await api<CodexModelsResponse>(`/api/codex/models${forceRefresh ? "?refresh=1" : ""}`);
       if (!result.ok || result.source !== "app-server" || result.authoritative !== true) {
         throw new Error(result.error || "模型列表不是 app-server 权威响应");
       }
@@ -3497,7 +3499,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    loadCodexModels();
+    loadCodexModels(true);
   }, [loadCodexModels]);
 
   const loadCodexAppStatus = useCallback(async () => {
@@ -9518,10 +9520,14 @@ function CloudChat({
 
 function reasoningLabel(value: string) {
   const labels: Record<string, string> = {
+    none: "无",
+    minimal: "最少",
     low: "低",
     medium: "中",
     high: "高",
     xhigh: "超高",
+    max: "最大",
+    ultra: "Ultra",
   };
   return labels[value] || value;
 }
