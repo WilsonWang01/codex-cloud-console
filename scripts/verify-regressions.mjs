@@ -77,6 +77,7 @@ async function writeFakeCodex(tempRoot) {
   await fs.writeFile(
     fakePath,
     `#!/usr/bin/env node
+import fsSync from "node:fs";
 import readline from "node:readline";
 const initDelay = Number(process.env.FAKE_INIT_DELAY_MS || 0);
 const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
@@ -84,6 +85,7 @@ process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", (line) => {
   const message = JSON.parse(line);
+  if (process.env.FAKE_CAPTURE_PATH) fsSync.appendFileSync(process.env.FAKE_CAPTURE_PATH, JSON.stringify(message) + "\\n");
   if (!message.id) return;
   const send = (payload, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(payload) + "\\n"), delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
@@ -194,6 +196,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const repoRoot = path.join(workspaceRoot, "invest-dashboard");
   const emptyRepoRoot = path.join(workspaceRoot, "macro-control-dashboard");
   const codexShim = path.join(binDir, "codex");
+  const capturePath = path.join(tempRoot, "app-server-requests.jsonl");
   const port = await freePort();
   await fs.mkdir(path.join(repoRoot, ".codex-cloud", "uploads", "test"), { recursive: true });
   await fs.mkdir(emptyRepoRoot, { recursive: true });
@@ -239,6 +242,14 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
           summary: "Codex app-server exited (SIGTERM)",
           detail: JSON.stringify({ signal: "SIGTERM" }),
         },
+        {
+          id: "audit-regression-running-shell",
+          time: new Date().toISOString(),
+          source: "app-server",
+          type: "shell",
+          summary: "shell inProgress: /bin/bash -lc 'codex doctor'",
+          detail: JSON.stringify({ status: "inProgress" }),
+        },
       ],
     }),
   );
@@ -258,6 +269,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
       CODEX_TURN_TIMEOUT_MS: "300",
       CODEX_ALLOW_LOCAL_FALLBACK: "0",
+      FAKE_CAPTURE_PATH: capturePath,
       PATH: `${binDir}:${process.env.PATH}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -278,6 +290,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     }
     assert.equal(serializedStatus.includes("控制台重启时云端自动化仍在运行"), false);
     assert.equal(serializedStatus.includes("控制台维护期间中断，已自动归档"), true);
+    assert.equal(serializedStatus.includes("/bin/bash -lc"), false);
+    assert.equal(serializedStatus.includes("shell: codex doctor"), true);
     assert.equal(
       (statusData?.attention?.items || []).some((item) => String(item.title || "").includes("exited (SIGTERM)")),
       false,
@@ -378,6 +392,22 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(timedOutTurn.status, 200);
     const timedOutBody = await timedOutTurn.text();
     assert.match(timedOutBody, /timed out after/i);
+    const capturedRequests = (await fs.readFile(capturePath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const runtimeResume = capturedRequests.find(
+      (request) =>
+        request.method === "thread/resume" &&
+        request.params?.threadId === "thread-runtime-regression" &&
+        request.params?.model === "gpt-5.6-sol",
+    );
+    assert.ok(runtimeResume);
+    assert.match(runtimeResume.params.developerInstructions, /authoritative model selected by the console/i);
+    assert.match(runtimeResume.params.developerInstructions, /"gpt-5\.6-sol"/);
+    assert.match(runtimeResume.params.developerInstructions, /generic model aliases and concrete model variants/i);
+    assert.match(runtimeResume.params.developerInstructions, /Do not edit ~\/\.codex\/config\.toml/i);
     const inactiveAfterTimeout = await jsonRequest(baseUrl, `/api/chat/active?repoId=invest-dashboard&sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(inactiveAfterTimeout.response.status, 200);
     assert.equal(inactiveAfterTimeout.data.turn, null);

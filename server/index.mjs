@@ -1537,6 +1537,17 @@ function writeSse(res, event, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+function cloudRuntimeDeveloperInstructions(runtime) {
+  return [
+    "You are running through Codex Cloud Console.",
+    `The authoritative model selected by the console for this thread is "${runtime.model}" with reasoning effort "${runtime.reasoning}".`,
+    "When asked which model is active, report that exact model ID. Do not infer the active model from ~/.codex/config.toml because that file only controls the standalone CLI default.",
+    "Treat generic model aliases and concrete model variants as distinct identifiers. A failed request for a generic alias does not prove that the selected concrete variant or its model family is unavailable.",
+    `Before claiming the selected model is unavailable, verify the exact selected ID "${runtime.model}", or rely on the fact that this turn was successfully started with it.`,
+    "Do not edit ~/.codex/config.toml unless the user explicitly asks to change the standalone CLI default.",
+  ].join("\n");
+}
+
 function appServerThreadParams(repo, runtime) {
   return {
     cwd: repo.path,
@@ -1545,7 +1556,7 @@ function appServerThreadParams(repo, runtime) {
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
-    developerInstructions: null,
+    developerInstructions: cloudRuntimeDeveloperInstructions(runtime),
     config: {
       model_reasoning_effort: runtime.reasoning,
       tools: { web_search: runtime.search },
@@ -1863,8 +1874,8 @@ function semanticAuditSummary(value) {
     const command = shell[1].replace(/^\/bin\/bash\s+-lc\s*/i, "").trim().replace(/^(['"])([\s\S]*)\1$/, "$2");
     return terminalCommandSummary(command, "shell");
   }
-  const shellCompleted = text.match(/^shell\s+(?:completed|failed):\s*([\s\S]+)$/i);
-  if (shellCompleted?.[1]) return terminalCommandSummary(shellCompleted[1], "shell");
+  const shellWithStatus = text.match(/^shell\s+(?:inProgress|completed|failed|cancelled):\s*([\s\S]+)$/i);
+  if (shellWithStatus?.[1]) return terminalCommandSummary(shellWithStatus[1], "shell");
   return text;
 }
 
