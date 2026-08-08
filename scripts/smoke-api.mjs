@@ -146,7 +146,7 @@ function assertRuntimeShape(runtime, label) {
   const required = ["model", "reasoning", "sandbox", "approval"];
   const missing = required.filter((key) => !runtime[key]);
   if (missing.length) throw new Error(`${label} runtime missing ${missing.join(", ")}: ${JSON.stringify(runtime)}`);
-  if (!["low", "medium", "high", "xhigh"].includes(runtime.reasoning)) {
+  if (!["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(runtime.reasoning)) {
     throw new Error(`${label} runtime has invalid reasoning: ${runtime.reasoning}`);
   }
   if (typeof runtime.search !== "boolean") throw new Error(`${label} runtime.search is not boolean: ${JSON.stringify(runtime)}`);

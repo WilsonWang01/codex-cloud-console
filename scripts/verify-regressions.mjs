@@ -305,6 +305,18 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
           summary: "shell inProgress: /bin/bash -lc 'codex doctor'",
           detail: JSON.stringify({ status: "inProgress" }),
         },
+        {
+          id: "audit-regression-systemd-deploy",
+          time: new Date().toISOString(),
+          source: "console",
+          type: "terminal",
+          summary: "terminal: sudo systemd-run --unit=codex-cloud-deploy-regression /bin/bash -lc 'set -euo pipefail'",
+          detail: JSON.stringify({
+            type: "commandExecution",
+            command: "sudo systemd-run --unit=codex-cloud-deploy-regression /bin/bash -lc 'set -euo pipefail'",
+            exitCode: 0,
+          }),
+        },
       ],
     }),
   );
@@ -353,6 +365,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(serializedStatus.includes("控制台维护期间中断，已自动归档"), true);
     assert.equal(serializedStatus.includes("/bin/bash -lc"), false);
     assert.equal(serializedStatus.includes("shell: codex doctor"), true);
+    assert.equal(serializedStatus.includes("terminal: deploy cloud console release"), true);
     assert.equal(
       (statusData?.attention?.items || []).some((item) => String(item.title || "").includes("exited (SIGTERM)")),
       false,

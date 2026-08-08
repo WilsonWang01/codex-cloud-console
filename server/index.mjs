@@ -1835,6 +1835,9 @@ function terminalCommandSummary(script, prefix = "terminal") {
   if (serverBlob && /base64\s+-d/i.test(command)) return `${prefix}: deploy backend service`;
   if (uiBlob && /base64\s+-d/i.test(command)) return `${prefix}: deploy frontend bundle`;
   if (deployBlob && /base64\s+-d/i.test(command)) return `${prefix}: deployment file sync`;
+  if (/\bsystemd-run\b[\s\S]*\bcodex-cloud-deploy[-\w]*\b/i.test(command) || /\binstall-systemd\.sh\b/i.test(command)) {
+    return `${prefix}: deploy cloud console release`;
+  }
   if (/systemctl\s+restart\s+codex-cloud-console\.service/i.test(command)) return `${prefix}: restart cloud console service`;
   if (/systemctl\s+is-active\s+codex-cloud-console\.service/i.test(command)) return `${prefix}: check cloud console service`;
   if (
