@@ -753,6 +753,7 @@ await check("atomic installer gates on strict health, prunes, and rolls back", a
   await fs.writeFile(
     path.join(binDir, "sudo"),
     `#!/bin/sh
+if [ "$1" = "-u" ]; then shift 2; fi
 if [ "$1" = "systemctl" ]; then
   [ "$2" = "status" ] && echo "fake systemd service active"
   exit 0
@@ -810,9 +811,17 @@ exec /usr/bin/readlink "$@"
     CODEX_CLOUD_HEALTH_INTERVAL_SECONDS: "0",
     CODEX_CLOUD_KEEP_RELEASES: "1",
     FAKE_HEALTH_COUNT: healthCountPath,
+    CODEX_CLOUD_SERVICE_USER: process.env.USER || "root",
   };
+  const installerArgs = [
+    "-c",
+    'umask 077; exec bash "$1" "$2"',
+    "installer-regression",
+    path.join(projectRoot, "ops", "install-systemd.sh"),
+    sourceRoot,
+  ];
   try {
-    const successful = await runCaptured("bash", [path.join(projectRoot, "ops", "install-systemd.sh"), sourceRoot], {
+    const successful = await runCaptured("bash", installerArgs, {
       cwd: projectRoot,
       env: { ...installerEnv, FAKE_HEALTH_MODE: "recover" },
     });
@@ -820,11 +829,13 @@ exec /usr/bin/readlink "$@"
     assert.match(successful.stdout, /retained releases: 1/i);
     const activeRelease = await fs.realpath(currentLink);
     assert.notEqual(activeRelease, previousRelease);
+    assert.equal((await fs.stat(activeRelease)).mode & 0o055, 0o055);
+    assert.equal((await fs.stat(path.join(activeRelease, "package-lock.json"))).mode & 0o044, 0o044);
     assert.equal((await fs.readdir(releaseRoot)).length, 1);
     assert.equal(await fs.readFile(path.join(sourceRoot, "source-marker.txt"), "utf8"), "source data remains intact\n");
 
     await fs.writeFile(healthCountPath, "0");
-    const failed = await runCaptured("bash", [path.join(projectRoot, "ops", "install-systemd.sh"), sourceRoot], {
+    const failed = await runCaptured("bash", installerArgs, {
       cwd: projectRoot,
       env: { ...installerEnv, CODEX_CLOUD_HEALTH_ATTEMPTS: "1", FAKE_HEALTH_MODE: "fail" },
     });

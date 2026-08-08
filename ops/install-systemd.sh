@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 SOURCE_ROOT="${1:-/home/ubuntu/codex-cloud/console}"
 ENV_FILE="${CODEX_CLOUD_ENV_FILE:-/etc/codex-cloud-console.env}"
@@ -9,6 +10,7 @@ HEALTH_URL="${CODEX_CLOUD_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
 HEALTH_ATTEMPTS="${CODEX_CLOUD_HEALTH_ATTEMPTS:-90}"
 HEALTH_INTERVAL_SECONDS="${CODEX_CLOUD_HEALTH_INTERVAL_SECONDS:-2}"
 KEEP_RELEASES="${CODEX_CLOUD_KEEP_RELEASES:-1}"
+SERVICE_USER="${CODEX_CLOUD_SERVICE_USER:-ubuntu}"
 RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RELEASE_DIR="${RELEASE_ROOT}/${RELEASE_ID}"
 PREVIOUS_TARGET=""
@@ -62,6 +64,11 @@ if ! [[ "$KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "Codex Cloud service user does not exist: $SERVICE_USER" >&2
+  exit 1
+fi
+
 if ! sudo test -f "$ENV_FILE"; then
   sudo install -m 0600 "${SOURCE_ROOT}/ops/codex-cloud-console.env.example" "$ENV_FILE"
   echo "Created $ENV_FILE. Set CODEX_CLOUD_WEBHOOK_TOKEN and CODEX_CLOUD_PUBLIC_ORIGIN, then rerun this installer." >&2
@@ -101,6 +108,13 @@ tar -C "$SOURCE_ROOT" \
   npm run build
   npm run codex:schema:check
   npm run verify:normalizers
+)
+
+chmod -R u=rwX,go=rX "$RELEASE_DIR"
+NPM_BIN="$(command -v npm)"
+(
+  cd "$RELEASE_DIR"
+  sudo -u "$SERVICE_USER" "$NPM_BIN" ls --omit=dev --depth=0 >/dev/null
 )
 
 rm -f "${CURRENT_LINK}.next"
