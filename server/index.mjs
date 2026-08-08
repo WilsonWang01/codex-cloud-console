@@ -565,21 +565,64 @@ async function atomicWriteJson(filePath, value) {
   const tmpPath = uniqueTempPath(filePath);
   const handle = await fs.open(tmpPath, "w", 0o600);
   try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    await fs.copyFile(filePath, `${filePath}.bak`);
-    await fs.chmod(`${filePath}.bak`, 0o600);
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      await fs.rm(tmpPath, { force: true }).catch(() => null);
-      throw error;
+    try {
+      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
+    try {
+      await fs.copyFile(filePath, `${filePath}.bak`);
+      await fs.chmod(`${filePath}.bak`, 0o600);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await fs.rename(tmpPath, filePath);
+  } finally {
+    await fs.rm(tmpPath, { force: true }).catch(() => null);
   }
-  await fs.rename(tmpPath, filePath);
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function cleanupStaleStateTempFiles() {
+  await fs.mkdir(stateRoot, { recursive: true });
+  const managedNames = new Set([
+    chatHistoryPath,
+    customReposPath,
+    automationRunsPath,
+    auditEventsPath,
+    attentionStatePath,
+    notificationStatePath,
+    diagnosticsStatePath,
+    codexAppStatusCachePath,
+    codexModelsCachePath,
+  ].map((filePath) => path.basename(filePath)));
+  const entries = await fs.readdir(stateRoot, { withFileTypes: true });
+  const removed = [];
+  const oldEnoughToIgnorePidReuseMs = 24 * 60 * 60 * 1000;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const match = entry.name.match(/^(.*)\.(\d+)\.[a-z0-9]+\.[a-f0-9]+\.tmp$/i);
+    if (!match || !managedNames.has(match[1])) continue;
+    const filePath = path.join(stateRoot, entry.name);
+    const stat = await fs.lstat(filePath).catch(() => null);
+    if (!stat?.isFile()) continue;
+    const ownerPid = Number(match[2]);
+    const ageMs = Date.now() - stat.mtimeMs;
+    if (ownerPid === process.pid) continue;
+    if (processExists(ownerPid) && ageMs < oldEnoughToIgnorePidReuseMs) continue;
+    await fs.rm(filePath, { force: true });
+    removed.push(entry.name);
+  }
+  return removed;
 }
 
 async function readJsonState(filePath, emptyValue) {
@@ -9366,6 +9409,14 @@ app.use((error, req, res, next) => {
     path: req.path,
   });
 });
+
+const removedStateTempFiles = await cleanupStaleStateTempFiles().catch((error) => {
+  console.warn(`State temp cleanup failed: ${error.message}`);
+  return [];
+});
+if (removedStateTempFiles.length) {
+  console.log(`Removed ${removedStateTempFiles.length} stale state temp file(s).`);
+}
 
 await reconcileStaleAutomationRuns().catch((error) => {
   console.warn(`Automation run reconciliation failed: ${error.message}`);

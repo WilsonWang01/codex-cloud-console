@@ -308,6 +308,10 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       ],
     }),
   );
+  const staleManagedTemp = path.join(stateRoot, "automation-runs.json.999999.deadbeef.abcdef.tmp");
+  const unmanagedTemp = path.join(stateRoot, "user-data.json.999999.deadbeef.abcdef.tmp");
+  await fs.writeFile(staleManagedTemp, "stale partial state");
+  await fs.writeFile(unmanagedTemp, "must remain");
   await fs.mkdir(binDir, { recursive: true });
   await fs.writeFile(codexShim, `#!/bin/sh\nexec "${process.execPath}" "${fakePath}"\n`, { mode: 0o755 });
   const child = spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
@@ -332,6 +336,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const baseUrl = `http://127.0.0.1:${port}/`;
   try {
     await waitForOutput(child, /listening on/i);
+    await assert.rejects(() => fs.stat(staleManagedTemp), /ENOENT/);
+    assert.equal(await fs.readFile(unmanagedTemp, "utf8"), "must remain");
     let serializedStatus = "";
     let statusData = null;
     for (let attempt = 0; attempt < 20; attempt += 1) {
