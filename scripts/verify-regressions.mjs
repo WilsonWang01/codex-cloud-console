@@ -60,6 +60,25 @@ async function stopProcess(child) {
   if (child.exitCode === null) child.kill("SIGKILL");
 }
 
+async function runCaptured(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      resolve({
+        code,
+        signal,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+  });
+}
+
 async function jsonRequest(baseUrl, pathname, options = {}) {
   const response = await fetch(new URL(pathname, baseUrl), options);
   const text = await response.text();
@@ -114,6 +133,32 @@ input.on("line", (line) => {
       ],
     },
   });
+  if (message.method === "fs/readDirectory") {
+    const entries = fsSync.readdirSync(message.params.path, { withFileTypes: true }).map((entry) => ({
+      fileName: entry.name,
+      isDirectory: entry.isDirectory(),
+    }));
+    return send({ id: message.id, result: { entries } });
+  }
+  if (message.method === "fs/getMetadata") {
+    const stat = fsSync.statSync(message.params.path);
+    return send({
+      id: message.id,
+      result: { isFile: stat.isFile(), size: stat.size, modifiedAtMs: stat.mtimeMs },
+    });
+  }
+  if (message.method === "fuzzyFileSearch") {
+    const root = message.params?.roots?.[0] || process.cwd();
+    return send({
+      id: message.id,
+      result: {
+        files: [
+          { root, path: "outside-link/secret.txt", file_name: "secret.txt", match_type: "file", score: 100 },
+          { root, path: ".codex-cloud", file_name: ".codex-cloud", match_type: "directory", score: 50 },
+        ],
+      },
+    });
+  }
   if (message.method === "thread/list") {
     const cwd = Array.isArray(message.params?.cwd) ? message.params.cwd.join(" ") : "";
     if (cwd.includes("macro-control-dashboard")) return send({ id: message.id, result: { data: [], nextCursor: null } });
@@ -195,11 +240,21 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const workspaceRoot = path.join(cloudRoot, "workspace");
   const repoRoot = path.join(workspaceRoot, "invest-dashboard");
   const emptyRepoRoot = path.join(workspaceRoot, "macro-control-dashboard");
+  const outsideRoot = path.join(tempRoot, "outside-repository");
+  const outsideSecretPath = path.join(outsideRoot, "secret.txt");
+  const danglingWriteTarget = path.join(outsideRoot, "created-through-symlink.txt");
   const codexShim = path.join(binDir, "codex");
   const capturePath = path.join(tempRoot, "app-server-requests.jsonl");
   const port = await freePort();
   await fs.mkdir(path.join(repoRoot, ".codex-cloud", "uploads", "test"), { recursive: true });
   await fs.mkdir(emptyRepoRoot, { recursive: true });
+  await fs.mkdir(outsideRoot, { recursive: true });
+  await fs.writeFile(outsideSecretPath, "must stay outside the repository\n");
+  await fs.symlink(outsideRoot, path.join(repoRoot, "outside-link"), "dir");
+  await fs.symlink(danglingWriteTarget, path.join(repoRoot, "dangling-write-link"), "file");
+  await fs.symlink("cyclic-link", path.join(repoRoot, "cyclic-link"), "file");
+  await fs.symlink(outsideSecretPath, path.join(repoRoot, ".codex-cloud", "uploads", "test", "outside-secret-link"), "file");
+  await fs.symlink(outsideRoot, path.join(repoRoot, ".codex-cloud", "uploads", new Date().toISOString().slice(0, 10)), "dir");
   await fs.mkdir(stateRoot, { recursive: true });
   await fs.writeFile(
     path.join(stateRoot, "codex-models-cache.json"),
@@ -302,6 +357,56 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(models.data.models[0].id, "gpt-5.6-sol");
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("max"));
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("ultra"));
+    const escapedRead = await jsonRequest(
+      baseUrl,
+      `/api/files/read?repoId=invest-dashboard&path=${encodeURIComponent("outside-link/secret.txt")}`,
+    );
+    assert.equal(escapedRead.response.status, 400);
+    assert.equal(escapedRead.data.source, "invalid-repository-path");
+    assert.equal(JSON.stringify(escapedRead.data).includes("must stay outside"), false);
+    const rootListing = await jsonRequest(baseUrl, "/api/files/tree?repoId=invest-dashboard&path=.");
+    assert.equal(rootListing.response.status, 200);
+    assert.equal(rootListing.data.entries.some((entry) => entry.name === "outside-link"), false);
+    assert.equal(rootListing.data.entries.some((entry) => entry.name === "cyclic-link"), false);
+    const escapedSearch = await jsonRequest(baseUrl, "/api/files/search?repoId=invest-dashboard&q=secret");
+    assert.equal(escapedSearch.response.status, 200);
+    assert.equal(escapedSearch.data.entries.some((entry) => entry.path.includes("outside-link")), false);
+    const cyclicRead = await jsonRequest(
+      baseUrl,
+      `/api/files/read?repoId=invest-dashboard&path=${encodeURIComponent("cyclic-link")}`,
+    );
+    assert.equal(cyclicRead.response.status, 400);
+    assert.match(cyclicRead.data.error, /cyclic symbolic links/i);
+    const escapedWrite = await jsonRequest(baseUrl, "/api/files/write", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "invest-dashboard", path: "dangling-write-link", content: "escaped" }),
+    });
+    assert.equal(escapedWrite.response.status, 400);
+    assert.equal(escapedWrite.data.source, "invalid-repository-path");
+    await assert.rejects(() => fs.stat(danglingWriteTarget), /ENOENT/);
+    const escapedUpload = await jsonRequest(baseUrl, "/api/uploads", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repoId: "invest-dashboard",
+        files: [{ name: "escape.txt", type: "text/plain", dataUrl: "data:text/plain;base64,ZXNjYXBl" }],
+      }),
+    });
+    assert.equal(escapedUpload.response.status, 400);
+    assert.equal(escapedUpload.data.source, "invalid-repository-path");
+    const escapedUploadDelete = await jsonRequest(baseUrl, "/api/uploads", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "invest-dashboard", paths: [".codex-cloud/uploads/test/outside-secret-link"] }),
+    });
+    assert.equal(escapedUploadDelete.response.status, 400);
+    assert.equal(await fs.readFile(outsideSecretPath, "utf8"), "must stay outside the repository\n");
+    const invalidAutomationMode = await jsonRequest(baseUrl, "/api/automations/invest-daily-update/delete", {
+      method: "POST",
+    });
+    assert.equal(invalidAutomationMode.response.status, 400);
+    assert.match(invalidAutomationMode.data.output, /pause or resume/i);
     const created = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -539,12 +644,19 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-proxy-regression-"));
   const proxyPort = await freePort();
   const upstreamPort = await freePort();
+  const oauthPort = await freePort();
   const credentialsPath = path.join(tempRoot, "credentials");
   const cachePath = path.join(tempRoot, "cache.json");
   const secretPath = path.join(tempRoot, "outside-secret.txt");
   const symlinkPath = path.join(projectRoot, "dist", "regression-outside.txt");
   const upstream = http.createServer((req, res) => {
     if (req.url === "/healthz") return;
+    if (req.url === "/api/notifications/push/status") {
+      const body = JSON.stringify({ ok: true, pushNotifications: { supported: true } });
+      res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("upstream-not-found");
   });
@@ -586,11 +698,136 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     assert.equal(symlinkBody.includes("must-not-be-served"), false);
     const manifest = await fetch(`http://127.0.0.1:${proxyPort}/manifest.webmanifest`);
     assert.equal(manifest.status, 200);
+    const cachedStatus = await fetch(`http://127.0.0.1:${proxyPort}/api/notifications/push/status`);
+    assert.equal(cachedStatus.status, 200);
+    await cachedStatus.arrayBuffer();
+    const cacheMode = (await fs.stat(cachePath)).mode & 0o777;
+    assert.equal(cacheMode, 0o600);
+    const callbackPath = "/callback/allowed-regression";
+    const authorizationUrl = new URL("https://auth.example/authorize");
+    authorizationUrl.searchParams.set("redirect_uri", `http://127.0.0.1:${oauthPort}${callbackPath}`);
+    const relayStart = await fetch(`http://127.0.0.1:${proxyPort}/api/local/mcp-oauth-relay/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ authorizationUrl: authorizationUrl.href }),
+    });
+    assert.equal(relayStart.status, 200);
+    const unknownRelayPath = await fetch(`http://127.0.0.1:${oauthPort}/callback/not-authorized`);
+    assert.equal(unknownRelayPath.status, 404);
+    const unknownRelayBody = await unknownRelayPath.text();
+    assert.match(unknownRelayBody, /unknown oauth relay path/i);
     assert.equal(child.exitCode, null);
   } finally {
     await stopProcess(child);
     await new Promise((resolve) => upstream.close(resolve));
     await fs.rm(symlinkPath, { force: true });
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+await check("atomic installer gates on strict health, prunes, and rolls back", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-deploy-regression-"));
+  const sourceRoot = path.join(tempRoot, "source");
+  const releaseRoot = path.join(tempRoot, "releases");
+  const currentLink = path.join(tempRoot, "console-current");
+  const envFile = path.join(tempRoot, "console.env");
+  const binDir = path.join(tempRoot, "bin");
+  const healthCountPath = path.join(tempRoot, "health-count");
+  const previousRelease = path.join(releaseRoot, "20260101T000000Z-previous");
+  await fs.mkdir(path.join(sourceRoot, "ops"), { recursive: true });
+  await fs.mkdir(previousRelease, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(sourceRoot, "package-lock.json"), "{}\n");
+  await fs.writeFile(path.join(sourceRoot, "source-marker.txt"), "source data remains intact\n");
+  await fs.writeFile(path.join(sourceRoot, "ops", "codex-cloud-console.service"), "[Service]\nExecStart=/bin/true\n");
+  await fs.writeFile(path.join(sourceRoot, "ops", "codex-cloud-console.env.example"), "CODEX_CLOUD_WEBHOOK_TOKEN=replace-me\n");
+  await fs.writeFile(envFile, "CODEX_CLOUD_WEBHOOK_TOKEN=regression-token-123456\n");
+  await fs.writeFile(path.join(previousRelease, "release-marker.txt"), "previous\n");
+  await fs.symlink(previousRelease, currentLink);
+  await fs.writeFile(
+    path.join(binDir, "sudo"),
+    `#!/bin/sh
+if [ "$1" = "systemctl" ]; then
+  [ "$2" = "status" ] && echo "fake systemd service active"
+  exit 0
+fi
+if [ "$1" = "install" ]; then exit 0; fi
+exec "$@"
+`,
+    { mode: 0o755 },
+  );
+  await fs.writeFile(path.join(binDir, "npm"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  await fs.writeFile(
+    path.join(binDir, "curl"),
+    `#!/bin/sh
+count=0
+[ -f "$FAKE_HEALTH_COUNT" ] && count=$(cat "$FAKE_HEALTH_COUNT")
+count=$((count + 1))
+printf '%s' "$count" > "$FAKE_HEALTH_COUNT"
+if [ "$FAKE_HEALTH_MODE" = "recover" ] && [ "$count" -ge 2 ]; then
+  printf '%s\n' '{"strictOk":true,"partial":false}'
+else
+  printf '%s\n' '{"strictOk":false,"partial":true}'
+fi
+`,
+    { mode: 0o755 },
+  );
+  await fs.writeFile(
+    path.join(binDir, "mv"),
+    `#!/bin/sh
+if [ "$1" = "-Tf" ]; then
+  /bin/rm -f "$3"
+  exec /bin/mv "$2" "$3"
+fi
+exec /bin/mv "$@"
+`,
+    { mode: 0o755 },
+  );
+  await fs.writeFile(
+    path.join(binDir, "readlink"),
+    `#!/bin/sh
+if [ "$1" = "-f" ]; then
+  exec "${process.execPath}" -e 'const fs=require("fs");try{process.stdout.write(fs.realpathSync(process.argv[1]))}catch{process.exit(1)}' "$2"
+fi
+exec /usr/bin/readlink "$@"
+`,
+    { mode: 0o755 },
+  );
+
+  const installerEnv = {
+    ...process.env,
+    PATH: `${binDir}:${process.env.PATH}`,
+    CODEX_CLOUD_ENV_FILE: envFile,
+    CODEX_CLOUD_RELEASE_ROOT: releaseRoot,
+    CODEX_CLOUD_CURRENT_LINK: currentLink,
+    CODEX_CLOUD_HEALTH_ATTEMPTS: "3",
+    CODEX_CLOUD_HEALTH_INTERVAL_SECONDS: "0",
+    CODEX_CLOUD_KEEP_RELEASES: "1",
+    FAKE_HEALTH_COUNT: healthCountPath,
+  };
+  try {
+    const successful = await runCaptured("bash", [path.join(projectRoot, "ops", "install-systemd.sh"), sourceRoot], {
+      cwd: projectRoot,
+      env: { ...installerEnv, FAKE_HEALTH_MODE: "recover" },
+    });
+    assert.equal(successful.code, 0, successful.stderr || successful.stdout);
+    assert.match(successful.stdout, /retained releases: 1/i);
+    const activeRelease = await fs.realpath(currentLink);
+    assert.notEqual(activeRelease, previousRelease);
+    assert.equal((await fs.readdir(releaseRoot)).length, 1);
+    assert.equal(await fs.readFile(path.join(sourceRoot, "source-marker.txt"), "utf8"), "source data remains intact\n");
+
+    await fs.writeFile(healthCountPath, "0");
+    const failed = await runCaptured("bash", [path.join(projectRoot, "ops", "install-systemd.sh"), sourceRoot], {
+      cwd: projectRoot,
+      env: { ...installerEnv, CODEX_CLOUD_HEALTH_ATTEMPTS: "1", FAKE_HEALTH_MODE: "fail" },
+    });
+    assert.notEqual(failed.code, 0);
+    assert.match(failed.stderr, /strict health check failed/i);
+    assert.equal(await fs.realpath(currentLink), activeRelease);
+    assert.equal((await fs.readdir(releaseRoot)).length, 1);
+    assert.equal(await fs.readFile(path.join(sourceRoot, "source-marker.txt"), "utf8"), "source data remains intact\n");
+  } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });

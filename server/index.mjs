@@ -6490,9 +6490,69 @@ function resolveRepoPath(repo, relativePath = ".") {
   const target = path.resolve(repo.path, clean);
   const root = path.resolve(repo.path);
   if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
-    throw new Error("Path escapes repository root");
+    throw repoPathError("Path escapes repository root");
   }
   return target;
+}
+
+function pathIsWithin(root, target) {
+  return target === root || target.startsWith(`${root}${path.sep}`);
+}
+
+function repoPathError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.source = "invalid-repository-path";
+  return error;
+}
+
+async function realPathOrNearestExisting(target, seenLinks = new Set()) {
+  let candidate = target;
+  while (true) {
+    try {
+      const metadata = await fs.lstat(candidate);
+      if (metadata.isSymbolicLink()) {
+        const linkedPath = await fs.readlink(candidate);
+        const resolvedLink = path.resolve(path.dirname(candidate), linkedPath);
+        if (seenLinks.size >= 64) throw repoPathError("Path contains too many symbolic links");
+        if (seenLinks.has(resolvedLink)) throw repoPathError("Path contains cyclic symbolic links");
+        seenLinks.add(resolvedLink);
+        return realPathOrNearestExisting(resolvedLink, seenLinks);
+      }
+      return await fs.realpath(candidate);
+    } catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes(error?.code)) throw error;
+      const parent = path.dirname(candidate);
+      if (parent === candidate) throw error;
+      candidate = parent;
+    }
+  }
+}
+
+async function assertRepoPathAccess(repo, target, options = {}) {
+  const lexicalTarget = resolveRepoPath(repo, target);
+  let realRoot;
+  try {
+    realRoot = await fs.realpath(repo.path);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw repoPathError("Repository path does not exist", 404);
+    throw error;
+  }
+
+  let realTarget;
+  try {
+    realTarget = options.allowMissing
+      ? await realPathOrNearestExisting(lexicalTarget)
+      : await fs.realpath(lexicalTarget);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw repoPathError("Path does not exist", 404);
+    if (error?.code === "ELOOP") throw repoPathError("Path contains cyclic symbolic links");
+    throw error;
+  }
+  if (!pathIsWithin(realRoot, realTarget)) {
+    throw repoPathError("Path resolves outside repository root");
+  }
+  return lexicalTarget;
 }
 
 async function appServerReviewExec(repo, command, options = {}) {
@@ -6722,6 +6782,7 @@ async function cleanupSessionUploadFiles(repo, session, store) {
   for (const filePath of owned) {
     if (referencedElsewhere.has(filePath)) continue;
     try {
+      await assertRepoPathAccess(repo, filePath, { allowMissing: true });
       await fs.unlink(filePath);
       deleted.push(path.relative(repo.path, filePath));
       await fs.rmdir(path.dirname(filePath)).catch(() => null);
@@ -6905,7 +6966,12 @@ async function resolveFileMentions(repo, message) {
       continue;
     }
     const relativePath = token.replace(/^\.?\//, "");
-    const absolutePath = resolveRepoPath(repo, relativePath);
+    let absolutePath;
+    try {
+      absolutePath = await assertRepoPathAccess(repo, relativePath);
+    } catch {
+      continue;
+    }
     const metadata = await codexAppServerRequest("fs/getMetadata", { path: absolutePath }, 8_000);
     if (!metadata.ok || seen.has(absolutePath)) continue;
     seen.add(absolutePath);
@@ -6920,6 +6986,7 @@ async function resolveFileMentions(repo, message) {
 
 async function buildUserInputs(repo, message, attachments = []) {
   const normalizedAttachments = attachments.slice(0, maxUploadFiles).map((item) => normalizeAttachment(repo, item));
+  await Promise.all(normalizedAttachments.map((attachment) => assertRepoPathAccess(repo, attachment.path)));
   const fileAttachments = normalizedAttachments.filter((attachment) => attachment.kind !== "image");
   const attachmentText = fileAttachments.length
     ? `\n\n上传文件路径:\n${fileAttachments.map((attachment) => `- ${attachment.relativePath}`).join("\n")}`
@@ -6945,16 +7012,24 @@ async function buildUserInputs(repo, message, attachments = []) {
 }
 
 async function listRepoFiles(repo, relativePath = ".") {
-  const target = resolveRepoPath(repo, relativePath);
+  const target = await assertRepoPathAccess(repo, relativePath);
   const response = await codexAppServerRequest("fs/readDirectory", { path: target }, 20_000);
   if (response.ok) {
     const rows = Array.isArray(response.result?.entries) ? response.result.entries : [];
     const visible = rows
-      .filter((entry) => entry?.fileName && ![".git", "node_modules", "dist", ".next", "build"].includes(entry.fileName))
+      .filter((entry) => {
+        const fileName = String(entry?.fileName || "");
+        return fileName && fileName === path.basename(fileName) && !fileName.includes("\\") && ![".git", "node_modules", "dist", ".next", "build"].includes(fileName);
+      })
       .slice(0, 220);
     const items = await Promise.all(
       visible.map(async (entry) => {
         const entryPath = path.join(target, entry.fileName);
+        try {
+          await assertRepoPathAccess(repo, entryPath);
+        } catch {
+          return null;
+        }
         const metadata = await codexAppServerRequest("fs/getMetadata", { path: entryPath }, 8_000);
         const modifiedAtMs = Number(metadata.result?.modifiedAtMs || 0);
         return {
@@ -6967,9 +7042,10 @@ async function listRepoFiles(repo, relativePath = ".") {
         };
       }),
     );
+    const safeItems = items.filter(Boolean);
     return {
       path: path.relative(repo.path, target) || ".",
-      entries: items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1)),
+      entries: safeItems.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1)),
       source: "app-server",
     };
   }
@@ -6980,10 +7056,15 @@ async function listRepoFiles(repo, relativePath = ".") {
   const entries = await fs.readdir(target, { withFileTypes: true });
   const items = await Promise.all(
     entries
-      .filter((entry) => ![".git", "node_modules", "dist", ".next", "build"].includes(entry.name))
+      .filter((entry) => !entry.name.includes("\\") && ![".git", "node_modules", "dist", ".next", "build"].includes(entry.name))
       .slice(0, 220)
       .map(async (entry) => {
         const entryPath = path.join(target, entry.name);
+        try {
+          await assertRepoPathAccess(repo, entryPath);
+        } catch {
+          return null;
+        }
         const stat = await fs.stat(entryPath).catch(() => null);
         return {
           name: entry.name,
@@ -6995,9 +7076,10 @@ async function listRepoFiles(repo, relativePath = ".") {
         };
       }),
   );
+  const safeItems = items.filter(Boolean);
   return {
     path: path.relative(repo.path, target) || ".",
-    entries: items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1)),
+    entries: safeItems.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1)),
     source: "local-fallback",
     error: response.error,
   };
@@ -7006,7 +7088,12 @@ async function listRepoFiles(repo, relativePath = ".") {
 function normalizeFuzzyFileResult(repo, result = {}) {
   const root = String(result.root || repo.path || "");
   const rawPath = String(result.path || "");
-  const absolutePath = path.isAbsolute(rawPath) ? rawPath : path.join(root || repo.path, rawPath);
+  let absolutePath;
+  try {
+    absolutePath = resolveRepoPath(repo, path.isAbsolute(rawPath) ? rawPath : path.join(root || repo.path, rawPath));
+  } catch {
+    return null;
+  }
   const relativePath = path.relative(repo.path, absolutePath) || rawPath || result.file_name || ".";
   const type = result.match_type === "directory" ? "directory" : "file";
   return {
@@ -7040,10 +7127,22 @@ async function searchRepoFiles(repo, query = "", options = {}) {
   );
   if (response.ok) {
     const seen = new Set();
-    const entries = (Array.isArray(response.result?.files) ? response.result.files : [])
-      .map((item) => normalizeFuzzyFileResult(repo, item))
+    const normalized = (Array.isArray(response.result?.files) ? response.result.files : [])
+      .map((item) => normalizeFuzzyFileResult(repo, item));
+    const validated = await Promise.all(
+      normalized.map(async (item) => {
+        if (!item?.path) return null;
+        try {
+          await assertRepoPathAccess(repo, item.path);
+          return item;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const entries = validated
       .filter((item) => {
-        if (!item.path || seen.has(item.path)) return false;
+        if (!item?.path || seen.has(item.path)) return false;
         if (!isMentionCandidatePath(item.path)) return false;
         seen.add(item.path);
         return true;
@@ -8520,7 +8619,11 @@ app.post("/api/uploads", async (req, res) => {
     const repo = getRepoById(payload.repoId);
     const incoming = Array.isArray(payload.files) ? payload.files.slice(0, maxUploadFiles) : [];
     if (!incoming.length) return res.status(400).json({ ok: false, error: "No files uploaded" });
-    const uploadDir = resolveRepoPath(repo, path.join(".codex-cloud", "uploads", new Date().toISOString().slice(0, 10)));
+    const uploadDir = await assertRepoPathAccess(
+      repo,
+      path.join(".codex-cloud", "uploads", new Date().toISOString().slice(0, 10)),
+      { allowMissing: true },
+    );
     const mkdirResponse = await codexAppServerRequest(
       "command/exec",
       {
@@ -8547,6 +8650,7 @@ app.post("/api/uploads", async (req, res) => {
       const { mimeType, buffer } = uploadFileBytes(file);
       const fileName = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${safeUploadName(file?.name || "upload")}`;
       const target = path.join(uploadDir, fileName);
+      await assertRepoPathAccess(repo, target, { allowMissing: true });
       const writeResponse = await codexAppServerRequest("fs/writeFile", { path: target, dataBase64: buffer.toString("base64") }, 30_000);
       if (!writeResponse.ok) {
         if (!allowLocalFallback) {
@@ -8571,7 +8675,7 @@ app.post("/api/uploads", async (req, res) => {
     }
     res.json({ ok: true, repoId: repo.id, files });
   } catch (error) {
-    res.status(400).json({ ok: false, error: error.message });
+    sendRouteError(res, error);
   }
 });
 
@@ -8581,20 +8685,23 @@ app.delete("/api/uploads", async (req, res) => {
   if (!requested.length) return res.status(400).json({ ok: false, error: "No upload paths supplied" });
   const deleted = [];
   const errors = [];
+  let errorStatus = 400;
   for (const relativePath of requested) {
     let target;
     try {
       target = resolveRepoPath(repo, relativePath);
-      if (!isUploadedAttachmentPath(repo, target)) throw new Error("Path is outside the upload directory");
+      if (!isUploadedAttachmentPath(repo, target)) throw repoPathError("Path is outside the upload directory");
+      await assertRepoPathAccess(repo, target, { allowMissing: true });
       await fs.unlink(target);
       deleted.push(path.relative(repo.path, target));
       await fs.rmdir(path.dirname(target)).catch(() => null);
     } catch (error) {
       if (error?.code === "ENOENT") continue;
+      if (!error?.statusCode) errorStatus = 500;
       errors.push(`${String(relativePath)}: ${error.message}`);
     }
   }
-  res.status(errors.length ? 500 : 200).json({ ok: errors.length === 0, repoId: repo.id, deleted, errors });
+  res.status(errors.length ? errorStatus : 200).json({ ok: errors.length === 0, repoId: repo.id, deleted, errors });
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -8721,7 +8828,7 @@ app.get("/api/files/search", async (req, res) => {
 app.get("/api/files/read", async (req, res) => {
   try {
     const repo = getRepoById(req.query?.repoId);
-    const filePath = resolveRepoPath(repo, req.query?.path || ".");
+    const filePath = await assertRepoPathAccess(repo, req.query?.path || ".");
     const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000);
     if (metadata.ok && !metadata.result?.isFile) return res.status(400).json({ ok: false, error: "Path is not a file" });
     const readResponse = await codexAppServerRequest("fs/readFile", { path: filePath }, 20_000);
@@ -8762,14 +8869,14 @@ app.get("/api/files/read", async (req, res) => {
       fallbackError: readResponse.error,
     });
   } catch (error) {
-    res.status(400).json({ ok: false, error: error.message });
+    sendRouteError(res, error);
   }
 });
 
 app.get("/api/files/blob", async (req, res) => {
   try {
     const repo = getRepoById(req.query?.repoId);
-    const filePath = resolveRepoPath(repo, req.query?.path || ".");
+    const filePath = await assertRepoPathAccess(repo, req.query?.path || ".");
     const imageMimeType = imageMimeForPath(filePath);
     const isUpload = isUploadedAttachmentPath(repo, filePath);
     if (!imageMimeType && !isUpload) {
@@ -8807,14 +8914,14 @@ app.get("/api/files/blob", async (req, res) => {
     res.setHeader("X-Codex-Source", "local-fallback");
     res.end(await fs.readFile(filePath));
   } catch (error) {
-    res.status(400).json({ ok: false, error: error.message });
+    sendRouteError(res, error);
   }
 });
 
 app.post("/api/files/write", async (req, res) => {
   try {
     const repo = getRepoById(req.body?.repoId);
-    const filePath = resolveRepoPath(repo, req.body?.path || ".");
+    const filePath = await assertRepoPathAccess(repo, req.body?.path || ".", { allowMissing: true });
     const content = String(req.body?.content || "");
     const writeResponse = await codexAppServerRequest(
       "fs/writeFile",
@@ -8846,7 +8953,7 @@ app.post("/api/files/write", async (req, res) => {
     const stat = await fs.stat(filePath);
     res.json({ ok: true, repoId: repo.id, path: path.relative(repo.path, filePath), size: stat.size, updatedAt: stat.mtime.toISOString(), source: "local-fallback", fallbackError: writeResponse.error });
   } catch (error) {
-    res.status(400).json({ ok: false, error: error.message });
+    sendRouteError(res, error);
   }
 });
 
@@ -9225,7 +9332,10 @@ app.post("/api/automations/:id/run", async (req, res) => {
 app.post("/api/automations/:id/:mode", async (req, res) => {
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
-  const action = req.params.mode === "pause" ? "disable" : "enable";
+  const action = { pause: "disable", resume: "enable" }[req.params.mode];
+  if (!action) {
+    return res.status(400).json({ ok: false, output: "Automation mode must be pause or resume" });
+  }
   const result = await run("systemctl", [action, "--now", automation.timer], { timeout: 20_000 });
   if (!result.ok) {
     const output = result.stderr || result.stdout || `${automation.name}: ${req.params.mode} failed`;

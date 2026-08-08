@@ -43,8 +43,10 @@ bash ops/install-systemd.sh
 The installer validates the environment first, builds with `npm ci` in a new
 `/home/ubuntu/codex-cloud/releases/console/<release-id>` directory, atomically
 switches `/home/ubuntu/codex-cloud/console-current`, and rolls back the symlink
-if the service does not pass its API health check. Existing releases and all
-workspace/state directories are retained.
+if the service does not pass the strict `/healthz` check. Workspace and state
+directories are never stored in a release and remain intact. After a successful
+deployment, only the active release is retained by default; set
+`CODEX_CLOUD_KEEP_RELEASES` to a larger positive integer to keep more.
 
 The systemd service listens on `127.0.0.1:8787` by default. Browser access should go through the fixed HTTPS Caddy entrypoint or the local `127.0.0.1:18787` proxy. Do not expose the raw console port directly in the EC2 security group.
 

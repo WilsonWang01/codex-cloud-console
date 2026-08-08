@@ -137,7 +137,8 @@ function loadResponseCache() {
 function persistResponseCache() {
   try {
     fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-    fs.writeFileSync(cachePath, JSON.stringify(Object.fromEntries(responseCache), null, 2));
+    fs.writeFileSync(cachePath, JSON.stringify(Object.fromEntries(responseCache), null, 2), { mode: 0o600 });
+    fs.chmodSync(cachePath, 0o600);
   } catch {
     // Best-effort cache only.
   }
@@ -384,6 +385,7 @@ function startOAuthRelay({ port, path: callbackPath }) {
   const existing = oauthRelayServers.get(port);
   if (existing) {
     clearTimeout(existing.timer);
+    existing.allowedPaths.add(callbackPath);
     existing.timer = setTimeout(() => existing.server.close(), 10 * 60 * 1000);
     return Promise.resolve({ ok: true, port, path: callbackPath, reused: true });
   }
@@ -392,7 +394,8 @@ function startOAuthRelay({ port, path: callbackPath }) {
     const relayServer = http.createServer(async (req, res) => {
       try {
         const requestUrl = new URL(req.url || "/", `http://127.0.0.1:${port}`);
-        if (!requestUrl.pathname.startsWith("/callback/")) {
+        const state = oauthRelayServers.get(port);
+        if (!state?.allowedPaths.has(requestUrl.pathname)) {
           sendPlainError(res, 404, "Unknown OAuth relay path\n");
           return;
         }
@@ -415,6 +418,7 @@ function startOAuthRelay({ port, path: callbackPath }) {
     relayServer.listen(port, "127.0.0.1", () => {
       const state = {
         server: relayServer,
+        allowedPaths: new Set([callbackPath]),
         timer: setTimeout(() => relayServer.close(), 10 * 60 * 1000),
       };
       oauthRelayServers.set(port, state);
