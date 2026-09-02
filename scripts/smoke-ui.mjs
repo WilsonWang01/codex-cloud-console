@@ -23,11 +23,11 @@ const badNeedles = [
 
 const pages = [
   ["inbox-desktop", "#/inbox", { width: 1440, height: 940 }],
-  ["cli-desktop", "#/project/invest-dashboard", { width: 1440, height: 940 }],
+  ["cli-desktop", "#/project/sample-app", { width: 1440, height: 940 }],
   ["settings-desktop", "#/settings", { width: 1440, height: 940 }],
-  ["automations-desktop", "#/automations/invest-dashboard/invest-daily-update", { width: 1440, height: 940 }],
+  ["automations-desktop", "#/automations/sample-app/sample-maintenance", { width: 1440, height: 940 }],
   ["inbox-mobile", "#/inbox", { width: 390, height: 844 }],
-  ["cli-mobile", "#/project/invest-dashboard", { width: 390, height: 844 }],
+  ["cli-mobile", "#/project/sample-app", { width: 390, height: 844 }],
 ];
 
 function pageUrl(hash) {

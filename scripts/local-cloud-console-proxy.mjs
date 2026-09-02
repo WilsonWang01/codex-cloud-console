@@ -60,7 +60,7 @@ function readCredentials() {
         return index >= 0 ? [line.slice(0, index), line.slice(index + 1)] : [line, ""];
       }),
   );
-  const rawTarget = process.env.CODEX_CLOUD_CONSOLE_TARGET || values.https_url || values.url || "https://13.231.3.21.sslip.io/";
+  const rawTarget = process.env.CODEX_CLOUD_CONSOLE_TARGET || values.https_url || values.url || "https://console.example.com/";
   return {
     target: normalizeConsoleTarget(rawTarget),
     upstreamIp: process.env.CODEX_CLOUD_CONSOLE_UPSTREAM_IP || values.public_ip || values.ip || "",

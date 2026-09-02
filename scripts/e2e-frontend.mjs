@@ -9,7 +9,7 @@ import { chromium } from "playwright";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 const baseUrl = new URL(process.env.CODEX_CLOUD_E2E_URL || process.env.CODEX_CLOUD_SMOKE_URL || process.env.CODEX_CLOUD_CONSOLE_URL || "http://127.0.0.1:18787/");
-const repoId = process.env.CODEX_CLOUD_E2E_REPO || process.env.CODEX_CLOUD_SMOKE_REPO || "invest-dashboard";
+const repoId = process.env.CODEX_CLOUD_E2E_REPO || process.env.CODEX_CLOUD_SMOKE_REPO || "sample-app";
 const runId = process.env.CODEX_CLOUD_E2E_RUN_ID || new Date().toISOString().replace(/[:.]/g, "-");
 const artifactRoot = path.resolve(projectRoot, process.env.CODEX_CLOUD_E2E_ARTIFACT_DIR || path.join("docs", "research", "acceptance", "frontend-e2e", runId));
 const screenshotDir = path.join(artifactRoot, "screenshots");

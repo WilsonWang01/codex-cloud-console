@@ -173,7 +173,7 @@ input.on("line", (line) => {
   }
   if (message.method === "thread/list") {
     const cwd = Array.isArray(message.params?.cwd) ? message.params.cwd.join(" ") : "";
-    if (cwd.includes("macro-control-dashboard")) return send({ id: message.id, result: { data: [], nextCursor: null } });
+    if (cwd.includes("sample-service")) return send({ id: message.id, result: { data: [], nextCursor: null } });
     return send({ id: message.id, error: { code: -32000, message: "injected thread/list failure" } });
   }
   if (message.method === "thread/start") return send({ id: message.id, result: { thread: { id: "thread-regression" } } });
@@ -250,8 +250,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const stateRoot = path.join(tempRoot, "state");
   const cloudRoot = path.join(tempRoot, "cloud");
   const workspaceRoot = path.join(cloudRoot, "workspace");
-  const repoRoot = path.join(workspaceRoot, "invest-dashboard");
-  const emptyRepoRoot = path.join(workspaceRoot, "macro-control-dashboard");
+  const repoRoot = path.join(workspaceRoot, "sample-app");
+  const emptyRepoRoot = path.join(workspaceRoot, "sample-service");
   const outsideRoot = path.join(tempRoot, "outside-repository");
   const outsideSecretPath = path.join(outsideRoot, "secret.txt");
   const danglingWriteTarget = path.join(outsideRoot, "created-through-symlink.txt");
@@ -443,8 +443,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(serializedStatus.includes("shell: codex doctor"), true);
     assert.equal(serializedStatus.includes("terminal: deploy cloud console release"), true);
     assert.equal(statusData.automations.some((automation) => automation.model === "gpt-5.5"), false);
-    assert.equal(statusData.automations.some((automation) => automation.id === "invest-holding-research"), true);
-    assert.equal(statusData.automations.some((automation) => automation.id === "invest-guba-hourly"), true);
+    assert.equal(statusData.automations.some((automation) => automation.id === "sample-research"), true);
+    assert.equal(statusData.automations.some((automation) => automation.id === "sample-hourly"), true);
     assert.equal(
       (statusData?.attention?.items || []).some((item) => String(item.title || "").includes("exited (SIGTERM)")),
       false,
@@ -478,28 +478,28 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(linkedGeneratedImage.data.source, "invalid-generated-image-path");
     const escapedRead = await jsonRequest(
       baseUrl,
-      `/api/files/read?repoId=invest-dashboard&path=${encodeURIComponent("outside-link/secret.txt")}`,
+      `/api/files/read?repoId=sample-app&path=${encodeURIComponent("outside-link/secret.txt")}`,
     );
     assert.equal(escapedRead.response.status, 400);
     assert.equal(escapedRead.data.source, "invalid-repository-path");
     assert.equal(JSON.stringify(escapedRead.data).includes("must stay outside"), false);
-    const rootListing = await jsonRequest(baseUrl, "/api/files/tree?repoId=invest-dashboard&path=.");
+    const rootListing = await jsonRequest(baseUrl, "/api/files/tree?repoId=sample-app&path=.");
     assert.equal(rootListing.response.status, 200);
     assert.equal(rootListing.data.entries.some((entry) => entry.name === "outside-link"), false);
     assert.equal(rootListing.data.entries.some((entry) => entry.name === "cyclic-link"), false);
-    const escapedSearch = await jsonRequest(baseUrl, "/api/files/search?repoId=invest-dashboard&q=secret");
+    const escapedSearch = await jsonRequest(baseUrl, "/api/files/search?repoId=sample-app&q=secret");
     assert.equal(escapedSearch.response.status, 200);
     assert.equal(escapedSearch.data.entries.some((entry) => entry.path.includes("outside-link")), false);
     const cyclicRead = await jsonRequest(
       baseUrl,
-      `/api/files/read?repoId=invest-dashboard&path=${encodeURIComponent("cyclic-link")}`,
+      `/api/files/read?repoId=sample-app&path=${encodeURIComponent("cyclic-link")}`,
     );
     assert.equal(cyclicRead.response.status, 400);
     assert.match(cyclicRead.data.error, /cyclic symbolic links/i);
     const escapedWrite = await jsonRequest(baseUrl, "/api/files/write", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "invest-dashboard", path: "dangling-write-link", content: "escaped" }),
+      body: JSON.stringify({ repoId: "sample-app", path: "dangling-write-link", content: "escaped" }),
     });
     assert.equal(escapedWrite.response.status, 400);
     assert.equal(escapedWrite.data.source, "invalid-repository-path");
@@ -508,7 +508,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        repoId: "invest-dashboard",
+        repoId: "sample-app",
         files: [{ name: "escape.txt", type: "text/plain", dataUrl: "data:text/plain;base64,ZXNjYXBl" }],
       }),
     });
@@ -517,11 +517,11 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const escapedUploadDelete = await jsonRequest(baseUrl, "/api/uploads", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "invest-dashboard", paths: [".codex-cloud/uploads/test/outside-secret-link"] }),
+      body: JSON.stringify({ repoId: "sample-app", paths: [".codex-cloud/uploads/test/outside-secret-link"] }),
     });
     assert.equal(escapedUploadDelete.response.status, 400);
     assert.equal(await fs.readFile(outsideSecretPath, "utf8"), "must stay outside the repository\n");
-    const invalidAutomationMode = await jsonRequest(baseUrl, "/api/automations/invest-daily-update/delete", {
+    const invalidAutomationMode = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/delete", {
       method: "POST",
     });
     assert.equal(invalidAutomationMode.response.status, 400);
@@ -529,7 +529,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const created = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "invest-dashboard" }),
+      body: JSON.stringify({ repoId: "sample-app" }),
     });
     assert.equal(created.response.status, 200);
     const sessionId = created.data.activeSessionId;
@@ -544,16 +544,16 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const crossSiteMutation = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json", origin: "https://attacker.example", "sec-fetch-site": "cross-site" },
-      body: JSON.stringify({ repoId: "invest-dashboard" }),
+      body: JSON.stringify({ repoId: "sample-app" }),
     });
     assert.equal(crossSiteMutation.response.status, 403);
-    const failedRead = await jsonRequest(baseUrl, "/api/chat/sessions?repoId=invest-dashboard");
+    const failedRead = await jsonRequest(baseUrl, "/api/chat/sessions?repoId=sample-app");
     assert.equal(failedRead.response.status, 503);
     assert.equal(failedRead.data.ok, false);
     const store = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
     assert.ok(store.sessions[sessionId]);
-    assert.equal(store.activeByRepo["invest-dashboard"], sessionId);
-    const explicitRead = await jsonRequest(baseUrl, `/api/chat/sessions?repoId=invest-dashboard&sessionId=${encodeURIComponent(sessionId)}`);
+    assert.equal(store.activeByRepo["sample-app"], sessionId);
+    const explicitRead = await jsonRequest(baseUrl, `/api/chat/sessions?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(explicitRead.response.status, 200);
     assert.equal(explicitRead.data.activeSessionId, sessionId);
     assert.equal(explicitRead.data.degraded, true);
@@ -565,7 +565,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     await fs.writeFile(path.join(stateRoot, "chat-history.json"), JSON.stringify(runtimeStore));
     const primedThreadState = await jsonRequest(
       baseUrl,
-      `/api/codex/thread-state?repoId=invest-dashboard&sessionId=${encodeURIComponent(sessionId)}`,
+      `/api/codex/thread-state?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`,
     );
     assert.equal(primedThreadState.response.status, 200);
     assert.equal(primedThreadState.data.runtime.model, "gpt-5.4-mini");
@@ -573,7 +573,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        repoId: "invest-dashboard",
+        repoId: "sample-app",
         model: "gpt-5.5",
         reasoning: "high",
         sandbox: "danger-full-access",
@@ -588,7 +588,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(runtimePatch.data.appliesOnNextTurn, true);
     const pendingThreadState = await jsonRequest(
       baseUrl,
-      `/api/codex/thread-state?repoId=invest-dashboard&sessionId=${encodeURIComponent(sessionId)}`,
+      `/api/codex/thread-state?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`,
     );
     assert.equal(pendingThreadState.response.status, 200);
     assert.equal(pendingThreadState.data.runtime.model, "gpt-5.6-terra");
@@ -597,7 +597,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        repoId: "invest-dashboard",
+        repoId: "sample-app",
         model: "gpt-5.6-sol",
         reasoning: "max",
         sandbox: "danger-full-access",
@@ -612,7 +612,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const timedOutTurn = await fetch(new URL("/api/chat/stream", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "invest-dashboard", sessionId, message: "timeout regression" }),
+      body: JSON.stringify({ repoId: "sample-app", sessionId, message: "timeout regression" }),
     });
     assert.equal(timedOutTurn.status, 200);
     const timedOutBody = await timedOutTurn.text();
@@ -633,7 +633,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.match(runtimeResume.params.developerInstructions, /"gpt-5\.6-sol"/);
     assert.match(runtimeResume.params.developerInstructions, /generic model aliases and concrete model variants/i);
     assert.match(runtimeResume.params.developerInstructions, /Do not edit ~\/\.codex\/config\.toml/i);
-    const inactiveAfterTimeout = await jsonRequest(baseUrl, `/api/chat/active?repoId=invest-dashboard&sessionId=${encodeURIComponent(sessionId)}`);
+    const inactiveAfterTimeout = await jsonRequest(baseUrl, `/api/chat/active?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(inactiveAfterTimeout.response.status, 200);
     assert.equal(inactiveAfterTimeout.data.turn, null);
 
@@ -647,7 +647,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        repoId: "invest-dashboard",
+        repoId: "sample-app",
         model: "gpt-5.5",
         reasoning: "high",
         sandbox: "danger-full-access",
@@ -667,13 +667,13 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        repoId: "invest-dashboard",
+        repoId: "sample-app",
         input: "",
         attachments: [{ name: "regression.txt", path: uploadRelative, absolutePath: uploadAbsolute, mimeType: "text/plain", size: 11, kind: "file" }],
       }),
     });
     assert.equal(draft.response.status, 200);
-    const deleted = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}?repoId=invest-dashboard`, { method: "DELETE" });
+    const deleted = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}?repoId=sample-app`, { method: "DELETE" });
     assert.equal(deleted.response.status, 200);
     assert.equal(deleted.data.deletedSessionId, sessionId);
     assert.deepEqual(deleted.data.uploadCleanup.errors, []);
@@ -697,7 +697,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       "content-type": "application/json",
     };
     const triggerBody = JSON.stringify({ prompt: "regression automation", worktree: false });
-    const firstTrigger = await jsonRequest(baseUrl, "/api/automations/invest-daily-update/webhook", {
+    const firstTrigger = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
       method: "POST",
       headers: triggerHeaders,
       body: triggerBody,
@@ -705,7 +705,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(firstTrigger.response.status, 200);
     assert.equal(firstTrigger.data.ok, true);
     assert.ok(firstTrigger.data.run?.id);
-    const duplicateTrigger = await jsonRequest(baseUrl, "/api/automations/invest-daily-update/webhook", {
+    const duplicateTrigger = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
       method: "POST",
       headers: triggerHeaders,
       body: triggerBody,
@@ -713,7 +713,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(duplicateTrigger.response.status, 200);
     assert.equal(duplicateTrigger.data.deduplicated, true);
     assert.equal(duplicateTrigger.data.run?.id, firstTrigger.data.run.id);
-    const rateLimitedTrigger = await jsonRequest(baseUrl, "/api/automations/invest-daily-update/webhook", {
+    const rateLimitedTrigger = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
       method: "POST",
       headers: { ...triggerHeaders, "idempotency-key": "regression-idempotency-2" },
       body: triggerBody,
@@ -724,21 +724,21 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(unknownApi.response.status, 404);
     assert.equal(unknownApi.data.ok, false);
 
-    const emptyActive = await jsonRequest(baseUrl, "/api/chat/active?repoId=macro-control-dashboard");
+    const emptyActive = await jsonRequest(baseUrl, "/api/chat/active?repoId=sample-service");
     assert.equal(emptyActive.response.status, 200);
     assert.equal(emptyActive.data.sessionId, null);
     assert.equal(emptyActive.data.authoritative, true);
     assert.equal(emptyActive.data.partial, false);
-    const emptyHistory = await jsonRequest(baseUrl, "/api/chat/history?repoId=macro-control-dashboard");
+    const emptyHistory = await jsonRequest(baseUrl, "/api/chat/history?repoId=sample-service");
     assert.equal(emptyHistory.response.status, 200);
     assert.equal(emptyHistory.data.activeSessionId, null);
     assert.deepEqual(emptyHistory.data.messages, []);
-    const emptyThreadState = await jsonRequest(baseUrl, "/api/codex/thread-state?repoId=macro-control-dashboard");
+    const emptyThreadState = await jsonRequest(baseUrl, "/api/codex/thread-state?repoId=sample-service");
     assert.equal(emptyThreadState.response.status, 200);
     assert.equal(emptyThreadState.data.threadId, null);
     assert.equal(emptyThreadState.data.authoritative, true);
     const finalStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
-    assert.equal(Object.values(finalStore.sessions).some((session) => session.repoId === "macro-control-dashboard"), false);
+    assert.equal(Object.values(finalStore.sessions).some((session) => session.repoId === "sample-service"), false);
 
     const chatStatePath = path.join(stateRoot, "chat-history.json");
     const validChatState = await fs.readFile(chatStatePath, "utf8");
@@ -746,7 +746,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const rejectedCorruptWrite = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "invest-dashboard" }),
+      body: JSON.stringify({ repoId: "sample-app" }),
     });
     assert.equal(rejectedCorruptWrite.response.status, 500);
     assert.equal(rejectedCorruptWrite.data.source, "state-store-invalid");

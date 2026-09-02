@@ -69,14 +69,14 @@ const uploadMessages = normalizeAppServerThreadMessages(
       },
     ],
   },
-  { repoPath: "/home/ubuntu/codex-cloud/workspace/invest-dashboard" },
+  { repoPath: "/home/ubuntu/codex-cloud/workspace/sample-app" },
 );
 
 assert(uploadMessages.length === 1, "upload path user message did not normalize");
 assert(uploadMessages[0].attachments?.length === 1, "upload path did not hydrate attachment metadata");
 assert(uploadMessages[0].attachments[0].kind === "image", "upload image path did not hydrate as image attachment");
 assert(
-  uploadMessages[0].attachments[0].absolutePath === "/home/ubuntu/codex-cloud/workspace/invest-dashboard/.codex-cloud/uploads/2026-07-02/123-report.png",
+  uploadMessages[0].attachments[0].absolutePath === "/home/ubuntu/codex-cloud/workspace/sample-app/.codex-cloud/uploads/2026-07-02/123-report.png",
   "upload attachment absolutePath was not reconstructed from repoPath",
 );
 

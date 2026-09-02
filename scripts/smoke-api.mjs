@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const baseUrl = new URL(process.env.CODEX_CLOUD_SMOKE_URL || process.env.CODEX_CLOUD_CONSOLE_URL || "http://127.0.0.1:18787/");
-const repoId = process.env.CODEX_CLOUD_SMOKE_REPO || "invest-dashboard";
+const repoId = process.env.CODEX_CLOUD_SMOKE_REPO || "sample-app";
 const repeat = Math.max(1, Number(process.env.CODEX_CLOUD_SMOKE_REPEAT || 10));
 const timeoutMs = Math.max(1_000, Number(process.env.CODEX_CLOUD_SMOKE_TIMEOUT_MS || 30_000));
 

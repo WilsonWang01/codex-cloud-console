@@ -2,6 +2,16 @@
   "name": "codex-cloud-console",
   "version": "0.1.0",
   "private": true,
+  "description": "A self-hosted web console for operating Codex workers and repository automations on AWS EC2.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WilsonWang01/codex-cloud-console.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WilsonWang01/codex-cloud-console/issues"
+  },
+  "homepage": "https://github.com/WilsonWang01/codex-cloud-console#readme",
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm:api\" \"vite --host 127.0.0.1\"",

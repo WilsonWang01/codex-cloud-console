@@ -7,3 +7,7 @@ dist/
 .codex-cloud-state/
 .codex-cloud-local/
 docs/research/acceptance/frontend-e2e/
+# Local product research and acceptance captures may contain repository names,
+# filesystem paths, instance metadata, or conversation excerpts. Keep them out
+# of the public source distribution.
+docs/research/

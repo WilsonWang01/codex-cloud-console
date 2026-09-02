@@ -78,8 +78,8 @@ type AppRoute = {
   automationId?: string;
 };
 
-const defaultRepoId = "invest-dashboard";
-const defaultAutomationId = "invest-daily-update";
+const defaultRepoId = "sample-app";
+const defaultAutomationId = "sample-maintenance";
 const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings"]);
 
 type GlobalSearchResult = {
@@ -639,16 +639,16 @@ const fallbackRun = {
   activeState: "inactive",
   failedState: "inactive",
   exitCode: "0",
-  logName: "memory-export-refresh-latest.log",
+  logName: "sample-data-refresh-latest.log",
   logUpdatedAt: new Date().toISOString(),
-  logTail: ["云端拉取完成", "定时器等待下一次运行"],
+  logTail: ["Sample run completed", "Timer waiting for next run"],
 };
 
 const fallbackStatus: ConsoleStatus = {
   generatedAt: new Date().toISOString(),
   localMode: false,
   publicConfig: {
-    publicOrigin: "https://13.231.3.21.sslip.io",
+    publicOrigin: "https://console.example.com",
     webhook: {
       tokenConfigured: false,
       tokenHeader: "x-codex-cloud-token",
@@ -668,8 +668,8 @@ const fallbackStatus: ConsoleStatus = {
   instance: {
     name: "codex-cloud-worker",
     region: "ap-northeast-1",
-    publicIp: "13.231.3.21",
-    privateIp: "172.31.7.169",
+    publicIp: "203.0.113.10",
+    privateIp: "10.0.1.10",
     type: "t3.small",
     root: "/home/ubuntu/codex-cloud",
   },
@@ -680,53 +680,53 @@ const fallbackStatus: ConsoleStatus = {
   },
   repos: [
     {
-      id: "invest-dashboard",
-      name: "invest-dashboard",
-      path: "/home/ubuntu/codex-cloud/workspace/invest-dashboard",
-      remote: "WilsonWang01/invest-dashboard",
+      id: "sample-app",
+      name: "sample-app",
+      path: "/home/ubuntu/codex-cloud/workspace/sample-app",
+      remote: "example-org/sample-app",
       accent: "teal",
       present: true,
       branch: "main",
-      commit: "7415506",
+      commit: "abcdef0",
       dirty: false,
       statusText: "## main...origin/main",
-      lastCommit: "Refresh dashboard research workflow",
+      lastCommit: "Update sample application",
     },
     {
-      id: "macro-control-dashboard",
-      name: "macro-control-dashboard",
-      path: "/home/ubuntu/codex-cloud/workspace/macro-control-dashboard",
-      remote: "WilsonWang01/macro-control-dashboard",
+      id: "sample-service",
+      name: "sample-service",
+      path: "/home/ubuntu/codex-cloud/workspace/sample-service",
+      remote: "example-org/sample-service",
       accent: "blue",
       present: true,
       branch: "main",
-      commit: "1c6c82b",
+      commit: "bcdef01",
       dirty: false,
       statusText: "## main...origin/main",
-      lastCommit: "Update macro dashboard",
+      lastCommit: "Update sample service",
     },
     {
-      id: "memory-export-tracker",
-      name: "memory-export-tracker",
-      path: "/home/ubuntu/codex-cloud/workspace/memory-export-tracker",
-      remote: "WilsonWang01/memory-export-tracker",
+      id: "sample-data",
+      name: "sample-data",
+      path: "/home/ubuntu/codex-cloud/workspace/sample-data",
+      remote: "example-org/sample-data",
       accent: "amber",
       present: true,
       branch: "main",
-      commit: "ce18209",
+      commit: "cdef012",
       dirty: false,
       statusText: "## main...origin/main",
-      lastCommit: "Update Korea semiconductor export tracking data",
+      lastCommit: "Refresh sample data",
     },
   ],
   automations: [
     {
-      id: "invest-daily-update",
-      name: "投资监控每日更新",
-      repoId: "invest-dashboard",
-      timer: "codex-auto-invest-daily-update.timer",
-      service: "codex-auto-invest-daily-update.service",
-      schedule: "工作日 09:30",
+      id: "sample-maintenance",
+      name: "Sample repository maintenance",
+      repoId: "sample-app",
+      timer: "codex-auto-sample-maintenance.timer",
+      service: "codex-auto-sample-maintenance.service",
+      schedule: "Weekdays 09:30",
       model: "gpt-5.6-terra",
       reasoning: "high",
       enabled: true,
@@ -735,12 +735,12 @@ const fallbackStatus: ConsoleStatus = {
       run: fallbackRun,
     },
     {
-      id: "invest-holding-research",
-      name: "持仓监控 Research 队列领取",
-      repoId: "invest-dashboard",
-      timer: "codex-auto-invest-holding-research.timer",
-      service: "codex-auto-invest-holding-research.service",
-      schedule: "每 5 分钟",
+      id: "sample-research",
+      name: "Sample research queue",
+      repoId: "sample-app",
+      timer: "codex-auto-sample-research.timer",
+      service: "codex-auto-sample-research.service",
+      schedule: "Every 30 minutes",
       model: "gpt-5.6-terra",
       reasoning: "high",
       enabled: true,
@@ -749,12 +749,12 @@ const fallbackStatus: ConsoleStatus = {
       run: fallbackRun,
     },
     {
-      id: "invest-guba-hourly",
-      name: "股吧舆情每小时分析",
-      repoId: "invest-dashboard",
-      timer: "codex-auto-invest-guba-hourly.timer",
-      service: "codex-auto-invest-guba-hourly.service",
-      schedule: "每小时 08 分",
+      id: "sample-hourly",
+      name: "Sample hourly analysis",
+      repoId: "sample-app",
+      timer: "codex-auto-sample-hourly.timer",
+      service: "codex-auto-sample-hourly.service",
+      schedule: "Hourly",
       model: "gpt-5.6-terra",
       reasoning: "high",
       enabled: true,
@@ -763,12 +763,12 @@ const fallbackStatus: ConsoleStatus = {
       run: fallbackRun,
     },
     {
-      id: "invest-completion-check",
-      name: "投资监控每日完成度检查",
-      repoId: "invest-dashboard",
-      timer: "codex-auto-invest-completion-check.timer",
-      service: "codex-auto-invest-completion-check.service",
-      schedule: "工作日 09:50",
+      id: "sample-verification",
+      name: "Sample completion check",
+      repoId: "sample-app",
+      timer: "codex-auto-sample-verification.timer",
+      service: "codex-auto-sample-verification.service",
+      schedule: "Weekdays 09:50",
       model: "gpt-5.6-terra",
       reasoning: "medium",
       enabled: true,
@@ -777,12 +777,12 @@ const fallbackStatus: ConsoleStatus = {
       run: fallbackRun,
     },
     {
-      id: "macro-control-refresh",
-      name: "每日宏观看板数据与解读刷新",
-      repoId: "macro-control-dashboard",
-      timer: "codex-auto-macro-control-refresh.timer",
-      service: "codex-auto-macro-control-refresh.service",
-      schedule: "每天 18:30",
+      id: "sample-service-refresh",
+      name: "Sample service refresh",
+      repoId: "sample-service",
+      timer: "codex-auto-sample-service-refresh.timer",
+      service: "codex-auto-sample-service-refresh.service",
+      schedule: "Daily 18:30",
       model: "gpt-5.6-terra",
       reasoning: "medium",
       enabled: true,
@@ -791,12 +791,12 @@ const fallbackStatus: ConsoleStatus = {
       run: fallbackRun,
     },
     {
-      id: "memory-export-refresh",
-      name: "Update Korea memory export dashboard data",
-      repoId: "memory-export-tracker",
-      timer: "codex-auto-memory-export-refresh.timer",
-      service: "codex-auto-memory-export-refresh.service",
-      schedule: "每 24 小时",
+      id: "sample-data-refresh",
+      name: "Sample data refresh",
+      repoId: "sample-data",
+      timer: "codex-auto-sample-data-refresh.timer",
+      service: "codex-auto-sample-data-refresh.service",
+      schedule: "Every 24 hours",
       model: "gpt-5.6-terra",
       reasoning: "high",
       enabled: true,
@@ -841,8 +841,8 @@ const fallbackStatus: ConsoleStatus = {
   logs: [
     {
       id: "mock-log",
-      job: "memory-export-refresh",
-      name: "memory-export-refresh-latest.log",
+      job: "sample-data-refresh",
+      name: "sample-data-refresh-latest.log",
       size: 619,
       updatedAt: new Date().toISOString(),
       tail: ["Codex 运行已完成", "定时器等待下一次运行"],
@@ -3122,7 +3122,7 @@ export function App() {
   const [fileDraft, setFileDraft] = useState("");
   const [terminalCommand, setTerminalCommand] = useState("git status --short --branch");
   const [terminalResult, setTerminalResult] = useState<TerminalResult | null>(null);
-  const [browserUrl, setBrowserUrl] = useState("https://13.231.3.21.sslip.io/");
+  const [browserUrl, setBrowserUrl] = useState("https://console.example.com/");
   const [browserResult, setBrowserResult] = useState<BrowserResult | null>(null);
   const [fullLog, setFullLog] = useState<{ name: string; content: string; mocked?: boolean } | null>(null);
   const [statusReady, setStatusReady] = useState(false);
