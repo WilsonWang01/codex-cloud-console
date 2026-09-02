@@ -262,6 +262,34 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const generatedImagePath = path.join(generatedImagesRoot, "thread-regression", "generated.png");
   const generatedImageBytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
   const port = await freePort();
+  const benxingPort = await freePort();
+  const benxingRequests = [];
+  const benxingUpstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const body = Buffer.concat(chunks);
+    benxingRequests.push({
+      method: req.method,
+      url: req.url,
+      authorization: req.headers["oai-sites-authorization"],
+      jobToken: req.headers["x-benxing-job-token"],
+      contentType: req.headers["content-type"],
+      body,
+    });
+    if (req.method === "GET" && req.url?.includes("/inputs/")) {
+      res.writeHead(200, { "content-type": "image/png" });
+      res.end(generatedImageBytes);
+      return;
+    }
+    if (req.method === "POST" && req.url?.endsWith("/complete")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: false }));
+  });
+  await new Promise((resolve) => benxingUpstream.listen(benxingPort, "127.0.0.1", resolve));
   await fs.mkdir(path.join(repoRoot, ".codex-cloud", "uploads", "test"), { recursive: true });
   await fs.mkdir(emptyRepoRoot, { recursive: true });
   await fs.mkdir(outsideRoot, { recursive: true });
@@ -360,6 +388,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
       CODEX_TURN_TIMEOUT_MS: "300",
       CODEX_ALLOW_LOCAL_FALLBACK: "0",
+      BENXING_SITE_ORIGIN: `http://127.0.0.1:${benxingPort}`,
+      BENXING_SITES_BYPASS_BEARER_TOKEN: "regression-sites-bypass-token",
       FAKE_CAPTURE_PATH: capturePath,
       PATH: `${binDir}:${process.env.PATH}`,
     },
@@ -368,6 +398,32 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const baseUrl = `http://127.0.0.1:${port}/`;
   try {
     await waitForOutput(child, /listening on/i);
+    const relayToken = "a".repeat(64);
+    const relayInput = await fetch(new URL(`/api/integrations/benxing/jobs/job-regression/inputs/input-regression?token=${relayToken}`, baseUrl));
+    assert.equal(relayInput.status, 200);
+    assert.equal(relayInput.headers.get("content-type"), "image/png");
+    assert.deepEqual(Buffer.from(await relayInput.arrayBuffer()), generatedImageBytes);
+    assert.equal(benxingRequests.at(-1)?.authorization, "Bearer regression-sites-bypass-token");
+    const relayCallback = await jsonRequest(baseUrl, "/api/integrations/benxing/jobs/job-regression/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-benxing-job-token": relayToken },
+      body: JSON.stringify({ candidates: [{ title: "regression" }] }),
+    });
+    assert.equal(relayCallback.response.status, 200);
+    assert.equal(benxingRequests.at(-1)?.jobToken, relayToken);
+    assert.deepEqual(JSON.parse(benxingRequests.at(-1)?.body.toString("utf8")), { candidates: [{ title: "regression" }] });
+    const multipartBody = Buffer.from("--regression\r\nContent-Disposition: form-data; name=\"audit\"\r\n\r\n{}\r\n--regression--\r\n");
+    const relayMultipart = await fetch(new URL("/api/integrations/benxing/jobs/job-regression/complete", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=regression", "x-benxing-job-token": relayToken },
+      body: multipartBody,
+    });
+    assert.equal(relayMultipart.status, 200);
+    assert.deepEqual(benxingRequests.at(-1)?.body, multipartBody);
+    const publicRelayAttempt = await jsonRequest(baseUrl, `/api/integrations/benxing/jobs/job-regression/inputs/input-regression?token=${relayToken}`, {
+      headers: { "x-forwarded-for": "203.0.113.10" },
+    });
+    assert.equal(publicRelayAttempt.response.status, 403);
     await assert.rejects(() => fs.stat(staleManagedTemp), /ENOENT/);
     assert.equal(await fs.readFile(unmanagedTemp, "utf8"), "must remain");
     let serializedStatus = "";
@@ -700,6 +756,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(backupState.version, 2);
   } finally {
     await stopProcess(child);
+    await new Promise((resolve) => benxingUpstream.close(resolve));
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });

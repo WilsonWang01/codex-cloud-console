@@ -46,6 +46,8 @@ const publicOrigin = String(
   process.env.CODEX_CLOUD_PUBLIC_ORIGIN ||
     `https://${process.env.CODEX_CLOUD_HTTPS_HOST || `${publicIp}.sslip.io`}`,
 ).replace(/\/+$/, "");
+const benxingSiteOrigin = String(process.env.BENXING_SITE_ORIGIN || "").replace(/\/+$/, "");
+const benxingSitesBypassBearerToken = String(process.env.BENXING_SITES_BYPASS_BEARER_TOKEN || "").trim();
 
 app.use((req, res, next) => {
   res.setHeader("Content-Security-Policy", "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data: blob: https:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'");
@@ -9540,6 +9542,106 @@ app.post("/api/automations/:id/:mode", async (req, res) => {
     return res.json({ ok: true, mocked: true, output: `${automation.name}: mock ${req.params.mode}` });
   }
   res.json({ ok: true, output: `${automation.timer} ${action}d` });
+});
+
+function isTrustedLocalBenxingRequest(req) {
+  const forwardedFor = String(req.get("x-forwarded-for") || "").trim();
+  const hostHeader = String(req.get("host") || "").trim().toLowerCase();
+  const hostName = hostHeader.startsWith("[")
+    ? hostHeader.slice(0, hostHeader.indexOf("]") + 1)
+    : hostHeader.split(":")[0];
+  const remoteAddress = String(req.socket.remoteAddress || "");
+  const loopbackRemote = remoteAddress === "::1" || remoteAddress === "127.0.0.1" || remoteAddress === "::ffff:127.0.0.1";
+  return !forwardedFor && loopbackRemote && ["127.0.0.1", "localhost", "[::1]"].includes(hostName);
+}
+
+function validBenxingIdentifier(value) {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(String(value || ""));
+}
+
+function ensureBenxingRelayAvailable(req, res) {
+  if (!isTrustedLocalBenxingRequest(req)) {
+    res.status(403).json({ ok: false, error: "Benxing relay only accepts local agent requests" });
+    return false;
+  }
+  if (!benxingSiteOrigin || !benxingSitesBypassBearerToken) {
+    res.status(503).json({ ok: false, error: "Benxing relay is not configured" });
+    return false;
+  }
+  if (!validBenxingIdentifier(req.params.jobId) || (req.params.inputId && !validBenxingIdentifier(req.params.inputId))) {
+    res.status(400).json({ ok: false, error: "Invalid Benxing relay identifier" });
+    return false;
+  }
+  return true;
+}
+
+async function relayBenxingResponse(upstream, res) {
+  const contentType = upstream.headers.get("content-type");
+  const contentLength = upstream.headers.get("content-length");
+  const cacheControl = upstream.headers.get("cache-control");
+  if (contentType) res.setHeader("Content-Type", contentType);
+  if (contentLength) res.setHeader("Content-Length", contentLength);
+  if (cacheControl) res.setHeader("Cache-Control", cacheControl);
+  const bytes = Buffer.from(await upstream.arrayBuffer());
+  return res.status(upstream.status).send(bytes);
+}
+
+async function readBenxingRequestBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > maxUploadBytes) {
+      const error = new Error("Benxing relay payload exceeds the upload limit");
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks);
+}
+
+app.get("/api/integrations/benxing/jobs/:jobId/inputs/:inputId", async (req, res, next) => {
+  if (!ensureBenxingRelayAvailable(req, res)) return;
+  const token = String(req.query.token || "");
+  if (!/^[A-Fa-f0-9]{64}$/.test(token)) return res.status(400).json({ ok: false, error: "Invalid Benxing job token" });
+  try {
+    const url = new URL(`/api/codex-cloud/jobs/${encodeURIComponent(req.params.jobId)}/inputs/${encodeURIComponent(req.params.inputId)}`, benxingSiteOrigin);
+    url.searchParams.set("token", token);
+    const upstream = await fetch(url, {
+      headers: { "OAI-Sites-Authorization": `Bearer ${benxingSitesBypassBearerToken}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    return await relayBenxingResponse(upstream, res);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/integrations/benxing/jobs/:jobId/complete", async (req, res, next) => {
+  if (!ensureBenxingRelayAvailable(req, res)) return;
+  const jobToken = String(req.get("x-benxing-job-token") || "");
+  if (!/^[A-Fa-f0-9]{64}$/.test(jobToken)) return res.status(400).json({ ok: false, error: "Invalid Benxing job token" });
+  try {
+    const contentType = String(req.get("content-type") || "application/octet-stream");
+    const body = contentType.includes("application/json")
+      ? JSON.stringify(req.body ?? {})
+      : await readBenxingRequestBody(req);
+    const upstream = await fetch(new URL(`/api/codex-cloud/jobs/${encodeURIComponent(req.params.jobId)}/complete`, benxingSiteOrigin), {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "x-benxing-job-token": jobToken,
+        "OAI-Sites-Authorization": `Bearer ${benxingSitesBypassBearerToken}`,
+      },
+      body,
+      signal: AbortSignal.timeout(60_000),
+    });
+    return await relayBenxingResponse(upstream, res);
+  } catch (error) {
+    return next(error);
+  }
 });
 
 app.use("/api", (req, res) => {
