@@ -171,6 +171,18 @@ const repoAccents = ["teal", "blue", "amber"];
 
 const automations = [
   {
+    id: "personal-style-makeover-task",
+    name: "本型穿搭检索与形象生成",
+    repoId: "personal-style-makeover",
+    timer: null,
+    service: null,
+    schedule: "按需触发",
+    mode: "on-demand",
+    model: "gpt-5.5",
+    reasoning: "high",
+    prompt: "使用仓库中的 personal-style-makeover Skill 执行一次按需任务。严格读取任务提示和 SKILL.md；不要启动定时器。",
+  },
+  {
     id: "invest-daily-update",
     name: "投资监控每日更新",
     repoId: "invest-dashboard",
@@ -4266,6 +4278,15 @@ async function getRepo(repo) {
 function parseTimerLines(stdout) {
   const lines = compactLines(stdout);
   return automations.map((automation) => {
+    if (automation.mode === "on-demand") {
+      return {
+        ...automation,
+        enabled: true,
+        nextRun: "按需触发",
+        lastRun: "查看任务运行记录",
+        run: defaultRunDetail(automation),
+      };
+    }
     const line = lines.find((item) => item.includes(automation.timer));
     const next = line?.match(/^(.+?)\s{2,}/)?.[1]?.trim();
     const enabled = Boolean(line);
@@ -4280,6 +4301,16 @@ function parseTimerLines(stdout) {
 }
 
 function defaultRunDetail(automation) {
+  if (automation.mode === "on-demand") {
+    return {
+      activeState: "inactive",
+      failedState: "inactive",
+      exitCode: "ready",
+      logName: null,
+      logUpdatedAt: null,
+      logTail: ["按需任务已就绪，等待外部单次调用"],
+    };
+  }
   return {
     activeState: "inactive",
     failedState: "inactive",
@@ -5962,6 +5993,9 @@ function automationLogHasOnlyExpiredUsageLimitFailure(logDetail = {}) {
 async function attachRunDetails(timerStatus) {
   return Promise.all(
     timerStatus.map(async (automation) => {
+      if (automation.mode === "on-demand") {
+        return automation;
+      }
       const [active, failed, logDetail] = await Promise.all([
         run("systemctl", ["is-active", automation.service], { timeout: 5_000 }),
         run("systemctl", ["is-failed", automation.service], { timeout: 5_000 }),
@@ -9419,6 +9453,13 @@ app.post("/api/automations/:id/run", async (req, res) => {
     }
   }
 
+  if (automation.mode === "on-demand") {
+    return res.status(400).json({
+      ok: false,
+      output: "On-demand automations must run through the app-server webhook or heartbeat endpoint",
+    });
+  }
+
   const runId = automationRunId(automation.id);
   await upsertAutomationRun({
     id: runId,
@@ -9457,6 +9498,9 @@ app.post("/api/automations/:id/:mode", async (req, res) => {
   const action = { pause: "disable", resume: "enable" }[req.params.mode];
   if (!action) {
     return res.status(400).json({ ok: false, output: "Automation mode must be pause or resume" });
+  }
+  if (automation.mode === "on-demand") {
+    return res.status(400).json({ ok: false, output: "On-demand automations do not have a timer" });
   }
   const result = await run("systemctl", [action, "--now", automation.timer], { timeout: 20_000 });
   if (!result.ok) {
