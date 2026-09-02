@@ -2394,6 +2394,33 @@ h3 {
   object-fit: cover;
 }
 
+.message-attachment.generated {
+  grid-template-columns: minmax(0, 1fr) auto;
+  width: min(560px, 100%);
+  max-width: 100%;
+  padding: 0 0 8px;
+  overflow: hidden;
+}
+
+.message-attachment.generated img {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  width: 100%;
+  height: auto;
+  max-height: 520px;
+  border-radius: 0;
+  object-fit: contain;
+  background: var(--surface-muted);
+}
+
+.message-attachment.generated strong {
+  padding: 7px 0 0 9px;
+}
+
+.message-attachment.generated small {
+  padding: 7px 9px 0 0;
+}
+
 .message-attachment > span {
   display: inline-flex;
   align-items: center;

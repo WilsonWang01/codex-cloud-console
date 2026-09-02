@@ -612,6 +612,7 @@ type UploadedAttachment = {
   size: number;
   kind: "image" | "file";
   previewUrl?: string;
+  generated?: boolean;
 };
 
 type ChatDraft = {
@@ -1055,7 +1056,7 @@ function MessageAttachments({ attachments }: { attachments?: UploadedAttachment[
     <div className="message-attachments">
       {attachments.map((attachment, index) => (
         <a
-          className={cx("message-attachment", attachment.kind === "image" && "image")}
+          className={cx("message-attachment", attachment.kind === "image" && "image", attachment.generated && "generated")}
           href={attachment.previewUrl || "#"}
           target={attachment.previewUrl ? "_blank" : undefined}
           rel={attachment.previewUrl ? "noreferrer" : undefined}
@@ -1067,7 +1068,7 @@ function MessageAttachments({ attachments }: { attachments?: UploadedAttachment[
           title={attachment.path}
         >
           {attachment.kind === "image" && attachment.previewUrl ? (
-            <img alt={attachment.name} src={attachment.previewUrl} />
+            <img alt={attachment.name} src={attachment.previewUrl} loading="lazy" />
           ) : (
             <span>{attachmentIcon(attachment)}</span>
           )}
@@ -1082,6 +1083,10 @@ function MessageAttachments({ attachments }: { attachments?: UploadedAttachment[
 function fileNameFromPath(value: string, fallback = "image") {
   const parts = value.replaceAll("\\", "/").split("/").filter(Boolean);
   return parts.at(-1) || fallback;
+}
+
+function pathIsAbsolute(value: string) {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 }
 
 function imageMimeFromPath(value: string) {
@@ -1126,6 +1131,19 @@ function imageAttachmentFromDetails(message: ChatMessage, repo: Repo): UploadedA
   const kind = String(details.kind || "");
   if (kind !== "imageView" && kind !== "imageGeneration") return null;
   const imagePath = String(details.path || details.savedPath || "");
+  if (kind === "imageGeneration" && pathIsAbsolute(imagePath)) {
+    const params = new URLSearchParams({ path: imagePath });
+    return {
+      name: String(details.name || fileNameFromPath(imagePath)),
+      path: imagePath,
+      absolutePath: imagePath,
+      mimeType: imageMimeFromPath(imagePath),
+      size: Number(details.size || 0),
+      kind: "image",
+      previewUrl: `/api/codex/generated-image?${params.toString()}`,
+      generated: true,
+    };
+  }
   const relativePath = repoRelativeImagePath(repo, imagePath);
   if (!relativePath) return null;
   const params = new URLSearchParams({ repoId: repo.id, path: relativePath });

@@ -147,6 +147,9 @@ input.on("line", (line) => {
       result: { isFile: stat.isFile(), size: stat.size, modifiedAtMs: stat.mtimeMs },
     });
   }
+  if (message.method === "fs/readFile") {
+    return send({ id: message.id, result: { dataBase64: fsSync.readFileSync(message.params.path).toString("base64") } });
+  }
   if (message.method === "fuzzyFileSearch") {
     const root = message.params?.roots?.[0] || process.cwd();
     return send({
@@ -245,11 +248,18 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   const danglingWriteTarget = path.join(outsideRoot, "created-through-symlink.txt");
   const codexShim = path.join(binDir, "codex");
   const capturePath = path.join(tempRoot, "app-server-requests.jsonl");
+  const codexHome = path.join(tempRoot, ".codex");
+  const generatedImagesRoot = path.join(codexHome, "generated_images");
+  const generatedImagePath = path.join(generatedImagesRoot, "thread-regression", "generated.png");
+  const generatedImageBytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
   const port = await freePort();
   await fs.mkdir(path.join(repoRoot, ".codex-cloud", "uploads", "test"), { recursive: true });
   await fs.mkdir(emptyRepoRoot, { recursive: true });
   await fs.mkdir(outsideRoot, { recursive: true });
+  await fs.mkdir(path.dirname(generatedImagePath), { recursive: true });
   await fs.writeFile(outsideSecretPath, "must stay outside the repository\n");
+  await fs.writeFile(generatedImagePath, generatedImageBytes);
+  await fs.symlink(outsideSecretPath, path.join(generatedImagesRoot, "thread-regression", "outside.png"), "file");
   await fs.symlink(outsideRoot, path.join(repoRoot, "outside-link"), "dir");
   await fs.symlink(danglingWriteTarget, path.join(repoRoot, "dangling-write-link"), "file");
   await fs.symlink("cyclic-link", path.join(repoRoot, "cyclic-link"), "file");
@@ -336,6 +346,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_CLOUD_ROOT: cloudRoot,
       CODEX_WORKSPACE_ROOT: workspaceRoot,
       CODEX_STATE_ROOT: stateRoot,
+      CODEX_HOME: codexHome,
       CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
       CODEX_TURN_TIMEOUT_MS: "300",
@@ -376,6 +387,25 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(models.data.models[0].id, "gpt-5.6-sol");
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("max"));
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("ultra"));
+    const generatedImage = await fetch(
+      new URL(`/api/codex/generated-image?path=${encodeURIComponent(generatedImagePath)}`, baseUrl),
+    );
+    assert.equal(generatedImage.status, 200);
+    assert.equal(generatedImage.headers.get("content-type"), "image/png");
+    assert.equal(generatedImage.headers.get("x-codex-source"), "app-server");
+    assert.deepEqual(Buffer.from(await generatedImage.arrayBuffer()), generatedImageBytes);
+    const escapedGeneratedImage = await jsonRequest(
+      baseUrl,
+      `/api/codex/generated-image?path=${encodeURIComponent(outsideSecretPath)}`,
+    );
+    assert.equal(escapedGeneratedImage.response.status, 400);
+    assert.equal(escapedGeneratedImage.data.source, "invalid-generated-image-path");
+    const linkedGeneratedImage = await jsonRequest(
+      baseUrl,
+      `/api/codex/generated-image?path=${encodeURIComponent(path.join(generatedImagesRoot, "thread-regression", "outside.png"))}`,
+    );
+    assert.equal(linkedGeneratedImage.response.status, 400);
+    assert.equal(linkedGeneratedImage.data.source, "invalid-generated-image-path");
     const escapedRead = await jsonRequest(
       baseUrl,
       `/api/files/read?repoId=invest-dashboard&path=${encodeURIComponent("outside-link/secret.txt")}`,

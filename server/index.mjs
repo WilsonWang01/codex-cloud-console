@@ -22,6 +22,8 @@ const defaultCloudRoot = process.platform === "linux" && process.env.NODE_ENV ==
   ? "/home/ubuntu/codex-cloud"
   : path.join(projectRoot, ".codex-cloud-local");
 const cloudRoot = process.env.CODEX_CLOUD_ROOT || defaultCloudRoot;
+const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || path.dirname(cloudRoot), ".codex");
+const generatedImagesRoot = process.env.CODEX_GENERATED_IMAGES_ROOT || path.join(codexHome, "generated_images");
 const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "workspace");
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
 const stateRoot =
@@ -6552,6 +6554,13 @@ function repoPathError(message, statusCode = 400) {
   return error;
 }
 
+function generatedImagePathError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.source = "invalid-generated-image-path";
+  return error;
+}
+
 async function realPathOrNearestExisting(target, seenLinks = new Set()) {
   let candidate = target;
   while (true) {
@@ -6599,6 +6608,35 @@ async function assertRepoPathAccess(repo, target, options = {}) {
     throw repoPathError("Path resolves outside repository root");
   }
   return lexicalTarget;
+}
+
+async function assertGeneratedImagePathAccess(target) {
+  const requestedPath = String(target || "").trim();
+  if (!requestedPath || !path.isAbsolute(requestedPath)) {
+    throw generatedImagePathError("Generated image path must be absolute");
+  }
+  const lexicalRoot = path.resolve(generatedImagesRoot);
+  const lexicalTarget = path.resolve(requestedPath);
+  if (!pathIsWithin(lexicalRoot, lexicalTarget)) {
+    throw generatedImagePathError("Path is outside the generated image directory");
+  }
+
+  let realRoot;
+  let realTarget;
+  try {
+    [realRoot, realTarget] = await Promise.all([fs.realpath(lexicalRoot), fs.realpath(lexicalTarget)]);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw generatedImagePathError("Generated image does not exist", 404);
+    if (error?.code === "ELOOP") throw generatedImagePathError("Generated image path contains cyclic symbolic links");
+    throw error;
+  }
+  if (!pathIsWithin(realRoot, realTarget)) {
+    throw generatedImagePathError("Generated image resolves outside its directory");
+  }
+  if (!imageMimeForPath(realTarget)) {
+    throw generatedImagePathError("Only raster generated images are supported", 415);
+  }
+  return realTarget;
 }
 
 async function appServerReviewExec(repo, command, options = {}) {
@@ -8959,6 +8997,44 @@ app.get("/api/files/blob", async (req, res) => {
     res.setHeader("Content-Disposition", `${disposition}; filename="${safeUploadName(path.basename(filePath))}"`);
     res.setHeader("X-Codex-Source", "local-fallback");
     res.end(await fs.readFile(filePath));
+  } catch (error) {
+    sendRouteError(res, error);
+  }
+});
+
+app.get("/api/codex/generated-image", async (req, res) => {
+  try {
+    const filePath = await assertGeneratedImagePathAccess(req.query?.path);
+    const mimeType = imageMimeForPath(filePath);
+    const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000);
+    if (metadata.ok && !metadata.result?.isFile) return res.status(400).json({ ok: false, error: "Path is not a file" });
+    const readResponse = await codexAppServerRequest("fs/readFile", { path: filePath }, 20_000);
+    if (readResponse.ok) {
+      const buffer = Buffer.from(String(readResponse.result?.dataBase64 || ""), "base64");
+      if (buffer.length > maxUploadBytes) return res.status(400).json({ ok: false, error: `Generated image exceeds ${Math.round(maxUploadBytes / 1024 / 1024)} MB` });
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Content-Length", String(buffer.length));
+      res.setHeader("Cache-Control", "private, max-age=300");
+      res.setHeader("Content-Disposition", `inline; filename="${safeUploadName(path.basename(filePath))}"`);
+      res.setHeader("X-Codex-Source", "app-server");
+      return res.end(buffer);
+    }
+    if (!allowLocalFallback) {
+      return res.status(502).json({
+        ok: false,
+        error: readResponse.error || "Codex app-server generated image read failed",
+        source: "app-server-unavailable",
+      });
+    }
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) return res.status(400).json({ ok: false, error: "Path is not a file" });
+    if (stat.size > maxUploadBytes) return res.status(400).json({ ok: false, error: `Generated image exceeds ${Math.round(maxUploadBytes / 1024 / 1024)} MB` });
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Length", String(stat.size));
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.setHeader("Content-Disposition", `inline; filename="${safeUploadName(path.basename(filePath))}"`);
+    res.setHeader("X-Codex-Source", "local-fallback");
+    return res.end(await fs.readFile(filePath));
   } catch (error) {
     sendRouteError(res, error);
   }
