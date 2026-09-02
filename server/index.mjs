@@ -86,12 +86,13 @@ const enableCliDebug = process.env.CODEX_ENABLE_CLI_DEBUG === "1";
 const enableLocalReviewRead = process.env.CODEX_ENABLE_LOCAL_REVIEW_READ === "1";
 const enableLocalReviewMutation = process.env.CODEX_ENABLE_LOCAL_REVIEW_MUTATION === "1";
 const defaultRuntime = {
-  model: "gpt-5.5",
+  model: "gpt-5.6-terra",
   reasoning: "medium",
   sandbox: "danger-full-access",
   approval: "never",
   search: true,
 };
+const deprecatedRuntimeModels = new Map([["gpt-5.5", defaultRuntime.model]]);
 const allowedReasoning = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const allowedSandbox = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const allowedApproval = new Set(["untrusted", "on-failure", "on-request", "never"]);
@@ -178,7 +179,7 @@ const automations = [
     service: null,
     schedule: "按需触发",
     mode: "on-demand",
-    model: "gpt-5.5",
+    model: "gpt-5.6-terra",
     reasoning: "high",
     prompt: "使用仓库中的 personal-style-makeover Skill 执行一次按需任务。严格读取任务提示和 SKILL.md；不要启动定时器。",
   },
@@ -189,9 +190,31 @@ const automations = [
     timer: "codex-auto-invest-daily-update.timer",
     service: "codex-auto-invest-daily-update.service",
     schedule: "工作日 09:30",
-    model: "gpt-5.5",
+    model: "gpt-5.6-terra",
     reasoning: "high",
     prompt: "运行投资监控每日更新流程。先检查仓库说明和现有脚本，在隔离工作区中完成数据/页面更新，最后汇总运行结果、文件变更和需要人工关注的问题。",
+  },
+  {
+    id: "invest-holding-research",
+    name: "持仓监控 Research 队列领取",
+    repoId: "invest-dashboard",
+    timer: "codex-auto-invest-holding-research.timer",
+    service: "codex-auto-invest-holding-research.service",
+    schedule: "每 5 分钟",
+    model: "gpt-5.6-terra",
+    reasoning: "high",
+    prompt: "领取并处理持仓监控 Research 队列。遵循仓库现有任务协议，在隔离工作区中完成研究、验证和结果回写。",
+  },
+  {
+    id: "invest-guba-hourly",
+    name: "股吧舆情每小时分析",
+    repoId: "invest-dashboard",
+    timer: "codex-auto-invest-guba-hourly.timer",
+    service: "codex-auto-invest-guba-hourly.service",
+    schedule: "每小时 08 分",
+    model: "gpt-5.6-terra",
+    reasoning: "high",
+    prompt: "执行股吧舆情每小时分析。遵循仓库现有流程，在隔离工作区中更新数据并报告验证结果。",
   },
   {
     id: "invest-completion-check",
@@ -200,7 +223,7 @@ const automations = [
     timer: "codex-auto-invest-completion-check.timer",
     service: "codex-auto-invest-completion-check.service",
     schedule: "工作日 09:50",
-    model: "gpt-5.5",
+    model: "gpt-5.6-terra",
     reasoning: "medium",
     prompt: "检查投资监控每日任务完成度。读取当前仓库状态和日志，确认数据刷新、研究摘要和页面输出是否完整，最后给出通过/失败原因和后续动作。",
   },
@@ -211,8 +234,8 @@ const automations = [
     timer: "codex-auto-macro-control-refresh.timer",
     service: "codex-auto-macro-control-refresh.service",
     schedule: "每天 18:30",
-    model: "gpt-5.4-mini",
-    reasoning: "low",
+    model: "gpt-5.6-terra",
+    reasoning: "medium",
     prompt: "刷新宏观看板数据与解读。使用仓库现有脚本和文档，在隔离工作区中执行更新，最后汇总数据来源、输出文件和任何失败。",
   },
   {
@@ -222,8 +245,8 @@ const automations = [
     timer: "codex-auto-memory-export-refresh.timer",
     service: "codex-auto-memory-export-refresh.service",
     schedule: "每 24 小时",
-    model: "gpt-5.4-mini",
-    reasoning: "low",
+    model: "gpt-5.6-terra",
+    reasoning: "high",
     prompt: "更新 Korea memory export dashboard 数据。使用仓库现有更新流程，在隔离工作区中运行并报告变更、验证结果和下一步。",
   },
 ];
@@ -561,8 +584,10 @@ function normalizeTokenUsage(value) {
 }
 
 function cleanModel(value, fallback = defaultRuntime.model) {
-  const model = String(value || "").trim();
-  return /^[A-Za-z0-9._:-]{2,64}$/.test(model) ? model : fallback;
+  const requested = String(value || "").trim();
+  const model = deprecatedRuntimeModels.get(requested) || requested;
+  const migratedFallback = deprecatedRuntimeModels.get(fallback) || fallback;
+  return /^[A-Za-z0-9._:-]{2,64}$/.test(model) ? model : migratedFallback;
 }
 
 function choice(value, allowed, fallback) {
@@ -1134,6 +1159,7 @@ function sessionSummary(item) {
   const isDraft = isLocalDraftSession(item);
   const storedMessageCount = Number(item.messageCount || 0);
   const messageCount = Math.max(Array.isArray(item.messages) ? item.messages.length : 0, Number.isFinite(storedMessageCount) ? storedMessageCount : 0);
+  const runtime = normalizeRuntime({}, item);
   return {
     id: item.id,
     repoId: item.repoId,
@@ -1145,8 +1171,8 @@ function sessionSummary(item) {
     threadId: item.codexSessionId || null,
     isDraft,
     source: item.codexSessionId ? "app-server" : "local",
-    model: item.model || null,
-    reasoning: item.reasoning || null,
+    model: runtime.model,
+    reasoning: runtime.reasoning,
     sandbox: item.sandbox || null,
     approval: item.approval || null,
     search: typeof item.search === "boolean" ? item.search : null,
@@ -7655,20 +7681,22 @@ app.get("/api/codex/capabilities", async (_req, res) => {
 });
 
 function normalizeCodexModelsResult(result = {}) {
-  return (result?.data || []).map((model) => ({
-    id: String(model.id || model.model),
-    model: String(model.model || model.id),
-    displayName: String(model.displayName || model.id || model.model),
-    description: String(model.description || ""),
-    hidden: Boolean(model.hidden),
-    isDefault: Boolean(model.isDefault),
-    upgrade: model.upgrade || null,
-    defaultReasoningEffort: model.defaultReasoningEffort || "medium",
-    supportedReasoningEfforts: (model.supportedReasoningEfforts || []).map((effort) => effort.reasoningEffort || effort).filter(Boolean),
-    inputModalities: model.inputModalities || [],
-    serviceTiers: model.serviceTiers || [],
-    additionalSpeedTiers: model.additionalSpeedTiers || [],
-  }));
+  return (result?.data || [])
+    .map((model) => ({
+      id: String(model.id || model.model),
+      model: String(model.model || model.id),
+      displayName: String(model.displayName || model.id || model.model),
+      description: String(model.description || ""),
+      hidden: Boolean(model.hidden),
+      isDefault: String(model.id || model.model) === defaultRuntime.model,
+      upgrade: model.upgrade || null,
+      defaultReasoningEffort: model.defaultReasoningEffort || "medium",
+      supportedReasoningEfforts: (model.supportedReasoningEfforts || []).map((effort) => effort.reasoningEffort || effort).filter(Boolean),
+      inputModalities: model.inputModalities || [],
+      serviceTiers: model.serviceTiers || [],
+      additionalSpeedTiers: model.additionalSpeedTiers || [],
+    }))
+    .filter((model) => !deprecatedRuntimeModels.has(model.id));
 }
 
 async function readStoredModelListCache() {
@@ -7676,7 +7704,8 @@ async function readStoredModelListCache() {
   try {
     const parsed = JSON.parse(await fs.readFile(codexModelsCachePath, "utf8"));
     if (parsed?.ok === true && parsed?.source === "app-server" && Array.isArray(parsed?.models) && parsed.models.length) {
-      modelListCache = { data: parsed, cachedAt: Date.parse(parsed.cachedAt || "") || 0 };
+      const data = { ...parsed, models: normalizeCodexModelsResult({ data: parsed.models }) };
+      modelListCache = { data, cachedAt: Date.parse(parsed.cachedAt || "") || 0 };
       return modelListCache;
     }
   } catch {

@@ -207,7 +207,9 @@ checks.push(await assertJson("/api/codex/models", (data) => {
     data?.authoritative === true &&
     models.length > 0 &&
     models.some((model) => model.id === "gpt-5.6-sol") &&
-    defaultModel?.id &&
+    models.some((model) => model.id === "gpt-5.6-terra") &&
+    !models.some((model) => model.id === "gpt-5.5") &&
+    defaultModel?.id === "gpt-5.6-terra" &&
     Array.isArray(defaultModel.supportedReasoningEfforts) &&
     defaultModel.supportedReasoningEfforts.includes("medium") &&
     models.some((model) => Array.isArray(model.inputModalities) && model.inputModalities.includes("image")),

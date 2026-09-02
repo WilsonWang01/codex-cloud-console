@@ -366,7 +366,7 @@ async function verifyPanels(page) {
   await assertPanel(page, "模型");
   const modelButtons = await page.locator(".command-panel .choice-list button").count();
   if (modelButtons < 1) throw new Error("model panel has no model choices");
-  await page.locator(".command-panel .choice-list button", { hasText: "GPT-5.6-Sol" }).waitFor({ state: "visible", timeout: 5_000 });
+  await page.locator(".command-panel .choice-list button", { hasText: "GPT-5.6-Terra" }).waitFor({ state: "visible", timeout: 5_000 });
   await capture(page, "desktop-model-panel");
   await closePanel(page);
 

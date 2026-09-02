@@ -122,6 +122,15 @@ input.on("line", (line) => {
           inputModalities: ["text", "image"],
         },
         {
+          id: "gpt-5.6-terra",
+          model: "gpt-5.6-terra",
+          displayName: "GPT-5.6-Terra",
+          isDefault: false,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort })),
+          inputModalities: ["text", "image"],
+        },
+        {
           id: "gpt-5.5",
           model: "gpt-5.5",
           displayName: "GPT-5.5",
@@ -377,6 +386,9 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(serializedStatus.includes("/bin/bash -lc"), false);
     assert.equal(serializedStatus.includes("shell: codex doctor"), true);
     assert.equal(serializedStatus.includes("terminal: deploy cloud console release"), true);
+    assert.equal(statusData.automations.some((automation) => automation.model === "gpt-5.5"), false);
+    assert.equal(statusData.automations.some((automation) => automation.id === "invest-holding-research"), true);
+    assert.equal(statusData.automations.some((automation) => automation.id === "invest-guba-hourly"), true);
     assert.equal(
       (statusData?.attention?.items || []).some((item) => String(item.title || "").includes("exited (SIGTERM)")),
       false,
@@ -385,6 +397,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(models.response.status, 200);
     assert.equal(models.response.headers.get("x-codex-model-list-cache"), "refreshed");
     assert.equal(models.data.models[0].id, "gpt-5.6-sol");
+    assert.equal(models.data.models.find((model) => model.isDefault)?.id, "gpt-5.6-terra");
+    assert.equal(models.data.models.some((model) => model.id === "gpt-5.5"), false);
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("max"));
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("ultra"));
     const generatedImage = await fetch(
@@ -463,6 +477,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(created.response.status, 200);
     const sessionId = created.data.activeSessionId;
+    assert.equal(created.data.sessions.find((session) => session.id === sessionId)?.model, "gpt-5.6-terra");
     const invalidRepo = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -511,7 +526,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       }),
     });
     assert.equal(runtimePatch.response.status, 200);
-    assert.equal(runtimePatch.data.runtime.model, "gpt-5.5");
+    assert.equal(runtimePatch.data.runtime.model, "gpt-5.6-terra");
     assert.equal(runtimePatch.data.runtime.reasoning, "high");
     assert.equal(runtimePatch.data.appServerRuntime.model, "gpt-5.4-mini");
     assert.equal(runtimePatch.data.appliesOnNextTurn, true);
@@ -520,7 +535,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       `/api/codex/thread-state?repoId=invest-dashboard&sessionId=${encodeURIComponent(sessionId)}`,
     );
     assert.equal(pendingThreadState.response.status, 200);
-    assert.equal(pendingThreadState.data.runtime.model, "gpt-5.5");
+    assert.equal(pendingThreadState.data.runtime.model, "gpt-5.6-terra");
     assert.equal(pendingThreadState.data.runtime.reasoning, "high");
     const gpt56RuntimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
       method: "PATCH",
@@ -585,7 +600,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       }),
     });
     assert.equal(matchedRuntimePatch.response.status, 200);
-    assert.equal(matchedRuntimePatch.data.appServerRuntime.model, "gpt-5.5");
+    assert.equal(matchedRuntimePatch.data.appServerRuntime.model, "gpt-5.6-terra");
     assert.equal(matchedRuntimePatch.data.appServerRuntime.reasoning, "high");
     assert.equal(matchedRuntimePatch.data.appliesOnNextTurn, true);
 
