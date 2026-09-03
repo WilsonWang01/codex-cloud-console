@@ -8107,7 +8107,7 @@ function CloudChat({
       ? appStatusIssue || "需要重新登录 Codex"
       : appStatus.account?.email || "Codex 登录状态";
   const mcpHint = appStatusPending ? "同步 MCP 状态中" : `${appStatus.mcpServers.length} 个服务器`;
-  const pluginHint = appStatusPending ? "同步插件状态中" : `${appStatus.plugins.enabled} 已启用 / ${appStatus.plugins.installed} 已安装`;
+  const pluginHint = appStatusPending ? "同步插件状态中" : `${appStatus.plugins.enabled} 个插件接口已启用`;
   const toolsSummary = appStatusPending
     ? "同步云端工具状态中"
     : `MCP ${appStatus.mcpServers.length} · 插件 ${appStatus.plugins.enabled} 已启用 · Skills ${appStatus.skills.enabled}`;

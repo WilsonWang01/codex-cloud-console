@@ -122,8 +122,8 @@ export default function CodexPluginManager({ repoId, onChanged }: { repoId: stri
   };
 
   const countLabel = query.trim()
-    ? `${catalogMeta.installedCount} 已安装 · ${catalogMeta.matched} 个结果`
-    : `${catalogMeta.installedCount} 已安装 · ${catalogMeta.total} 可用`;
+    ? `目录内 ${catalogMeta.installedCount} 已安装 · ${catalogMeta.matched} 个结果`
+    : `目录内 ${catalogMeta.installedCount} 已安装 · ${catalogMeta.total} 可浏览`;
   return (
     <section className="settings-copy plugin-manager">
       <div className="settings-section-head">
