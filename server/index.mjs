@@ -4515,8 +4515,105 @@ function redactAutomationPrompt(value) {
     .replace(/((?:x-benxing-job-token|x-codex-cloud-token)\s*:\s*)[^'"\s]+/gi, "$1<redacted>");
 }
 
+const automationCompletionContractVersion = 1;
+const automationCompletionContractType = "exact-final-line";
+const automationCompletionMarkerPattern = /^[A-Z][A-Z0-9_:-]{7,79}$/;
+const automationCompletionOutcomeValues = new Set(["pending", "passed", "missing", "invalid", "turn-failed"]);
+
+function invalidAutomationCompletionContract(message, strict) {
+  if (strict) throw new Error(message);
+  return { version: automationCompletionContractVersion, type: "invalid", marker: "" };
+}
+
+function normalizeAutomationCompletionContract(value, { strict = false } = {}) {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return invalidAutomationCompletionContract("completionContract 必须是对象", strict);
+  }
+  const allowedKeys = new Set(["version", "type", "marker"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    return invalidAutomationCompletionContract("completionContract 只允许 version、type 和 marker 字段", strict);
+  }
+  const version = value.version;
+  const type = typeof value.type === "string" ? value.type.trim() : "";
+  const marker = typeof value.marker === "string" ? value.marker.trim() : "";
+  if (version !== automationCompletionContractVersion || type !== automationCompletionContractType) {
+    return invalidAutomationCompletionContract(
+      `completionContract 仅支持 { version: ${automationCompletionContractVersion}, type: "${automationCompletionContractType}", marker: "..." }`,
+      strict,
+    );
+  }
+  if (!automationCompletionMarkerPattern.test(marker)) {
+    return invalidAutomationCompletionContract("completionContract.marker 必须是 8–80 位大写 ASCII 标记", strict);
+  }
+  return { version, type, marker };
+}
+
+function automationCompletionContractsEqual(left, right) {
+  const normalizedLeft = normalizeAutomationCompletionContract(left);
+  const normalizedRight = normalizeAutomationCompletionContract(right);
+  if (!normalizedLeft || !normalizedRight) return normalizedLeft === normalizedRight;
+  return normalizedLeft.version === normalizedRight.version &&
+    normalizedLeft.type === normalizedRight.type &&
+    normalizedLeft.marker === normalizedRight.marker;
+}
+
+function automationCompletionContractForRequest(req, automation) {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const forbiddenFields = ["completionMarker", "successWhen", "completionPredicate", "completionRegex", "completionScript", "completionCommand"];
+  const forbidden = forbiddenFields.find((field) => Object.prototype.hasOwnProperty.call(body, field));
+  if (forbidden) throw new Error(`不支持 ${forbidden}；仅支持声明式 completionContract`);
+
+  const configured = normalizeAutomationCompletionContract(automation.completionContract, { strict: true });
+  if (!Object.prototype.hasOwnProperty.call(body, "completionContract")) return configured;
+  const requested = normalizeAutomationCompletionContract(body.completionContract, { strict: true });
+  if (configured && !automationCompletionContractsEqual(configured, requested)) {
+    throw new Error("请求不能覆盖自动化配置中已有的 completionContract");
+  }
+  return requested || configured;
+}
+
+function promptWithAutomationCompletionContract(prompt, contract) {
+  if (!contract) return prompt;
+  return [
+    prompt,
+    "",
+    "系统完成契约：仅当你已核验原任务的业务结果确实完成时，才在最终回复的最后一个非空行输出以下标记。",
+    "不得把标记放入代码块、解释文字或中间进度；无法确认完成时不得输出。",
+    contract.marker,
+  ].join("\n");
+}
+
+function automationCompletionOutcome(contract, output) {
+  if (!contract) return { outcome: null, satisfied: true, error: null };
+  if (contract.type !== automationCompletionContractType || !automationCompletionMarkerPattern.test(contract.marker || "")) {
+    return { outcome: "invalid", satisfied: false, error: "持久化的完成契约无效，需要人工处理" };
+  }
+  const lastLine = String(output || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1) || "";
+  const actual = Buffer.from(lastLine, "utf8");
+  const expected = Buffer.from(contract.marker, "utf8");
+  const satisfied = actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  return satisfied
+    ? { outcome: "passed", satisfied: true, error: null }
+    : { outcome: "missing", satisfied: false, error: `完成契约未满足：最终回复最后一行缺少精确标记 ${contract.marker}` };
+}
+
 function normalizeAutomationRun(run = {}) {
   const startedAt = run.startedAt ? String(run.startedAt) : new Date().toISOString();
+  const completionContract = normalizeAutomationCompletionContract(run.completionContract);
+  const rawCompletionOutcome = String(run.completionOutcome || "");
+  const completionOutcome = completionContract
+    ? completionContract.type === "invalid"
+      ? "invalid"
+      : automationCompletionOutcomeValues.has(rawCompletionOutcome)
+        ? rawCompletionOutcome
+        : "pending"
+    : null;
   return {
     id: String(run.id || automationRunId(String(run.automationId || "automation"))),
     automationId: String(run.automationId || ""),
@@ -4532,6 +4629,9 @@ function normalizeAutomationRun(run = {}) {
     recoveryAttempt: Math.max(0, Math.floor(Number(run.recoveryAttempt || 0))),
     recoveryRunId: run.recoveryRunId ? String(run.recoveryRunId) : null,
     recoverySkippedReason: run.recoverySkippedReason ? String(run.recoverySkippedReason).slice(0, 320) : null,
+    completionContract,
+    completionOutcome,
+    completionCheckedAt: run.completionCheckedAt ? String(run.completionCheckedAt) : null,
     runner: String(run.runner || "systemd"),
     status: String(run.status || "queued"),
     startedAt,
@@ -4563,60 +4663,75 @@ async function readAutomationRuns() {
   return { version: 1, runs };
 }
 
-async function writeAutomationRuns(store) {
-  return enqueueWrite("automation", async () => {
-    const current = await readAutomationRuns();
-    const byId = new Map((current.runs || []).map((run) => [run.id, run]));
-    for (const incoming of store.runs || []) {
-      const normalized = normalizeAutomationRun(incoming);
-      const existing = byId.get(normalized.id);
-      if (!existing) {
-        byId.set(normalized.id, normalized);
-        continue;
-      }
-      const seen = new Set();
-      const events = [...(existing.events || []), ...(normalized.events || [])].filter((event) => {
-        const key = `${event.time}|${event.type}|${event.text}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      }).slice(-80);
-      byId.set(normalized.id, normalizeAutomationRun({ ...existing, ...normalized, events }));
-    }
-    const runs = [...byId.values()].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)).slice(0, 200);
-    await atomicWriteJson(automationRunsPath, { version: 1, runs });
-  });
+function mergeAutomationRunEvents(...groups) {
+  const seen = new Set();
+  return groups.flat().filter(Boolean).filter((event) => {
+    const key = `${event.time || ""}|${event.type || ""}|${event.text || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(-80);
+}
+
+async function writeAutomationRunsWithinQueue(store) {
+  const runs = (store.runs || [])
+    .map(normalizeAutomationRun)
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .slice(0, 200);
+  await atomicWriteJson(automationRunsPath, { version: 1, runs });
 }
 
 async function upsertAutomationRun(run, event = null) {
-  const store = await readAutomationRuns();
-  const normalized = normalizeAutomationRun({
-    ...run,
-    updatedAt: new Date().toISOString(),
-    events: event ? [...(run.events || []), event] : run.events,
+  return enqueueWrite("automation", async () => {
+    const store = await readAutomationRuns();
+    const index = store.runs.findIndex((item) => item.id === run.id);
+    const current = index >= 0 ? store.runs[index] : null;
+    const normalized = normalizeAutomationRun({
+      ...(current || {}),
+      ...run,
+      updatedAt: new Date().toISOString(),
+      events: mergeAutomationRunEvents(current?.events || [], run.events || [], event ? [event] : []),
+    });
+    if (index >= 0) store.runs[index] = normalized;
+    else store.runs.unshift(normalized);
+    await writeAutomationRunsWithinQueue(store);
+    return normalized;
   });
-  const index = store.runs.findIndex((item) => item.id === normalized.id);
-  if (index >= 0) store.runs[index] = { ...store.runs[index], ...normalized };
-  else store.runs.unshift(normalized);
-  store.runs.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  await writeAutomationRuns(store);
-  return normalized;
 }
 
 async function appendAutomationRunEvent(runId, patch = {}, event = null) {
-  const store = await readAutomationRuns();
-  const current = store.runs.find((item) => item.id === runId);
-  if (!current) return null;
-  const next = normalizeAutomationRun({
-    ...current,
-    ...patch,
-    updatedAt: new Date().toISOString(),
-    events: event ? [...(current.events || []), event] : current.events,
+  return enqueueWrite("automation", async () => {
+    const store = await readAutomationRuns();
+    const index = store.runs.findIndex((item) => item.id === runId);
+    if (index < 0) return null;
+    const current = store.runs[index];
+    const next = normalizeAutomationRun({
+      ...current,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+      events: mergeAutomationRunEvents(current.events || [], event ? [event] : []),
+    });
+    store.runs[index] = next;
+    await writeAutomationRunsWithinQueue(store);
+    return next;
   });
-  const index = store.runs.findIndex((item) => item.id === runId);
-  store.runs[index] = next;
-  await writeAutomationRuns(store);
-  return next;
+}
+
+async function appendAutomationRunEventWithRetry(runId, patch = {}, event = null, attempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const record = await appendAutomationRunEvent(runId, patch, event);
+      if (!record) throw new Error(`找不到自动化运行记录 ${runId}`);
+      return record;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, 40 * 2 ** (attempt - 1)));
+      }
+    }
+  }
+  throw lastError || new Error(`自动化运行记录 ${runId} 写入失败`);
 }
 
 async function reconcileStaleAutomationRuns(reason = "控制台重启时 app-server 自动化任务仍在运行") {
@@ -6040,14 +6155,24 @@ function automationTriggerHash(key) {
   return key ? crypto.createHash("sha256").update(key).digest("hex") : null;
 }
 
-function automationRunCanSatisfyIdempotentReplay(run) {
-  return ["queued", "running", "completed"].includes(String(run?.status || ""));
+async function refreshAutomationTriggerPayload(payload) {
+  const runId = String(payload?.run?.id || "").trim();
+  if (!runId) return payload;
+  const stored = (await readAutomationRuns().catch(() => ({ runs: [] }))).runs.find((run) => run.id === runId);
+  return stored ? { ...payload, run: stored } : payload;
 }
 
-function automationTriggerOptions(req, trigger, triggerIdempotencyHash = null) {
+function automationRunCanSatisfyIdempotentReplay(run) {
+  const status = String(run?.status || "");
+  if (["queued", "running", "completed"].includes(status)) return true;
+  return status === "failed" && Boolean(normalizeAutomationCompletionContract(run?.completionContract));
+}
+
+function automationTriggerOptions(req, trigger, triggerIdempotencyHash = null, completionContract = null) {
   return {
     trigger,
     triggerIdempotencyHash,
+    completionContract,
     prompt: req.body?.prompt,
     sessionId: req.body?.sessionId,
     worktree: req.body?.worktree !== false,
@@ -6068,6 +6193,11 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   );
   const prompt = String(options.prompt || automation.prompt || "").trim();
   if (!prompt) throw new Error("Automation prompt is required");
+  const completionContractSource = Object.prototype.hasOwnProperty.call(options, "completionContract")
+    ? options.completionContract
+    : automation.completionContract;
+  const completionContract = normalizeAutomationCompletionContract(completionContractSource, { strict: true });
+  const executionPrompt = promptWithAutomationCompletionContract(prompt, completionContract);
   const heartbeatSessionId = options.sessionId ? String(options.sessionId) : "";
   const store = heartbeatSessionId ? await readChatStore() : null;
   const heartbeatSession = heartbeatSessionId ? store.sessions[heartbeatSessionId] : null;
@@ -6086,6 +6216,8 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     recoveryOfRunId: options.recoveryOfRunId || null,
     recoveryRootRunId: options.recoveryRootRunId || null,
     recoveryAttempt: options.recoveryAttempt || 0,
+    completionContract,
+    completionOutcome: completionContract ? "pending" : null,
     runner: "app-server",
     status: "queued",
     worktreePolicy: heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd",
@@ -6109,7 +6241,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     }
     const runRepo = { ...repo, path: worktreePath || repo.path };
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
-    const job = await startTurnJob(runRepo, session, runtime, prompt, [], prompt, {
+    const job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
     });
@@ -6126,26 +6258,68 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       appendAutomationRunEvent(runId, { threadId: job.threadId || null }, { type: payload.event, text }).catch(() => null);
     });
     job.promise.then(async (result) => {
-      activeAutomationRuns.delete(runId);
-      const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
-      await appendAutomationRunEvent(
+      const completion = result.ok
+        ? automationCompletionOutcome(completionContract, job.output)
+        : {
+            outcome: completionContract ? "turn-failed" : null,
+            satisfied: false,
+            error: result.error || job.error || "自动化任务失败",
+          };
+      const completed = result.ok && completion.satisfied;
+      const error = completed ? null : completion.error || result.error || job.error || "自动化任务失败";
+      await appendAutomationRunEventWithRetry(
         runId,
         {
-          status: result.ok ? "completed" : "failed",
+          status: completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           summary: job.output || "",
-          diffStat,
-          error: result.ok ? null : result.error || job.error || "Automation failed",
+          error,
+          completionOutcome: completion.outcome,
+          completionCheckedAt: completionContract ? new Date().toISOString() : null,
         },
-        { type: "done", text: result.ok ? "Automation completed" : result.error || "Automation failed" },
+        { type: completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: completed ? "自动化任务已完成" : error },
       );
-    }).catch(() => null);
+      activeAutomationRuns.delete(runId);
+      const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
+      if (diffStat) {
+        await appendAutomationRunEvent(runId, { diffStat }, { type: "diff", text: "检测到工作区变更，需要检查" }).catch((diffError) => {
+          appendAuditEvent({
+            source: "automation",
+            type: "automation-diff-persistence-failed",
+            repoId: repo.id,
+            sessionId: session.id,
+            threadId: job.threadId,
+            summary: `自动化任务 ${runId} 已写入终态，但工作区差异保存失败`,
+            detail: jsonDetail({ runId, error: diffError.message || String(diffError) }),
+          }).catch(() => null);
+        });
+      }
+    }).catch((persistenceError) => {
+      const message = `自动化任务 ${runId} 的终态写入失败，已保留为可重启恢复状态：${persistenceError.message || persistenceError}`;
+      console.error(message);
+      appendAuditEvent({
+        source: "automation",
+        type: "automation-terminal-persistence-failed",
+        repoId: repo.id,
+        sessionId: session.id,
+        threadId: job.threadId,
+        summary: message,
+        detail: jsonDetail({ runId, error: persistenceError.message || String(persistenceError) }),
+      }).catch(() => null);
+    });
     return { ...runRecord, threadId: job.threadId, sessionId: session.id, status: "running" };
   } catch (error) {
     await appendAutomationRunEvent(
       runId,
-      { status: "failed", finishedAt: new Date().toISOString(), worktreePath, error: error.message },
+      {
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        worktreePath,
+        error: error.message,
+        completionOutcome: completionContract ? "turn-failed" : null,
+        completionCheckedAt: completionContract ? new Date().toISOString() : null,
+      },
       { type: "error", text: error.message },
     );
     throw error;
@@ -6253,6 +6427,7 @@ async function recoverInterruptedAutomationRuns() {
         sessionId: session.id,
         worktree: false,
         requireExistingThread: true,
+        completionContract: runRecord.completionContract,
         model: runRecord.model,
         reasoning: runRecord.reasoning,
         prompt: automationRecoveryContinuationPrompt(),
@@ -6277,6 +6452,7 @@ async function recoverInterruptedAutomationRuns() {
       }).catch(() => null);
     } catch (error) {
       skipped += 1;
+      await markAutomationRecoverySkipped(runRecord, `自动续跑失败：${sanitizeCloudPathText(error.message || String(error), 240)}`).catch(() => null);
       appendAuditEvent({
         source: "automation",
         type: "automation-recovery-failed",
@@ -9824,6 +10000,12 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
   }
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
+  let completionContract;
+  try {
+    completionContract = automationCompletionContractForRequest(req, automation);
+  } catch (error) {
+    return res.status(400).json({ ok: false, error: error.message, output: error.message });
+  }
   const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger);
   if (idempotency.error) return res.status(400).json({ ok: false, error: idempotency.error });
   if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
@@ -9832,7 +10014,10 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
   const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
   if (existing) {
     try {
-      const payload = existing.payload || await existing.promise;
+      const payload = await refreshAutomationTriggerPayload(existing.payload || await existing.promise);
+      if (!automationCompletionContractsEqual(payload?.run?.completionContract, completionContract)) {
+        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能更改 completionContract" });
+      }
       return res.json({ ...payload, deduplicated: true });
     } catch {
       automationTriggerIdempotency.delete(idempotency.key);
@@ -9848,6 +10033,9 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
       new Date(run.startedAt).getTime() >= cutoff
     );
     if (stored) {
+      if (!automationCompletionContractsEqual(stored.completionContract, completionContract)) {
+        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能更改 completionContract" });
+      }
       const payload = { ok: true, run: stored, output: `${automation.name}: ${trigger} app-server run already accepted` };
       automationTriggerIdempotency.set(idempotency.key, {
         promise: Promise.resolve(payload),
@@ -9866,7 +10054,7 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
   const runPromise = startAppServerAutomationRun(
     automation,
     repo,
-    automationTriggerOptions(req, trigger, triggerIdempotencyHash),
+    automationTriggerOptions(req, trigger, triggerIdempotencyHash, completionContract),
   ).then((runRecord) => ({
     ok: true,
     run: runRecord,
@@ -9918,6 +10106,12 @@ app.post("/api/automations/:id/run", async (req, res) => {
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
   const repo = getRepoById(automation.repoId);
   if (req.body?.runner === "app-server" || req.query?.runner === "app-server") {
+    let completionContract;
+    try {
+      completionContract = automationCompletionContractForRequest(req, automation);
+    } catch (error) {
+      return res.status(400).json({ ok: false, error: error.message, output: error.message });
+    }
     try {
       if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
       const runRecord = await startAppServerAutomationRun(automation, repo, {
@@ -9926,6 +10120,7 @@ app.post("/api/automations/:id/run", async (req, res) => {
         model: req.body?.model,
         reasoning: req.body?.reasoning,
         worktree: req.body?.worktree !== false,
+        completionContract,
       });
       return res.json({ ok: true, run: runRecord, output: `${automation.name}: app-server automation run started` });
     } catch (error) {

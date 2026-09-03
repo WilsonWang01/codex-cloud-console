@@ -176,11 +176,29 @@ curl -X POST "$CODEX_CLOUD_URL/api/automations/sample-maintenance/webhook" \
   -H "x-codex-cloud-token: $CODEX_CLOUD_WEBHOOK_TOKEN" \
   -H "Idempotency-Key: sample-maintenance-$(date +%F)" \
   -H "Content-Type: application/json" \
-  -d '{"runner":"app-server","worktree":true}'
+  -d '{
+    "runner":"app-server",
+    "worktree":true,
+    "completionContract": {
+      "version": 1,
+      "type": "exact-final-line",
+      "marker": "MAINTENANCE_RUN_COMPLETE"
+    }
+  }'
 ```
 
 Use `/api/automations/:id/heartbeat` with a session ID to continue an existing
 thread instead of creating an isolated run.
+
+`completionContract` is optional in an app-server trigger body or automation
+configuration. When declared, the run completes only when the last non-empty
+line of the current turn output exactly matches the marker.
+The contract supports only the fixed `exact-final-line` type and an 8–80
+character uppercase ASCII marker; regular expressions, scripts, commands, and
+predicates are rejected rather than evaluated. A recovery run inherits the
+persisted contract snapshot. Missing markers fail closed, remain idempotently
+terminal for the original key, and appear in the attention inbox. Retry such a
+task only after review and with a new idempotency key.
 
 ## Project status
 

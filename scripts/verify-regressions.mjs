@@ -190,8 +190,10 @@ input.on("line", (line) => {
     });
   }
   if (message.method === "turn/start") {
-    const progressRegression = JSON.stringify(message.params || {}).includes("progress regression");
-    const recoveryRegression = JSON.stringify(message.params || {}).includes("继续上一轮因服务重启中断的自动化任务");
+    const requestText = JSON.stringify(message.params || {});
+    const progressRegression = requestText.includes("progress regression");
+    const recoveryRegression = requestText.includes("继续上一轮因服务重启中断的自动化任务");
+    const outcomeContractRegression = requestText.includes("outcome contract regression");
     send({ id: message.id, result: { turn: { id: "turn-regression" } } });
     if (progressRegression) {
       for (const delay of [150, 300, 450]) {
@@ -207,7 +209,40 @@ input.on("line", (line) => {
         turn: { id: "turn-regression", status: "completed" },
       } }, 650);
     }
-    if (recoveryRegression) {
+    if (outcomeContractRegression) {
+      const missingMarker = requestText.includes("missing marker");
+      const legacyRun = requestText.includes("legacy no contract");
+      const output = missingMarker
+        ? "CONTRACT_MISSING_COMPLETE\\n任务尚未得到业务确认"
+        : legacyRun
+          ? "旧任务正常完成，无需完成契约"
+          : "业务结果已核验\\r\\nCONTRACT_PASS_COMPLETE\\r\\n\\r\\n";
+      send({ method: "item/agentMessage/delta", params: {
+        threadId: message.params?.threadId,
+        turnId: "turn-regression",
+        delta: output,
+      } }, 40);
+      if (requestText.includes("late event")) {
+        for (const delay of [75, 82, 90, 110]) {
+          send({ method: "thread/status/changed", params: {
+            threadId: message.params?.threadId,
+            status: "idle",
+          } }, delay);
+        }
+      }
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId,
+        turn: { id: "turn-regression", status: "completed" },
+      } }, 80);
+    } else if (recoveryRegression) {
+      const output = requestText.includes("RECOVERY_REGRESSION_COMPLETE")
+        ? "恢复后的业务动作已核验\\nRECOVERY_REGRESSION_COMPLETE"
+        : "恢复回合结束，但没有业务完成标记";
+      send({ method: "item/agentMessage/delta", params: {
+        threadId: message.params?.threadId,
+        turnId: "turn-regression",
+        delta: output,
+      } }, 40);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
         turn: { id: "turn-regression", status: "completed" },
@@ -269,6 +304,146 @@ await check("app-server request timeout is an end-to-end budget", async () => {
   }
 });
 
+await check("automation completion contracts fail closed without changing legacy runs", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-completion-contract-"));
+  const fakePath = await writeFakeCodex(tempRoot);
+  const binDir = path.join(tempRoot, "bin");
+  const cloudRoot = path.join(tempRoot, "cloud");
+  const workspaceRoot = path.join(cloudRoot, "workspace");
+  const repoRoot = path.join(workspaceRoot, "sample-app");
+  const stateRoot = path.join(tempRoot, "state");
+  const codexHome = path.join(tempRoot, ".codex");
+  const codexShim = path.join(binDir, "codex");
+  const port = await freePort();
+  const runsPath = path.join(stateRoot, "automation-runs.json");
+  const passContract = { version: 1, type: "exact-final-line", marker: "CONTRACT_PASS_COMPLETE" };
+  const missingContract = { version: 1, type: "exact-final-line", marker: "CONTRACT_MISSING_COMPLETE" };
+
+  await fs.mkdir(repoRoot, { recursive: true });
+  await fs.mkdir(stateRoot, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(codexShim, `#!/bin/sh\nexec "${process.execPath}" "${fakePath}"\n`, { mode: 0o755 });
+
+  const childEnvironment = {
+    ...process.env,
+    NODE_ENV: "production",
+    HOST: "127.0.0.1",
+    PORT: String(port),
+    CODEX_CLOUD_ROOT: cloudRoot,
+    CODEX_WORKSPACE_ROOT: workspaceRoot,
+    CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: codexHome,
+    CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
+    CODEX_ALLOW_LOCAL_FALLBACK: "0",
+    CODEX_TURN_TIMEOUT_MS: "1000",
+    CODEX_AUTOMATION_RECOVERY_ENABLED: "0",
+    PATH: `${binDir}:${process.env.PATH}`,
+  };
+  const startServer = () => spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
+    cwd: projectRoot,
+    env: childEnvironment,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const trigger = (idempotencyKey, prompt, completionContract) => jsonRequest(
+    `http://127.0.0.1:${port}/`,
+    "/api/automations/sample-research/webhook",
+    {
+      method: "POST",
+      headers: {
+        "x-codex-cloud-token": "regression-token-123456",
+        "idempotency-key": idempotencyKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ prompt, worktree: false, ...(completionContract === undefined ? {} : { completionContract }) }),
+    },
+  );
+  const waitForRun = async (runId, expectedStatus) => {
+    let run = null;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const store = JSON.parse(await fs.readFile(runsPath, "utf8"));
+      run = store.runs.find((item) => item.id === runId) || null;
+      if (run?.status === expectedStatus) return run;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    throw new Error(`run ${runId} did not reach ${expectedStatus}: ${JSON.stringify(run)}`);
+  };
+
+  let firstServer = startServer();
+  let secondServer = null;
+  try {
+    await waitForOutput(firstServer, /listening on/i);
+
+    const passedStart = await trigger("contract-pass-0001", "outcome contract regression pass with late event", passContract);
+    assert.equal(passedStart.response.status, 200);
+    assert.deepEqual(passedStart.data.run?.completionContract, passContract);
+    const passedRun = await waitForRun(passedStart.data.run.id, "completed");
+    assert.equal(passedRun.completionOutcome, "passed");
+    assert.ok(passedRun.completionCheckedAt);
+    assert.match(passedRun.summary, /CONTRACT_PASS_COMPLETE\s*$/);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const passedAfterLateEvents = (JSON.parse(await fs.readFile(runsPath, "utf8"))).runs.find((run) => run.id === passedRun.id);
+    assert.equal(passedAfterLateEvents.status, "completed");
+    assert.equal(passedAfterLateEvents.completionOutcome, "passed");
+
+    const changedContractReplay = await trigger(
+      "contract-pass-0001",
+      "outcome contract regression changed contract",
+      { version: 1, type: "exact-final-line", marker: "CONTRACT_CHANGED_COMPLETE" },
+    );
+    assert.equal(changedContractReplay.response.status, 409);
+
+    const missingStart = await trigger("contract-missing-0001", "outcome contract regression missing marker", missingContract);
+    assert.equal(missingStart.response.status, 200);
+    const missingRun = await waitForRun(missingStart.data.run.id, "failed");
+    assert.equal(missingRun.completionOutcome, "missing");
+    assert.match(missingRun.error, /完成契约未满足/);
+    assert.match(missingRun.summary, /^CONTRACT_MISSING_COMPLETE/);
+    assert.doesNotMatch(missingRun.summary, /CONTRACT_MISSING_COMPLETE\s*$/);
+    const inbox = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/inbox");
+    assert.equal(inbox.response.status, 200);
+    assert.ok(inbox.data.needsAttention.some((run) => run.id === missingRun.id));
+
+    const sameProcessReplay = await trigger("contract-missing-0001", "outcome contract regression missing marker", missingContract);
+    assert.equal(sameProcessReplay.response.status, 200);
+    assert.equal(sameProcessReplay.data.deduplicated, true);
+    assert.equal(sameProcessReplay.data.run?.id, missingRun.id);
+    assert.equal(sameProcessReplay.data.run?.status, "failed");
+
+    const invalidContract = await trigger("contract-invalid-0001", "outcome contract regression invalid", {
+      version: 1,
+      type: "exact-final-line",
+      marker: "CONTRACT_INVALID_COMPLETE",
+      completionCommand: "touch /tmp/should-never-run",
+    });
+    assert.equal(invalidContract.response.status, 400);
+
+    await stopProcess(firstServer);
+    firstServer = null;
+    secondServer = startServer();
+    await waitForOutput(secondServer, /listening on/i);
+
+    const afterRestartReplay = await trigger("contract-missing-0001", "outcome contract regression missing marker", missingContract);
+    assert.equal(afterRestartReplay.response.status, 200);
+    assert.equal(afterRestartReplay.data.deduplicated, true);
+    assert.equal(afterRestartReplay.data.run?.id, missingRun.id);
+    assert.equal(afterRestartReplay.data.run?.status, "failed");
+
+    const legacyStart = await trigger("contract-legacy-0001", "outcome contract regression legacy no contract", undefined);
+    assert.equal(legacyStart.response.status, 200);
+    const legacyRun = await waitForRun(legacyStart.data.run.id, "completed");
+    assert.equal(legacyRun.completionContract, null);
+    assert.equal(legacyRun.completionOutcome, null);
+    assert.equal(legacyRun.error, null);
+
+    const finalRuns = JSON.parse(await fs.readFile(runsPath, "utf8"));
+    assert.equal(finalRuns.runs.filter((run) => run.triggerIdempotencyHash === missingRun.triggerIdempotencyHash).length, 1);
+  } finally {
+    await stopProcess(firstServer);
+    await stopProcess(secondServer);
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 await check("startup recovery continues one recent interrupted automation in the same session", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-automation-recovery-"));
   const fakePath = await writeFakeCodex(tempRoot);
@@ -285,6 +460,7 @@ await check("startup recovery continues one recent interrupted automation in the
   const old = new Date(now.getTime() - 2 * 60 * 60_000).toISOString();
   const recent = new Date(now.getTime() - 5_000).toISOString();
   const recoveryKey = "recovery-key-0001";
+  const recoveryContract = { version: 1, type: "exact-final-line", marker: "RECOVERY_REGRESSION_COMPLETE" };
   const recoveryHash = crypto
     .createHash("sha256")
     .update(`sample-research:webhook:${recoveryKey}`)
@@ -339,6 +515,8 @@ await check("startup recovery continues one recent interrupted automation in the
       model: "gpt-5.6-terra",
       reasoning: "high",
       prompt: "original recovery regression prompt",
+      completionContract: recoveryContract,
+      completionOutcome: "pending",
       events: [],
     },
     {
@@ -426,7 +604,7 @@ await check("startup recovery continues one recent interrupted automation in the
         "idempotency-key": recoveryKey,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ prompt: "startup retry must wait for recovery", worktree: false }),
+      body: JSON.stringify({ prompt: "startup retry must wait for recovery", worktree: false, completionContract: recoveryContract }),
     });
     assert.equal(startupReplay.response.status, 200);
     assert.equal(startupReplay.data.deduplicated, true);
@@ -447,6 +625,9 @@ await check("startup recovery continues one recent interrupted automation in the
     assert.equal(recoveryRun.triggerIdempotencyHash, recoveryHash);
     assert.equal(recoveryRun.recoveryRootRunId, "run-recovery-source");
     assert.equal(recoveryRun.recoveryAttempt, 1);
+    assert.deepEqual(recoveryRun.completionContract, recoveryContract);
+    assert.equal(recoveryRun.completionOutcome, "passed");
+    assert.match(recoveryRun.summary, /RECOVERY_REGRESSION_COMPLETE\s*$/);
     assert.equal(startupReplay.data.run?.id, recoveryRun.id);
     const recoveredSource = storedRuns.find((run) => run.id === "run-recovery-source");
     assert.equal(recoveredSource.status, "interrupted");
@@ -473,7 +654,7 @@ await check("startup recovery continues one recent interrupted automation in the
         "idempotency-key": recoveryKey,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ prompt: "explicit retry should deduplicate", worktree: false }),
+      body: JSON.stringify({ prompt: "explicit retry should deduplicate", worktree: false, completionContract: recoveryContract }),
     });
     assert.equal(replay.response.status, 200);
     assert.equal(replay.data.deduplicated, true);
