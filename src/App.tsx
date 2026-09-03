@@ -44,6 +44,7 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 
 const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
+const LazyCodexPluginManager = lazy(() => import("./CodexPluginManager"));
 
 type RunEvent = {
   id: string;
@@ -464,8 +465,21 @@ type CodexAppStatus = {
   rateLimits?: {
     primary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
     secondary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
+    credits?: { hasCredits?: boolean; unlimited?: boolean; balance?: string | null } | null;
+    individualLimit?: { limit?: string; used?: string; remainingPercent?: number; resetsAt?: number } | null;
+    spendControlReached?: boolean | null;
     planType?: string;
     rateLimitReachedType?: string | null;
+  } | null;
+  accountUsage?: {
+    summary?: {
+      lifetimeTokens?: number | string | null;
+      peakDailyTokens?: number | string | null;
+      longestRunningTurnSec?: number | string | null;
+      currentStreakDays?: number | string | null;
+      longestStreakDays?: number | string | null;
+    };
+    dailyUsageBuckets?: Array<{ startDate: string; tokens: number | string }> | null;
   } | null;
   usageLimit?: {
     code?: string | null;
@@ -522,6 +536,7 @@ const fallbackAppStatus: CodexAppStatus = {
   partial: true,
   account: null,
   rateLimits: null,
+  accountUsage: null,
   usageLimit: null,
   mcpServers: [],
   plugins: { installed: 0, enabled: 0, available: 0, names: [] },
@@ -1898,6 +1913,8 @@ function timelineMessageMeta(message: ChatMessage) {
   if (/hookPrompt|hook /i.test(marker)) return { label: "Hook", className: "hook-item", pre: false };
   if (/fileChange|filePatch/i.test(marker)) return { label: "文件", className: "file-item", pre: false };
   if (/diff/i.test(marker)) return { label: "差异", className: "diff-item", pre: true };
+  if (/functionCallOutput/i.test(marker)) return { label: "结果", className: "tool-item", pre: false };
+  if (/subAgentActivity/i.test(marker)) return { label: "子 Agent", className: "agent-item", pre: false };
   if (/collabAgentToolCall|collabAgent|agent /i.test(marker)) return { label: "Agent", className: "agent-item", pre: false };
   if (/mcpToolCall|mcp/i.test(marker)) return { label: "MCP", className: "tool-item", pre: false };
   if (/dynamicToolCall|tool/i.test(marker)) return { label: "工具", className: "tool-item", pre: false };
@@ -1907,7 +1924,9 @@ function timelineMessageMeta(message: ChatMessage) {
   if (/contextCompaction|compact/i.test(marker)) return { label: "压缩", className: "compact-item", pre: false };
   if (/review/i.test(marker)) return { label: "审查", className: "review-item", pre: false };
   if (/webSearch/i.test(marker)) return { label: "搜索", className: "tool-item", pre: false };
+  if (/imageGeneration/i.test(marker) && /failed/i.test(marker)) return { label: "图片失败", className: "error-item", pre: false };
   if (/imageView|imageGeneration|image/i.test(marker)) return { label: "图片", className: "tool-item", pre: false };
+  if (/sleep/i.test(marker)) return { label: "等待", className: "tool-item", pre: false };
   if (/turnError|failed/i.test(marker)) return { label: "错误", className: "error-item", pre: false };
   return { label: "", className: "", pre: false };
 }
@@ -2032,10 +2051,13 @@ function timelineDetailTitle(kind: string) {
     modelVerification: "模型验证",
     mcp: "MCP 工具",
     tool: "动态工具",
+    functionCallOutput: "函数结果",
     collabAgent: "Agent 协作",
+    subAgentActivity: "子 Agent 活动",
     webSearch: "联网搜索",
     imageView: "图片查看",
     imageGeneration: "图片生成",
+    sleep: "等待",
     review: "代码审查",
   };
   return labels[kind] || "事件详情";
@@ -2240,6 +2262,9 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
   const collabReceivers = Array.isArray(details.receiverThreadIds) ? (details.receiverThreadIds as unknown[]) : [];
   const collabPrompt = detailText(details.prompt);
   const collabStates = detailText(details.agentsStates);
+  const asyncQuestions = Array.isArray(details.questions) ? (details.questions as Array<Record<string, unknown>>) : [];
+  const webSearchResults = Array.isArray(details.results) ? (details.results as Array<Record<string, unknown>>) : [];
+  const imageFailure = details.failure && typeof details.failure === "object" ? (details.failure as Record<string, unknown>) : null;
   const copyDetail = async (key: string, text: string) => {
     await copyText(text);
     setCopied(key);
@@ -2374,9 +2399,24 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
           <div className="detail-grid command-detail-meta">
             <span>阶段</span>
             <strong>{detailPhaseLabel(detailText(details.phase), "未知阶段")}</strong>
+            <span>投递</span>
+            <strong>{detailText(details.delivery) === "async" ? "异步" : detailText(details.delivery) || "同步"}</strong>
             <span>记忆</span>
             <strong>{detailText(details.memoryCitationSummary) || "无"}</strong>
           </div>
+          {asyncQuestions.length > 0 && (
+            <div className="question-preview-list">
+              {asyncQuestions.map((question, index) => {
+                const options = Array.isArray(question.options) ? question.options : [];
+                return (
+                  <article key={`${detailText(question.title)}-${index}`}>
+                    <strong>{detailText(question.title) || `问题 ${index + 1}`}</strong>
+                    {options.length > 0 && <small>{options.map((option) => detailText(option)).join(" / ")}</small>}
+                  </article>
+                );
+              })}
+            </div>
+          )}
           {memoryThreadIds.length > 0 && (
             <div className="memory-thread-list">
               {memoryThreadIds.map((threadId, index) => (
@@ -2708,12 +2748,17 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
         </div>
       )}
       {kind === "webSearch" && (
-        <div className="detail-grid">
-          <span>查询</span>
-          <code>{detailText(details.query) || "搜索"}</code>
-          <span>动作</span>
-          <strong>{detailText(details.action) || "搜索"}</strong>
-        </div>
+        <>
+          <div className="detail-grid">
+            <span>查询</span>
+            <code>{detailText(details.query) || "搜索"}</code>
+            <span>动作</span>
+            <strong>{detailText(details.action) || "搜索"}</strong>
+            <span>结果</span>
+            <strong>{detailText(details.resultCount) || webSearchResults.length || "等待返回"}</strong>
+          </div>
+          {webSearchResults.length > 0 && <pre>{detailText(webSearchResults)}</pre>}
+        </>
       )}
       {kind === "imageView" && (
         <div className="detail-grid">
@@ -2730,9 +2775,36 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
             <strong>{timelineStatusLabel(detailText(details.status)) || "图片生成"}</strong>
             <span>保存位置</span>
             <code>{detailText(details.savedPath) || "等待保存"}</code>
+            <span>背景</span>
+            <strong>{details.transparentBackground ? "透明" : "默认"}</strong>
           </div>
+          {imageFailure && <p className="detail-error">{imageFailure.type === "usageLimitExceeded" ? "图片生成额度已用尽，请在额度恢复后重试。" : detailText(imageFailure)}</p>}
           {Boolean(details.revisedPrompt) && <pre>{detailText(details.revisedPrompt)}</pre>}
+          {Boolean(details.result) && !details.savedPath && <pre>{detailText(details.result)}</pre>}
         </>
+      )}
+      {kind === "functionCallOutput" && (
+        <div className="command-detail-card tool-detail-card">
+          <div className="detail-grid">
+            <span>函数</span>
+            <code>{`${detailText(details.namespace) ? `${detailText(details.namespace)}.` : ""}${detailText(details.name) || "function"}`}</code>
+          </div>
+          {Boolean(details.output) && <pre>{detailText(details.output)}</pre>}
+        </div>
+      )}
+      {kind === "subAgentActivity" && (
+        <div className="detail-grid">
+          <span>状态</span>
+          <strong>{timelineStatusLabel(detailText(details.activity)) || "已更新"}</strong>
+          <span>Agent</span>
+          <code>{detailText(details.agentPath) || detailText(details.agentThreadId) || "未知"}</code>
+        </div>
+      )}
+      {kind === "sleep" && (
+        <div className="detail-grid">
+          <span>等待时间</span>
+          <strong>{detailText(details.durationMs) || "0"} 毫秒</strong>
+        </div>
       )}
       {kind === "review" && (
         <div className="detail-grid">
@@ -2742,7 +2814,7 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
           <pre>{detailText(details.diff) || "暂无审查差异事件"}</pre>
         </div>
       )}
-      {!["command", "hookPrompt", "agentMessage", "reasoning", "fileChange", "approval", "guardianReview", "mcpProgress", "terminalInteraction", "requestResolved", "modelRerouted", "modelVerification", "mcp", "tool", "collabAgent", "webSearch", "imageView", "imageGeneration", "review"].includes(kind) && (
+      {!["command", "hookPrompt", "agentMessage", "reasoning", "fileChange", "approval", "guardianReview", "mcpProgress", "terminalInteraction", "requestResolved", "modelRerouted", "modelVerification", "mcp", "tool", "functionCallOutput", "collabAgent", "subAgentActivity", "webSearch", "imageView", "imageGeneration", "sleep", "review"].includes(kind) && (
         <pre>{JSON.stringify(details, null, 2)}</pre>
       )}
     </details>
@@ -5742,6 +5814,7 @@ export function App() {
           <div className="content-grid">
             <SettingsView
               status={status}
+              repo={selectedRepo}
               appStatus={codexAppStatus}
               appStatusLoading={codexAppStatusLoading}
               onRefresh={() => {
@@ -8025,10 +8098,10 @@ function CloudChat({
       ? appStatusIssue || "需要重新登录 Codex"
       : appStatus.account?.email || "Codex 登录状态";
   const mcpHint = appStatusPending ? "同步 MCP 状态中" : `${appStatus.mcpServers.length} 个服务器`;
-  const pluginHint = appStatusPending ? "同步插件状态中" : `${appStatus.plugins.enabled} 已启用 / ${appStatus.plugins.available} 可用`;
+  const pluginHint = appStatusPending ? "同步插件状态中" : `${appStatus.plugins.enabled} 已启用 / ${appStatus.plugins.installed} 已安装`;
   const toolsSummary = appStatusPending
     ? "同步云端工具状态中"
-    : `MCP ${appStatus.mcpServers.length} · 插件 ${appStatus.plugins.enabled}/${appStatus.plugins.available} · Skills ${appStatus.skills.enabled}`;
+    : `MCP ${appStatus.mcpServers.length} · 插件 ${appStatus.plugins.enabled} 已启用 · Skills ${appStatus.skills.enabled}`;
   const providerSummary = appStatusPending
     ? "同步模型能力中"
     : `联网 ${enabledFlagLabel(appStatus.providerCapabilities?.webSearch)} · 图片 ${enabledFlagLabel(appStatus.providerCapabilities?.imageGeneration)} · 工具 ${enabledFlagLabel(appStatus.providerCapabilities?.namespaceTools)}`;
@@ -9941,6 +10014,7 @@ function LogsView({
 
 function SettingsView({
   status,
+  repo,
   appStatus,
   appStatusLoading,
   onRefresh,
@@ -9967,6 +10041,7 @@ function SettingsView({
   onRunDiagnostics,
 }: {
   status: ConsoleStatus;
+  repo: Repo;
   appStatus: CodexAppStatus;
   appStatusLoading: boolean;
   onRefresh: () => void;
@@ -10041,6 +10116,11 @@ function SettingsView({
   const activeAccountLogin = appStatus.accountLogin?.active || null;
   const codexAuthOk = appStatus.auth?.ok !== false && status.codex.authenticated;
   const usageLimit = appStatus.usageLimit || status.usageLimit || null;
+  const accountUsage = appStatus.accountUsage?.summary;
+  const lifetimeTokens = Number(accountUsage?.lifetimeTokens || 0);
+  const peakDailyTokens = Number(accountUsage?.peakDailyTokens || 0);
+  const credits = appStatus.rateLimits?.credits;
+  const spendLimit = appStatus.rateLimits?.individualLimit;
   const appServerLive = status.appServerLive || appStatus.live || fallbackAppStatus.live!;
   const appStatusHasData =
     Boolean(appStatus.account) ||
@@ -10143,6 +10223,13 @@ function SettingsView({
           <span className={usageLimit ? "warn-text" : ""} title={usageLimit?.message || usageLimit?.body || quotaText}>
             额度 {appStatusPending ? "同步中" : quotaText}
           </span>
+          {lifetimeTokens > 0 && <span>累计使用 {formatTokenCount(lifetimeTokens)} tokens · 单日峰值 {formatTokenCount(peakDailyTokens)}</span>}
+          {credits?.hasCredits && <span>Codex 余额 {credits.unlimited ? "不限量" : credits.balance || "可用"}</span>}
+          {spendLimit && (
+            <span className={appStatus.rateLimits?.spendControlReached ? "warn-text" : ""}>
+              用量控制 {spendLimit.used || "0"} / {spendLimit.limit || "未知"} · 剩余 {Math.max(0, Number(spendLimit.remainingPercent || 0))}%
+            </span>
+          )}
           {activeAccountLogin && (
             <div className="account-flow-card">
               <div className="account-flow-head">
@@ -10201,6 +10288,9 @@ function SettingsView({
                   ))}
         </div>
       </div>
+      <Suspense fallback={<div className="settings-copy"><span className="empty-copy">正在载入插件目录...</span></div>}>
+        <LazyCodexPluginManager repoId={repo.id} onChanged={onRefresh} />
+      </Suspense>
       <div className="settings-copy">
         <div className="settings-section-head">
           <strong>云端实时事件</strong>

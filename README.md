@@ -24,6 +24,7 @@ keeping the worker and its data self-hosted.
 
 - Browser access to Codex app-server threads and turn events.
 - Repository-aware sessions, file browsing, uploads, and generated artifacts.
+- Searchable Codex plugin catalog with explicit install and uninstall controls.
 - Scheduled, manual, webhook, and heartbeat automation triggers.
 - Run history, audit events, attention queues, and optional notifications.
 - Production fail-closed behavior when the authoritative app-server source is
@@ -115,6 +116,7 @@ Important server-side variables include:
 | `CODEX_ENABLE_CLI_DEBUG` | Opt-in raw CLI diagnostics |
 | `CODEX_ENABLE_LOCAL_REVIEW_READ` | Opt-in local review reads |
 | `CODEX_ENABLE_LOCAL_REVIEW_MUTATION` | Opt-in local review mutations |
+| `CODEX_PLUGIN_CATALOG_CACHE_TTL_MS` | Plugin catalog cache lifetime; defaults to five minutes |
 
 The checked-in values are documentation placeholders. Never commit a populated
 environment file.
@@ -143,6 +145,14 @@ For the full browser pass with replayable Playwright artifacts:
 
 ```bash
 npm run verify:cloud:full
+```
+
+When the bundled Playwright browser is unavailable, point the verification
+scripts at an installed browser:
+
+```bash
+PLAYWRIGHT_CHROMIUM_CHANNEL=chrome npm run verify:ui
+# Or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to an absolute browser path.
 ```
 
 Real model turns are opt-in because they can incur usage:

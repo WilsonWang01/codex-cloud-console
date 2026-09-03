@@ -135,7 +135,13 @@ async function inspectSlashCommandCenter(page, needles) {
   }, needles);
 }
 
-const browser = await chromium.launch({ headless: true });
+const launchOptions = { headless: true };
+if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+  launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+} else if (process.env.PLAYWRIGHT_CHROMIUM_CHANNEL) {
+  launchOptions.channel = process.env.PLAYWRIGHT_CHROMIUM_CHANNEL;
+}
+const browser = await chromium.launch(launchOptions);
 const results = [];
 try {
   for (const [name, hash, viewport] of pages) {

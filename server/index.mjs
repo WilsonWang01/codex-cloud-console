@@ -10,6 +10,7 @@ import { WebSocketServer } from "ws";
 import webPush from "web-push";
 import { CodexAppServerClient } from "./codex-app-server-client.mjs";
 import { normalizeAppServerThreadMessages } from "./app-server-normalizers.mjs";
+import { pluginCatalogPage } from "./plugin-catalog.mjs";
 import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mjs";
 
 const app = express();
@@ -75,6 +76,7 @@ const statusFirstResponseMs = Number(process.env.CODEX_STATUS_FIRST_RESPONSE_MS 
 const appStatusCacheTtlMs = Number(process.env.CODEX_APP_STATUS_CACHE_TTL_MS || 60_000);
 const appStatusFirstResponseMs = Number(process.env.CODEX_APP_STATUS_FIRST_RESPONSE_MS || 8_000);
 const modelListCacheTtlMs = Number(process.env.CODEX_MODEL_LIST_CACHE_TTL_MS || 10 * 60_000);
+const pluginCatalogCacheTtlMs = Number(process.env.CODEX_PLUGIN_CATALOG_CACHE_TTL_MS || 5 * 60_000);
 const modelListFirstResponseMs = Number(process.env.CODEX_MODEL_LIST_FIRST_RESPONSE_MS || 6_000);
 const threadStateCacheTtlMs = Number(process.env.CODEX_THREAD_STATE_CACHE_TTL_MS || 10_000);
 const threadStateFirstResponseMs = Number(process.env.CODEX_THREAD_STATE_FIRST_RESPONSE_MS || 5_000);
@@ -128,6 +130,8 @@ let modelListCache = null;
 let modelListRefreshPromise = null;
 const appStatusCacheByRepo = new Map();
 const appStatusRefreshByRepo = new Map();
+const pluginCatalogCacheByRepo = new Map();
+const pluginCatalogRefreshByRepo = new Map();
 const repoSessionSyncByRepo = new Map();
 const threadSummaryRefreshByKey = new Map();
 const threadStateCacheByKey = new Map();
@@ -3474,6 +3478,41 @@ function countInstalledPlugins(pluginResponse) {
   };
 }
 
+function normalizePluginCatalog(pluginResponse) {
+  const result = pluginResponse?.result || pluginResponse || {};
+  const featured = new Set(Array.isArray(result.featuredPluginIds) ? result.featuredPluginIds : []);
+  const marketplaces = Array.isArray(result.marketplaces) ? result.marketplaces : [];
+  const plugins = marketplaces.flatMap((marketplace) =>
+    (Array.isArray(marketplace?.plugins) ? marketplace.plugins : []).map((plugin) => ({
+      id: String(plugin?.id || ""),
+      name: String(plugin?.name || plugin?.id || ""),
+      displayName: String(plugin?.interface?.displayName || plugin?.name || plugin?.id || ""),
+      description: String(plugin?.interface?.shortDescription || plugin?.interface?.longDescription || "").slice(0, 800),
+      developerName: plugin?.interface?.developerName ? String(plugin.interface.developerName) : null,
+      category: plugin?.interface?.category ? String(plugin.interface.category) : null,
+      capabilities: Array.isArray(plugin?.interface?.capabilities) ? plugin.interface.capabilities.map(String).slice(0, 20) : [],
+      logoUrl: plugin?.interface?.logoUrl ? String(plugin.interface.logoUrl) : null,
+      websiteUrl: plugin?.interface?.websiteUrl ? String(plugin.interface.websiteUrl) : null,
+      marketplaceName: String(marketplace?.name || ""),
+      installed: plugin?.installed === true,
+      enabled: plugin?.enabled === true,
+      featured: featured.has(plugin?.id),
+      availability: String(plugin?.availability || "AVAILABLE"),
+      disabledReason: plugin?.disabledReason ? String(plugin.disabledReason) : null,
+      installPolicy: String(plugin?.installPolicy || "NOT_AVAILABLE"),
+      authPolicy: String(plugin?.authPolicy || "ON_USE"),
+      version: plugin?.version ? String(plugin.version) : null,
+      localVersion: plugin?.localVersion ? String(plugin.localVersion) : null,
+    })),
+  );
+  return {
+    plugins: plugins.filter((plugin) => plugin.id && plugin.name),
+    marketplaceLoadErrors: (Array.isArray(result.marketplaceLoadErrors) ? result.marketplaceLoadErrors : []).map((error) => ({
+      message: sanitizeCloudPathText(error?.message || "Plugin marketplace load failed", 320),
+    })),
+  };
+}
+
 // Adapted in spirit from friuns2/codexui's MIT-licensed skill grouping
 // helpers in src/api/codexGateway.ts. Keep app-server as the source of truth.
 function normalizeSkillMarkdownPath(skillPath) {
@@ -3616,6 +3655,7 @@ function accountLoginSnapshot() {
 function summarizeAppServerStatus(results) {
   const account = results.account.result?.account || null;
   const rateLimits = results.rateLimits.result?.rateLimits || null;
+  const accountUsage = results.accountUsage?.result || null;
   const mcpServers = results.mcp.result?.data || [];
   const skills = groupedSkillsFromEntries(results.skills.result?.data || []);
   const features = results.features.result?.data || [];
@@ -3648,7 +3688,7 @@ function summarizeAppServerStatus(results) {
     gaps.push("Realtime voice/audio 是底层未启用能力，网页端暂不对齐。");
   }
   const requiredKeys = ["account", "rateLimits", "mcp", "plugins", "provider"];
-  const capabilityKeys = ["skills", "features", "permissions", "config", "appList"];
+  const capabilityKeys = ["skills", "features", "permissions", "config", "appList", "accountUsage"];
   const failedCriticalKeys = requiredKeys.filter((key) => !results[key]?.ok);
   const capabilityWarnings = capabilityKeys
     .filter((key) => !results[key]?.ok)
@@ -3672,6 +3712,7 @@ function summarizeAppServerStatus(results) {
     capabilityWarnings,
     account,
     rateLimits,
+    accountUsage,
     usageLimit,
     mcpServers: mcpServers.map((server) => ({
       name: server.name,
@@ -3722,20 +3763,68 @@ function appStatusRequestList(repo) {
   return [
     { key: "account", method: "account/read", params: {} },
     { key: "rateLimits", method: "account/rateLimits/read", params: undefined },
+    { key: "accountUsage", method: "account/usage/read", params: {} },
     { key: "mcp", method: "mcpServerStatus/list", params: {} },
-    { key: "plugins", method: "plugin/list", params: {} },
+    { key: "plugins", method: "plugin/installed", params: { cwds: [repo.path] } },
     { key: "skills", method: "skills/list", params: { cwds: [repo.path] } },
     { key: "features", method: "experimentalFeature/list", params: {} },
     { key: "permissions", method: "permissionProfile/list", params: {} },
     { key: "provider", method: "modelProvider/capabilities/read", params: {} },
-    { key: "appList", method: "app/list", params: {} },
+    { key: "appList", method: "app/installed", params: {} },
     { key: "config", method: "config/read", params: { includeLayers: false } },
   ];
 }
 
 async function computeCodexAppStatus(repo, timeout = 12_000) {
   const results = await codexAppServerBatchRequest(appStatusRequestList(repo), timeout);
+  if (!results.plugins?.ok) {
+    results.plugins = await codexAppServerRequest("plugin/list", { cwds: [repo.path] }, Math.min(timeout, 12_000));
+  }
   return summarizeAppServerStatus(results);
+}
+
+async function readPluginCatalog(repo, options = {}) {
+  const cached = pluginCatalogCacheByRepo.get(repo.id);
+  const age = cached ? Date.now() - cached.cachedAt : Infinity;
+  if (options.forceRefetch !== true && options.bypassCache !== true && cached && age <= pluginCatalogCacheTtlMs) {
+    return cached.response;
+  }
+  if (pluginCatalogRefreshByRepo.has(repo.id)) return pluginCatalogRefreshByRepo.get(repo.id);
+  const task = codexAppServerRequest(
+    "plugin/list",
+    { cwds: [repo.path], forceRefetch: options.forceRefetch === true },
+    options.forceRefetch === true ? 45_000 : 20_000,
+  )
+    .then((response) => {
+      if (!response.ok) throw new Error(response.error || "Plugin catalog is unavailable");
+      pluginCatalogCacheByRepo.set(repo.id, { response, cachedAt: Date.now() });
+      return response;
+    })
+    .finally(() => pluginCatalogRefreshByRepo.delete(repo.id));
+  pluginCatalogRefreshByRepo.set(repo.id, task);
+  return task;
+}
+
+function findCatalogPlugin(response, marketplaceName, pluginKey, options = {}) {
+  const marketplaces = Array.isArray(response?.result?.marketplaces) ? response.result.marketplaces : [];
+  const marketplace = marketplaces.find((item) => String(item?.name || "") === marketplaceName);
+  if (!marketplace) throw new Error("Plugin marketplace is no longer available; refresh and retry");
+  const plugins = Array.isArray(marketplace.plugins) ? marketplace.plugins : [];
+  const plugin = plugins.find((item) => [item?.id, item?.name].map(String).includes(pluginKey));
+  if (!plugin) throw new Error("Plugin is no longer available; refresh and retry");
+  if (options.installed === true && plugin.installed !== true) throw new Error("Plugin is not installed");
+  if (options.installable === true) {
+    if (plugin.availability === "DISABLED_BY_ADMIN" || plugin.installPolicy === "NOT_AVAILABLE") {
+      throw new Error(`Plugin cannot be installed${plugin.disabledReason ? `: ${plugin.disabledReason}` : ""}`);
+    }
+  }
+  return { marketplace, plugin };
+}
+
+function refreshAppStatusAfterPluginChange(repo) {
+  appStatusCacheByRepo.delete(repo.id);
+  pluginCatalogCacheByRepo.delete(repo.id);
+  startAppStatusRefresh(repo).catch(() => null);
 }
 
 async function readStoredAppStatusCache(repo) {
@@ -3785,6 +3874,7 @@ function fastCodexAppStatusFallback(repo, error = "") {
     partial: true,
     account: null,
     rateLimits: null,
+    accountUsage: null,
     usageLimit: null,
     mcpServers: [],
     plugins: { installed: 0, enabled: 0, available: 0, names: [] },
@@ -3943,7 +4033,7 @@ async function runCodexDiagnostics(repo) {
           { key: "config", method: "config/read", params: { includeLayers: false } },
           { key: "models", method: "model/list", params: { includeHidden: false } },
           { key: "mcp", method: "mcpServerStatus/list", params: {} },
-          { key: "plugins", method: "plugin/list", params: {} },
+          { key: "plugins", method: "plugin/installed", params: { cwds: [repo.path] } },
           { key: "skills", method: "skills/list", params: { cwds: [repo.path] } },
           { key: "permissions", method: "permissionProfile/list", params: {} },
           { key: "provider", method: "modelProvider/capabilities/read", params: {} },
@@ -3962,7 +4052,7 @@ async function runCodexDiagnostics(repo) {
           : [
               `模型 ${(results.models.result?.data || []).length} 个`,
               `MCP 服务器 ${(results.mcp.result?.data || []).length} 个`,
-              `插件 ${countInstalledPlugins(results.plugins)} 个`,
+              `已安装插件 ${countInstalledPlugins(results.plugins).installed} 个`,
               `Skills ${groupedSkillsFromEntries(results.skills.result?.data || []).length} 个`,
               `权限配置 ${(results.permissions.result?.data || []).length} 个`,
             ].join(" · "),
@@ -7856,6 +7946,77 @@ app.get("/api/codex/app-status", async (req, res) => {
   const { data, cache } = await getCodexAppStatusForRoute(repo);
   res.setHeader("x-codex-app-status-cache", cache);
   res.status(data.ok === false || data.authoritative !== true || data.partial === true ? 503 : 200).json(data);
+});
+
+app.get("/api/codex/plugins", async (req, res) => {
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    const response = await readPluginCatalog(repo, { forceRefetch: req.query?.refresh === "1" });
+    const catalog = pluginCatalogPage(normalizePluginCatalog(response), {
+      query: req.query?.q,
+      limit: req.query?.limit,
+    });
+    res.json({ ok: true, repoId: repo.id, ...catalog });
+  } catch (error) {
+    res.status(502).json({ ok: false, error: sanitizeCloudPathText(error.message || "Plugin catalog is unavailable", 320) });
+  }
+});
+
+app.post("/api/codex/plugins/install", async (req, res) => {
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const marketplaceName = String(req.body?.marketplaceName || "").trim();
+    const pluginKey = String(req.body?.pluginId || req.body?.pluginName || "").trim();
+    if (!marketplaceName || !pluginKey) return res.status(400).json({ ok: false, error: "marketplaceName and pluginId are required" });
+    const catalogResponse = await readPluginCatalog(repo);
+    const { marketplace, plugin } = findCatalogPlugin(catalogResponse, marketplaceName, pluginKey, { installable: true });
+    const params = {
+      pluginName: String(plugin.name),
+      installAttemptId: crypto.randomUUID(),
+      ...(marketplace.path ? { marketplacePath: marketplace.path } : { remoteMarketplaceName: String(marketplace.name) }),
+    };
+    const response = await codexAppServerRequest("plugin/install", params, 60_000);
+    if (!response.ok) throw new Error(response.error || "Plugin installation failed");
+    refreshAppStatusAfterPluginChange(repo);
+    appendAuditEvent({
+      source: "app-server",
+      type: "plugin-install",
+      repoId: repo.id,
+      summary: `已安装插件 ${plugin.interface?.displayName || plugin.name}`,
+      detail: jsonDetail({ pluginId: plugin.id, marketplaceName }),
+    }).catch(() => null);
+    const refreshed = await readPluginCatalog(repo, { bypassCache: true });
+    const catalog = pluginCatalogPage(normalizePluginCatalog(refreshed), { query: req.body?.query, limit: req.body?.limit });
+    res.json({ ok: true, repoId: repo.id, result: response.result || null, ...catalog });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: sanitizeCloudPathText(error.message || "Plugin installation failed", 320) });
+  }
+});
+
+app.post("/api/codex/plugins/uninstall", async (req, res) => {
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const marketplaceName = String(req.body?.marketplaceName || "").trim();
+    const pluginKey = String(req.body?.pluginId || "").trim();
+    if (!marketplaceName || !pluginKey) return res.status(400).json({ ok: false, error: "marketplaceName and pluginId are required" });
+    const catalogResponse = await readPluginCatalog(repo);
+    const { plugin } = findCatalogPlugin(catalogResponse, marketplaceName, pluginKey, { installed: true });
+    const response = await codexAppServerRequest("plugin/uninstall", { pluginId: String(plugin.id) }, 60_000);
+    if (!response.ok) throw new Error(response.error || "Plugin uninstall failed");
+    refreshAppStatusAfterPluginChange(repo);
+    appendAuditEvent({
+      source: "app-server",
+      type: "plugin-uninstall",
+      repoId: repo.id,
+      summary: `已卸载插件 ${plugin.interface?.displayName || plugin.name}`,
+      detail: jsonDetail({ pluginId: plugin.id, marketplaceName }),
+    }).catch(() => null);
+    const refreshed = await readPluginCatalog(repo, { bypassCache: true });
+    const catalog = pluginCatalogPage(normalizePluginCatalog(refreshed), { query: req.body?.query, limit: req.body?.limit });
+    res.json({ ok: true, repoId: repo.id, ...catalog });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: sanitizeCloudPathText(error.message || "Plugin uninstall failed", 320) });
+  }
 });
 
 app.post("/api/codex/diagnostics", async (req, res) => {

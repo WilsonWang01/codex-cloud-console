@@ -400,6 +400,24 @@ function memoryCitationSummary(memoryCitation) {
   return parts.length ? parts.join(" · ") : "";
 }
 
+function asyncQuestions(questions) {
+  return (Array.isArray(questions) ? questions : [])
+    .map((question) => ({
+      title: typeof question?.title === "string" ? question.title.trim() : "",
+      options: Array.isArray(question?.options)
+        ? question.options.filter((option) => typeof option === "string" && option.trim()).slice(0, 12)
+        : null,
+    }))
+    .filter((question) => question.title)
+    .slice(0, 8);
+}
+
+function webSearchResultSummary(results) {
+  const rows = Array.isArray(results) ? results : [];
+  if (!rows.length) return "";
+  return ` · ${rows.length} 条结果`;
+}
+
 function fileNameFromPath(value, fallback = "image") {
   const parts = String(value || "")
     .replaceAll("\\", "/")
@@ -424,13 +442,16 @@ function itemMessages(item, time, options = {}) {
 
   if (item.type === "agentMessage") {
     if (!item.text) return [];
+    const questions = asyncQuestions(item.questions);
     const details = {
       kind: "agentMessage",
       phase: item.phase || null,
+      delivery: item.delivery || null,
+      questions,
       memoryCitation: item.memoryCitation || null,
       memoryCitationSummary: memoryCitationSummary(item.memoryCitation),
     };
-    const hasDetails = Boolean(details.phase || details.memoryCitationSummary);
+    const hasDetails = Boolean(details.phase || details.delivery || details.questions.length || details.memoryCitationSummary);
     return [message(item.id, "codex", displayProjectPathText(item.text, options), time, { messageType: item.type, ...(hasDetails ? { details } : {}) })];
   }
 
@@ -459,6 +480,23 @@ function itemMessages(item, time, options = {}) {
     return [message(item.id, "codex", displayProjectPathText(item.text || "计划已更新。", options), time, { messageType: item.type, status: "plan" })];
   }
 
+  if (item.type === "functionCallOutput") {
+    const output = structuredPreview(item.output, 5000);
+    const name = `${item.namespace ? `${item.namespace}.` : ""}${item.name || "function"}`;
+    return [
+      message(item.id, "codex", `函数结果: ${name}`, time, {
+        messageType: item.type,
+        status: "tool completed",
+        details: {
+          kind: "functionCallOutput",
+          name: item.name || null,
+          namespace: item.namespace || null,
+          output,
+        },
+      }),
+    ];
+  }
+
   if (item.type === "commandExecution") {
     const status = normalizeCommandStatus(item.status);
     const stats = outputStats(item.aggregatedOutput || "");
@@ -478,6 +516,8 @@ function itemMessages(item, time, options = {}) {
           durationMs: typeof item.durationMs === "number" ? item.durationMs : null,
           processId: item.processId || null,
           source: item.source || null,
+          pluginId: item.pluginId || null,
+          scriptPath: item.scriptPath || null,
           status,
           commandActions: Array.isArray(item.commandActions) ? item.commandActions : [],
           output: stats.output,
@@ -523,7 +563,9 @@ function itemMessages(item, time, options = {}) {
           error: item.error ?? null,
           durationMs: typeof item.durationMs === "number" ? item.durationMs : null,
           pluginId: item.pluginId ?? null,
+          appContext: item.appContext ?? null,
           mcpAppResourceUri: item.mcpAppResourceUri || null,
+          readOnlyHint: typeof item.readOnlyHint === "boolean" ? item.readOnlyHint : null,
         },
       }),
     ];
@@ -574,12 +616,35 @@ function itemMessages(item, time, options = {}) {
     ];
   }
 
-  if (item.type === "webSearch") {
+  if (item.type === "subAgentActivity") {
+    const state = item.kind ? String(item.kind) : "unknown";
     return [
-      message(item.id, "codex", `联网搜索: ${item.query || ""}`.trim(), time, {
+      message(item.id, "codex", `子 Agent ${state}: ${item.agentPath || item.agentThreadId || "agent"}`, time, {
+        messageType: item.type,
+        status: `agent ${state}`,
+        details: {
+          kind: "subAgentActivity",
+          activity: state,
+          agentThreadId: item.agentThreadId || null,
+          agentPath: item.agentPath || null,
+        },
+      }),
+    ];
+  }
+
+  if (item.type === "webSearch") {
+    const results = Array.isArray(item.results) ? item.results.slice(0, 20) : [];
+    return [
+      message(item.id, "codex", `联网搜索: ${item.query || ""}${webSearchResultSummary(item.results)}`.trim(), time, {
         messageType: item.type,
         status: "webSearch",
-        details: { kind: "webSearch", query: item.query || "", action: item.action || null },
+        details: {
+          kind: "webSearch",
+          query: item.query || "",
+          action: item.action || null,
+          results,
+          resultCount: Array.isArray(item.results) ? item.results.length : 0,
+        },
       }),
     ];
   }
@@ -595,18 +660,36 @@ function itemMessages(item, time, options = {}) {
     ];
   }
 
+  if (item.type === "sleep") {
+    const durationMs = Number(item.durationMs || 0);
+    const durationText = durationMs >= 1000 ? `${Math.round(durationMs / 100) / 10} 秒` : `${durationMs} 毫秒`;
+    return [
+      message(item.id, "codex", `等待 ${durationText}`, time, {
+        messageType: item.type,
+        status: "sleep completed",
+        details: { kind: "sleep", durationMs },
+      }),
+    ];
+  }
+
   if (item.type === "imageGeneration") {
     const savedPath = item.savedPath || "";
+    const failure = item.failure && typeof item.failure === "object" ? item.failure : null;
+    const result = truncateOutput(item.result || "", 3000);
+    const failedText = failure?.type === "usageLimitExceeded" ? "图片生成额度已用尽" : failure ? "图片生成失败" : "";
     return [
-      message(item.id, "codex", savedPath ? `生成图片: ${fileNameFromPath(savedPath)}` : "图片生成已更新。", time, {
+      message(item.id, "codex", failedText || (savedPath ? `生成图片: ${fileNameFromPath(savedPath)}` : "图片生成已更新。"), time, {
         messageType: item.type,
-        status: item.status || "imageGeneration",
+        status: failure ? "failed" : item.status || "imageGeneration",
         details: {
           kind: "imageGeneration",
           status: item.status || null,
           savedPath,
           name: fileNameFromPath(savedPath),
           revisedPrompt: item.revisedPrompt || null,
+          transparentBackground: item.transparentBackground === true,
+          failure,
+          result,
         },
       }),
     ];
