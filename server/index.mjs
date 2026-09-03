@@ -147,7 +147,23 @@ const automationTriggerIdempotency = new Map();
 const configuredOwnerEntries = Number(process.env.CODEX_OWNER_INDEX_MAX || 5_000);
 const maxOwnerEntries = Number.isFinite(configuredOwnerEntries) ? Math.max(500, configuredOwnerEntries) : 5_000;
 
-const repos = [
+function parseBase64ArrayConfig(variableName, fallback) {
+  const encoded = String(process.env[variableName] || "").trim();
+  if (!encoded) return fallback;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  } catch {
+    throw new Error(`${variableName} must be base64-encoded JSON`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => !item || typeof item !== "object" || !String(item.id || "").trim())) {
+    throw new Error(`${variableName} must decode to an array of objects with non-empty ids`);
+  }
+  return parsed;
+}
+
+const defaultRepos = [
   {
     id: "sample-app",
     name: "sample-app",
@@ -171,9 +187,16 @@ const repos = [
   },
 ];
 
+const repos = parseBase64ArrayConfig("CODEX_CLOUD_REPOS_CONFIG_B64", defaultRepos).map((repo) => ({
+  ...repo,
+  path: path.isAbsolute(String(repo.path || ""))
+    ? String(repo.path)
+    : path.join(workspaceRoot, String(repo.path || repo.id)),
+}));
+
 const repoAccents = ["teal", "blue", "amber"];
 
-const automations = [
+const defaultAutomations = [
   {
     id: "sample-on-demand",
     name: "Sample on-demand workflow",
@@ -253,6 +276,8 @@ const automations = [
     prompt: "Refresh the repository data using the documented process and report changes, verification, and next steps.",
   },
 ];
+
+const automations = parseBase64ArrayConfig("CODEX_CLOUD_AUTOMATIONS_CONFIG_B64", defaultAutomations);
 
 await loadCustomRepos();
 
