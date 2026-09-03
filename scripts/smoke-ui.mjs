@@ -5,6 +5,12 @@ import { chromium } from "playwright";
 const baseUrl = new URL(process.env.CODEX_CLOUD_SMOKE_URL || process.env.CODEX_CLOUD_CONSOLE_URL || "http://127.0.0.1:18787/");
 const waitMs = Math.max(1_000, Number(process.env.CODEX_CLOUD_SMOKE_UI_WAIT_MS || 10_000));
 const allowLoading = process.env.CODEX_CLOUD_SMOKE_UI_ALLOW_LOADING === "1";
+const repoId = process.env.CODEX_CLOUD_SMOKE_REPO || "sample-app";
+const automationId = process.env.CODEX_CLOUD_SMOKE_AUTOMATION || "";
+const projectHash = `#/project/${encodeURIComponent(repoId)}`;
+const automationHash = automationId
+  ? `#/automations/${encodeURIComponent(repoId)}/${encodeURIComponent(automationId)}`
+  : "#/automations";
 const badNeedles = [
   "连接断开",
   "Local mock",
@@ -23,11 +29,11 @@ const badNeedles = [
 
 const pages = [
   ["inbox-desktop", "#/inbox", { width: 1440, height: 940 }],
-  ["cli-desktop", "#/project/sample-app", { width: 1440, height: 940 }],
+  ["cli-desktop", projectHash, { width: 1440, height: 940 }],
   ["settings-desktop", "#/settings", { width: 1440, height: 940 }],
-  ["automations-desktop", "#/automations/sample-app/sample-maintenance", { width: 1440, height: 940 }],
+  ["automations-desktop", automationHash, { width: 1440, height: 940 }],
   ["inbox-mobile", "#/inbox", { width: 390, height: 844 }],
-  ["cli-mobile", "#/project/sample-app", { width: 390, height: 844 }],
+  ["cli-mobile", projectHash, { width: 390, height: 844 }],
 ];
 
 function pageUrl(hash) {

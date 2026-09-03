@@ -3254,6 +3254,7 @@ export function App() {
     () => status.repos.find((item) => item.id === selectedRepoId) || status.repos[0],
     [selectedRepoId, status.repos],
   );
+  const repoSelectionReady = statusReady && status.repos.some((item) => item.id === selectedRepoId);
   const selectedAutomation = useMemo(
     () =>
       status.automations.find((item) => item.id === selectedAutomationId && item.repoId === selectedRepoId) ||
@@ -3305,6 +3306,11 @@ export function App() {
     selectedRepoIdRef.current = repoId;
     setSelectedRepoId(repoId);
   }, []);
+
+  useEffect(() => {
+    if (!statusReady || status.repos.length === 0 || status.repos.some((repo) => repo.id === selectedRepoId)) return;
+    switchRepoConversation(status.repos[0].id);
+  }, [selectedRepoId, status.repos, statusReady, switchRepoConversation]);
 
   const selectRepo = useCallback(
     (repoId: string) => {
@@ -3646,10 +3652,11 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!repoSelectionReady) return;
     loadCodexAppStatus();
     const interval = window.setInterval(loadCodexAppStatus, 90_000);
     return () => window.clearInterval(interval);
-  }, [loadCodexAppStatus, selectedRepoId]);
+  }, [loadCodexAppStatus, repoSelectionReady, selectedRepoId]);
 
   useEffect(() => {
     if (!codexAppStatus.accountLogin?.active) return;
@@ -3931,6 +3938,7 @@ export function App() {
   );
 
   useEffect(() => {
+    if (!repoSelectionReady) return;
     const routedSessionId = pendingRouteSession?.repoId === selectedRepoId ? pendingRouteSession.sessionId : "";
     if (!routedSessionId && activeSessionIdRef.current) return;
     void loadChatHistory(selectedRepoId, routedSessionId || undefined).finally(() => {
@@ -3939,7 +3947,7 @@ export function App() {
         setPendingRouteSession(null);
       }
     });
-  }, [loadChatHistory, pendingRouteSession, selectedRepoId]);
+  }, [loadChatHistory, pendingRouteSession, repoSelectionReady, selectedRepoId]);
 
   const saveComposerDraft = useCallback(
     async (repoId: string, sessionId: string, input: string, attachments: UploadedAttachment[]) => {
@@ -5815,6 +5823,7 @@ export function App() {
             <SettingsView
               status={status}
               repo={selectedRepo}
+              repoSelectionReady={repoSelectionReady}
               appStatus={codexAppStatus}
               appStatusLoading={codexAppStatusLoading}
               onRefresh={() => {
@@ -10015,6 +10024,7 @@ function LogsView({
 function SettingsView({
   status,
   repo,
+  repoSelectionReady,
   appStatus,
   appStatusLoading,
   onRefresh,
@@ -10042,6 +10052,7 @@ function SettingsView({
 }: {
   status: ConsoleStatus;
   repo: Repo;
+  repoSelectionReady: boolean;
   appStatus: CodexAppStatus;
   appStatusLoading: boolean;
   onRefresh: () => void;
@@ -10288,9 +10299,13 @@ function SettingsView({
                   ))}
         </div>
       </div>
-      <Suspense fallback={<div className="settings-copy"><span className="empty-copy">正在载入插件目录...</span></div>}>
-        <LazyCodexPluginManager repoId={repo.id} onChanged={onRefresh} />
-      </Suspense>
+      {repoSelectionReady ? (
+        <Suspense fallback={<div className="settings-copy"><span className="empty-copy">正在载入插件目录...</span></div>}>
+          <LazyCodexPluginManager repoId={repo.id} onChanged={onRefresh} />
+        </Suspense>
+      ) : (
+        <div className="settings-copy"><span className="empty-copy">正在读取项目配置...</span></div>
+      )}
       <div className="settings-copy">
         <div className="settings-section-head">
           <strong>云端实时事件</strong>
