@@ -191,6 +191,7 @@ input.on("line", (line) => {
   }
   if (message.method === "turn/start") {
     const progressRegression = JSON.stringify(message.params || {}).includes("progress regression");
+    const recoveryRegression = JSON.stringify(message.params || {}).includes("继续上一轮因服务重启中断的自动化任务");
     send({ id: message.id, result: { turn: { id: "turn-regression" } } });
     if (progressRegression) {
       for (const delay of [150, 300, 450]) {
@@ -205,6 +206,12 @@ input.on("line", (line) => {
         threadId: "thread-regression",
         turn: { id: "turn-regression", status: "completed" },
       } }, 650);
+    }
+    if (recoveryRegression) {
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId,
+        turn: { id: "turn-regression", status: "completed" },
+      } }, 80);
     }
     return;
   }
@@ -258,6 +265,231 @@ await check("app-server request timeout is an end-to-end budget", async () => {
     assert.ok(elapsed >= 550 && elapsed < 1_050, `request exceeded total budget: ${elapsed}ms`);
   } finally {
     await client.stop({ waitForExit: true });
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+await check("startup recovery continues one recent interrupted automation in the same session", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-automation-recovery-"));
+  const fakePath = await writeFakeCodex(tempRoot);
+  const binDir = path.join(tempRoot, "bin");
+  const cloudRoot = path.join(tempRoot, "cloud");
+  const workspaceRoot = path.join(cloudRoot, "workspace");
+  const repoRoot = path.join(workspaceRoot, "sample-app");
+  const stateRoot = path.join(tempRoot, "state");
+  const codexHome = path.join(tempRoot, ".codex");
+  const codexShim = path.join(binDir, "codex");
+  const capturePath = path.join(tempRoot, "app-server-requests.jsonl");
+  const port = await freePort();
+  const now = new Date();
+  const old = new Date(now.getTime() - 2 * 60 * 60_000).toISOString();
+  const recent = new Date(now.getTime() - 5_000).toISOString();
+  const recoveryKey = "recovery-key-0001";
+  const recoveryHash = crypto
+    .createHash("sha256")
+    .update(`sample-research:webhook:${recoveryKey}`)
+    .digest("hex");
+  const sessions = {
+    "sess-recovery": {
+      id: "sess-recovery",
+      repoId: "sample-app",
+      title: "Recovery regression",
+      createdAt: recent,
+      updatedAt: recent,
+      messages: [],
+      codexSessionId: "thread-recovery",
+      model: "gpt-5.6-terra",
+      reasoning: "high",
+    },
+    "sess-recovery-old": {
+      id: "sess-recovery-old",
+      repoId: "sample-app",
+      title: "Old recovery regression",
+      createdAt: old,
+      updatedAt: old,
+      messages: [],
+      codexSessionId: "thread-recovery-old",
+    },
+    "sess-recovery-attempted": {
+      id: "sess-recovery-attempted",
+      repoId: "sample-app",
+      title: "Bounded recovery regression",
+      createdAt: recent,
+      updatedAt: recent,
+      messages: [],
+      codexSessionId: "thread-recovery-attempted",
+    },
+  };
+  const sourceRuns = [
+    {
+      id: "run-recovery-source",
+      automationId: "sample-research",
+      repoId: "sample-app",
+      name: "Sample research queue",
+      trigger: "webhook",
+      triggerIdempotencyHash: recoveryHash,
+      runner: "app-server",
+      status: "running",
+      startedAt: recent,
+      updatedAt: recent,
+      finishedAt: null,
+      threadId: "thread-recovery",
+      sessionId: "sess-recovery",
+      worktreePolicy: "repo-cwd",
+      model: "gpt-5.6-terra",
+      reasoning: "high",
+      prompt: "original recovery regression prompt",
+      events: [],
+    },
+    {
+      id: "run-recovery-old",
+      automationId: "sample-hourly",
+      repoId: "sample-app",
+      name: "Sample hourly analysis",
+      trigger: "manual",
+      runner: "app-server",
+      status: "running",
+      startedAt: old,
+      updatedAt: old,
+      threadId: "thread-recovery-old",
+      sessionId: "sess-recovery-old",
+      worktreePolicy: "repo-cwd",
+      prompt: "old recovery regression prompt",
+      events: [],
+    },
+    {
+      id: "run-recovery-attempted",
+      automationId: "sample-maintenance",
+      repoId: "sample-app",
+      name: "Sample repository maintenance",
+      trigger: "manual",
+      runner: "app-server",
+      status: "running",
+      startedAt: recent,
+      updatedAt: recent,
+      threadId: "thread-recovery-attempted",
+      sessionId: "sess-recovery-attempted",
+      worktreePolicy: "existing-thread",
+      prompt: "bounded recovery regression prompt",
+      recoveryOfRunId: "run-recovery-root",
+      recoveryRootRunId: "run-recovery-root",
+      recoveryAttempt: 1,
+      events: [],
+    },
+  ];
+
+  await fs.mkdir(repoRoot, { recursive: true });
+  await fs.mkdir(stateRoot, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(codexShim, `#!/bin/sh\nexec "${process.execPath}" "${fakePath}"\n`, { mode: 0o755 });
+  await fs.writeFile(
+    path.join(stateRoot, "chat-history.json"),
+    JSON.stringify({ version: 2, activeByRepo: {}, sessions }),
+  );
+  await fs.writeFile(
+    path.join(stateRoot, "automation-runs.json"),
+    JSON.stringify({ version: 1, runs: sourceRuns }),
+  );
+
+  const childEnvironment = {
+    ...process.env,
+    NODE_ENV: "production",
+    HOST: "127.0.0.1",
+    PORT: String(port),
+    CODEX_CLOUD_ROOT: cloudRoot,
+    CODEX_WORKSPACE_ROOT: workspaceRoot,
+    CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: codexHome,
+    CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
+    CODEX_ALLOW_LOCAL_FALLBACK: "0",
+    CODEX_TURN_TIMEOUT_MS: "1000",
+    CODEX_AUTOMATION_RECOVERY_ENABLED: "1",
+    CODEX_AUTOMATION_RECOVERY_MAX_AGE_MS: "60000",
+    CODEX_AUTOMATION_RECOVERY_MAX_ATTEMPTS: "1",
+    CODEX_AUTOMATION_RECOVERY_STARTUP_DELAY_MS: "500",
+    FAKE_CAPTURE_PATH: capturePath,
+    PATH: `${binDir}:${process.env.PATH}`,
+  };
+  const startServer = () => spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
+    cwd: projectRoot,
+    env: childEnvironment,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let firstServer = startServer();
+  let secondServer = null;
+  try {
+    await waitForOutput(firstServer, /listening on/i);
+    const startupReplay = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/sample-research/webhook", {
+      method: "POST",
+      headers: {
+        "x-codex-cloud-token": "regression-token-123456",
+        "idempotency-key": recoveryKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ prompt: "startup retry must wait for recovery", worktree: false }),
+    });
+    assert.equal(startupReplay.response.status, 200);
+    assert.equal(startupReplay.data.deduplicated, true);
+    let storedRuns = [];
+    let recoveryRun = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      storedRuns = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
+      recoveryRun = storedRuns.find((run) => run.recoveryOfRunId === "run-recovery-source") || null;
+      if (recoveryRun?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(recoveryRun, "recent interrupted automation was not recovered");
+    assert.equal(recoveryRun.status, "completed");
+    assert.equal(recoveryRun.sessionId, "sess-recovery");
+    assert.equal(recoveryRun.threadId, "thread-recovery");
+    assert.equal(recoveryRun.worktreePolicy, "existing-thread");
+    assert.equal(recoveryRun.trigger, "webhook");
+    assert.equal(recoveryRun.triggerIdempotencyHash, recoveryHash);
+    assert.equal(recoveryRun.recoveryRootRunId, "run-recovery-source");
+    assert.equal(recoveryRun.recoveryAttempt, 1);
+    assert.equal(startupReplay.data.run?.id, recoveryRun.id);
+    const recoveredSource = storedRuns.find((run) => run.id === "run-recovery-source");
+    assert.equal(recoveredSource.status, "interrupted");
+    assert.equal(recoveredSource.interruptionKind, "console-restart");
+    assert.equal(recoveredSource.recoveryRunId, recoveryRun.id);
+    assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-old"), false);
+    assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-attempted"), false);
+
+    const captured = (await fs.readFile(capturePath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.ok(captured.some((request) => request.method === "thread/resume" && request.params?.threadId === "thread-recovery"));
+    assert.equal(captured.some((request) => request.method === "thread/start"), false);
+    assert.ok(captured.some((request) =>
+      request.method === "turn/start" && JSON.stringify(request.params || {}).includes("不要重复已经完成的写入")
+    ));
+
+    const replay = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/sample-research/webhook", {
+      method: "POST",
+      headers: {
+        "x-codex-cloud-token": "regression-token-123456",
+        "idempotency-key": recoveryKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ prompt: "explicit retry should deduplicate", worktree: false }),
+    });
+    assert.equal(replay.response.status, 200);
+    assert.equal(replay.data.deduplicated, true);
+    assert.equal(replay.data.run?.id, recoveryRun.id);
+
+    await stopProcess(firstServer);
+    firstServer = null;
+    secondServer = startServer();
+    await waitForOutput(secondServer, /listening on/i);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const afterSecondRestart = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
+    assert.equal(afterSecondRestart.filter((run) => run.recoveryOfRunId === "run-recovery-source").length, 1);
+    assert.equal(afterSecondRestart.filter((run) => run.recoveryRootRunId === "run-recovery-source").length, 1);
+  } finally {
+    await stopProcess(firstServer);
+    await stopProcess(secondServer);
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });

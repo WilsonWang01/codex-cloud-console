@@ -117,6 +117,10 @@ Important server-side variables include:
 | `CODEX_ENABLE_LOCAL_REVIEW_READ` | Opt-in local review reads |
 | `CODEX_ENABLE_LOCAL_REVIEW_MUTATION` | Opt-in local review mutations |
 | `CODEX_PLUGIN_CATALOG_CACHE_TTL_MS` | Plugin catalog cache lifetime; defaults to five minutes |
+| `CODEX_AUTOMATION_RECOVERY_ENABLED` | Continue eligible interrupted app-server runs after restart; defaults to enabled |
+| `CODEX_AUTOMATION_RECOVERY_MAX_AGE_MS` | Only recover runs active within this window; defaults to 30 minutes |
+| `CODEX_AUTOMATION_RECOVERY_MAX_ATTEMPTS` | Bounded automatic continuation attempts per lineage; defaults to one |
+| `CODEX_AUTOMATION_RECOVERY_STARTUP_DELAY_MS` | Startup grace period before recovery; trigger requests wait behind this gate; defaults to one second |
 
 The checked-in values are documentation placeholders. Never commit a populated
 environment file.

@@ -86,6 +86,19 @@ const codexTurnIdleTimeoutMs = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS || 
 const codexTurnMaxRuntimeMs = Number(process.env.CODEX_TURN_MAX_RUNTIME_MS || 60 * 60_000);
 const codexCompactTimeoutMs = Number(process.env.CODEX_COMPACT_TIMEOUT_MS || 900_000);
 const automationAttentionMaxAgeHours = Number(process.env.CODEX_AUTOMATION_ATTENTION_MAX_AGE_HOURS || 72);
+const automationRecoveryEnabled = process.env.CODEX_AUTOMATION_RECOVERY_ENABLED !== "0";
+const configuredAutomationRecoveryMaxAgeMs = Number(process.env.CODEX_AUTOMATION_RECOVERY_MAX_AGE_MS || 30 * 60_000);
+const automationRecoveryMaxAgeMs = Number.isFinite(configuredAutomationRecoveryMaxAgeMs)
+  ? Math.min(Math.max(configuredAutomationRecoveryMaxAgeMs, 60_000), 24 * 60 * 60_000)
+  : 30 * 60_000;
+const configuredAutomationRecoveryMaxAttempts = Number(process.env.CODEX_AUTOMATION_RECOVERY_MAX_ATTEMPTS || 1);
+const automationRecoveryMaxAttempts = Number.isFinite(configuredAutomationRecoveryMaxAttempts)
+  ? Math.min(Math.max(Math.floor(configuredAutomationRecoveryMaxAttempts), 0), 3)
+  : 1;
+const configuredAutomationRecoveryStartupDelayMs = Number(process.env.CODEX_AUTOMATION_RECOVERY_STARTUP_DELAY_MS || 1_000);
+const automationRecoveryStartupDelayMs = Number.isFinite(configuredAutomationRecoveryStartupDelayMs)
+  ? Math.min(Math.max(configuredAutomationRecoveryStartupDelayMs, 0), 30_000)
+  : 1_000;
 const allowLocalFallback = process.env.CODEX_ALLOW_LOCAL_FALLBACK === "1";
 const enableCliDebug = process.env.CODEX_ENABLE_CLI_DEBUG === "1";
 const enableLocalReviewRead = process.env.CODEX_ENABLE_LOCAL_REVIEW_READ === "1";
@@ -124,6 +137,8 @@ let attentionStateWriteQueue = Promise.resolve();
 let notificationStateWriteQueue = Promise.resolve();
 let diagnosticsStateWriteQueue = Promise.resolve();
 let notificationCheckRunning = false;
+let startupAutomationRecoveryPromise = null;
+let startupAutomationRecoveryScheduled = false;
 let statusCache = null;
 let statusRefreshPromise = null;
 let modelListCache = null;
@@ -2687,6 +2702,9 @@ async function resolveThreadForJob(job) {
       rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
       return job.threadId;
     } catch (error) {
+      if (job.requireExistingThread) {
+        throw new Error(`原 app-server thread 无法恢复：${error.message || error}`);
+      }
       emitJobEvent(job, "status", { text: "旧 session 无法恢复，正在创建新的 app-server thread..." });
     }
   }
@@ -2707,6 +2725,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
 
   const job = createServerJob("turn", repo, session, runtime);
   job.makeSessionActive = options.makeSessionActive !== false;
+  job.requireExistingThread = options.requireExistingThread === true;
   job.message = message;
   job.storedMessage = storedMessage;
   activeTurns.set(key, job);
@@ -4505,6 +4524,14 @@ function normalizeAutomationRun(run = {}) {
     name: String(run.name || run.automationId || "Automation run"),
     trigger: String(run.trigger || "manual"),
     triggerIdempotencyHash: run.triggerIdempotencyHash ? String(run.triggerIdempotencyHash) : null,
+    interruptionKind: run.interruptionKind ? String(run.interruptionKind) : null,
+    interruptedAt: run.interruptedAt ? String(run.interruptedAt) : null,
+    interruptedLastActiveAt: run.interruptedLastActiveAt ? String(run.interruptedLastActiveAt) : null,
+    recoveryOfRunId: run.recoveryOfRunId ? String(run.recoveryOfRunId) : null,
+    recoveryRootRunId: run.recoveryRootRunId ? String(run.recoveryRootRunId) : null,
+    recoveryAttempt: Math.max(0, Math.floor(Number(run.recoveryAttempt || 0))),
+    recoveryRunId: run.recoveryRunId ? String(run.recoveryRunId) : null,
+    recoverySkippedReason: run.recoverySkippedReason ? String(run.recoverySkippedReason).slice(0, 320) : null,
     runner: String(run.runner || "systemd"),
     status: String(run.status || "queued"),
     startedAt,
@@ -4592,19 +4619,23 @@ async function appendAutomationRunEvent(runId, patch = {}, event = null) {
   return next;
 }
 
-async function reconcileStaleAutomationRuns(reason = "Console restarted while app-server automation was running") {
+async function reconcileStaleAutomationRuns(reason = "控制台重启时 app-server 自动化任务仍在运行") {
   const store = await readAutomationRuns();
   const staleRuns = store.runs.filter(
     (run) => run.runner === "app-server" && ["queued", "running"].includes(run.status) && !activeAutomationRuns.has(run.id),
   );
   for (const runRecord of staleRuns) {
+    const interruptedAt = new Date().toISOString();
     await appendAutomationRunEvent(
       runRecord.id,
       {
         status: "interrupted",
-        finishedAt: new Date().toISOString(),
+        finishedAt: interruptedAt,
         error: null,
         summary: reason,
+        interruptionKind: "console-restart",
+        interruptedAt,
+        interruptedLastActiveAt: runRecord.updatedAt || runRecord.startedAt,
       },
       { type: "interrupted", text: reason },
     );
@@ -4613,11 +4644,11 @@ async function reconcileStaleAutomationRuns(reason = "Console restarted while ap
     appendAuditEvent({
       source: "automation",
       type: "automation-reconcile",
-      summary: `Marked ${staleRuns.length} stale app-server automation run(s) as interrupted`,
+      summary: `已将 ${staleRuns.length} 个遗留 app-server 自动化任务标记为中断`,
       detail: jsonDetail({ runIds: staleRuns.map((runRecord) => runRecord.id), reason }),
     }).catch(() => null);
   }
-  return staleRuns.length;
+  return staleRuns;
 }
 
 async function createAutomationWorktree(repo, runId) {
@@ -6052,6 +6083,9 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     name: automation.name,
     trigger: options.trigger || "manual",
     triggerIdempotencyHash: options.triggerIdempotencyHash || null,
+    recoveryOfRunId: options.recoveryOfRunId || null,
+    recoveryRootRunId: options.recoveryRootRunId || null,
+    recoveryAttempt: options.recoveryAttempt || 0,
     runner: "app-server",
     status: "queued",
     worktreePolicy: heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd",
@@ -6075,7 +6109,10 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     }
     const runRepo = { ...repo, path: worktreePath || repo.path };
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
-    const job = await startTurnJob(runRepo, session, runtime, prompt, [], prompt, { makeSessionActive: false });
+    const job = await startTurnJob(runRepo, session, runtime, prompt, [], prompt, {
+      makeSessionActive: false,
+      requireExistingThread: options.requireExistingThread === true,
+    });
     activeAutomationRuns.set(runId, job);
     await appendAutomationRunEvent(runId, { threadId: job.threadId, sessionId: session.id, status: "running" }, { type: "thread", text: "Started Codex app-server automation thread" });
     job.emitter.on("event", (payload) => {
@@ -6113,6 +6150,167 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     );
     throw error;
   }
+}
+
+function automationRecoveryContinuationPrompt() {
+  return [
+    "继续上一轮因服务重启中断的自动化任务。",
+    "使用当前会话已有上下文，从中断点继续，并先检查现有输出与仓库状态。",
+    "不要重复已经完成的写入、回调、支付、发布或其他有外部副作用的操作。",
+    "仅完成原任务尚未完成的部分，并按原任务要求交付最终结果。",
+  ].join("\n");
+}
+
+function automationRunRecoveryAgeMs(run, now = Date.now()) {
+  const timestamp = Date.parse(run.interruptedLastActiveAt || run.updatedAt || run.startedAt || "");
+  return Number.isFinite(timestamp) ? Math.max(0, now - timestamp) : Infinity;
+}
+
+function latestAutomationRunForSession(runs, run) {
+  return runs
+    .filter((item) => item.runner === "app-server" && item.repoId === run.repoId && item.sessionId === run.sessionId)
+    .sort((a, b) => {
+      const timeDifference = Date.parse(b.startedAt || "") - Date.parse(a.startedAt || "");
+      return Number.isFinite(timeDifference) && timeDifference !== 0 ? timeDifference : String(b.id).localeCompare(String(a.id));
+    })[0] || null;
+}
+
+async function markAutomationRecoverySkipped(run, reason) {
+  if (run.recoverySkippedReason === reason) return;
+  await appendAutomationRunEvent(
+    run.id,
+    { recoverySkippedReason: reason },
+    { type: "recovery-skipped", text: reason },
+  );
+}
+
+async function recoverInterruptedAutomationRuns() {
+  if (!automationRecoveryEnabled || automationRecoveryMaxAttempts <= 0) return { recovered: 0, skipped: 0 };
+  const [runStore, chatStore] = await Promise.all([readAutomationRuns(), readChatStore()]);
+  const runs = runStore.runs;
+  const candidates = runs
+    .filter((run) =>
+      run.runner === "app-server" &&
+      run.status === "interrupted" &&
+      run.interruptionKind === "console-restart" &&
+      !run.recoverySkippedReason &&
+      Number(run.recoveryAttempt || 0) < automationRecoveryMaxAttempts &&
+      automationRunRecoveryAgeMs(run) <= automationRecoveryMaxAgeMs
+    )
+    .sort((a, b) => Date.parse(b.startedAt || "") - Date.parse(a.startedAt || ""));
+  let recovered = 0;
+  let skipped = 0;
+
+  for (const runRecord of candidates) {
+    const idempotentReplacement = runRecord.triggerIdempotencyHash
+      ? runs.find((run) =>
+          run.id !== runRecord.id &&
+          run.automationId === runRecord.automationId &&
+          run.trigger === runRecord.trigger &&
+          run.triggerIdempotencyHash === runRecord.triggerIdempotencyHash &&
+          automationRunCanSatisfyIdempotentReplay(run) &&
+          Date.parse(run.startedAt || "") >= Date.now() - automationTriggerIdempotencyTtlMs
+        )
+      : null;
+    if (idempotentReplacement) {
+      await appendAutomationRunEvent(
+        runRecord.id,
+        { recoveryRunId: idempotentReplacement.id },
+        { type: "recovery-deduplicated", text: `同一幂等请求已由 ${idempotentReplacement.id} 接收，不再重复续跑` },
+      );
+      continue;
+    }
+    const hasRecoveryRun = runs.some((run) => run.recoveryOfRunId === runRecord.id || run.id === runRecord.recoveryRunId);
+    if (hasRecoveryRun) continue;
+    if (latestAutomationRunForSession(runs, runRecord)?.id !== runRecord.id) continue;
+    if ([...activeAutomationRuns.values()].some((job) => job.repoId === runRecord.repoId && job.sessionId === runRecord.sessionId)) continue;
+
+    const automation = automations.find((item) => item.id === runRecord.automationId && item.repoId === runRecord.repoId);
+    const repo = repos.find((item) => item.id === runRecord.repoId);
+    const session = runRecord.sessionId ? chatStore.sessions[runRecord.sessionId] : null;
+    const invalidReason = !automation
+      ? "自动续跑已跳过：原自动化配置不存在。"
+      : !repo
+        ? "自动续跑已跳过：原项目配置不存在。"
+        : !session || session.repoId !== runRecord.repoId
+          ? "自动续跑已跳过：原会话不存在或不属于该项目。"
+          : !session.codexSessionId
+            ? "自动续跑已跳过：原会话没有可恢复的 app-server thread。"
+            : runRecord.threadId && runRecord.threadId !== session.codexSessionId
+              ? "自动续跑已跳过：运行记录与原会话 thread 不一致。"
+              : "";
+    if (invalidReason) {
+      skipped += 1;
+      await markAutomationRecoverySkipped(runRecord, invalidReason);
+      continue;
+    }
+
+    const recoveryAttempt = Number(runRecord.recoveryAttempt || 0) + 1;
+    try {
+      const recoveryRun = await startAppServerAutomationRun(automation, repo, {
+        trigger: runRecord.trigger,
+        triggerIdempotencyHash: runRecord.triggerIdempotencyHash,
+        sessionId: session.id,
+        worktree: false,
+        requireExistingThread: true,
+        model: runRecord.model,
+        reasoning: runRecord.reasoning,
+        prompt: automationRecoveryContinuationPrompt(),
+        recoveryOfRunId: runRecord.id,
+        recoveryRootRunId: runRecord.recoveryRootRunId || runRecord.id,
+        recoveryAttempt,
+      });
+      recovered += 1;
+      await appendAutomationRunEvent(
+        runRecord.id,
+        { recoveryRunId: recoveryRun.id },
+        { type: "recovery", text: `已由 ${recoveryRun.id} 在原会话 ${session.id} 中续跑` },
+      );
+      appendAuditEvent({
+        source: "automation",
+        type: "automation-recovery",
+        repoId: repo.id,
+        sessionId: session.id,
+        threadId: session.codexSessionId,
+        summary: `已续跑中断的自动化任务 ${runRecord.id}`,
+        detail: jsonDetail({ sourceRunId: runRecord.id, recoveryRunId: recoveryRun.id, recoveryAttempt }),
+      }).catch(() => null);
+    } catch (error) {
+      skipped += 1;
+      appendAuditEvent({
+        source: "automation",
+        type: "automation-recovery-failed",
+        repoId: runRecord.repoId,
+        sessionId: runRecord.sessionId,
+        threadId: runRecord.threadId,
+        summary: `中断的自动化任务 ${runRecord.id} 续跑失败`,
+        detail: jsonDetail({ sourceRunId: runRecord.id, error: sanitizeCloudPathText(error.message || String(error), 320) }),
+      }).catch(() => null);
+    }
+  }
+
+  return { recovered, skipped };
+}
+
+function scheduleStartupAutomationRecovery() {
+  if (!automationRecoveryEnabled || automationRecoveryMaxAttempts <= 0 || startupAutomationRecoveryScheduled) {
+    return startupAutomationRecoveryPromise;
+  }
+  startupAutomationRecoveryScheduled = true;
+  startupAutomationRecoveryPromise = new Promise((resolve) => {
+    const timer = setTimeout(resolve, automationRecoveryStartupDelayMs);
+    timer.unref?.();
+  })
+    .then(() => recoverInterruptedAutomationRuns())
+    .then(({ recovered, skipped }) => {
+      if (recovered || skipped) console.log(`自动化续跑检查完成：${recovered} 个已续跑，${skipped} 个已跳过。`);
+      return { recovered, skipped };
+    })
+    .catch((error) => {
+      console.warn(`自动化续跑检查失败：${error.message}`);
+      return { recovered: 0, skipped: 0, error: error.message };
+    });
+  return startupAutomationRecoveryPromise;
 }
 
 async function getLogForAutomation(automation) {
@@ -9628,6 +9826,7 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
   const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger);
   if (idempotency.error) return res.status(400).json({ ok: false, error: idempotency.error });
+  if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
   const triggerIdempotencyHash = automationTriggerHash(idempotency.key);
   pruneAutomationTriggerIdempotency();
   const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
@@ -9720,6 +9919,7 @@ app.post("/api/automations/:id/run", async (req, res) => {
   const repo = getRepoById(automation.repoId);
   if (req.body?.runner === "app-server" || req.query?.runner === "app-server") {
     try {
+      if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
       const runRecord = await startAppServerAutomationRun(automation, repo, {
         trigger: "manual",
         prompt: req.body?.prompt,
@@ -9939,6 +10139,7 @@ function startExternalNotificationWatcher() {
 
 startExternalNotificationWatcher();
 
+scheduleStartupAutomationRecovery();
 server.listen(port, host, () => {
   console.log(`Codex Cloud Console listening on http://${host}:${port}`);
 });
