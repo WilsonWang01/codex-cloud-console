@@ -80,7 +80,8 @@ const threadStateCacheTtlMs = Number(process.env.CODEX_THREAD_STATE_CACHE_TTL_MS
 const threadStateFirstResponseMs = Number(process.env.CODEX_THREAD_STATE_FIRST_RESPONSE_MS || 5_000);
 const maxUploadBytes = Number(process.env.CODEX_MAX_UPLOAD_BYTES || 20 * 1024 * 1024);
 const maxUploadFiles = Number(process.env.CODEX_MAX_UPLOAD_FILES || 8);
-const codexTurnTimeoutMs = Number(process.env.CODEX_TURN_TIMEOUT_MS || 900_000);
+const codexTurnIdleTimeoutMs = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS || process.env.CODEX_TURN_TIMEOUT_MS || 900_000);
+const codexTurnMaxRuntimeMs = Number(process.env.CODEX_TURN_MAX_RUNTIME_MS || 60 * 60_000);
 const codexCompactTimeoutMs = Number(process.env.CODEX_COMPACT_TIMEOUT_MS || 900_000);
 const automationAttentionMaxAgeHours = Number(process.env.CODEX_AUTOMATION_ATTENTION_MAX_AGE_HOURS || 72);
 const allowLocalFallback = process.env.CODEX_ALLOW_LOCAL_FALLBACK === "1";
@@ -2381,6 +2382,7 @@ function appServerLiveSnapshot() {
 }
 
 function emitJobEvent(job, event, data = {}) {
+  touchTurnJobTimeout(job);
   const payload = eventPayload(event, semanticJobEventData(event, data));
   job.events.push(payload);
   if (job.events.length > 500) job.events.splice(0, job.events.length - 500);
@@ -2599,6 +2601,7 @@ function createServerJob(kind, repo, session, runtime) {
     code: null,
     error: null,
     timeoutTimer: null,
+    maxRuntimeTimer: null,
     events: [],
     emitter: new EventEmitter(),
     startedAt: new Date().toISOString(),
@@ -2612,20 +2615,38 @@ function createServerJob(kind, repo, session, runtime) {
   return job;
 }
 
-function armTurnJobTimeout(job) {
-  job.timeoutTimer = setTimeout(() => {
-    if (job.completed) return;
-    job.cancelRequested = true;
-    const interrupt = job.threadId && job.turnId
-      ? getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
-      : Promise.resolve();
-    interrupt.finally(() => {
-      finishTurnJob(job, false, 124, `Codex turn timed out after ${Math.round(codexTurnTimeoutMs / 1000)} seconds`).catch((error) => {
-        emitJobEvent(job, "error", { message: error.message || "Codex turn timeout cleanup failed" });
-      });
+function interruptTimedOutTurn(job, message) {
+  if (job.completed || job.finishing) return;
+  job.cancelRequested = true;
+  const interrupt = job.threadId && job.turnId
+    ? getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
+    : Promise.resolve();
+  interrupt.finally(() => {
+    finishTurnJob(job, false, 124, message).catch((error) => {
+      emitJobEvent(job, "error", { message: error.message || "Codex turn timeout cleanup failed" });
     });
-  }, codexTurnTimeoutMs);
+  });
+}
+
+function scheduleTurnIdleTimeout(job) {
+  if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
+  job.timeoutTimer = setTimeout(() => {
+    interruptTimedOutTurn(job, `Codex turn timed out after ${Math.max(1, Math.round(codexTurnIdleTimeoutMs / 1000))} seconds without activity`);
+  }, codexTurnIdleTimeoutMs);
   job.timeoutTimer.unref?.();
+}
+
+function touchTurnJobTimeout(job) {
+  if (job?.kind !== "turn" || job.completed || job.finishing || job.cancelRequested || !job.timeoutTimer) return;
+  scheduleTurnIdleTimeout(job);
+}
+
+function armTurnJobTimeout(job) {
+  scheduleTurnIdleTimeout(job);
+  job.maxRuntimeTimer = setTimeout(() => {
+    interruptTimedOutTurn(job, `Codex turn exceeded the ${Math.round(codexTurnMaxRuntimeMs / 1000)} second maximum runtime`);
+  }, codexTurnMaxRuntimeMs);
+  job.maxRuntimeTimer.unref?.();
 }
 
 async function resolveThreadForJob(job) {
@@ -2746,6 +2767,7 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   if (job.completed || job.finishing) return;
   job.finishing = true;
   if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
+  if (job.maxRuntimeTimer) clearTimeout(job.maxRuntimeTimer);
   job.ok = ok;
   job.code = code;
   job.error = error;
@@ -4353,6 +4375,12 @@ function automationRunId(automationId) {
   return `run-${automationId}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+function redactAutomationPrompt(value) {
+  return String(value || "")
+    .replace(/([?&]token=)[^'"\s&]+/gi, "$1<redacted>")
+    .replace(/((?:x-benxing-job-token|x-codex-cloud-token)\s*:\s*)[^'"\s]+/gi, "$1<redacted>");
+}
+
 function normalizeAutomationRun(run = {}) {
   const startedAt = run.startedAt ? String(run.startedAt) : new Date().toISOString();
   return {
@@ -4361,6 +4389,7 @@ function normalizeAutomationRun(run = {}) {
     repoId: String(run.repoId || ""),
     name: String(run.name || run.automationId || "Automation run"),
     trigger: String(run.trigger || "manual"),
+    triggerIdempotencyHash: run.triggerIdempotencyHash ? String(run.triggerIdempotencyHash) : null,
     runner: String(run.runner || "systemd"),
     status: String(run.status || "queued"),
     startedAt,
@@ -4372,7 +4401,7 @@ function normalizeAutomationRun(run = {}) {
     worktreePolicy: String(run.worktreePolicy || "none"),
     model: run.model ? String(run.model) : null,
     reasoning: run.reasoning ? String(run.reasoning) : null,
-    prompt: run.prompt ? String(run.prompt) : "",
+    prompt: redactAutomationPrompt(run.prompt),
     summary: run.summary ? String(run.summary).slice(0, 4000) : "",
     diffStat: run.diffStat ? String(run.diffStat).slice(0, 4000) : "",
     error: run.error ? String(run.error).slice(0, 2000) : null,
@@ -5861,9 +5890,14 @@ function pruneAutomationTriggerIdempotency(now = Date.now()) {
   }
 }
 
-function automationTriggerOptions(req, trigger) {
+function automationTriggerHash(key) {
+  return key ? crypto.createHash("sha256").update(key).digest("hex") : null;
+}
+
+function automationTriggerOptions(req, trigger, triggerIdempotencyHash = null) {
   return {
     trigger,
+    triggerIdempotencyHash,
     prompt: req.body?.prompt,
     sessionId: req.body?.sessionId,
     worktree: req.body?.worktree !== false,
@@ -5898,6 +5932,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     repoId: repo.id,
     name: automation.name,
     trigger: options.trigger || "manual",
+    triggerIdempotencyHash: options.triggerIdempotencyHash || null,
     runner: "app-server",
     status: "queued",
     worktreePolicy: heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd",
@@ -9403,6 +9438,7 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
   const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger);
   if (idempotency.error) return res.status(400).json({ ok: false, error: idempotency.error });
+  const triggerIdempotencyHash = automationTriggerHash(idempotency.key);
   pruneAutomationTriggerIdempotency();
   const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
   if (existing) {
@@ -9413,13 +9449,35 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
       automationTriggerIdempotency.delete(idempotency.key);
     }
   }
+  if (triggerIdempotencyHash) {
+    const cutoff = Date.now() - automationTriggerIdempotencyTtlMs;
+    const stored = (await readAutomationRuns()).runs.find((run) =>
+      run.automationId === automation.id &&
+      run.trigger === trigger &&
+      run.triggerIdempotencyHash === triggerIdempotencyHash &&
+      new Date(run.startedAt).getTime() >= cutoff
+    );
+    if (stored) {
+      const payload = { ok: true, run: stored, output: `${automation.name}: ${trigger} app-server run already accepted` };
+      automationTriggerIdempotency.set(idempotency.key, {
+        promise: Promise.resolve(payload),
+        payload,
+        expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
+      });
+      return res.json({ ...payload, deduplicated: true, recovered: true });
+    }
+  }
   const rate = consumeAutomationTriggerRate(req, automation.id);
   if (!rate.ok) {
     res.setHeader("Retry-After", String(Math.ceil(rate.retryAfterMs / 1000)));
     return res.status(429).json({ ok: false, error: "Automation trigger rate limit exceeded", retryAfterMs: rate.retryAfterMs });
   }
   const repo = getRepoById(automation.repoId);
-  const runPromise = startAppServerAutomationRun(automation, repo, automationTriggerOptions(req, trigger)).then((runRecord) => ({
+  const runPromise = startAppServerAutomationRun(
+    automation,
+    repo,
+    automationTriggerOptions(req, trigger, triggerIdempotencyHash),
+  ).then((runRecord) => ({
     ok: true,
     run: runRecord,
     output: `${automation.name}: ${trigger} app-server run started`,

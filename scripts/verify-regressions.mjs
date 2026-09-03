@@ -188,7 +188,25 @@ input.on("line", (line) => {
       },
     });
   }
-  if (message.method === "turn/start") return send({ id: message.id, result: { turn: { id: "turn-regression" } } });
+  if (message.method === "turn/start") {
+    const progressRegression = JSON.stringify(message.params || {}).includes("progress regression");
+    send({ id: message.id, result: { turn: { id: "turn-regression" } } });
+    if (progressRegression) {
+      for (const delay of [150, 300, 450]) {
+        send({ method: "item/mcpToolCall/progress", params: {
+          threadId: "thread-regression",
+          turnId: "turn-regression",
+          itemId: "progress-regression",
+          message: "progress regression activity",
+        } }, delay);
+      }
+      send({ method: "turn/completed", params: {
+        threadId: "thread-regression",
+        turn: { id: "turn-regression", status: "completed" },
+      } }, 650);
+    }
+    return;
+  }
   if (message.method === "slow") return send({ id: message.id, result: { ok: true, generation: process.pid } }, 900);
   return send({ id: message.id, result: { ok: true, method: message.method } });
 });
@@ -720,6 +738,33 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(rateLimitedTrigger.response.status, 429);
     assert.ok(Number(rateLimitedTrigger.response.headers.get("retry-after")) >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const progressTriggerKey = "regression-idempotency-progress";
+    const promptQueryToken = "progress-query-token-123456789";
+    const promptHeaderToken = "progress-header-token-123456789";
+    const progressTrigger = await jsonRequest(baseUrl, "/api/automations/sample-research/webhook", {
+      method: "POST",
+      headers: { ...triggerHeaders, "idempotency-key": progressTriggerKey },
+      body: JSON.stringify({
+        prompt: `progress regression https://example.com/input?token=${promptQueryToken} -H 'x-benxing-job-token: ${promptHeaderToken}'`,
+        worktree: false,
+      }),
+    });
+    assert.equal(progressTrigger.response.status, 200);
+    let progressRun = null;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const runs = await jsonRequest(baseUrl, "/api/automations/runs?automationId=sample-research");
+      progressRun = runs.data.runs.find((run) => run.id === progressTrigger.data.run.id) || null;
+      if (progressRun?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(progressRun?.status, "completed");
+    assert.ok(new Date(progressRun.finishedAt).getTime() - new Date(progressRun.startedAt).getTime() >= 600);
+    const persistedAutomationRuns = await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8");
+    assert.equal(persistedAutomationRuns.includes(progressTriggerKey), false);
+    assert.equal(persistedAutomationRuns.includes(promptQueryToken), false);
+    assert.equal(persistedAutomationRuns.includes(promptHeaderToken), false);
+    assert.match(persistedAutomationRuns, /"triggerIdempotencyHash"\s*:\s*"[a-f0-9]{64}"/);
     const unknownApi = await jsonRequest(baseUrl, "/api/not-a-route");
     assert.equal(unknownApi.response.status, 404);
     assert.equal(unknownApi.data.ok, false);
