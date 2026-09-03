@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -760,6 +761,36 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     }
     assert.equal(progressRun?.status, "completed");
     assert.ok(new Date(progressRun.finishedAt).getTime() - new Date(progressRun.startedAt).getTime() >= 600);
+
+    const interruptedKey = "regression-idempotency-interrupted";
+    const interruptedHash = crypto
+      .createHash("sha256")
+      .update(`sample-hourly:webhook:${interruptedKey}`)
+      .digest("hex");
+    const automationRunPath = path.join(stateRoot, "automation-runs.json");
+    const interruptedStore = JSON.parse(await fs.readFile(automationRunPath, "utf8"));
+    interruptedStore.runs.unshift({
+      ...progressRun,
+      id: "run-sample-research-interrupted-regression",
+      automationId: "sample-hourly",
+      status: "interrupted",
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      triggerIdempotencyHash: interruptedHash,
+    });
+    await fs.writeFile(automationRunPath, JSON.stringify(interruptedStore), "utf8");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const retriedInterruptedTrigger = await jsonRequest(baseUrl, "/api/automations/sample-hourly/webhook", {
+      method: "POST",
+      headers: { ...triggerHeaders, "idempotency-key": interruptedKey },
+      body: triggerBody,
+    });
+    assert.equal(retriedInterruptedTrigger.response.status, 200);
+    assert.equal(retriedInterruptedTrigger.data.ok, true);
+    assert.equal(retriedInterruptedTrigger.data.deduplicated, undefined);
+    assert.notEqual(retriedInterruptedTrigger.data.run?.id, "run-sample-research-interrupted-regression");
+
     const persistedAutomationRuns = await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8");
     assert.equal(persistedAutomationRuns.includes(progressTriggerKey), false);
     assert.equal(persistedAutomationRuns.includes(promptQueryToken), false);

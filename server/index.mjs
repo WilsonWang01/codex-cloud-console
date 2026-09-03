@@ -6009,6 +6009,10 @@ function automationTriggerHash(key) {
   return key ? crypto.createHash("sha256").update(key).digest("hex") : null;
 }
 
+function automationRunCanSatisfyIdempotentReplay(run) {
+  return ["queued", "running", "completed"].includes(String(run?.status || ""));
+}
+
 function automationTriggerOptions(req, trigger, triggerIdempotencyHash = null) {
   return {
     trigger,
@@ -9641,6 +9645,7 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
       run.automationId === automation.id &&
       run.trigger === trigger &&
       run.triggerIdempotencyHash === triggerIdempotencyHash &&
+      automationRunCanSatisfyIdempotentReplay(run) &&
       new Date(run.startedAt).getTime() >= cutoff
     );
     if (stored) {
