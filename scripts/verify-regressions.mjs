@@ -160,6 +160,10 @@ input.on("line", (line) => {
   if (message.method === "fs/readFile") {
     return send({ id: message.id, result: { dataBase64: fsSync.readFileSync(message.params.path).toString("base64") } });
   }
+  if (message.method === "fs/writeFile") {
+    fsSync.writeFileSync(message.params.path, Buffer.from(message.params.dataBase64, "base64"));
+    return send({ id: message.id, result: {} });
+  }
   if (message.method === "fuzzyFileSearch") {
     const root = message.params?.roots?.[0] || process.cwd();
     return send({
@@ -335,7 +339,7 @@ await check("automation completion contracts fail closed without changing legacy
     CODEX_HOME: codexHome,
     CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
     CODEX_ALLOW_LOCAL_FALLBACK: "0",
-    CODEX_TURN_TIMEOUT_MS: "1000",
+    CODEX_TURN_TIMEOUT_MS: "2500",
     CODEX_AUTOMATION_RECOVERY_ENABLED: "0",
     PATH: `${binDir}:${process.env.PATH}`,
   };
@@ -455,6 +459,8 @@ await check("startup recovery continues one recent interrupted automation in the
   const codexHome = path.join(tempRoot, ".codex");
   const codexShim = path.join(binDir, "codex");
   const capturePath = path.join(tempRoot, "app-server-requests.jsonl");
+  const originalWorktree = path.join(cloudRoot, "worktrees", "original-run");
+  await fs.mkdir(originalWorktree, { recursive: true });
   const port = await freePort();
   const now = new Date();
   const old = new Date(now.getTime() - 2 * 60 * 60_000).toISOString();
@@ -511,7 +517,8 @@ await check("startup recovery continues one recent interrupted automation in the
       finishedAt: null,
       threadId: "thread-recovery",
       sessionId: "sess-recovery",
-      worktreePolicy: "repo-cwd",
+      worktreePolicy: "detached-worktree",
+      worktreePath: originalWorktree,
       model: "gpt-5.6-terra",
       reasoning: "high",
       prompt: "original recovery regression prompt",
@@ -620,7 +627,8 @@ await check("startup recovery continues one recent interrupted automation in the
     assert.equal(recoveryRun.status, "completed");
     assert.equal(recoveryRun.sessionId, "sess-recovery");
     assert.equal(recoveryRun.threadId, "thread-recovery");
-    assert.equal(recoveryRun.worktreePolicy, "existing-thread");
+    assert.equal(recoveryRun.worktreePolicy, "detached-worktree");
+    assert.equal(recoveryRun.worktreePath, await fs.realpath(originalWorktree));
     assert.equal(recoveryRun.trigger, "webhook");
     assert.equal(recoveryRun.triggerIdempotencyHash, recoveryHash);
     assert.equal(recoveryRun.recoveryRootRunId, "run-recovery-source");
@@ -642,6 +650,9 @@ await check("startup recovery continues one recent interrupted automation in the
       .filter(Boolean)
       .map((line) => JSON.parse(line));
     assert.ok(captured.some((request) => request.method === "thread/resume" && request.params?.threadId === "thread-recovery"));
+    for (const request of captured.filter((item) => ["thread/resume", "turn/start"].includes(item.method))) {
+      assert.equal(request.params.cwd, await fs.realpath(originalWorktree));
+    }
     assert.equal(captured.some((request) => request.method === "thread/start"), false);
     assert.ok(captured.some((request) =>
       request.method === "turn/start" && JSON.stringify(request.params || {}).includes("不要重复已经完成的写入")
@@ -1105,6 +1116,34 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       }),
     });
     assert.equal(draft.response.status, 200);
+    assert.equal(draft.data.draft.revision, 1);
+    const staleDraft = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/draft`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", input: "stale", expectedRevision: 0 }),
+    });
+    assert.equal(staleDraft.response.status, 409);
+    const unchangedDraft = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/draft?repoId=sample-app`);
+    assert.equal(unchangedDraft.data.draft.input, "");
+    const editedDraft = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/draft`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", input: "latest", attachments: [], expectedRevision: 1 }),
+    });
+    assert.equal(editedDraft.response.status, 200);
+    const lateUpload = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/draft/attachments`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", attachments: draft.data.draft.attachments }),
+    });
+    assert.equal(lateUpload.response.status, 200);
+    assert.equal(lateUpload.data.draft.input, "latest");
+    assert.equal(lateUpload.data.draft.attachments.length, 1);
+    const readFile = await jsonRequest(baseUrl, `/api/files/read?repoId=sample-app&path=${encodeURIComponent(uploadRelative)}`);
+    await fs.writeFile(uploadAbsolute, "new agent content");
+    const staleFileWrite = await jsonRequest(baseUrl, "/api/files/write", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", path: uploadRelative, content: "stale browser content", expectedHash: readFile.data.contentHash }),
+    });
+    assert.equal(staleFileWrite.response.status, 409);
+    assert.equal(await fs.readFile(uploadAbsolute, "utf8"), "new agent content");
     const deleted = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}?repoId=sample-app`, { method: "DELETE" });
     assert.equal(deleted.response.status, 200);
     assert.equal(deleted.data.deletedSessionId, sessionId);
@@ -1129,11 +1168,14 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       "content-type": "application/json",
     };
     const triggerBody = JSON.stringify({ prompt: "regression automation", worktree: false });
-    const firstTrigger = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
+    const concurrentTriggers = await Promise.all(Array.from({ length: 6 }, () => jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
       method: "POST",
       headers: triggerHeaders,
       body: triggerBody,
-    });
+    })));
+    const firstTrigger = concurrentTriggers[0];
+    assert.ok(concurrentTriggers.every((item) => item.response.status === 200));
+    assert.equal(new Set(concurrentTriggers.map((item) => item.data.run.id)).size, 1);
     assert.equal(firstTrigger.response.status, 200);
     assert.equal(firstTrigger.data.ok, true);
     assert.ok(firstTrigger.data.run?.id);

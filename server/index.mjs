@@ -12,6 +12,10 @@ import { CodexAppServerClient } from "./codex-app-server-client.mjs";
 import { normalizeAppServerThreadMessages } from "./app-server-normalizers.mjs";
 import { pluginCatalogPage } from "./plugin-catalog.mjs";
 import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mjs";
+import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "./run-safety.mjs";
+
+const serializeAutomationTrigger = createKeyedQueue();
+const serializeFileWrite = createKeyedQueue();
 
 const app = express();
 app.set("trust proxy", "loopback");
@@ -534,6 +538,7 @@ function normalizeChatDraft(value = {}) {
   return {
     input,
     attachments,
+    revision: Math.max(0, Number(value?.revision) || 0),
     updatedAt: value?.updatedAt ? String(value.updatedAt) : null,
   };
 }
@@ -863,8 +868,11 @@ async function readChatStore() {
 async function mutateChatStore(mutator) {
   return enqueueWrite("chat", async () => {
     const store = await readChatStore();
+    const before = JSON.stringify(store);
     const result = await mutator(store);
-    await atomicWriteJson(chatHistoryPath, { version: 2, activeByRepo: store.activeByRepo, sessions: store.sessions });
+    if (JSON.stringify(store) !== before) {
+      await atomicWriteJson(chatHistoryPath, { version: 2, activeByRepo: store.activeByRepo, sessions: store.sessions });
+    }
     return result;
   });
 }
@@ -2702,10 +2710,7 @@ async function resolveThreadForJob(job) {
       rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
       return job.threadId;
     } catch (error) {
-      if (job.requireExistingThread) {
-        throw new Error(`原 app-server thread 无法恢复：${error.message || error}`);
-      }
-      emitJobEvent(job, "status", { text: "旧 session 无法恢复，正在创建新的 app-server thread..." });
+      throw new Error(`原 app-server thread 无法恢复，已保留原会话，请重试：${error.message || error}`);
     }
   }
   const started = await client.request("thread/start", appServerThreadParams(job.repo, job.runtime), 30_000);
@@ -4674,10 +4679,9 @@ function mergeAutomationRunEvents(...groups) {
 }
 
 async function writeAutomationRunsWithinQueue(store) {
-  const runs = (store.runs || [])
-    .map(normalizeAutomationRun)
-    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
-    .slice(0, 200);
+  const runs = retainAutomationRuns((store.runs || []).map(normalizeAutomationRun), {
+    now: Date.now(), idempotencyTtlMs: automationTriggerIdempotencyTtlMs, recoveryMaxAgeMs: automationRecoveryMaxAgeMs,
+  });
   await atomicWriteJson(automationRunsPath, { version: 1, runs });
 }
 
@@ -6220,7 +6224,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     completionOutcome: completionContract ? "pending" : null,
     runner: "app-server",
     status: "queued",
-    worktreePolicy: heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd",
+    worktreePolicy: options.executionPolicy || (heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd"),
     model: runtime.model,
     reasoning: runtime.reasoning,
     prompt,
@@ -6421,7 +6425,9 @@ async function recoverInterruptedAutomationRuns() {
 
     const recoveryAttempt = Number(runRecord.recoveryAttempt || 0) + 1;
     try {
-      const recoveryRun = await startAppServerAutomationRun(automation, repo, {
+      const executionRepo = await recoveryExecutionRepo(repo, runRecord, worktreesRoot);
+      const recoveryRun = await startAppServerAutomationRun(automation, executionRepo, {
+        executionPolicy: runRecord.worktreePolicy,
         trigger: runRecord.trigger,
         triggerIdempotencyHash: runRecord.triggerIdempotencyHash,
         sessionId: session.id,
@@ -7696,26 +7702,24 @@ async function listRepoFiles(repo, relativePath = ".") {
         return fileName && fileName === path.basename(fileName) && !fileName.includes("\\") && ![".git", "node_modules", "dist", ".next", "build"].includes(fileName);
       })
       .slice(0, 220);
-    const items = await Promise.all(
-      visible.map(async (entry) => {
-        const entryPath = path.join(target, entry.fileName);
-        try {
-          await assertRepoPathAccess(repo, entryPath);
-        } catch {
-          return null;
-        }
-        const metadata = await codexAppServerRequest("fs/getMetadata", { path: entryPath }, 8_000);
-        const modifiedAtMs = Number(metadata.result?.modifiedAtMs || 0);
-        return {
-          name: entry.fileName,
-          path: path.relative(repo.path, entryPath) || ".",
-          type: entry.isDirectory ? "directory" : "file",
-          size: Number(metadata.result?.size || metadata.result?.sizeBytes || 0),
-          updatedAt: modifiedAtMs > 0 ? new Date(modifiedAtMs).toISOString() : null,
-          source: "app-server",
-        };
-      }),
-    );
+    const items = await mapConcurrent(visible, 8, async (entry) => {
+      const entryPath = path.join(target, entry.fileName);
+      try {
+        await assertRepoPathAccess(repo, entryPath);
+      } catch {
+        return null;
+      }
+      const metadata = await codexAppServerRequest("fs/getMetadata", { path: entryPath }, 8_000);
+      const modifiedAtMs = Number(metadata.result?.modifiedAtMs || 0);
+      return {
+        name: entry.fileName,
+        path: path.relative(repo.path, entryPath) || ".",
+        type: entry.isDirectory ? "directory" : "file",
+        size: Number(metadata.result?.size || metadata.result?.sizeBytes || 0),
+        updatedAt: modifiedAtMs > 0 ? new Date(modifiedAtMs).toISOString() : null,
+        source: "app-server",
+      };
+    });
     const safeItems = items.filter(Boolean);
     return {
       path: path.relative(repo.path, target) || ".",
@@ -9111,7 +9115,26 @@ app.patch("/api/chat/sessions/:id/draft", async (req, res) => {
   const updated = await mutateChatStore((store) => {
     const session = findStoredSessionByHint(store, repo.id, req.params.id);
     if (!session) return null;
-    const next = normalizeSession({ ...session, draft, updatedAt: session.updatedAt || new Date().toISOString() }, repo.id);
+    const previous = normalizeChatDraft(session.draft);
+    if (req.body?.expectedRevision !== undefined && req.body.expectedRevision !== previous.revision) {
+      throw Object.assign(new Error("草稿已在其他页面修改，已保留当前输入，请重新载入后合并"), { statusCode: 409 });
+    }
+    if (JSON.stringify([previous.input, previous.attachments]) === JSON.stringify([draft.input, draft.attachments])) return session;
+    const next = normalizeSession({ ...session, draft: { ...draft, revision: previous.revision + 1 }, updatedAt: session.updatedAt || new Date().toISOString() }, repo.id);
+    store.sessions[next.id] = next;
+    return next;
+  });
+  if (!updated) return res.status(404).json({ ok: false, error: "Unknown session" });
+  res.json({ ok: true, repoId: repo.id, sessionId: updated.id, draft: updated.draft });
+});
+
+app.delete("/api/chat/sessions/:id/draft", async (req, res) => {
+  const repo = getRepoById(req.query?.repoId);
+  const updated = await mutateChatStore((store) => {
+    const session = findStoredSessionByHint(store, repo.id, req.params.id);
+    if (!session) return null;
+    const previous = normalizeChatDraft(session.draft);
+    const next = normalizeSession({ ...session, draft: { input: "", attachments: [], updatedAt: null, revision: previous.revision + 1 } }, repo.id);
     store.sessions[next.id] = next;
     return next;
   });
@@ -9120,18 +9143,27 @@ app.patch("/api/chat/sessions/:id/draft", async (req, res) => {
   res.json({ ok: true, repoId: repo.id, sessionId: updated.id, draft: updated.draft, sessions: summary.sessions });
 });
 
-app.delete("/api/chat/sessions/:id/draft", async (req, res) => {
-  const repo = getRepoById(req.query?.repoId);
+app.post("/api/chat/sessions/:id/draft/attachments", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId);
+  if (!Array.isArray(req.body?.attachments) || !req.body.attachments.length || req.body.attachments.length > maxUploadFiles) {
+    return res.status(400).json({ ok: false, error: "附件数量无效" });
+  }
+  const attachments = req.body.attachments.map((item) => normalizeAttachment(repo, item));
+  await Promise.all(attachments.map((item) => assertRepoPathAccess(repo, item.path)));
   const updated = await mutateChatStore((store) => {
     const session = findStoredSessionByHint(store, repo.id, req.params.id);
     if (!session) return null;
-    const next = normalizeSession({ ...session, draft: { input: "", attachments: [], updatedAt: null } }, repo.id);
-    store.sessions[next.id] = next;
-    return next;
+    const previous = normalizeChatDraft(session.draft);
+    const combined = [...previous.attachments];
+    for (const item of attachments) {
+      if (!combined.some((existing) => (existing.absolutePath || existing.path) === (item.absolutePath || item.path))) combined.push(item);
+    }
+    if (combined.length > maxUploadFiles) throw Object.assign(new Error("原会话附件已满，上传文件已保留，请先整理附件"), { statusCode: 409 });
+    session.draft = normalizeChatDraft({ ...previous, attachments: combined, revision: previous.revision + 1, updatedAt: new Date().toISOString() });
+    return session;
   });
-  if (!updated) return res.status(404).json({ ok: false, error: "Unknown session" });
-  const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true });
-  res.json({ ok: true, repoId: repo.id, sessionId: updated.id, draft: updated.draft, sessions: summary.sessions });
+  if (!updated) return res.status(404).json({ ok: false, error: "原会话已不存在，上传文件已保留" });
+  res.json({ ok: true, repoId: repo.id, sessionId: updated.id, draft: updated.draft });
 });
 
 app.delete("/api/chat/sessions/:id", async (req, res) => {
@@ -9590,6 +9622,7 @@ app.get("/api/files/read", async (req, res) => {
         size: buffer.length,
         updatedAt: metadata.result?.modifiedAtMs ? new Date(Number(metadata.result.modifiedAtMs)).toISOString() : new Date().toISOString(),
         content: buffer.toString("utf8"),
+        contentHash: crypto.createHash("sha256").update(buffer).digest("hex"),
         source: "app-server",
       });
     }
@@ -9605,7 +9638,8 @@ app.get("/api/files/read", async (req, res) => {
     const stat = await fs.stat(filePath);
     if (!stat.isFile()) return res.status(400).json({ ok: false, error: "Path is not a file" });
     if (stat.size > 512_000) return res.status(400).json({ ok: false, error: "File is larger than 512 KB" });
-    const content = await fs.readFile(filePath, "utf8");
+    const buffer = await fs.readFile(filePath);
+    const content = buffer.toString("utf8");
     res.json({
       ok: true,
       repoId: repo.id,
@@ -9613,6 +9647,7 @@ app.get("/api/files/read", async (req, res) => {
       size: stat.size,
       updatedAt: stat.mtime.toISOString(),
       content,
+      contentHash: crypto.createHash("sha256").update(buffer).digest("hex"),
       source: "local-fallback",
       fallbackError: readResponse.error,
     });
@@ -9709,35 +9744,49 @@ app.post("/api/files/write", async (req, res) => {
     const repo = getRepoById(req.body?.repoId);
     const filePath = await assertRepoPathAccess(repo, req.body?.path || ".", { allowMissing: true });
     const content = String(req.body?.content || "");
-    const writeResponse = await codexAppServerRequest(
-      "fs/writeFile",
-      { path: filePath, dataBase64: Buffer.from(content, "utf8").toString("base64") },
-      20_000,
-    );
-    if (writeResponse.ok) {
-      const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000);
-      return res.json({
-        ok: true,
-        repoId: repo.id,
-        path: path.relative(repo.path, filePath),
-        size: Buffer.byteLength(content),
-        updatedAt: metadata.result?.modifiedAtMs ? new Date(Number(metadata.result.modifiedAtMs)).toISOString() : new Date().toISOString(),
-        source: "app-server",
-      });
-    }
+    await serializeFileWrite(filePath, async () => {
+      if (req.body?.expectedHash !== undefined) {
+        const current = await codexAppServerRequest("fs/readFile", { path: filePath }, 20_000);
+        let buffer;
+        if (current.ok) buffer = Buffer.from(String(current.result?.dataBase64 || ""), "base64");
+        else if (allowLocalFallback) buffer = await fs.readFile(filePath);
+        else throw new Error("无法核验文件当前版本，请稍后重试");
+        if (crypto.createHash("sha256").update(buffer).digest("hex") !== req.body.expectedHash) {
+          return res.status(409).json({ ok: false, error: "文件已被其他任务修改，已保留编辑内容，请重新读取并合并" });
+        }
+      }
+      const contentHash = crypto.createHash("sha256").update(content).digest("hex");
+      const writeResponse = await codexAppServerRequest(
+        "fs/writeFile",
+        { path: filePath, dataBase64: Buffer.from(content, "utf8").toString("base64") },
+        20_000,
+      );
+      if (writeResponse.ok) {
+        const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000);
+        return res.json({
+          ok: true,
+          repoId: repo.id,
+          path: path.relative(repo.path, filePath),
+          size: Buffer.byteLength(content),
+          contentHash,
+          updatedAt: metadata.result?.modifiedAtMs ? new Date(Number(metadata.result.modifiedAtMs)).toISOString() : new Date().toISOString(),
+          source: "app-server",
+        });
+      }
 
-    if (!allowLocalFallback) {
-      return res.status(502).json({
-        ok: false,
-        error: writeResponse.error || "Codex app-server file write failed",
-        source: "app-server-unavailable",
-      });
-    }
+      if (!allowLocalFallback) {
+        return res.status(502).json({
+          ok: false,
+          error: writeResponse.error || "Codex app-server file write failed",
+          source: "app-server-unavailable",
+        });
+      }
 
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, content);
-    const stat = await fs.stat(filePath);
-    res.json({ ok: true, repoId: repo.id, path: path.relative(repo.path, filePath), size: stat.size, updatedAt: stat.mtime.toISOString(), source: "local-fallback", fallbackError: writeResponse.error });
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, content);
+      const stat = await fs.stat(filePath);
+      res.json({ ok: true, repoId: repo.id, path: path.relative(repo.path, filePath), size: stat.size, contentHash, updatedAt: stat.mtime.toISOString(), source: "local-fallback", fallbackError: writeResponse.error });
+    });
   } catch (error) {
     sendRouteError(res, error);
   }
@@ -9991,6 +10040,12 @@ app.get("/api/automations/inbox", async (_req, res) => {
 });
 
 async function handleAutomationTriggerRequest(req, res, trigger) {
+  const rawKey = String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim();
+  if (!rawKey) return processAutomationTriggerRequest(req, res, trigger);
+  return serializeAutomationTrigger(`${req.params.id}:${trigger}:${rawKey}`, () => processAutomationTriggerRequest(req, res, trigger));
+}
+
+async function processAutomationTriggerRequest(req, res, trigger) {
   if (!validateAutomationTrigger(req)) {
     return res.status(401).json({
       ok: false,

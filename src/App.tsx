@@ -1,3 +1,4 @@
+import { DraftPersistence } from "./draft-persistence";
 import {
   Activity,
   Bell,
@@ -584,6 +585,7 @@ type AgentFileRead = {
   size: number;
   updatedAt: string;
   content: string;
+  contentHash: string;
 };
 
 type ComposerTrigger = {
@@ -634,6 +636,7 @@ type ChatDraft = {
   input: string;
   attachments: UploadedAttachment[];
   updatedAt?: string | null;
+  revision?: number;
 };
 
 type ChatDraftResponse = {
@@ -993,7 +996,7 @@ async function api<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
   const data = await parseJsonResponse(response);
   if (!response.ok) {
-    throw new Error(apiErrorMessage(data, `HTTP ${response.status}`));
+    throw Object.assign(new Error(apiErrorMessage(data, `HTTP ${response.status}`)), { status: response.status });
   }
   if (data && typeof data === "object" && (data as { ok?: unknown }).ok === false) {
     throw new Error(apiErrorMessage(data, "API returned ok:false"));
@@ -1211,11 +1214,25 @@ function messageTimelineAttachments(message: ChatMessage, repo: Repo) {
   return attachments;
 }
 
-function hydrateChatDraft(repo: Repo, draft?: ChatDraft | null): ChatDraft {
+const composerDrafts = new DraftPersistence(
+  (repoId, sessionId) => api<ChatDraftResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/draft?repoId=${encodeURIComponent(repoId)}`),
+  (repoId, sessionId, draft, expectedRevision) => api<ChatDraftResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/draft`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repoId, ...draft, expectedRevision }),
+  }),
+  window.localStorage,
+);
+
+function hydrateChatDraft(repo: Repo, draft?: ChatDraft | null, sessionId = ""): ChatDraft {
+  if (sessionId) {
+    composerDrafts.seed(repo.id, sessionId, draft);
+    draft = (composerDrafts.recover(repo.id, sessionId) as ChatDraft | null) || draft;
+  }
   return {
     input: persistedDraftInput(draft?.input || ""),
     attachments: (draft?.attachments || []).map((attachment) => withAttachmentPreview(repo, attachment)),
     updatedAt: draft?.updatedAt || null,
+    revision: draft?.revision || 0,
   };
 }
 
@@ -3228,7 +3245,12 @@ export function App() {
   const runtimePersistSeq = useRef(0);
   const threadStateLoadSeq = useRef(0);
   const codexAppStatusLoadSeq = useRef(0);
-  const draftPersistSeq = useRef(0);
+  const fileReadSeq = useRef(0);
+  const [draftConflict, setDraftConflict] = useState<{ repoId: string; sessionId: string } | null>(null);
+  const [resolvingDraft, setResolvingDraft] = useState(false);
+  const uploadInFlight = useRef(false);
+  const editorRef = useRef({ file: selectedFile, draft: fileDraft });
+  editorRef.current = { file: selectedFile, draft: fileDraft };
   const hydratedDraftRef = useRef<{ key: string; snapshot: string } | null>(null);
   const chatRuntimeRef = useRef<ChatRuntime>(defaultChatRuntime);
   const statusRef = useRef<ConsoleStatus>(fallbackStatus);
@@ -3289,6 +3311,18 @@ export function App() {
 
   const switchRepoConversation = useCallback((repoId: string) => {
     if (selectedRepoIdRef.current !== repoId) {
+      const editor = editorRef.current;
+      if (editor.file && editor.draft !== editor.file.content) {
+        try {
+          window.localStorage.setItem(`codex-cloud-editor:${editor.file.repoId}:${editor.file.path}`, JSON.stringify({ content: editor.draft, contentHash: editor.file.contentHash }));
+        } catch {
+          pushEvent({ tone: "warn", title: "未切换项目", body: "本机无法保存未提交的编辑，请先保存文件" });
+          return;
+        }
+      }
+      fileReadSeq.current += 1;
+      setSelectedFile(null);
+      setFileDraft("");
       void flushComposerDraftRef.current();
       chatLoadSeq.current += 1;
       setChatSessions([]);
@@ -3305,7 +3339,7 @@ export function App() {
     }
     selectedRepoIdRef.current = repoId;
     setSelectedRepoId(repoId);
-  }, []);
+  }, [pushEvent]);
 
   useEffect(() => {
     if (!statusReady || status.repos.length === 0 || status.repos.some((repo) => repo.id === selectedRepoId)) return;
@@ -3911,7 +3945,7 @@ export function App() {
           statusRef.current.repos[0] ||
           fallbackStatus.repos[0];
         const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-        const draft = hydrateChatDraft(repo, activeSession?.draft || null);
+        const draft = hydrateChatDraft(repo, activeSession?.draft || null, nextActiveSessionId);
         hydratedDraftRef.current = {
           key: draftStorageKey(repoId, nextActiveSessionId),
           snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -3952,15 +3986,15 @@ export function App() {
   const saveComposerDraft = useCallback(
     async (repoId: string, sessionId: string, input: string, attachments: UploadedAttachment[]) => {
       if (!repoId || !sessionId) return null;
-      const result = await api<ChatDraftResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/draft`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId, ...draftPayload(input, attachments) }),
-      });
-      if (result.sessions && selectedRepoIdRef.current === repoId) setChatSessions(result.sessions);
-      return result;
+      try {
+        return await composerDrafts.save(repoId, sessionId, draftPayload(input, attachments));
+      } catch (error) {
+        if ((error as { status?: number })?.status === 409) setDraftConflict({ repoId, sessionId });
+        pushEvent({ tone: "warn", title: "草稿未同步", body: error instanceof Error ? error.message : "当前草稿已保留在本机" });
+        throw error;
+      }
     },
-    [],
+    [pushEvent],
   );
 
   const flushComposerDraft = useCallback(async () => {
@@ -3972,6 +4006,36 @@ export function App() {
 
   flushComposerDraftRef.current = flushComposerDraft;
 
+  const resolveDraftConflict = async (keepLocal: boolean) => {
+    if (!draftConflict || resolvingDraft) return;
+    if (draftConflict.repoId !== selectedRepoIdRef.current || draftConflict.sessionId !== activeSessionIdRef.current) return;
+    if (!window.confirm(keepLocal ? "确认用当前输入替换云端草稿？" : "确认载入云端草稿？当前输入会保留为本机冲突备份。")) return;
+    const { repoId, sessionId } = draftConflict;
+    const localInput = chatInputRef.current;
+    const localAttachments = chatAttachmentsRef.current;
+    setResolvingDraft(true);
+    try {
+      await composerDrafts.drain(repoId, sessionId).catch(() => null);
+      const remote = await api<ChatDraftResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/draft?repoId=${encodeURIComponent(repoId)}`);
+      composerDrafts.accept(repoId, sessionId, remote.draft);
+      if (keepLocal) {
+        await saveComposerDraft(repoId, sessionId, localInput, localAttachments);
+      } else {
+        window.localStorage.setItem(`${composerDrafts.key(repoId, sessionId)}:conflict-backup`, JSON.stringify(draftPayload(localInput, localAttachments)));
+        window.localStorage.removeItem(composerDrafts.key(repoId, sessionId));
+        if (selectedRepoIdRef.current === repoId && activeSessionIdRef.current === sessionId) {
+          const draft = hydrateChatDraft(selectedRepo, remote.draft, sessionId);
+          hydratedDraftRef.current = { key: draftStorageKey(repoId, sessionId), snapshot: draftSnapshot(draft.input, draft.attachments) };
+          setChatInput(draft.input);
+          setChatAttachments(draft.attachments);
+        }
+      }
+      setDraftConflict(null);
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "草稿冲突", body: error instanceof Error ? error.message : "请稍后重试" });
+    } finally { setResolvingDraft(false); }
+  };
+
   useEffect(() => {
     if (!activeSessionId || isLoadingChatHistory) return;
     const key = draftStorageKey(selectedRepoId, activeSessionId);
@@ -3980,13 +4044,9 @@ export function App() {
       hydratedDraftRef.current = null;
       return;
     }
-    const requestSeq = ++draftPersistSeq.current;
+    composerDrafts.remember(selectedRepoId, activeSessionId, draftPayload(chatInput, chatAttachments));
     const timer = window.setTimeout(() => {
-      saveComposerDraft(selectedRepoId, activeSessionId, chatInput, chatAttachments).catch(() => {
-        if (requestSeq === draftPersistSeq.current) {
-          // Best-effort UI metadata; the next successful edit will retry.
-        }
-      });
+      void saveComposerDraft(selectedRepoId, activeSessionId, chatInput, chatAttachments).catch(() => null);
     }, 450);
     return () => window.clearTimeout(timer);
   }, [activeSessionId, chatAttachments, chatInput, isLoadingChatHistory, saveComposerDraft, selectedRepoId]);
@@ -4251,7 +4311,7 @@ export function App() {
       const nextSessions = result.sessions || [];
       const nextActiveSessionId = result.activeSessionId || "";
       const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null);
+      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
       hydratedDraftRef.current = {
         key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
         snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -4281,7 +4341,7 @@ export function App() {
       const nextSessions = result.sessions || [];
       const nextActiveSessionId = result.activeSessionId || "";
       const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null);
+      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
       hydratedDraftRef.current = {
         key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
         snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -4309,7 +4369,7 @@ export function App() {
       const nextSessions = result.sessions || [];
       const nextActiveSessionId = result.activeSessionId || "";
       const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null);
+      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
       hydratedDraftRef.current = {
         key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
         snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -4344,7 +4404,7 @@ export function App() {
       const nextSessions = result.sessions || [];
       const nextActiveSessionId = result.activeSessionId || "";
       const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null);
+      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
       hydratedDraftRef.current = {
         key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
         snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -4375,7 +4435,7 @@ export function App() {
       const nextSessions = result.sessions || [];
       const nextActiveSessionId = result.activeSessionId || "";
       const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null);
+      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
       hydratedDraftRef.current = {
         key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
         snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -4433,7 +4493,7 @@ export function App() {
       const nextSessions = result.sessions || [];
       const nextActiveSessionId = result.activeSessionId || "";
       const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null);
+      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
       hydratedDraftRef.current = {
         key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
         snapshot: draftSnapshot(draft.input, draft.attachments),
@@ -4880,12 +4940,27 @@ export function App() {
       await loadFileTree(entry.path);
       return;
     }
+    const previousEditor = editorRef.current;
+    if (previousEditor.file && previousEditor.draft !== previousEditor.file.content) {
+      try {
+        window.localStorage.setItem(`codex-cloud-editor:${previousEditor.file.repoId}:${previousEditor.file.path}`, JSON.stringify({ content: previousEditor.draft, contentHash: previousEditor.file.contentHash }));
+      } catch {
+        pushEvent({ tone: "warn", title: "未切换文件", body: "本机无法保存未提交的编辑，请先保存文件" });
+        return;
+      }
+    }
     setBusyAction("file-read");
+    const requestSeq = ++fileReadSeq.current;
+    const repoId = selectedRepo.id;
     try {
       const params = new URLSearchParams({ repoId: selectedRepo.id, path: entry.path });
       const result = await api<AgentFileRead>(`/api/files/read?${params.toString()}`);
-      setSelectedFile(result);
-      setFileDraft(result.content);
+      if (fileReadSeq.current !== requestSeq || selectedRepoIdRef.current !== repoId) return;
+      let saved: { content: string; contentHash: string } | null = null;
+      try { saved = JSON.parse(window.localStorage.getItem(`codex-cloud-editor:${repoId}:${result.path}`) || "null"); } catch { /* Use server content when no valid local edit exists. */ }
+      if (saved && (typeof saved.content !== "string" || typeof saved.contentHash !== "string")) saved = null;
+      setSelectedFile(saved ? { ...result, contentHash: saved.contentHash } : result);
+      setFileDraft(saved?.content ?? result.content);
     } catch (error) {
       pushEvent({ tone: "warn", title: "文件读取", body: error instanceof Error ? error.message : "读取文件失败" });
     } finally {
@@ -4894,15 +4969,29 @@ export function App() {
   };
 
   const saveAgentFile = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || selectedFile.repoId !== selectedRepo.id) return;
+    if (!selectedFile.contentHash) {
+      pushEvent({ tone: "warn", title: "文件未保存", body: "文件版本未知，请重新读取后再保存" });
+      return;
+    }
+    const file = selectedFile;
+    const content = fileDraft;
+    const generation = fileReadSeq.current;
     setBusyAction("file-write");
     try {
       const result = await api<AgentFileRead>("/api/files/write", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId: selectedRepo.id, path: selectedFile.path, content: fileDraft }),
+        body: JSON.stringify({ repoId: file.repoId, path: file.path, content, expectedHash: file.contentHash }),
       });
-      setSelectedFile({ ...selectedFile, ...result, content: fileDraft });
+      const localKey = `codex-cloud-editor:${file.repoId}:${file.path}`;
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(localKey) || "null");
+        if (saved?.content === content) window.localStorage.removeItem(localKey);
+      } catch { /* Retain newer local edits. */ }
+      if (selectedRepoIdRef.current === file.repoId && editorRef.current.file?.path === file.path && generation === fileReadSeq.current) {
+        setSelectedFile({ ...file, ...result, content });
+      }
       pushEvent({ tone: "ok", title: "文件保存", body: `${result.path} 已写入云端工作区` });
       await refresh();
     } catch (error) {
@@ -4948,8 +5037,11 @@ export function App() {
   };
 
   const uploadChatFiles = async (files: FileList | File[]) => {
-    const selected = Array.from(files).slice(0, 8);
-    if (!selected.length || busyAction === "chat") return;
+    const selected = Array.from(files).slice(0, Math.max(0, 8 - chatAttachments.length));
+    if (!selected.length || busyAction === "chat" || uploadInFlight.current || !activeSessionId) return;
+    const uploadRepo = selectedRepo;
+    const uploadSessionId = activeSessionId;
+    uploadInFlight.current = true;
     setUploadingAttachments(true);
     try {
       const encoded = await Promise.all(
@@ -4968,16 +5060,30 @@ export function App() {
         ...file,
         previewUrl: file.kind === "image" ? encoded[index]?.dataUrl : attachmentBlobUrl(selectedRepo, file),
       }));
-      setChatAttachments((current) => [...current, ...filesWithPreview].slice(0, 8));
+      if (selectedRepoIdRef.current === uploadRepo.id && activeSessionIdRef.current === uploadSessionId) {
+        setChatAttachments((current) => [...current, ...filesWithPreview].slice(0, 8));
+      } else {
+        await composerDrafts.drain(uploadRepo.id, uploadSessionId).catch(() => null);
+        const saved = await api<ChatDraftResponse>(`/api/chat/sessions/${encodeURIComponent(uploadSessionId)}/draft/attachments`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repoId: uploadRepo.id, attachments: attachmentPayload(filesWithPreview) }),
+        });
+        composerDrafts.accept(uploadRepo.id, uploadSessionId, saved.draft);
+        if (selectedRepoIdRef.current === uploadRepo.id && activeSessionIdRef.current === uploadSessionId) {
+          setChatAttachments(saved.draft.attachments.map((item) => withAttachmentPreview(uploadRepo, item)));
+        }
+      }
       pushEvent({ tone: "ok", title: "附件已上传", body: `${selected.length} 个文件已保存到 ${selectedRepo.name}` });
     } catch (error) {
       pushEvent({ tone: "warn", title: "附件上传失败", body: error instanceof Error ? error.message : "无法上传附件" });
     } finally {
+      uploadInFlight.current = false;
       setUploadingAttachments(false);
     }
   };
 
   const sendChat = async (overrideMessage?: string, overrideAttachments?: UploadedAttachment[]) => {
+    if (uploadInFlight.current) return;
     const usingOverride = overrideMessage !== undefined || overrideAttachments !== undefined;
     const message = (overrideMessage ?? chatInput).trim();
     const attachments = overrideAttachments ?? chatAttachments;
@@ -4992,10 +5098,7 @@ export function App() {
       setChatMessages((current) => [...current, { id: `${Date.now()}-user-steer`, role: "user", text: message, time: new Date().toISOString() }]);
       try {
         if (!usingOverride) {
-          await api<ChatDraftResponse>(
-            `/api/chat/sessions/${encodeURIComponent(activeSessionId)}/draft?repoId=${encodeURIComponent(chatRepoId)}`,
-            { method: "DELETE" },
-          ).catch(() => null);
+          await saveComposerDraft(chatRepoId, activeSessionId, "", []).catch(() => null);
         }
         await api("/api/codex/turn-steer", {
           method: "POST",
@@ -5038,10 +5141,7 @@ export function App() {
         throw new Error(await responseFailureMessage(response, "云端 Codex 对话失败"));
       }
       if (!usingOverride) {
-        await api<ChatDraftResponse>(
-          `/api/chat/sessions/${encodeURIComponent(activeSessionId)}/draft?repoId=${encodeURIComponent(chatRepoId)}`,
-          { method: "DELETE" },
-        ).catch(() => null);
+        await saveComposerDraft(chatRepoId, activeSessionId, "", []).catch(() => null);
       }
 
       const reader = response.body.getReader();
@@ -5704,6 +5804,13 @@ export function App() {
 
         {activeView === "cli" && (
           <div className="content-grid session-content-grid">
+            {draftConflict?.repoId === selectedRepoId && draftConflict.sessionId === activeSessionId && (
+              <div className="draft-conflict" role="alert">
+                <span>草稿已在其他页面修改，当前输入已保留。</span>
+                <button type="button" className="mini-action" disabled={resolvingDraft} onClick={() => void resolveDraftConflict(true)}>保留当前输入</button>
+                <button type="button" className="mini-action" disabled={resolvingDraft} onClick={() => void resolveDraftConflict(false)}>载入云端草稿</button>
+              </div>
+            )}
             <CloudChat
               status={status}
               cloudConnection={cloudConnection}
