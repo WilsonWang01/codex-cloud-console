@@ -772,6 +772,18 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       version: 1,
       events: [
         {
+          id: "audit-regression-command-path",
+          time: new Date().toISOString(),
+          source: "app-server",
+          type: "shell",
+          summary: "Read project files",
+          detail: JSON.stringify({
+            type: "commandExecution",
+            command: `rg --files ${path.join(cloudRoot, "worktrees", "run-regression")}`,
+            exitCode: 0,
+          }),
+        },
+        {
           id: "audit-regression-interrupted-run",
           time: new Date().toISOString(),
           source: "console",
@@ -885,6 +897,10 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(serializedStatus.includes("/bin/bash -lc"), false);
     assert.equal(serializedStatus.includes("shell: codex doctor"), true);
     assert.equal(serializedStatus.includes("terminal: deploy cloud console release"), true);
+    const commandAudit = statusData.auditEvents.find((event) => event.id === "audit-regression-command-path");
+    assert.ok(commandAudit);
+    assert.equal(commandAudit.detail.includes(cloudRoot), false);
+    assert.equal(JSON.parse(commandAudit.detail).command, "rg --files 隔离工作区");
     assert.equal(statusData.automations.some((automation) => automation.model === "gpt-5.5"), false);
     assert.equal(statusData.automations.some((automation) => automation.id === "sample-research"), true);
     assert.equal(statusData.automations.some((automation) => automation.id === "sample-hourly"), true);

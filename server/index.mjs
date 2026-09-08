@@ -2033,7 +2033,7 @@ function sanitizeAuditValue(value, maxStringLength = 900, depth = 0) {
     if (value.type === "commandExecution" || value.command) {
       return {
         type: "commandExecution",
-        command: commandSummaryLabel(value.command || ""),
+        command: sanitizeCloudPathText(commandSummaryLabel(value.command || ""), 180),
         status: value.status ? String(value.status) : undefined,
         exitCode: typeof value.exitCode === "number" ? value.exitCode : undefined,
         cwd: value.cwd ? sanitizeCloudPathText(value.cwd, 180) : undefined,
