@@ -102,6 +102,63 @@ test("草稿串行写入版本递增，跨页面冲突保留本机文本", async
   assert.equal(writer.recover("r", "s").input, "keep locally");
 });
 
+test("重新载入草稿采用最新版本，但保留未同步输入的冲突基线", async () => {
+  const local = storage();
+  const revisions = [];
+  const writer = new DraftPersistence(async () => assert.fail("seeded"), async (_repo, _session, draft, revision) => {
+    revisions.push(revision);
+    return { draft: { ...draft, revision: revision + 1 } };
+  }, local);
+  writer.seed("r", "s", { input: "", attachments: [], revision: 1 });
+  writer.seed("r", "s", { input: "remote", attachments: [], revision: 7 });
+  await writer.save("r", "s", { input: "edited", attachments: [] });
+  assert.deepEqual(revisions, [7]);
+  writer.remember("r", "s", { input: "unsaved", attachments: [] });
+  writer.seed("r", "s", { input: "other edit", attachments: [], revision: 12 });
+  await writer.save("r", "s", { input: "unsaved", attachments: [] });
+  assert.deepEqual(revisions, [7, 8]);
+});
+
+test("首次写入先获取版本，进行中的写入不会被再次载入改变基线", async () => {
+  const gate = deferred();
+  const started = deferred();
+  const revisions = [];
+  const writer = new DraftPersistence(async () => ({ draft: { input: "", attachments: [], revision: 4 } }), async (_r, _s, draft, revision) => {
+    revisions.push(revision); started.resolve(); await gate.promise;
+    return { draft: { ...draft, revision: revision + 1 } };
+  }, storage());
+  const first = writer.save("r", "s", { input: "first", attachments: [] });
+  await started.promise;
+  writer.seed("r", "s", { input: "remote", attachments: [], revision: 20 });
+  const next = writer.save("r", "s", { input: "next", attachments: [] });
+  gate.resolve(); await Promise.all([first, next]);
+  assert.deepEqual(revisions, [4, 5]);
+});
+
+test("会话回写拒绝旧项目、旧请求及错误项目响应", () => {
+  const updates = [];
+  const context = {
+    useCallback: (fn) => fn,
+    chatLoadSeq: { current: 5 }, selectedRepoIdRef: { current: "B" },
+    hydratedDraftRef: { current: null },
+    composerDrafts: { recover: () => null },
+    hydrateChatDraft: (_repo, draft) => draft || { input: "", attachments: [] },
+    draftStorageKey: (repo, session) => `${repo}:${session}`, draftSnapshot: JSON.stringify,
+  };
+  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatInput", "setChatAttachments"]) {
+    context[name] = (value) => updates.push([name, value]);
+  }
+  vm.createContext(context);
+  vm.runInContext(ts.transpileModule(section(frontend, "  const applyChatHistory =", "  const loadChatHistory ="), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + "\nglobalThis.apply = applyChatHistory", context);
+  const result = { repoId: "B", activeSessionId: "b-1", sessions: [], messages: [] };
+  assert.equal(context.apply(result, { id: "A" }, 5), false);
+  assert.equal(context.apply(result, { id: "B" }, 4), false);
+  assert.equal(context.apply({ ...result, repoId: "A" }, { id: "B" }, 5), false);
+  assert.deepEqual(updates, []);
+  assert.equal(context.apply(result, { id: "B" }, 5), true);
+  assert.equal(updates.length, 5);
+});
+
 test("项目切换清空编辑器且旧文件不能写入新项目", async () => {
   const context = {
     selectedRepo: { id: "A" }, selectedRepoIdRef: { current: "A" },

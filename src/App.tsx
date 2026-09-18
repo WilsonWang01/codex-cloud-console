@@ -3249,6 +3249,7 @@ export function App() {
   const [draftConflict, setDraftConflict] = useState<{ repoId: string; sessionId: string } | null>(null);
   const [resolvingDraft, setResolvingDraft] = useState(false);
   const uploadInFlight = useRef(false);
+  const chatSubmissionInFlight = useRef<symbol | null>(null);
   const editorRef = useRef({ file: selectedFile, draft: fileDraft });
   editorRef.current = { file: selectedFile, draft: fileDraft };
   const hydratedDraftRef = useRef<{ key: string; snapshot: string } | null>(null);
@@ -3924,6 +3925,25 @@ export function App() {
     setCompactStatus(null);
   }, [activeSessionId]);
 
+  const applyChatHistory = useCallback((result: ChatHistoryResponse, repo: Repo, requestSeq: number) => {
+    if (requestSeq !== chatLoadSeq.current || selectedRepoIdRef.current !== repo.id || result.repoId !== repo.id) return false;
+    const nextSessions = result.sessions || [];
+    const nextActiveSessionId = result.activeSessionId || "";
+    const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
+    const hasLocalDraft = Boolean(composerDrafts.recover(repo.id, nextActiveSessionId));
+    const draft = hydrateChatDraft(repo, activeSession?.draft || null, nextActiveSessionId);
+    hydratedDraftRef.current = hasLocalDraft ? null : {
+      key: draftStorageKey(repo.id, nextActiveSessionId),
+      snapshot: draftSnapshot(draft.input, draft.attachments),
+    };
+    setChatSessions(nextSessions);
+    setActiveSessionId(nextActiveSessionId);
+    setChatMessages(result.messages || []);
+    setChatInput(draft.input);
+    setChatAttachments(draft.attachments);
+    return true;
+  }, []);
+
   const loadChatHistory = useCallback(
     async (repoId: string, sessionId?: string) => {
       if (selectedRepoIdRef.current !== repoId) return;
@@ -3937,24 +3957,12 @@ export function App() {
         if (result.degraded && !sessionId) {
           throw new Error(result.error || "云端会话暂时不可用；已保留当前消息，稍后将自动重试");
         }
-        const nextSessions = result.sessions || [];
-        const nextActiveSessionId = result.activeSessionId || "";
         const repo =
           statusRef.current.repos.find((item) => item.id === repoId) ||
           fallbackStatus.repos.find((item) => item.id === repoId) ||
           statusRef.current.repos[0] ||
           fallbackStatus.repos[0];
-        const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-        const draft = hydrateChatDraft(repo, activeSession?.draft || null, nextActiveSessionId);
-        hydratedDraftRef.current = {
-          key: draftStorageKey(repoId, nextActiveSessionId),
-          snapshot: draftSnapshot(draft.input, draft.attachments),
-        };
-        setChatSessions(nextSessions);
-        setActiveSessionId(nextActiveSessionId);
-        setChatMessages(result.messages || []);
-        setChatInput(draft.input);
-        setChatAttachments(draft.attachments);
+        if (!applyChatHistory(result, repo, requestSeq)) return;
         setChatHistoryError(result.degraded ? result.error || "当前仅显示本地草稿，云端会话暂时不可用" : "");
       } catch (error) {
         if (requestSeq !== chatLoadSeq.current) return;
@@ -3968,7 +3976,7 @@ export function App() {
         if (requestSeq === chatLoadSeq.current) setIsLoadingChatHistory(false);
       }
     },
-    [pushEvent],
+    [applyChatHistory, pushEvent],
   );
 
   useEffect(() => {
@@ -4017,12 +4025,17 @@ export function App() {
     try {
       await composerDrafts.drain(repoId, sessionId).catch(() => null);
       const remote = await api<ChatDraftResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/draft?repoId=${encodeURIComponent(repoId)}`);
-      composerDrafts.accept(repoId, sessionId, remote.draft);
+      if (selectedRepoIdRef.current !== repoId || activeSessionIdRef.current !== sessionId) return;
+      if (draftSnapshot(chatInputRef.current, chatAttachmentsRef.current) !== draftSnapshot(localInput, localAttachments)) {
+        throw new Error("处理期间输入已改变，已保留最新输入，请重新确认草稿冲突");
+      }
       if (keepLocal) {
+        composerDrafts.accept(repoId, sessionId, remote.draft);
         await saveComposerDraft(repoId, sessionId, localInput, localAttachments);
       } else {
         window.localStorage.setItem(`${composerDrafts.key(repoId, sessionId)}:conflict-backup`, JSON.stringify(draftPayload(localInput, localAttachments)));
         window.localStorage.removeItem(composerDrafts.key(repoId, sessionId));
+        composerDrafts.accept(repoId, sessionId, remote.draft);
         if (selectedRepoIdRef.current === repoId && activeSessionIdRef.current === sessionId) {
           const draft = hydrateChatDraft(selectedRepo, remote.draft, sessionId);
           hydratedDraftRef.current = { key: draftStorageKey(repoId, sessionId), snapshot: draftSnapshot(draft.input, draft.attachments) };
@@ -4298,29 +4311,18 @@ export function App() {
   }, [activeSessionId, attachToActiveJob, busyAction, selectedRepo.id]);
 
   const newChatSession = async () => {
-    if (busyAction === "chat") return;
+    if (busyAction || isLoadingChatHistory) return;
+    const requestSeq = ++chatLoadSeq.current;
     setBusyAction("new-session");
     try {
       await saveComposerDraft(selectedRepo.id, activeSessionId, chatInput, chatAttachments).catch(() => null);
-      setChatRuntime(defaultChatRuntime);
       const result = await api<ChatHistoryResponse>("/api/chat/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: selectedRepo.id, title: "新会话" }),
       });
-      const nextSessions = result.sessions || [];
-      const nextActiveSessionId = result.activeSessionId || "";
-      const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
-      hydratedDraftRef.current = {
-        key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
-        snapshot: draftSnapshot(draft.input, draft.attachments),
-      };
-      setChatSessions(nextSessions);
-      setActiveSessionId(nextActiveSessionId);
-      setChatMessages(result.messages || []);
-      setChatInput(draft.input);
-      setChatAttachments(draft.attachments);
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
+      setChatRuntime(defaultChatRuntime);
     } catch (error) {
       pushEvent({ tone: "warn", title: "新建会话", body: error instanceof Error ? error.message : "新建会话失败" });
     } finally {
@@ -4329,7 +4331,8 @@ export function App() {
   };
 
   const selectChatSession = async (sessionId: string) => {
-    if (!sessionId || sessionId === activeSessionId || busyAction === "chat") return;
+    if (!sessionId || sessionId === activeSessionId || busyAction || isLoadingChatHistory) return;
+    const requestSeq = ++chatLoadSeq.current;
     setBusyAction("select-session");
     try {
       await saveComposerDraft(selectedRepo.id, activeSessionId, chatInput, chatAttachments).catch(() => null);
@@ -4338,19 +4341,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: selectedRepo.id }),
       });
-      const nextSessions = result.sessions || [];
-      const nextActiveSessionId = result.activeSessionId || "";
-      const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
-      hydratedDraftRef.current = {
-        key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
-        snapshot: draftSnapshot(draft.input, draft.attachments),
-      };
-      setChatSessions(nextSessions);
-      setActiveSessionId(nextActiveSessionId);
-      setChatMessages(result.messages || []);
-      setChatInput(draft.input);
-      setChatAttachments(draft.attachments);
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
     } catch (error) {
       pushEvent({ tone: "warn", title: "切换会话", body: error instanceof Error ? error.message : "切换会话失败" });
     } finally {
@@ -4359,26 +4350,15 @@ export function App() {
   };
 
   const deleteChatSession = async (sessionId: string) => {
-    if (!sessionId || busyAction === "chat") return;
+    if (!sessionId || busyAction || isLoadingChatHistory) return;
+    const requestSeq = ++chatLoadSeq.current;
     setBusyAction("delete-session");
     try {
       const result = await api<ChatHistoryResponse>(
         `/api/chat/sessions/${encodeURIComponent(sessionId)}?repoId=${encodeURIComponent(selectedRepo.id)}`,
         { method: "DELETE" },
       );
-      const nextSessions = result.sessions || [];
-      const nextActiveSessionId = result.activeSessionId || "";
-      const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
-      hydratedDraftRef.current = {
-        key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
-        snapshot: draftSnapshot(draft.input, draft.attachments),
-      };
-      setChatSessions(nextSessions);
-      setActiveSessionId(nextActiveSessionId);
-      setChatMessages(result.messages || []);
-      setChatInput(draft.input);
-      setChatAttachments(draft.attachments);
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
       pushEvent({
         tone: "ok",
         title: result.archived ? "会话归档" : "草稿删除",
@@ -4392,7 +4372,8 @@ export function App() {
   };
 
   const forkThread = async () => {
-    if (!activeSessionId || busyAction) return;
+    if (!activeSessionId || busyAction || isLoadingChatHistory) return;
+    const requestSeq = ++chatLoadSeq.current;
     setBusyAction("fork-thread");
     try {
       await flushComposerDraft();
@@ -4401,19 +4382,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: selectedRepo.id, sessionId: activeSessionId }),
       });
-      const nextSessions = result.sessions || [];
-      const nextActiveSessionId = result.activeSessionId || "";
-      const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
-      hydratedDraftRef.current = {
-        key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
-        snapshot: draftSnapshot(draft.input, draft.attachments),
-      };
-      setChatSessions(nextSessions);
-      setActiveSessionId(nextActiveSessionId);
-      setChatMessages(result.messages || []);
-      setChatInput(draft.input);
-      setChatAttachments(draft.attachments);
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
 	      pushEvent({ tone: "ok", title: "会话分支", body: "已从当前会话创建分支" });
     } catch (error) {
       pushEvent({ tone: "warn", title: "会话分支", body: error instanceof Error ? error.message : "分支会话失败" });
@@ -4423,7 +4392,8 @@ export function App() {
   };
 
   const archiveThread = async () => {
-    if (!activeSessionId || busyAction) return;
+    if (!activeSessionId || busyAction || isLoadingChatHistory) return;
+    const requestSeq = ++chatLoadSeq.current;
     setBusyAction("archive-thread");
     try {
       await flushComposerDraft();
@@ -4432,19 +4402,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: selectedRepo.id, sessionId: activeSessionId }),
       });
-      const nextSessions = result.sessions || [];
-      const nextActiveSessionId = result.activeSessionId || "";
-      const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
-      hydratedDraftRef.current = {
-        key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
-        snapshot: draftSnapshot(draft.input, draft.attachments),
-      };
-      setChatSessions(nextSessions);
-      setActiveSessionId(nextActiveSessionId);
-      setChatMessages(result.messages || []);
-      setChatInput(draft.input);
-      setChatAttachments(draft.attachments);
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
       pushEvent({ tone: "ok", title: "会话归档", body: "已归档当前会话" });
     } catch (error) {
       pushEvent({ tone: "warn", title: "会话归档", body: error instanceof Error ? error.message : "归档会话失败" });
@@ -4476,7 +4434,7 @@ export function App() {
   };
 
   const clearChatHistory = async () => {
-    if (busyAction === "chat") return;
+    if (busyAction || isLoadingChatHistory) return;
     if (activeChatSession?.codexSessionId) {
       pushEvent({
         tone: "warn",
@@ -4485,24 +4443,13 @@ export function App() {
       });
       return;
     }
+    const requestSeq = ++chatLoadSeq.current;
     setBusyAction("clear-chat");
     try {
       const params = new URLSearchParams({ repoId: selectedRepo.id });
       if (activeSessionId) params.set("sessionId", activeSessionId);
       const result = await api<ChatHistoryResponse>(`/api/chat/history?${params.toString()}`, { method: "DELETE" });
-      const nextSessions = result.sessions || [];
-      const nextActiveSessionId = result.activeSessionId || "";
-      const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
-      const draft = hydrateChatDraft(selectedRepo, activeSession?.draft || null, nextActiveSessionId);
-      hydratedDraftRef.current = {
-        key: draftStorageKey(selectedRepo.id, nextActiveSessionId),
-        snapshot: draftSnapshot(draft.input, draft.attachments),
-      };
-      setChatSessions(nextSessions);
-      setActiveSessionId(nextActiveSessionId);
-      setChatMessages(result.messages || []);
-      setChatInput(draft.input);
-      setChatAttachments(draft.attachments);
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
       pushEvent({
         tone: "ok",
         title: "会话清空",
@@ -5083,30 +5030,44 @@ export function App() {
   };
 
   const sendChat = async (overrideMessage?: string, overrideAttachments?: UploadedAttachment[]) => {
-    if (uploadInFlight.current) return;
+    if (uploadInFlight.current || chatSubmissionInFlight.current) return;
     const usingOverride = overrideMessage !== undefined || overrideAttachments !== undefined;
     const message = (overrideMessage ?? chatInput).trim();
     const attachments = overrideAttachments ?? chatAttachments;
     if (!message && attachments.length === 0) return;
     const chatRepoId = selectedRepo.id;
+    const conversationSeq = chatLoadSeq.current;
+    const isCurrentConversation = () => selectedRepoIdRef.current === chatRepoId && chatLoadSeq.current === conversationSeq;
+    const submissionId = Symbol();
+    const releaseSubmission = () => {
+      if (chatSubmissionInFlight.current === submissionId) chatSubmissionInFlight.current = null;
+    };
+    const submittedSnapshot = draftSnapshot(chatInput, chatAttachments);
+    const clearSubmittedDraft = async () => {
+      if (usingOverride || selectedRepoIdRef.current !== chatRepoId || activeSessionIdRef.current !== activeSessionId) return;
+      if (draftSnapshot(chatInputRef.current, chatAttachmentsRef.current) !== submittedSnapshot) return;
+      setChatInput("");
+      setChatAttachments([]);
+      await saveComposerDraft(chatRepoId, activeSessionId, "", []).catch(() => null);
+    };
     if (busyAction === "chat") {
       if (attachments.length) {
         pushEvent({ tone: "warn", title: "附件", body: "当前回复运行中，附件请等本轮完成后再发送。" });
         return;
       }
-      if (!usingOverride) setChatInput("");
       setChatMessages((current) => [...current, { id: `${Date.now()}-user-steer`, role: "user", text: message, time: new Date().toISOString() }]);
+      chatSubmissionInFlight.current = submissionId;
       try {
-        if (!usingOverride) {
-          await saveComposerDraft(chatRepoId, activeSessionId, "", []).catch(() => null);
-        }
         await api("/api/codex/turn-steer", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, message }),
         });
+        await clearSubmittedDraft();
       } catch (error) {
         pushEvent({ tone: "warn", title: "补充指令", body: error instanceof Error ? error.message : "当前回复无法补充指令" });
+      } finally {
+        releaseSubmission();
       }
       return;
     }
@@ -5114,10 +5075,6 @@ export function App() {
     const displayMessage = message || "请查看我上传的附件。";
     const now = new Date().toISOString();
     const responseId = `${Date.now()}-codex`;
-    if (!usingOverride) {
-      setChatInput("");
-      setChatAttachments([]);
-    }
     setChatMessages((current) => [
       ...settleStaleStreamingMessages(current),
       { id: `${Date.now()}-user`, role: "user", text: displayMessage, attachments, time: now },
@@ -5131,6 +5088,7 @@ export function App() {
       },
     ]);
     setBusyAction("chat");
+    chatSubmissionInFlight.current = submissionId;
     try {
       const response = await fetch("/api/chat/stream", {
         method: "POST",
@@ -5139,9 +5097,6 @@ export function App() {
       });
       if (!response.ok || !response.body) {
         throw new Error(await responseFailureMessage(response, "云端 Codex 对话失败"));
-      }
-      if (!usingOverride) {
-        await saveComposerDraft(chatRepoId, activeSessionId, "", []).catch(() => null);
       }
 
       const reader = response.body.getReader();
@@ -5152,6 +5107,7 @@ export function App() {
       let stderr = "";
       let streamSessionId = activeSessionId;
       let terminalEventReceived = false;
+      let submissionAccepted = false;
 
       const patchResponse = (patch: Partial<ChatMessage> | ((message: ChatMessage) => Partial<ChatMessage>)) => {
         setChatMessages((current) =>
@@ -5163,7 +5119,7 @@ export function App() {
         );
       };
 
-      const handleFrame = (frame: string) => {
+      const handleFrame = async (frame: string) => {
         const lines = frame.split("\n");
         const event = lines.find((line) => line.startsWith("event: "))?.slice(7) || "message";
         const data = lines
@@ -5171,8 +5127,16 @@ export function App() {
           .map((line) => line.slice(6))
           .join("\n");
         const payload = data ? JSON.parse(data) : {};
+        if (event === "error" || event === "done") terminalEventReceived = true;
+        if (!isCurrentConversation()) return;
+        // Older backends confirm acceptance through output or a successful completion.
+        if (!submissionAccepted && (event === "accepted" || event === "delta" || (event === "done" && payload.ok))) {
+          submissionAccepted = true;
+          await clearSubmittedDraft();
+          releaseSubmission();
+          if (!isCurrentConversation()) return;
+        }
         if (event === "meta") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           mocked = Boolean(payload.mocked);
           if (payload.sessionId) {
             streamSessionId = String(payload.sessionId);
@@ -5182,7 +5146,6 @@ export function App() {
           return;
         }
         if (event === "session") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           const codexSessionId = payload.codexSessionId ? String(payload.codexSessionId) : "";
           if (codexSessionId) {
 	            patchResponse({ status: `云端会话 ${codexSessionId.slice(0, 8)} 已建立` });
@@ -5190,19 +5153,16 @@ export function App() {
           return;
         }
         if (event === "status") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           patchResponse({ status: String(payload.text || "") });
           return;
         }
         if (event === "tokenUsage") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           const nextUsage = payload.tokenUsage as ThreadTokenUsage | null;
           setThreadTokenUsage(nextUsage);
           setChatSessions((current) => current.map((session) => (session.id === streamSessionId ? { ...session, tokenUsage: nextUsage } : session)));
           return;
         }
         if (event === "goal") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           const nextGoal = payload.goal as ThreadGoal | null;
           setThreadGoal(nextGoal);
           setGoalDraft(nextGoal?.objective || "");
@@ -5211,18 +5171,15 @@ export function App() {
           return;
         }
         if (event === "tool") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           const patch = liveToolEventPatch(payload);
           if (patch.status) patchResponse(patch);
           return;
         }
         if (event === "guardian") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           patchResponse(guardianMessagePatch(payload));
           return;
         }
         if (event === "approval") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           patchResponse({
             status: String(payload.summary || "Codex 已处理 approval request"),
             messageType: "approval",
@@ -5237,27 +5194,21 @@ export function App() {
           return;
         }
         if (event === "stderr") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           stderr += String(payload.text || "");
           patchResponse({ status: "Codex 正在运行，收到运行日志..." });
           return;
         }
         if (event === "delta") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
           const text = String(payload.text || "");
           collected += text;
           patchResponse((item) => ({ text: `${item.text}${text}`, status: "正在生成..." }));
           return;
         }
         if (event === "error") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
-          terminalEventReceived = true;
           patchResponse({ text: String(payload.message || "云端 Codex 对话失败"), messageType: "error", streaming: false, status: "失败" });
           return;
         }
         if (event === "done") {
-          if (selectedRepoIdRef.current !== chatRepoId) return;
-          terminalEventReceived = true;
           const ok = Boolean(payload.ok);
           if (payload.sessionId) {
             streamSessionId = String(payload.sessionId);
@@ -5277,14 +5228,14 @@ export function App() {
         buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
         const frames = buffer.split("\n\n");
         buffer = frames.pop() || "";
-        frames.filter(Boolean).forEach(handleFrame);
+        for (const frame of frames.filter(Boolean)) await handleFrame(frame);
         if (done) break;
       }
-      if (buffer.trim()) handleFrame(buffer);
+      if (buffer.trim()) await handleFrame(buffer);
       if (!terminalEventReceived) throw new Error("云端 Codex 连接已断开，未收到完成事件。");
-      if (selectedRepoIdRef.current === chatRepoId) await loadChatHistory(chatRepoId, streamSessionId);
+      if (isCurrentConversation()) await loadChatHistory(chatRepoId, streamSessionId);
     } catch (error) {
-      if (selectedRepoIdRef.current !== chatRepoId) return;
+      if (!isCurrentConversation()) return;
       setChatMessages((current) =>
         current.map((item) =>
           item.id === responseId
@@ -5301,6 +5252,7 @@ export function App() {
         ),
       );
     } finally {
+      releaseSubmission();
       setBusyAction(null);
     }
   };

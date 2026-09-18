@@ -15,7 +15,9 @@ export class DraftPersistence {
 
   seed(repoId: string, sessionId: string, draft?: DraftContent | null) {
     const key = this.key(repoId, sessionId);
-    if (!this.revisions.has(key)) this.revisions.set(key, this.recover(repoId, sessionId)?.revision ?? draft?.revision ?? 0);
+    if (this.pending.has(key) && this.revisions.has(key)) return;
+    const local = this.recover(repoId, sessionId);
+    if (!this.revisions.has(key) || !local) this.revisions.set(key, local?.revision ?? draft?.revision ?? 0);
   }
 
   recover(repoId: string, sessionId: string): DraftContent | null {

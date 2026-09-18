@@ -1075,6 +1075,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(timedOutTurn.status, 200);
     const timedOutBody = await timedOutTurn.text();
+    assert.match(timedOutBody, /event: accepted\n/);
     assert.match(timedOutBody, /timed out after/i);
     const capturedRequests = (await fs.readFile(capturePath, "utf8"))
       .trim()

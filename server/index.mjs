@@ -2755,6 +2755,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
         }
         return;
       }
+      emitJobEvent(job, "accepted", { sessionId: session.id, threadId: job.threadId, turnId: job.turnId });
       await updateSessionRuntime(
         repo.id,
         session.id,
