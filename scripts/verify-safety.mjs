@@ -10,6 +10,8 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 const source = await fs.readFile(new URL("../server/index.mjs", import.meta.url), "utf8");
 const frontend = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const draftSource = await fs.readFile(new URL("../src/draft-persistence.ts", import.meta.url), "utf8");
+const streamSource = await fs.readFile(new URL("../src/conversation-stream.ts", import.meta.url), "utf8");
+const { ConversationStreamScope } = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(streamSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(draftSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
@@ -141,6 +143,7 @@ test("会话回写拒绝旧项目、旧请求及错误项目响应", () => {
     useCallback: (fn) => fn,
     chatLoadSeq: { current: 5 }, selectedRepoIdRef: { current: "B" },
     hydratedDraftRef: { current: null },
+    activeSessionIdRef: { current: "b-1" }, detachConversationStream() {}, setReviewActivity() {},
     composerDrafts: { recover: () => null },
     hydrateChatDraft: (_repo, draft) => draft || { input: "", attachments: [] },
     draftStorageKey: (repo, session) => `${repo}:${session}`, draftSnapshot: JSON.stringify,
@@ -165,6 +168,7 @@ test("项目切换清空编辑器且旧文件不能写入新项目", async () =>
     selectedFile: { repoId: "A", path: "README.md", content: "original", contentHash: "hash" }, fileDraft: "edited",
     flushComposerDraftRef: { current: async () => {} }, chatLoadSeq: { current: 0 }, fileReadSeq: { current: 0 }, hydratedDraftRef: { current: null },
     useCallback: (fn) => fn, pushEvent() {}, window: { localStorage: storage() },
+    detachConversationStream() {},
     setSelectedRepoId: (id) => { context.selectedRepo = { id }; }, setSelectedFile: (file) => { context.selectedFile = file; }, setFileDraft: (draft) => { context.fileDraft = draft; },
     api: async () => assert.fail("stale file must not be written"),
   };
@@ -191,4 +195,33 @@ test("目录元数据并发有上限且结果顺序稳定", async () => {
   });
   assert.equal(peak, 4);
   assert.deepEqual(result, items.map((item) => item * 2));
+});
+
+test("切换会话取消旧订阅，旧 finally 不能释放新订阅", () => {
+  const scope = new ConversationStreamScope();
+  const first = scope.begin();
+  let disconnects = 0;
+  first.signal.addEventListener("abort", () => disconnects++);
+  assert.equal(first.isCurrent(), true);
+  const second = scope.begin();
+  assert.equal(disconnects, 1);
+  assert.equal(first.signal.aborted, true);
+  assert.equal(first.isCurrent(), false);
+  assert.equal(first.finish(), false);
+  assert.equal(second.isCurrent(), true);
+  assert.equal(second.signal.aborted, false);
+  assert.equal(second.finish(), true);
+  assert.equal(second.finish(), false);
+  assert.equal(scope.active, false);
+  assert.equal(second.signal.aborted, true);
+  assert.equal(scope.detach(), false);
+});
+
+test("重连失败采用有上限的指数等待，避免请求风暴", () => {
+  const context = { useCallback: (fn) => fn, reconnectBackoff: { current: { failures: 0, after: 0 } }, Date: { now: () => 1000 } };
+  vm.createContext(context);
+  const code = section(frontend, "  const delayStreamReconnect =", "  useEffect(() => () =>");
+  vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + "\nglobalThis.retry = delayStreamReconnect", context);
+  assert.deepEqual(Array.from({ length: 8 }, () => context.retry()), [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  assert.equal(context.reconnectBackoff.current.after, 31000);
 });

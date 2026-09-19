@@ -1,4 +1,5 @@
 import { DraftPersistence } from "./draft-persistence";
+import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
 import {
   Activity,
   Bell,
@@ -3216,7 +3217,9 @@ export function App() {
   const [fullLog, setFullLog] = useState<{ name: string; content: string; mocked?: boolean } | null>(null);
   const [statusReady, setStatusReady] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [pendingAction, setBusyAction] = useState<string | null>(null);
+  const [streamAction, setStreamAction] = useState<"chat" | "compact" | null>(null);
+  const busyAction = pendingAction || streamAction;
   const [mcpLoginBusy, setMcpLoginBusy] = useState<string | null>(null);
   const [codexAccountBusy, setCodexAccountBusy] = useState<"login" | "cancel" | "logout" | null>(null);
   const [attentionBusy, setAttentionBusy] = useState<string | null>(null);
@@ -3264,7 +3267,8 @@ export function App() {
     initialRoute.repoId && initialRoute.sessionId ? { repoId: initialRoute.repoId, sessionId: initialRoute.sessionId } : null,
   );
   const codexAppStatusLoadedRef = useRef(false);
-  const attachedJobIds = useRef<Set<string>>(new Set());
+  const streamScope = useRef(new ConversationStreamScope()).current;
+  const reconnectBackoff = useRef({ failures: 0, after: 0 });
   const lastNotifiedAttentionId = useRef("");
   statusRef.current = status;
   selectedRepoIdRef.current = selectedRepoId;
@@ -3310,6 +3314,32 @@ export function App() {
     ].slice(0, 20));
   }, []);
 
+  const detachConversationStream = useCallback(() => {
+    reconnectBackoff.current = { failures: 0, after: 0 };
+    if (!streamScope.detach()) return;
+    chatSubmissionInFlight.current = null;
+    setStreamAction(null);
+    setReviewActivity(null);
+  }, [streamScope]);
+
+  const beginConversationStream = useCallback((action: "chat" | "compact") => {
+    const stream = streamScope.begin();
+    setStreamAction(action);
+    return stream;
+  }, [streamScope]);
+
+  const finishConversationStream = useCallback((stream: ConversationStream) => {
+    if (stream.finish()) setStreamAction(null);
+  }, []);
+
+  const delayStreamReconnect = useCallback(() => {
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectBackoff.current.failures, 5));
+    reconnectBackoff.current = { failures: reconnectBackoff.current.failures + 1, after: Date.now() + delay };
+    return delay;
+  }, []);
+
+  useEffect(() => () => { streamScope.detach(); }, [streamScope]);
+
   const switchRepoConversation = useCallback((repoId: string) => {
     if (selectedRepoIdRef.current !== repoId) {
       const editor = editorRef.current;
@@ -3322,6 +3352,7 @@ export function App() {
         }
       }
       fileReadSeq.current += 1;
+      detachConversationStream();
       setSelectedFile(null);
       setFileDraft("");
       void flushComposerDraftRef.current();
@@ -3340,7 +3371,7 @@ export function App() {
     }
     selectedRepoIdRef.current = repoId;
     setSelectedRepoId(repoId);
-  }, [pushEvent]);
+  }, [detachConversationStream, pushEvent]);
 
   useEffect(() => {
     if (!statusReady || status.repos.length === 0 || status.repos.some((repo) => repo.id === selectedRepoId)) return;
@@ -3929,6 +3960,10 @@ export function App() {
     if (requestSeq !== chatLoadSeq.current || selectedRepoIdRef.current !== repo.id || result.repoId !== repo.id) return false;
     const nextSessions = result.sessions || [];
     const nextActiveSessionId = result.activeSessionId || "";
+    if (nextActiveSessionId !== activeSessionIdRef.current) {
+      detachConversationStream();
+      setReviewActivity(null);
+    }
     const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
     const hasLocalDraft = Boolean(composerDrafts.recover(repo.id, nextActiveSessionId));
     const draft = hydrateChatDraft(repo, activeSession?.draft || null, nextActiveSessionId);
@@ -3942,11 +3977,12 @@ export function App() {
     setChatInput(draft.input);
     setChatAttachments(draft.attachments);
     return true;
-  }, []);
+  }, [detachConversationStream]);
 
   const loadChatHistory = useCallback(
     async (repoId: string, sessionId?: string) => {
       if (selectedRepoIdRef.current !== repoId) return;
+      detachConversationStream();
       const requestSeq = ++chatLoadSeq.current;
       setIsLoadingChatHistory(true);
       try {
@@ -3976,7 +4012,7 @@ export function App() {
         if (requestSeq === chatLoadSeq.current) setIsLoadingChatHistory(false);
       }
     },
-    [applyChatHistory, pushEvent],
+    [applyChatHistory, detachConversationStream, pushEvent],
   );
 
   useEffect(() => {
@@ -4116,35 +4152,33 @@ export function App() {
   }, [activeSessionId, chatSessions]);
 
   useEffect(() => {
-    if (busyAction === "compact") return;
+    if (streamAction) return;
     setChatMessages((current) => {
       const next = settleStaleStreamingMessages(current);
       return next.some((message, index) => message !== current[index]) ? next : current;
     });
-  }, [busyAction]);
+  }, [streamAction]);
 
   const attachToActiveJob = useCallback(
     async (kind: "turn" | "compact", job: ActiveJob, repoId: string, sessionId: string) => {
-      if (attachedJobIds.current.has(job.id)) return;
-      attachedJobIds.current.add(job.id);
+      if (streamScope.active || selectedRepoIdRef.current !== repoId || activeSessionIdRef.current !== sessionId) return;
+      const stream = beginConversationStream(kind === "compact" ? "compact" : "chat");
       const responseId = `active-${job.id}`;
-      setBusyAction(kind === "compact" ? "compact" : "chat");
       if (kind === "compact") {
         setCompactStatus({ running: true, text: "正在恢复主动压缩状态...", threadId: job.threadId });
       }
       setChatMessages((current) => {
-        if (current.some((message) => message.id === responseId)) return current;
-        return [
-          ...settleStaleStreamingMessages(current),
-          {
-            id: responseId,
-            role: "codex",
-            text: "",
-            time: job.startedAt || new Date().toISOString(),
-            streaming: true,
-            status: kind === "compact" ? "正在恢复压缩事件..." : "正在恢复运行中的任务...",
-          },
-        ];
+        const response: ChatMessage = {
+          id: responseId,
+          role: "codex",
+          text: "",
+          time: job.startedAt || new Date().toISOString(),
+          streaming: true,
+          status: kind === "compact" ? "正在恢复压缩事件..." : "正在恢复运行中的任务...",
+        };
+        // The server replays its event buffer on each subscription.
+        if (current.some((message) => message.id === responseId)) return current.map((message) => message.id === responseId ? response : message);
+        return [...settleStaleStreamingMessages(current), response];
       });
 
       const patchResponse = (patch: Partial<ChatMessage> | ((message: ChatMessage) => Partial<ChatMessage>)) => {
@@ -4159,7 +4193,7 @@ export function App() {
 
       try {
         const params = new URLSearchParams({ repoId, sessionId, kind });
-        const response = await fetch(`/api/chat/job-events?${params.toString()}`);
+        const response = await fetch(`/api/chat/job-events?${params.toString()}`, { signal: stream.signal });
         if (!response.ok || !response.body) throw new Error(await responseFailureMessage(response, "无法恢复云端任务事件"));
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -4174,7 +4208,7 @@ export function App() {
             .map((line) => line.slice(6))
             .join("\n");
           const payload = data ? (JSON.parse(data) as Record<string, unknown>) : {};
-          if (selectedRepoIdRef.current !== repoId) return;
+          if (!stream.isCurrent()) return;
 
           if (event === "status") {
             const text = String(payload.text || "");
@@ -4277,38 +4311,49 @@ export function App() {
         }
         if (buffer.trim()) handleFrame(buffer);
         if (!terminalEventReceived) throw new Error("云端 Codex 任务连接已断开，未收到完成事件。");
-        if (selectedRepoIdRef.current === repoId) {
+        if (stream.isCurrent()) {
+          finishConversationStream(stream);
           await loadChatHistory(repoId, sessionId);
           await loadThreadState(sessionId);
         }
       } catch (error) {
+        if (!stream.isCurrent()) return;
+        delayStreamReconnect();
         const message = error instanceof Error ? error.message : "云端 Codex 任务恢复失败";
         patchResponse({ text: message, messageType: "error", streaming: false, status: "失败" });
         pushEvent({ tone: "warn", title: "任务恢复", body: message });
       } finally {
-        attachedJobIds.current.delete(job.id);
-        setBusyAction(null);
+        finishConversationStream(stream);
       }
     },
-    [loadChatHistory, loadThreadState, pushEvent],
+    [beginConversationStream, delayStreamReconnect, finishConversationStream, loadChatHistory, loadThreadState, pushEvent, streamScope],
   );
 
   useEffect(() => {
-    if (!activeSessionId || busyAction) return;
+    if (!activeSessionId || busyAction || isLoadingChatHistory) return;
     let cancelled = false;
+    let timer: number | undefined;
+    const controller = new AbortController();
     const repoId = selectedRepo.id;
     const sessionId = activeSessionId;
-    api<ActiveJobsResponse>(`/api/chat/active?${new URLSearchParams({ repoId, sessionId }).toString()}`)
-      .then((result) => {
-        if (cancelled || selectedRepoIdRef.current !== repoId) return;
-        if (result.turn) attachToActiveJob("turn", result.turn, repoId, sessionId);
-        if (result.compact) attachToActiveJob("compact", result.compact, repoId, sessionId);
-      })
-      .catch(() => null);
+    const check = async () => {
+      try {
+        const result = await api<ActiveJobsResponse>(`/api/chat/active?${new URLSearchParams({ repoId, sessionId }).toString()}`, { signal: controller.signal });
+        if (cancelled || selectedRepoIdRef.current !== repoId || activeSessionIdRef.current !== sessionId) return;
+        if (result.turn) void attachToActiveJob("turn", result.turn, repoId, sessionId);
+        else if (result.compact) void attachToActiveJob("compact", result.compact, repoId, sessionId);
+        else reconnectBackoff.current = { failures: 0, after: 0 };
+      } catch {
+        if (!cancelled) timer = window.setTimeout(check, delayStreamReconnect());
+      }
+    };
+    timer = window.setTimeout(check, Math.max(0, reconnectBackoff.current.after - Date.now()));
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
+      controller.abort();
     };
-  }, [activeSessionId, attachToActiveJob, busyAction, selectedRepo.id]);
+  }, [activeSessionId, attachToActiveJob, busyAction, delayStreamReconnect, isLoadingChatHistory, selectedRepo.id]);
 
   const newChatSession = async () => {
     if (busyAction || isLoadingChatHistory) return;
@@ -4331,7 +4376,8 @@ export function App() {
   };
 
   const selectChatSession = async (sessionId: string) => {
-    if (!sessionId || sessionId === activeSessionId || busyAction || isLoadingChatHistory) return;
+    if (!sessionId || sessionId === activeSessionId || pendingAction || isLoadingChatHistory) return;
+    detachConversationStream();
     const requestSeq = ++chatLoadSeq.current;
     setBusyAction("select-session");
     try {
@@ -4510,11 +4556,11 @@ export function App() {
   };
 
   const compactThread = async () => {
-    if (!activeSessionId) return;
+    if (!activeSessionId || busyAction || streamScope.active) return;
     const chatRepoId = selectedRepo.id;
     const compactSessionId = activeSessionId;
     const responseId = `${Date.now()}-compact`;
-    setBusyAction("compact");
+    const stream = beginConversationStream("compact");
 	    setCompactStatus({ running: true, text: "正在连接云端 Codex..." });
     setChatMessages((current) => [
       ...settleStaleStreamingMessages(current),
@@ -4541,6 +4587,7 @@ export function App() {
     try {
       const response = await fetch("/api/codex/thread-compact/stream", {
         method: "POST",
+        signal: stream.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: chatRepoId, sessionId: compactSessionId, ...chatRuntime }),
       });
@@ -4559,7 +4606,7 @@ export function App() {
           .map((line) => line.slice(6))
           .join("\n");
         const payload = data ? JSON.parse(data) : {};
-        if (selectedRepoIdRef.current !== chatRepoId) return;
+        if (!stream.isCurrent()) return;
 
         if (event === "meta") {
           const threadId = payload.threadId ? String(payload.threadId) : null;
@@ -4643,14 +4690,15 @@ export function App() {
       }
       if (buffer.trim()) handleFrame(buffer);
       if (!terminalEventReceived) throw new Error("主动压缩连接已断开，未收到完成事件。");
-      if (selectedRepoIdRef.current === chatRepoId) await loadThreadState(compactSessionId);
+      if (stream.isCurrent()) await loadThreadState(compactSessionId);
     } catch (error) {
+      if (!stream.isCurrent()) return;
       const message = error instanceof Error ? error.message : "主动压缩失败";
       setCompactStatus({ running: false, ok: false, text: "压缩失败", error: message });
       patchCompactMessage({ text: message, messageType: "error", streaming: false, status: "失败" });
       pushEvent({ tone: "warn", title: "上下文压缩", body: message });
     } finally {
-      setBusyAction(null);
+      finishConversationStream(stream);
     }
   };
 
@@ -5037,14 +5085,13 @@ export function App() {
     if (!message && attachments.length === 0) return;
     const chatRepoId = selectedRepo.id;
     const conversationSeq = chatLoadSeq.current;
-    const isCurrentConversation = () => selectedRepoIdRef.current === chatRepoId && chatLoadSeq.current === conversationSeq;
     const submissionId = Symbol();
     const releaseSubmission = () => {
       if (chatSubmissionInFlight.current === submissionId) chatSubmissionInFlight.current = null;
     };
     const submittedSnapshot = draftSnapshot(chatInput, chatAttachments);
     const clearSubmittedDraft = async () => {
-      if (usingOverride || selectedRepoIdRef.current !== chatRepoId || activeSessionIdRef.current !== activeSessionId) return;
+      if (usingOverride || chatLoadSeq.current !== conversationSeq || selectedRepoIdRef.current !== chatRepoId || activeSessionIdRef.current !== activeSessionId) return;
       if (draftSnapshot(chatInputRef.current, chatAttachmentsRef.current) !== submittedSnapshot) return;
       setChatInput("");
       setChatAttachments([]);
@@ -5071,7 +5118,8 @@ export function App() {
       }
       return;
     }
-    if (busyAction) return;
+    if (busyAction || streamScope.active) return;
+    const stream = beginConversationStream("chat");
     const displayMessage = message || "请查看我上传的附件。";
     const now = new Date().toISOString();
     const responseId = `${Date.now()}-codex`;
@@ -5087,11 +5135,11 @@ export function App() {
         status: "正在连接云端 Codex...",
       },
     ]);
-    setBusyAction("chat");
     chatSubmissionInFlight.current = submissionId;
     try {
       const response = await fetch("/api/chat/stream", {
         method: "POST",
+        signal: stream.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, message, attachments: attachmentPayload(attachments), ...chatRuntime }),
       });
@@ -5128,13 +5176,13 @@ export function App() {
           .join("\n");
         const payload = data ? JSON.parse(data) : {};
         if (event === "error" || event === "done") terminalEventReceived = true;
-        if (!isCurrentConversation()) return;
+        if (!stream.isCurrent()) return;
         // Older backends confirm acceptance through output or a successful completion.
         if (!submissionAccepted && (event === "accepted" || event === "delta" || (event === "done" && payload.ok))) {
           submissionAccepted = true;
           await clearSubmittedDraft();
           releaseSubmission();
-          if (!isCurrentConversation()) return;
+          if (!stream.isCurrent()) return;
         }
         if (event === "meta") {
           mocked = Boolean(payload.mocked);
@@ -5233,9 +5281,12 @@ export function App() {
       }
       if (buffer.trim()) await handleFrame(buffer);
       if (!terminalEventReceived) throw new Error("云端 Codex 连接已断开，未收到完成事件。");
-      if (isCurrentConversation()) await loadChatHistory(chatRepoId, streamSessionId);
+      if (stream.isCurrent()) {
+        finishConversationStream(stream);
+        await loadChatHistory(chatRepoId, streamSessionId);
+      }
     } catch (error) {
-      if (!isCurrentConversation()) return;
+      if (!stream.isCurrent()) return;
       setChatMessages((current) =>
         current.map((item) =>
           item.id === responseId
@@ -5253,12 +5304,13 @@ export function App() {
       );
     } finally {
       releaseSubmission();
-      setBusyAction(null);
+      finishConversationStream(stream);
     }
   };
 
   const runReview = async () => {
-    if (!activeSessionId || busyAction) return;
+    if (!activeSessionId || busyAction || streamScope.active) return;
+    const stream = beginConversationStream("chat");
     const chatRepoId = selectedRepo.id;
     const responseId = `${Date.now()}-review`;
     const reviewStartedAt = new Date().toISOString();
@@ -5284,10 +5336,10 @@ export function App() {
         messageType: "review",
       },
     ]);
-    setBusyAction("chat");
     try {
       const response = await fetch("/api/codex/review/stream", {
         method: "POST",
+        signal: stream.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, targetType: "uncommittedChanges", delivery: "inline", ...chatRuntime }),
       });
@@ -5332,7 +5384,7 @@ export function App() {
           .map((line) => line.slice(6))
           .join("\n");
         const payload = data ? JSON.parse(data) : {};
-        if (selectedRepoIdRef.current !== chatRepoId) return;
+        if (!stream.isCurrent()) return;
         if (event === "meta" && payload.sessionId) {
           streamSessionId = String(payload.sessionId);
           setActiveSessionId(streamSessionId);
@@ -5438,9 +5490,12 @@ export function App() {
       }
       if (buffer.trim()) handleFrame(buffer);
       if (!terminalEventReceived) throw new Error("Codex review 连接已断开，未收到完成事件。");
-      if (selectedRepoIdRef.current === chatRepoId) await loadChatHistory(chatRepoId, streamSessionId);
+      if (stream.isCurrent()) {
+        finishConversationStream(stream);
+        await loadChatHistory(chatRepoId, streamSessionId);
+      }
     } catch (error) {
-      if (selectedRepoIdRef.current !== chatRepoId) return;
+      if (!stream.isCurrent()) return;
       setChatMessages((current) =>
         current.map((item) =>
           item.id === responseId
@@ -5465,7 +5520,7 @@ export function App() {
         updatedAt: new Date().toISOString(),
       }));
     } finally {
-      setBusyAction(null);
+      finishConversationStream(stream);
     }
   };
 
@@ -9447,7 +9502,7 @@ function CloudChat({
                                     if (!selected) onSelectSession(session.id);
                                     setActivePanel(null);
                                   }}
-                                  disabled={busy}
+                                  disabled={Boolean(busyAction) && busyAction !== "chat" && busyAction !== "compact"}
                                   title={`${sessionDisplayTitle(session)} · ${sessionSubtitle(session)} · ${state.detail}`}
                                   type="button"
                                   role="tab"

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import vm from "node:vm";
 import ts from "typescript";
 import { chromium } from "playwright";
+import { verifyConversationStreams } from "./verify-stream-ui.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixtureContext = { Date };
@@ -16,6 +17,7 @@ status.health.layers.appServer = { ok: true, running: true };
 const runtime = { model: "gpt-5.6-terra", reasoning: "medium", sandbox: "workspace-write", approval: "never", search: true };
 const sessions = status.repos.flatMap((repo) => [1, 2].map((n) => ({ id: `${repo.id}-${n}`, repoId: repo.id, title: `验收会话 ${repo.id} ${n}`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messageCount: 0, isDraft: true, ...runtime, draft: { input: "", attachments: [], revision: 0 } })));
 const active = Object.fromEntries(status.repos.map((repo) => [repo.id, `${repo.id}-1`]));
+const activeJobs = new Map();
 const writes = [];
 const errors = [];
 let releaseUpload;
@@ -84,7 +86,7 @@ await context.route("**/api/**", async (route) => {
     if (requested) active[repoId] = requested;
     return send({ ok: true, authoritative: true, repoId, activeSessionId: active[repoId], sessions: sessions.filter((s) => s.repoId === repoId), messages: [] });
   }
-  if (url.pathname === "/api/chat/active") return send({ ok: true, turn: null, compact: null });
+  if (url.pathname === "/api/chat/active") return send({ ok: true, turn: activeJobs.get(url.searchParams.get("sessionId")) || null, compact: null });
   return send({ ok: true, ...runtime, entries: [], items: [], sessions: [], runs: [], events: [], matches: [], runtime });
 });
 const page = await context.newPage();
@@ -187,8 +189,9 @@ try {
   await waitUntil(() => submissions === 4);
   await waitUntil(async () => await composer.inputValue() === "");
   await waitUntil(() => sessions.find((s) => s.id === active["sample-service"]).draft.input === "");
+  const streamChecks = await verifyConversationStreams({ page, baseUrl, sessions, activeJobs, waitUntil, out });
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["跨项目文件保护", "延迟上传归属", "草稿冲突保留与解决", "桌面与移动端无横向溢出", "迟到会话操作不覆盖新项目", "发送失败保留草稿", "等待接受期间禁止重复提交", "发送成功保留等待期间的新输入", "流式初始化失败保留草稿", "成功发送后清空已提交草稿", "冲突处理不覆盖期间的新输入"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["跨项目文件保护", "延迟上传归属", "草稿冲突保留与解决", "桌面与移动端无横向溢出", "迟到会话操作不覆盖新项目", "发送失败保留草稿", "等待接受期间禁止重复提交", "发送成功保留等待期间的新输入", "流式初始化失败保留草稿", "成功发送后清空已提交草稿", "冲突处理不覆盖期间的新输入", ...streamChecks], screenshots: out.pathname }, null, 2));
 } finally {
   releaseUpload(); createGate?.resolve(); submissionGate?.resolve(); draftReadGate?.resolve(); await browser.close();
 }
