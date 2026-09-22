@@ -100,14 +100,18 @@ tar -C "$SOURCE_ROOT" \
   --exclude=dist \
   --exclude=.codex-cloud-state \
   --exclude=.codex-cloud-local \
+  --exclude=./docs/research \
+  --exclude=./test-results \
+  --exclude=./playwright-report \
   -cf - . | tar -C "$RELEASE_DIR" -xf -
 
 (
   cd "$RELEASE_DIR"
-  npm ci
+  npm ci --include=dev
   npm run build
   npm run codex:schema:check
   npm run verify:normalizers
+  npm prune --omit=dev --ignore-scripts
 )
 
 chmod -R u=rwX,go=rX "$RELEASE_DIR"

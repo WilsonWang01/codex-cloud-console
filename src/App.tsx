@@ -42,7 +42,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
+import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 
 const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
@@ -1006,28 +1006,51 @@ async function api<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 async function apiWithDeadline<T>(url: string, options: RequestInit = {}, timeoutMs = 15_000): Promise<T> {
+  options.signal?.throwIfAborted();
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener("abort", abort, { once: true });
+  let timedOut = false;
+  const timeout = window.setTimeout(() => {
+    if (controller.signal.aborted) return;
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
-    return await api<T>(url, { ...options, signal: options.signal || controller.signal });
+    return await api<T>(url, { ...options, signal: controller.signal });
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("请求超时，请稍后重试");
-    }
+    if (timedOut) throw new Error("请求超时，请稍后重试");
     throw error;
   } finally {
     window.clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
   }
 }
 
 async function apiWithRetry<T>(url: string, options?: RequestInit, attempts = 4): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    options?.signal?.throwIfAborted();
     try {
       return await api<T>(url, options);
     } catch (error) {
       lastError = error;
-      await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+      if (options?.signal?.aborted) throw error;
+      if (attempt === attempts - 1) break;
+      await new Promise<void>((resolve, reject) => {
+        const signal = options?.signal;
+        const abort = () => {
+          window.clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          reject(signal?.reason || new DOMException("请求已取消", "AbortError"));
+        };
+        const timer = window.setTimeout(() => {
+          signal?.removeEventListener("abort", abort);
+          resolve();
+        }, 250 * (attempt + 1));
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+      });
     }
   }
   throw lastError instanceof Error ? lastError : new Error("API request failed");
@@ -3198,6 +3221,7 @@ export function App() {
   const [reviewActivity, setReviewActivity] = useState<ReviewActivity | null>(null);
   const [reviewPrContext, setReviewPrContext] = useState<ReviewPrContext | null>(null);
   const [reviewPrLoading, setReviewPrLoading] = useState(false);
+  const reviewPrController = useRef<AbortController | null>(null);
   const [reviewPrPublishBusy, setReviewPrPublishBusy] = useState("");
   const [threadTokenUsage, setThreadTokenUsage] = useState<ThreadTokenUsage | null>(null);
   const [compactStatus, setCompactStatus] = useState<CompactStatus | null>(null);
@@ -3244,6 +3268,7 @@ export function App() {
     typeof window.Notification === "undefined" ? "unsupported" : window.Notification.permission,
   );
   const chatLoadSeq = useRef(0);
+  const chatHistoryController = useRef<AbortController | null>(null);
   const globalSearchSeq = useRef(0);
   const runtimePersistSeq = useRef(0);
   const threadStateLoadSeq = useRef(0);
@@ -3301,6 +3326,8 @@ export function App() {
     () => chatSessions.find((session) => session.id === activeSessionId && session.repoId === selectedRepoId) || null,
     [activeSessionId, chatSessions, selectedRepoId],
   );
+  const activeChatSessionRef = useRef(activeChatSession);
+  activeChatSessionRef.current = activeChatSession;
   const activeRouteSessionId = activeChatSession?.codexSessionId || activeSessionId;
 
   const pushEvent = useCallback((event: Omit<RunEvent, "id" | "time">) => {
@@ -3338,7 +3365,10 @@ export function App() {
     return delay;
   }, []);
 
-  useEffect(() => () => { streamScope.detach(); }, [streamScope]);
+  useEffect(() => () => {
+    streamScope.detach();
+    chatHistoryController.current?.abort();
+  }, [streamScope]);
 
   const switchRepoConversation = useCallback((repoId: string) => {
     if (selectedRepoIdRef.current !== repoId) {
@@ -3352,6 +3382,7 @@ export function App() {
         }
       }
       fileReadSeq.current += 1;
+      chatHistoryController.current?.abort();
       detachConversationStream();
       setSelectedFile(null);
       setFileDraft("");
@@ -3400,9 +3431,7 @@ export function App() {
       setProjectName("");
       setProjectRemote("");
       await refresh();
-      switchRepoConversation(result.repo.id);
-      setActiveView("cli");
-      await loadChatHistory(result.repo.id, result.activeSessionId);
+      openAttentionThread(result.repo.id, result.activeSessionId);
       pushEvent({ tone: "ok", title: "项目已创建", body: `${result.repo.name} 已加入云端 workspace` });
     } catch (error) {
       pushEvent({ tone: "warn", title: "项目创建失败", body: error instanceof Error ? error.message : "无法创建项目" });
@@ -3856,15 +3885,16 @@ export function App() {
   };
 
   const loadThreadState = useCallback(
-    async (sessionId = activeSessionId) => {
+    async (sessionId = activeSessionId, signal?: AbortSignal) => {
       if (!sessionId) return;
       const repoId = selectedRepo.id;
       const requestSeq = ++threadStateLoadSeq.current;
       const runtimeSeq = runtimePersistSeq.current;
       try {
         const params = new URLSearchParams({ repoId, sessionId });
-        const result = await apiWithRetry<ThreadStateResponse>(`/api/codex/thread-state?${params.toString()}`, undefined, 3);
+        const result = await apiWithRetry<ThreadStateResponse>(`/api/codex/thread-state?${params.toString()}`, { signal }, 3);
         if (
+          signal?.aborted ||
           requestSeq !== threadStateLoadSeq.current ||
           selectedRepoIdRef.current !== repoId ||
           activeSessionIdRef.current !== sessionId
@@ -3888,19 +3918,22 @@ export function App() {
         setAutoCompactScope(result.config?.autoCompactTokenLimitScope || "body_after_prefix");
       } catch (error) {
         if (
+          signal?.aborted ||
           requestSeq !== threadStateLoadSeq.current ||
           selectedRepoIdRef.current !== repoId ||
           activeSessionIdRef.current !== sessionId
         ) return;
-        setThreadGoal(activeChatSession?.goal || null);
-        setThreadTokenUsage(activeChatSession?.tokenUsage || null);
+        setThreadGoal(activeChatSessionRef.current?.goal || null);
+        setThreadTokenUsage(activeChatSessionRef.current?.tokenUsage || null);
       }
     },
-    [activeChatSession?.goal, activeChatSession?.tokenUsage, activeSessionId, selectedRepo.id],
+    [activeSessionId, selectedRepo.id],
   );
 
   useEffect(() => {
-    loadThreadState();
+    const controller = new AbortController();
+    void loadThreadState(undefined, controller.signal);
+    return () => controller.abort();
   }, [loadThreadState]);
 
   const persistChatRuntime = useCallback(
@@ -3982,13 +4015,16 @@ export function App() {
   const loadChatHistory = useCallback(
     async (repoId: string, sessionId?: string) => {
       if (selectedRepoIdRef.current !== repoId) return;
+      chatHistoryController.current?.abort();
+      const controller = new AbortController();
+      chatHistoryController.current = controller;
       detachConversationStream();
       const requestSeq = ++chatLoadSeq.current;
       setIsLoadingChatHistory(true);
       try {
         const params = new URLSearchParams({ repoId });
         if (sessionId) params.set("sessionId", sessionId);
-        const result = await apiWithRetry<ChatHistoryResponse>(`/api/chat/sessions?${params.toString()}`, undefined, 5);
+        const result = await apiWithRetry<ChatHistoryResponse>(`/api/chat/sessions?${params.toString()}`, { signal: controller.signal }, 5);
         if (requestSeq !== chatLoadSeq.current || selectedRepoIdRef.current !== repoId || result.repoId !== repoId) return;
         if (result.degraded && !sessionId) {
           throw new Error(result.error || "云端会话暂时不可用；已保留当前消息，稍后将自动重试");
@@ -4001,7 +4037,7 @@ export function App() {
         if (!applyChatHistory(result, repo, requestSeq)) return;
         setChatHistoryError(result.degraded ? result.error || "当前仅显示本地草稿，云端会话暂时不可用" : "");
       } catch (error) {
-        if (requestSeq !== chatLoadSeq.current) return;
+        if (controller.signal.aborted || requestSeq !== chatLoadSeq.current) return;
         setChatHistoryError(error instanceof Error ? error.message : "无法读取云端会话历史");
         pushEvent({
           tone: "warn",
@@ -4009,6 +4045,7 @@ export function App() {
           body: error instanceof Error ? error.message : "无法读取云端会话历史",
         });
       } finally {
+        if (chatHistoryController.current === controller) chatHistoryController.current = null;
         if (requestSeq === chatLoadSeq.current) setIsLoadingChatHistory(false);
       }
     },
@@ -4020,7 +4057,7 @@ export function App() {
     const routedSessionId = pendingRouteSession?.repoId === selectedRepoId ? pendingRouteSession.sessionId : "";
     if (!routedSessionId && activeSessionIdRef.current) return;
     void loadChatHistory(selectedRepoId, routedSessionId || undefined).finally(() => {
-      if (routedSessionId) {
+      if (routedSessionId && pendingRouteSessionRef.current === pendingRouteSession) {
         pendingRouteSessionRef.current = null;
         setPendingRouteSession(null);
       }
@@ -4123,21 +4160,22 @@ export function App() {
       const route = parseAppHash();
       setActiveView(route.view);
       if (route.automationId) setSelectedAutomationId(route.automationId);
+      if (route.view === "cli" && route.sessionId && (!route.repoId || route.repoId === selectedRepoIdRef.current)) {
+        void flushComposerDraft();
+      }
       if (route.repoId && route.repoId !== selectedRepoIdRef.current) {
         switchRepoConversation(route.repoId);
       }
       if (route.view === "cli" && route.sessionId) {
         const repoId = route.repoId || selectedRepoIdRef.current;
-        void flushComposerDraft();
         const pending = { repoId, sessionId: route.sessionId };
         pendingRouteSessionRef.current = pending;
         setPendingRouteSession(pending);
-        if (repoId === selectedRepoIdRef.current) void loadChatHistory(repoId, route.sessionId);
       }
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, [flushComposerDraft, loadChatHistory, switchRepoConversation]);
+  }, [flushComposerDraft, switchRepoConversation]);
 
   useEffect(() => {
     const activeSession = chatSessions.find((session) => session.id === activeSessionId);
@@ -4379,6 +4417,7 @@ export function App() {
     if (!sessionId || sessionId === activeSessionId || pendingAction || isLoadingChatHistory) return;
     detachConversationStream();
     const requestSeq = ++chatLoadSeq.current;
+    setIsLoadingChatHistory(true);
     setBusyAction("select-session");
     try {
       await saveComposerDraft(selectedRepo.id, activeSessionId, chatInput, chatAttachments).catch(() => null);
@@ -4391,6 +4430,7 @@ export function App() {
     } catch (error) {
       pushEvent({ tone: "warn", title: "切换会话", body: error instanceof Error ? error.message : "切换会话失败" });
     } finally {
+      if (requestSeq === chatLoadSeq.current) setIsLoadingChatHistory(false);
       setBusyAction(null);
     }
   };
@@ -4888,10 +4928,10 @@ export function App() {
     }
     if (result.kind === "session" && result.repoId && result.sessionId) {
       const sameRepo = selectedRepoIdRef.current === result.repoId;
-      switchRepoConversation(result.repoId);
-      setActiveView("cli");
-      if (sameRepo) void selectChatSession(result.sessionId);
-      else void loadChatHistory(result.repoId, result.sessionId);
+      if (sameRepo) {
+        setActiveView("cli");
+        void selectChatSession(result.sessionId);
+      } else openAttentionThread(result.repoId, result.sessionId);
       return;
     }
     if (result.kind === "automation" && result.repoId && result.automationId) {
@@ -5033,7 +5073,7 @@ export function App() {
 
   const uploadChatFiles = async (files: FileList | File[]) => {
     const selected = Array.from(files).slice(0, Math.max(0, 8 - chatAttachments.length));
-    if (!selected.length || busyAction === "chat" || uploadInFlight.current || !activeSessionId) return;
+    if (!selected.length || isLoadingChatHistory || busyAction === "chat" || uploadInFlight.current || !activeSessionId) return;
     const uploadRepo = selectedRepo;
     const uploadSessionId = activeSessionId;
     uploadInFlight.current = true;
@@ -5078,7 +5118,7 @@ export function App() {
   };
 
   const sendChat = async (overrideMessage?: string, overrideAttachments?: UploadedAttachment[]) => {
-    if (uploadInFlight.current || chatSubmissionInFlight.current) return;
+    if (isLoadingChatHistory || uploadInFlight.current || chatSubmissionInFlight.current) return;
     const usingOverride = overrideMessage !== undefined || overrideAttachments !== undefined;
     const message = (overrideMessage ?? chatInput).trim();
     const attachments = overrideAttachments ?? chatAttachments;
@@ -5525,13 +5565,21 @@ export function App() {
   };
 
   const loadReviewPrContext = useCallback(async () => {
+    if (selectedRepoIdRef.current !== selectedRepo.id) return;
+    reviewPrController.current?.abort();
+    const controller = new AbortController();
+    reviewPrController.current = controller;
+    const isCurrent = () => !controller.signal.aborted && selectedRepoIdRef.current === selectedRepo.id;
     setReviewPrLoading(true);
+    setReviewPrContext(null);
     try {
       const params = new URLSearchParams({ repoId: selectedRepo.id });
-      const payload = await apiWithDeadline<ReviewPrContextResponse>(`/api/codex/review/pr-context?${params.toString()}`, {}, 12_000);
+      const payload = await apiWithDeadline<ReviewPrContextResponse>(`/api/codex/review/pr-context?${params.toString()}`, { signal: controller.signal }, 12_000);
       if (payload.error) throw new Error(payload.error);
+      if (!isCurrent()) return;
       setReviewPrContext(payload.data || null);
     } catch (error) {
+      if (!isCurrent()) return;
       setReviewPrContext({
         available: false,
         reason: error instanceof Error ? error.message : "无法读取 PR 状态",
@@ -5541,8 +5589,14 @@ export function App() {
         pr: null,
       });
     } finally {
-      setReviewPrLoading(false);
+      if (isCurrent()) setReviewPrLoading(false);
     }
+  }, [selectedRepo.id]);
+
+  useEffect(() => {
+    setReviewPrContext(null);
+    setReviewPrLoading(false);
+    return () => reviewPrController.current?.abort();
   }, [selectedRepo.id]);
 
   const publishReviewPrComment = useCallback(
@@ -5617,8 +5671,7 @@ export function App() {
     setPendingRouteSession(pending);
     setActiveView("cli");
     replaceAppHash({ view: "cli", repoId, sessionId });
-    void loadChatHistory(repoId, sessionId);
-  }, [flushComposerDraft, loadChatHistory, switchRepoConversation]);
+  }, [flushComposerDraft, switchRepoConversation]);
 
   useEffect(() => {
     if (!notificationsEnabled || typeof window.Notification === "undefined" || window.Notification.permission !== "granted") return;
@@ -5819,6 +5872,7 @@ export function App() {
               </div>
             )}
             <CloudChat
+              key={selectedRepo.id}
               status={status}
               cloudConnection={cloudConnection}
               repo={selectedRepo}
@@ -6262,6 +6316,33 @@ function ChatMessageText({
     </>
   );
 }
+
+const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }: { message: ChatMessage; repo: Repo }) {
+  const meta = timelineMessageMeta(message);
+  const body = displayProjectMessageText(message.text || (message.streaming ? " " : "Codex 没有返回内容。"), repo);
+  const attachments = messageTimelineAttachments(message, repo);
+  const status = timelineStatusLabel(message.status);
+  return (
+    <article className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
+      <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
+      <div>
+        <strong>
+          {message.role === "user" ? "你" : "云端 Codex"}
+          {meta.label && <span className="item-kind">{meta.label}</span>}
+          <small>{timeLabel(message.time)}</small>
+        </strong>
+        <ChatMessageText text={body} pre={meta.pre} streaming={message.streaming} />
+        <MessageAttachments attachments={attachments} />
+        <TimelineDetailsPanel details={message.details} />
+        {status && <em className="chat-status">{status}</em>}
+      </div>
+    </article>
+  );
+});
+
+const ChatTimeline = memo(function ChatTimeline({ messages, repo }: { messages: ChatMessage[]; repo: Repo }) {
+  return messages.map((message) => <ChatTimelineMessage key={message.id} message={message} repo={repo} />);
+});
 
 function AttentionRunCard({
   run,
@@ -7646,6 +7727,7 @@ function ReviewPanel({
   workspaceView,
   baseBranch,
   busyAction,
+  canRunReview,
   onScope,
   onWorkspaceView,
   onBaseBranch,
@@ -7672,6 +7754,7 @@ function ReviewPanel({
   workspaceView: ReviewWorkspaceView;
   baseBranch: string;
   busyAction: string | null;
+  canRunReview: boolean;
   onScope: (value: ReviewScope) => void;
   onWorkspaceView: (value: ReviewWorkspaceView) => void;
   onBaseBranch: (value: string) => void;
@@ -7689,9 +7772,9 @@ function ReviewPanel({
   const files = snapshot?.files || [];
   const visibleSummary = snapshot?.summary || summary;
   const selectedFile = files.find((file) => file.id === selectedFileId) || files[0] || null;
-  const canApply = scope === "workspace" && Boolean(selectedFile) && !snapshot?.readOnly;
+  const canApply = scope === "workspace" && Boolean(selectedFile) && !snapshot?.readOnly && !loading && !error;
   const rowActions: ReviewAction[] = workspaceView === "staged" ? ["unstage"] : ["stage", "revert"];
-  const reviewResult = parseReviewText(activity?.text || "");
+  const reviewResult = parseReviewText(activity?.repoId === repo.id ? activity.text : "");
   const findingFileId = (finding: ReviewFinding) => {
     const absolute = finding.absolutePath || "";
     return (
@@ -7742,7 +7825,7 @@ function ReviewPanel({
             {loading ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />}
             刷新
           </button>
-          <button className="mini-action" type="button" onClick={onRunReview} disabled={Boolean(busyAction)}>
+          <button className="mini-action" type="button" onClick={onRunReview} disabled={!canRunReview || Boolean(busyAction) || Boolean(actionBusy)}>
             {activity?.running ? <Loader2 size={13} className="spin" /> : <GitPullRequestArrow size={13} />}
             运行 Review
           </button>
@@ -7751,17 +7834,17 @@ function ReviewPanel({
 
       <div className="review-toolbar">
         <div className="choice-row compact">
-          <button type="button" className={cx(scope === "workspace" && "selected")} onClick={() => onScope("workspace")}>工作区</button>
-          <button type="button" className={cx(scope === "baseBranch" && "selected")} onClick={() => onScope("baseBranch")}>Base 分支</button>
+          <button type="button" disabled={Boolean(actionBusy)} className={cx(scope === "workspace" && "selected")} onClick={() => onScope("workspace")}>工作区</button>
+          <button type="button" disabled={Boolean(actionBusy)} className={cx(scope === "baseBranch" && "selected")} onClick={() => onScope("baseBranch")}>Base 分支</button>
         </div>
         {scope === "workspace" && (
           <div className="choice-row compact">
-            <button type="button" className={cx(workspaceView === "unstaged" && "selected")} onClick={() => onWorkspaceView("unstaged")}>未暂存</button>
-            <button type="button" className={cx(workspaceView === "staged" && "selected")} onClick={() => onWorkspaceView("staged")}>已暂存</button>
+            <button type="button" disabled={Boolean(actionBusy)} className={cx(workspaceView === "unstaged" && "selected")} onClick={() => onWorkspaceView("unstaged")}>未暂存</button>
+            <button type="button" disabled={Boolean(actionBusy)} className={cx(workspaceView === "staged" && "selected")} onClick={() => onWorkspaceView("staged")}>已暂存</button>
           </div>
         )}
         {scope === "baseBranch" && (
-          <select value={baseBranch || snapshot?.baseBranch || ""} onChange={(event) => onBaseBranch(event.target.value)} className="review-branch-select">
+          <select disabled={Boolean(actionBusy)} value={baseBranch || snapshot?.baseBranch || ""} onChange={(event) => onBaseBranch(event.target.value)} className="review-branch-select">
             {(snapshot?.baseBranchOptions?.length ? snapshot.baseBranchOptions : [snapshot?.baseBranch || "main"]).filter((branch): branch is string => Boolean(branch)).map((branch) => (
               <option key={branch} value={branch}>{branch}</option>
             ))}
@@ -7833,7 +7916,7 @@ function ReviewPanel({
         <div className="review-empty">
           <strong>这个目录还不是 Git 仓库</strong>
           <span>初始化后才能使用工作区和 Base 分支对比。</span>
-          <button className="command-button" type="button" onClick={onInitGit} disabled={Boolean(actionBusy)}>初始化 Git</button>
+          <button className="command-button" type="button" onClick={onInitGit} disabled={loading || Boolean(error) || Boolean(actionBusy)}>初始化 Git</button>
         </div>
       )}
 
@@ -7917,7 +8000,7 @@ function ReviewPanel({
                                   type="button"
                                   className="mini-action"
                                   onClick={() => onPublishReviewComment(finding, findingDrafts[finding.id] ?? finding.body, selectedFile.path)}
-                                  disabled={!prContext?.available || Boolean(prPublishBusy) || Boolean(busyAction)}
+                                  disabled={!prContext?.available || prLoading || loading || Boolean(error) || Boolean(prPublishBusy) || Boolean(busyAction)}
                                   title={prContext?.available ? "发布到当前 GitHub PR" : prContext?.reason || "当前没有可发布的 PR"}
                                 >
                                   {prPublishBusy === finding.id ? <Loader2 size={13} className="spin" /> : <GitPullRequestArrow size={13} />}
@@ -8144,10 +8227,26 @@ function CloudChat({
   const [reviewWorkspaceView, setReviewWorkspaceView] = useState<ReviewWorkspaceView>("unstaged");
   const [reviewBaseBranch, setReviewBaseBranch] = useState("");
   const [reviewSummary, setReviewSummary] = useState<ReviewSummary | null>(null);
-  const [reviewSnapshot, setReviewSnapshot] = useState<ReviewSnapshot | null>(null);
+  const [reviewSnapshotState, setReviewSnapshotState] = useState<{ key: string; data: ReviewSnapshot | null } | null>(null);
+  const reviewKey = JSON.stringify([repo.id, reviewScope, reviewWorkspaceView, reviewBaseBranch]);
+  const reviewKeyRef = useRef(reviewKey);
+  reviewKeyRef.current = reviewKey;
+  const reviewSnapshot = reviewSnapshotState?.key === reviewKey ? reviewSnapshotState.data : null;
+  const reviewController = useRef<AbortController | null>(null);
+  const diffController = useRef<AbortController | null>(null);
+  const reviewActionPending = useRef(false);
+  const panelMounted = useRef(true);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState("");
   const [reviewActionBusy, setReviewActionBusy] = useState("");
+  useEffect(() => {
+    panelMounted.current = true;
+    return () => {
+      panelMounted.current = false;
+      reviewController.current?.abort();
+      diffController.current?.abort();
+    };
+  }, []);
   const [mentionFiles, setMentionFiles] = useState<AgentFileEntry[]>([]);
   const [mentionLoading, setMentionLoading] = useState(false);
   const [mentionError, setMentionError] = useState("");
@@ -8160,10 +8259,10 @@ function CloudChat({
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const displaySessions = useMemo(() => visibleSessionList(sessions, activeSessionId), [activeSessionId, sessions]);
   const activeSessionTitle = sessionDisplayTitle(activeSession);
-  const activeSessionSubtitle = activeSession
-    ? `${sessionSubtitle(activeSession)} · ${timeLabel(activeSession.updatedAt)}`
-    : historyLoading
-      ? "同步中"
+  const activeSessionSubtitle = historyLoading
+    ? "同步会话中..."
+    : activeSession
+      ? `${sessionSubtitle(activeSession)} · ${timeLabel(activeSession.updatedAt)}`
       : "未选择";
   const localFilteredSessions = useMemo(() => {
     const query = sessionQuery.trim().toLowerCase();
@@ -8292,19 +8391,29 @@ function CloudChat({
     }] : []),
   ];
   const loadDiff = async () => {
+    diffController.current?.abort();
+    const controller = new AbortController();
+    diffController.current = controller;
     setActivePanel("diff");
     setDiffLoading(true);
     setDiffError("");
+    setDiffResult(null);
     try {
       const params = new URLSearchParams({ repoId: repo.id });
-      setDiffResult(await api<GitDiffResponse>(`/api/codex/git-diff-to-remote?${params.toString()}`));
+      const result = await apiWithDeadline<GitDiffResponse>(`/api/codex/git-diff-to-remote?${params.toString()}`, { signal: controller.signal });
+      if (!controller.signal.aborted) setDiffResult(result);
     } catch (error) {
-      setDiffError(error instanceof Error ? error.message : "无法读取 diff");
+      if (!controller.signal.aborted) setDiffError(error instanceof Error ? error.message : "无法读取 diff");
     } finally {
-      setDiffLoading(false);
+      if (!controller.signal.aborted) setDiffLoading(false);
     }
   };
   const loadReviewSnapshot = useCallback(async () => {
+    if (!panelMounted.current || reviewActionPending.current || reviewKeyRef.current !== reviewKey) return;
+    reviewController.current?.abort();
+    const controller = new AbortController();
+    reviewController.current = controller;
+    const isCurrent = () => !controller.signal.aborted && reviewKeyRef.current === reviewKey;
     setReviewLoading(true);
     setReviewError("");
     try {
@@ -8314,27 +8423,36 @@ function CloudChat({
         workspaceView: reviewWorkspaceView,
       });
       if (reviewScope === "baseBranch" && reviewBaseBranch) params.set("baseBranch", reviewBaseBranch);
-      const payload = await api<ReviewApiResponse>(`/api/codex/review/snapshot?${params.toString()}`);
+      const payload = await apiWithDeadline<ReviewApiResponse>(`/api/codex/review/snapshot?${params.toString()}`, { signal: controller.signal });
       if (payload.error) throw new Error(payload.error);
+      if (!isCurrent()) return;
       const snapshot = payload.data || null;
-      setReviewSnapshot(snapshot);
+      setReviewSnapshotState({ key: reviewKey, data: snapshot });
       if (reviewScope === "workspace") setReviewSummary(snapshot?.summary || null);
-      if (snapshot?.baseBranch && !reviewBaseBranch) setReviewBaseBranch(snapshot.baseBranch);
     } catch (error) {
+      if (!isCurrent()) return;
+      setReviewSnapshotState(null);
+      setReviewSummary(null);
       setReviewError(error instanceof Error ? error.message : "无法读取变更");
     } finally {
-      setReviewLoading(false);
+      if (isCurrent()) setReviewLoading(false);
     }
-  }, [repo.id, reviewScope, reviewWorkspaceView, reviewBaseBranch]);
-  const runReviewFromPanel = () => {
+  }, [repo.id, reviewScope, reviewWorkspaceView, reviewBaseBranch, reviewKey]);
+  const openReviewPanel = () => {
     setActivePanel("review");
-    onReview();
     onRefreshReviewPrContext();
-    window.setTimeout(() => {
-      void loadReviewSnapshot();
-    }, 800);
+  };
+  const runReviewFromPanel = () => {
+    if (reviewActionPending.current || !canUseThreadControls || busyAction) return;
+    openReviewPanel();
+    onReview();
   };
   const applyReviewAction = async (action: ReviewAction, level: ReviewActionLevel, patch = "") => {
+    if (reviewActionPending.current || reviewLoading || reviewError || !reviewSnapshot?.isGitRepo || reviewSnapshot.readOnly || reviewScope !== "workspace") return;
+    if (action === "revert" && !window.confirm(`确认在项目「${repo.name}」中${reviewActionLabel(action, level)}？\n未暂存的修改将丢失，无法通过撤销恢复。${level === "all" ? "未跟踪的文件和目录也会被删除。" : ""}\n已暂存的修改会保留。`)) return;
+    reviewActionPending.current = true;
+    reviewController.current?.abort();
+    const isCurrent = () => panelMounted.current && reviewKeyRef.current === reviewKey;
     setReviewActionBusy(`${action}:${level}`);
     setReviewError("");
     try {
@@ -8351,15 +8469,22 @@ function CloudChat({
         }),
       });
       if (payload.error) throw new Error(payload.error);
-      setReviewSnapshot(payload.data || null);
+      if (!isCurrent()) return;
+      setReviewSnapshotState({ key: reviewKey, data: payload.data || null });
       setReviewSummary(payload.data?.summary || null);
     } catch (error) {
+      if (!isCurrent()) return;
+      setReviewSnapshotState(null);
+      setReviewSummary(null);
       setReviewError(error instanceof Error ? error.message : "无法应用 review 操作");
     } finally {
-      setReviewActionBusy("");
+      reviewActionPending.current = false;
+      if (isCurrent()) setReviewActionBusy("");
     }
   };
   const initReviewGit = async () => {
+    if (reviewActionPending.current || reviewLoading || reviewError || !reviewSnapshot || reviewSnapshot.isGitRepo) return;
+    reviewActionPending.current = true;
     setReviewActionBusy("git:init");
     setReviewError("");
     try {
@@ -8369,26 +8494,19 @@ function CloudChat({
         body: JSON.stringify({ repoId: repo.id }),
       });
       if (payload.error) throw new Error(payload.error);
+      reviewActionPending.current = false;
       await loadReviewSnapshot();
     } catch (error) {
-      setReviewError(error instanceof Error ? error.message : "无法初始化 Git");
+      if (panelMounted.current) setReviewError(error instanceof Error ? error.message : "无法初始化 Git");
     } finally {
-      setReviewActionBusy("");
+      reviewActionPending.current = false;
+      if (panelMounted.current) setReviewActionBusy("");
     }
   };
   useEffect(() => {
     if (activePanel === "review") void loadReviewSnapshot();
+    return () => reviewController.current?.abort();
   }, [activePanel, loadReviewSnapshot]);
-
-  useEffect(() => {
-    setSessionQuery("");
-    setSessionSearchResults([]);
-    setSessionSearchErrors({});
-    setRenamingSessionId("");
-    setRenameDraft("");
-    setReviewSnapshot(null);
-    setReviewSummary(null);
-  }, [repo.id]);
 
   useEffect(() => {
     const query = sessionQuery.trim();
@@ -8639,11 +8757,10 @@ function CloudChat({
       id: "review",
       label: "Review",
       group: "代码",
-      hint: canUseThreadControls ? `用 Codex 检查当前改动 · ${reviewChangeHint}` : "先发送一条消息建立会话",
+      hint: reviewChangeHint,
       icon: <GitPullRequestArrow size={17} />,
       aliases: ["code-review", "pr"],
-      run: runReviewFromPanel,
-      disabled: !canUseThreadControls || Boolean(busyAction),
+      run: openReviewPanel,
     },
     {
       id: "diff",
@@ -8890,7 +9007,7 @@ function CloudChat({
               <strong>{activeSessionTitle}</strong>
               <small>{activeSessionSubtitle}</small>
             </span>
-            <ChevronRight size={15} />
+            {historyLoading ? <Loader2 size={15} className="spin" aria-label="同步会话中" /> : <ChevronRight size={15} />}
           </button>
         )}
         <div className="session-actions">
@@ -8918,7 +9035,7 @@ function CloudChat({
         </div>
       )}
 
-      <div className="chat-window">
+      <div className="chat-window" aria-busy={historyLoading}>
         {historyLoading && messages.length === 0 && (
           <article className="chat-bubble codex compact">
             <span className="chat-avatar">
@@ -8930,27 +9047,7 @@ function CloudChat({
             </div>
           </article>
         )}
-        {messages.map((message) => {
-          const meta = timelineMessageMeta(message);
-          const body = displayProjectMessageText(message.text || (message.streaming ? " " : "Codex 没有返回内容。"), repo);
-          const timelineAttachments = messageTimelineAttachments(message, repo);
-          return (
-            <article key={message.id} className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
-              <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
-              <div>
-                <strong>
-                  {message.role === "user" ? "你" : "云端 Codex"}
-                  {meta.label && <span className="item-kind">{meta.label}</span>}
-                  <small>{timeLabel(message.time)}</small>
-                </strong>
-                <ChatMessageText text={body} pre={meta.pre} streaming={message.streaming} />
-                <MessageAttachments attachments={timelineAttachments} />
-                <TimelineDetailsPanel details={message.details} />
-                {timelineStatusLabel(message.status) && <em className="chat-status">{timelineStatusLabel(message.status)}</em>}
-              </div>
-            </article>
-          );
-        })}
+        <ChatTimeline messages={messages} repo={repo} />
         {busy && !messages.some((message) => message.streaming) && (
           <article className="chat-bubble codex">
             <span className="chat-avatar">
@@ -9173,6 +9270,7 @@ function CloudChat({
                 workspaceView={reviewWorkspaceView}
                 baseBranch={reviewBaseBranch}
                 busyAction={busyAction}
+                canRunReview={canUseThreadControls}
                 onScope={setReviewScope}
                 onWorkspaceView={setReviewWorkspaceView}
                 onBaseBranch={setReviewBaseBranch}
@@ -9610,6 +9708,7 @@ function CloudChat({
             ref={fileInputRef}
             type="file"
             multiple
+            disabled={historyLoading}
             className="hidden-file-input"
             onChange={(event) => {
               if (event.target.files) onFilesSelected(event.target.files);
@@ -9618,6 +9717,7 @@ function CloudChat({
           />
           <textarea
             value={input}
+            disabled={historyLoading}
             onChange={(event) => onInput(event.target.value)}
             onPaste={(event) => {
               const files = filesFromTransfer(event.clipboardData);
@@ -9688,7 +9788,7 @@ function CloudChat({
           <button
             className="icon-command attach-button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={Boolean(busyAction) || uploadingAttachments}
+            disabled={historyLoading || Boolean(busyAction) || uploadingAttachments}
             title="上传截图或文件"
             aria-label={uploadingAttachments ? "正在上传附件" : "上传截图或文件"}
             type="button"
@@ -9698,7 +9798,7 @@ function CloudChat({
           <button
             className="primary-command send-button"
             onClick={onSend}
-            disabled={(!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
+            disabled={historyLoading || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
             aria-label={
               busy || busyAction === "compact"
                 ? "云端 Codex 正在处理"

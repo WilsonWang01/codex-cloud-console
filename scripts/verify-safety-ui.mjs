@@ -4,6 +4,8 @@ import vm from "node:vm";
 import ts from "typescript";
 import { chromium } from "playwright";
 import { verifyConversationStreams } from "./verify-stream-ui.mjs";
+import { verifyNavigationPerformance } from "./verify-navigation-ui.mjs";
+import { verifyReviewSafety } from "./verify-review-ui.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixtureContext = { Date };
@@ -18,6 +20,7 @@ const runtime = { model: "gpt-5.6-terra", reasoning: "medium", sandbox: "workspa
 const sessions = status.repos.flatMap((repo) => [1, 2].map((n) => ({ id: `${repo.id}-${n}`, repoId: repo.id, title: `验收会话 ${repo.id} ${n}`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messageCount: 0, isDraft: true, ...runtime, draft: { input: "", attachments: [], revision: 0 } })));
 const active = Object.fromEntries(status.repos.map((repo) => [repo.id, `${repo.id}-1`]));
 const activeJobs = new Map();
+const navigation = { requests: [], delays: new Map(), messages: [] };
 const writes = [];
 const errors = [];
 let releaseUpload;
@@ -40,6 +43,7 @@ await context.route("**/api/**", async (route) => {
   const req = route.request(); const url = new URL(req.url());
   const body = req.postDataJSON() || {};
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
+  navigation.requests.push({ path: url.pathname, repoId, sessionId: url.searchParams.get("sessionId"), method: req.method() });
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
   if (url.pathname === "/api/codex/app-status") return send({ ok: true, authoritative: true, partial: false, account: null, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: runtime, gaps: [], auth: { ok: true } });
@@ -62,6 +66,7 @@ await context.route("**/api/**", async (route) => {
   const draftRoute = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft(\/attachments)?$/);
   if (draftRoute) {
     const session = sessions.find((item) => item.id === decodeURIComponent(draftRoute[1]));
+    if (!session || session.repoId !== repoId) return send({ ok: false, error: "会话不属于当前项目" }, 404);
     if (req.method() === "GET" && draftReadGate) { draftReadStarted = true; await draftReadGate.promise; }
     if (draftRoute[2]) {
       session.draft.attachments.push(...body.attachments); session.draft.revision += 1;
@@ -83,8 +88,10 @@ await context.route("**/api/**", async (route) => {
       sessions.push(session); active[repoId] = session.id;
     }
     const requested = url.searchParams.get("sessionId");
+    const delay = navigation.delays.get(requested) || 0;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     if (requested) active[repoId] = requested;
-    return send({ ok: true, authoritative: true, repoId, activeSessionId: active[repoId], sessions: sessions.filter((s) => s.repoId === repoId), messages: [] });
+    return send({ ok: true, authoritative: true, repoId, activeSessionId: active[repoId], sessions: sessions.filter((s) => s.repoId === repoId), messages: navigation.messages });
   }
   if (url.pathname === "/api/chat/active") return send({ ok: true, turn: activeJobs.get(url.searchParams.get("sessionId")) || null, compact: null });
   return send({ ok: true, ...runtime, entries: [], items: [], sessions: [], runs: [], events: [], matches: [], runtime });
@@ -94,7 +101,7 @@ page.on("pageerror", (error) => errors.push(error.message));
 page.on("dialog", (dialog) => dialog.accept());
 const waitUntil = async (check) => { for (let n = 0; n < 100; n++) { if (await check()) return; await new Promise((resolve) => setTimeout(resolve, 50)); } throw new Error("验收等待超时"); };
 const baseUrl = process.env.CODEX_CLOUD_SAFETY_UI_URL || "http://127.0.0.1:5174/";
-const out = new URL("../docs/research/acceptance/safety-ui-2026-09-19/", import.meta.url);
+const out = new URL("../docs/research/acceptance/safety-ui-2026-09-22/", import.meta.url);
 await fs.mkdir(out, { recursive: true });
 try {
   await page.goto(`${baseUrl}#/agent`);
@@ -139,6 +146,8 @@ try {
   draftReadGate = null;
   await page.getByRole("button", { name: "载入云端草稿", exact: true }).click();
   await waitUntil(async () => await composer.inputValue() === "其他页面的草稿");
+  await waitUntil(async () => await page.locator(".draft-conflict").count() === 0);
+  await page.waitForTimeout(650);
   assert.equal(await page.locator(".draft-conflict").count(), 0);
 
   await page.setViewportSize({ width: 1440, height: 1000 });
@@ -190,8 +199,10 @@ try {
   await waitUntil(async () => await composer.inputValue() === "");
   await waitUntil(() => sessions.find((s) => s.id === active["sample-service"]).draft.input === "");
   const streamChecks = await verifyConversationStreams({ page, baseUrl, sessions, activeJobs, waitUntil, out });
+  const navigationChecks = await verifyNavigationPerformance({ page, baseUrl, sessions, navigation, waitUntil, out });
+  const reviewChecks = await verifyReviewSafety({ page, baseUrl, waitUntil, out });
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["跨项目文件保护", "延迟上传归属", "草稿冲突保留与解决", "桌面与移动端无横向溢出", "迟到会话操作不覆盖新项目", "发送失败保留草稿", "等待接受期间禁止重复提交", "发送成功保留等待期间的新输入", "流式初始化失败保留草稿", "成功发送后清空已提交草稿", "冲突处理不覆盖期间的新输入", ...streamChecks], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["跨项目文件保护", "延迟上传归属", "草稿冲突保留与解决", "桌面与移动端无横向溢出", "迟到会话操作不覆盖新项目", "发送失败保留草稿", "等待接受期间禁止重复提交", "发送成功保留等待期间的新输入", "流式初始化失败保留草稿", "成功发送后清空已提交草稿", "冲突处理不覆盖期间的新输入", ...streamChecks, ...navigationChecks, ...reviewChecks], screenshots: out.pathname }, null, 2));
 } finally {
   releaseUpload(); createGate?.resolve(); submissionGate?.resolve(); draftReadGate?.resolve(); await browser.close();
 }

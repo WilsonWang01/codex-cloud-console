@@ -1,9 +1,11 @@
 export type DraftContent = { input: string; attachments: unknown[]; revision?: number };
 type DraftResponse = { draft: DraftContent };
+const contentKey = (draft: DraftContent) => JSON.stringify([draft.input, draft.attachments]);
 
 export class DraftPersistence {
   private revisions = new Map<string, number>();
   private pending = new Map<string, Promise<unknown>>();
+  private confirmed = new Map<string, { content: string; draft: DraftContent }>();
 
   constructor(
     private read: (repoId: string, sessionId: string) => Promise<DraftResponse>,
@@ -17,7 +19,11 @@ export class DraftPersistence {
     const key = this.key(repoId, sessionId);
     if (this.pending.has(key) && this.revisions.has(key)) return;
     const local = this.recover(repoId, sessionId);
-    if (!this.revisions.has(key) || !local) this.revisions.set(key, local?.revision ?? draft?.revision ?? 0);
+    if (!this.revisions.has(key) || !local) {
+      this.revisions.set(key, local?.revision ?? draft?.revision ?? 0);
+      if (draft) this.confirmed.set(key, { content: contentKey(draft), draft });
+      else this.confirmed.delete(key);
+    }
   }
 
   recover(repoId: string, sessionId: string): DraftContent | null {
@@ -38,8 +44,21 @@ export class DraftPersistence {
     const previous = this.pending.get(key) || Promise.resolve();
     const next = previous.catch(() => {}).then(async () => {
       if (!this.revisions.has(key)) this.seed(repoId, sessionId, (await this.read(repoId, sessionId)).draft);
-      const result = await this.write(repoId, sessionId, draft, this.revisions.get(key)!);
+      const confirmed = this.confirmed.get(key);
+      let result: DraftResponse;
+      // Navigation often flushes an unchanged draft. Preserve revision checks for actual edits.
+      if (confirmed?.content === contentKey(draft) && (confirmed.draft.revision ?? 0) === this.revisions.get(key)) {
+        result = { draft: confirmed.draft };
+      } else {
+        try {
+          result = await this.write(repoId, sessionId, draft, this.revisions.get(key)!);
+        } catch (error) {
+          this.confirmed.delete(key);
+          throw error;
+        }
+      }
       this.revisions.set(key, result.draft.revision ?? 0);
+      this.confirmed.set(key, { content: contentKey(result.draft), draft: result.draft });
       const local = this.recover(repoId, sessionId);
       if (local && JSON.stringify([local.input, local.attachments]) === JSON.stringify([draft.input, draft.attachments])) {
         try { this.storage.removeItem(key); } catch { /* Best effort local cleanup. */ }
@@ -56,6 +75,8 @@ export class DraftPersistence {
   async drain(repoId: string, sessionId: string) { await this.pending.get(this.key(repoId, sessionId)); }
 
   accept(repoId: string, sessionId: string, draft: DraftContent) {
-    this.revisions.set(this.key(repoId, sessionId), draft.revision ?? 0);
+    const key = this.key(repoId, sessionId);
+    this.revisions.set(key, draft.revision ?? 0);
+    this.confirmed.set(key, { content: contentKey(draft), draft });
   }
 }

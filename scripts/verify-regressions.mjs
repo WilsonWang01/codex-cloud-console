@@ -1402,12 +1402,17 @@ await check("atomic installer gates on strict health, prunes, and rolls back", a
   const envFile = path.join(tempRoot, "console.env");
   const binDir = path.join(tempRoot, "bin");
   const healthCountPath = path.join(tempRoot, "health-count");
+  const npmCallsPath = path.join(tempRoot, "npm-calls");
   const previousRelease = path.join(releaseRoot, "20260101T000000Z-previous");
   await fs.mkdir(path.join(sourceRoot, "ops"), { recursive: true });
   await fs.mkdir(previousRelease, { recursive: true });
   await fs.mkdir(binDir, { recursive: true });
   await fs.writeFile(path.join(sourceRoot, "package-lock.json"), "{}\n");
   await fs.writeFile(path.join(sourceRoot, "source-marker.txt"), "source data remains intact\n");
+  for (const folder of ["docs/research", "test-results", "playwright-report"]) {
+    await fs.mkdir(path.join(sourceRoot, folder), { recursive: true });
+    await fs.writeFile(path.join(sourceRoot, folder, "test-artifact.txt"), "local-only artifact");
+  }
   await fs.writeFile(path.join(sourceRoot, "ops", "codex-cloud-console.service"), "[Service]\nExecStart=/bin/true\n");
   await fs.writeFile(path.join(sourceRoot, "ops", "codex-cloud-console.env.example"), "CODEX_CLOUD_WEBHOOK_TOKEN=replace-me\n");
   await fs.writeFile(envFile, "CODEX_CLOUD_WEBHOOK_TOKEN=regression-token-123456\n");
@@ -1426,7 +1431,11 @@ exec "$@"
 `,
     { mode: 0o755 },
   );
-  await fs.writeFile(path.join(binDir, "npm"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  await fs.writeFile(path.join(binDir, "npm"), `#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_NPM_CALLS"
+if [ "$1" = "prune" ] && [ "$FAKE_NPM_FAIL_PRUNE" = "1" ]; then exit 1; fi
+exit 0
+`, { mode: 0o755 });
   await fs.writeFile(
     path.join(binDir, "curl"),
     `#!/bin/sh
@@ -1474,6 +1483,7 @@ exec /usr/bin/readlink "$@"
     CODEX_CLOUD_HEALTH_INTERVAL_SECONDS: "0",
     CODEX_CLOUD_KEEP_RELEASES: "1",
     FAKE_HEALTH_COUNT: healthCountPath,
+    FAKE_NPM_CALLS: npmCallsPath,
     CODEX_CLOUD_SERVICE_USER: process.env.USER || "root",
   };
   const installerArgs = [
@@ -1496,6 +1506,22 @@ exec /usr/bin/readlink "$@"
     assert.equal((await fs.stat(path.join(activeRelease, "package-lock.json"))).mode & 0o044, 0o044);
     assert.equal((await fs.readdir(releaseRoot)).length, 1);
     assert.equal(await fs.readFile(path.join(sourceRoot, "source-marker.txt"), "utf8"), "source data remains intact\n");
+    assert.deepEqual((await fs.readFile(npmCallsPath, "utf8")).trim().split("\n"), [
+      "ci --include=dev", "run build", "run codex:schema:check", "run verify:normalizers",
+      "prune --omit=dev --ignore-scripts", "ls --omit=dev --depth=0",
+    ]);
+    for (const folder of ["docs/research", "test-results", "playwright-report"]) {
+      await assert.rejects(fs.access(path.join(activeRelease, folder)), { code: "ENOENT" });
+      await fs.access(path.join(sourceRoot, folder, "test-artifact.txt"));
+    }
+
+    const pruneFailed = await runCaptured("bash", installerArgs, {
+      cwd: projectRoot,
+      env: { ...installerEnv, FAKE_HEALTH_MODE: "recover", FAKE_NPM_FAIL_PRUNE: "1" },
+    });
+    assert.notEqual(pruneFailed.code, 0);
+    assert.equal(await fs.realpath(currentLink), activeRelease);
+    assert.equal((await fs.readdir(releaseRoot)).length, 1);
 
     await fs.writeFile(healthCountPath, "0");
     const failed = await runCaptured("bash", installerArgs, {

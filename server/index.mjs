@@ -657,7 +657,7 @@ async function atomicWriteJson(filePath, value) {
   const handle = await fs.open(tmpPath, "w", 0o600);
   try {
     try {
-      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+      await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
       await handle.sync();
     } finally {
       await handle.close();
@@ -7916,10 +7916,11 @@ async function runBrowserCheck(url) {
   if (!/^https?:\/\//i.test(target)) {
     return { ok: false, error: "URL must start with http:// or https://" };
   }
+  let browser;
   try {
     const { chromium } = await import("playwright");
     const executablePath = await findBrowserExecutable();
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
       executablePath: executablePath || undefined,
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -7934,7 +7935,6 @@ async function runBrowserCheck(url) {
     await page.waitForTimeout(600);
     const title = await page.title();
     const screenshot = await page.screenshot({ type: "png", fullPage: false });
-    await browser.close();
     return {
       ok: Boolean(response?.ok()),
       status: response?.status() || 0,
@@ -7946,6 +7946,8 @@ async function runBrowserCheck(url) {
     };
   } catch (error) {
     return { ok: false, url: target, error: error.message };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
 }
 

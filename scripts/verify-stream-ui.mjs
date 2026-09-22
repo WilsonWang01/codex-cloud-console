@@ -67,6 +67,8 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   await navigate("sample-app-2", true);
   assert.equal((await records())[0].aborted, true);
   await command("/review");
+  assert.equal((await records()).length, 1, "打开 Review 不应启动模型任务");
+  await page.getByRole("button", { name: "运行 Review", exact: true }).click();
   await waitUntil(async () => (await records()).length === 2);
   assert.equal((await records())[1].path, "/api/codex/review/stream");
   assert.equal(await emit(0, "done", { ok: true, sessionId: "sample-app-1" }), false);

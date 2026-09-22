@@ -963,12 +963,10 @@ async function applyAllAction(repoRoot, action, workspaceView) {
     return;
   }
   if (workspaceView === "unstaged" && action === "revert") {
-    try {
-      await runCommand("git", ["restore", "--worktree", "--source=HEAD", "--", "."], { cwd: repoRoot });
-    } catch (error) {
-      if (!isMissingHeadError(error)) {
-        throw error;
-      }
+    // Unstaged changes are relative to the index, including before the first commit.
+    const trackedFiles = await runCommandCapture("git", ["ls-files", "-z"], { cwd: repoRoot });
+    if (trackedFiles) {
+      await runCommand("git", ["restore", "--worktree", "--", "."], { cwd: repoRoot });
     }
     await runCommand("git", ["clean", "-fd", "--", "."], { cwd: repoRoot });
     return;

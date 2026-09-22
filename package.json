@@ -25,6 +25,7 @@
     "verify:regressions": "node scripts/verify-regressions.mjs",
     "verify:safety": "node --test scripts/verify-safety.mjs",
     "verify:safety:ui": "node scripts/verify-safety-ui.mjs",
+    "verify:runtime": "node scripts/verify-runtime-package.mjs",
     "verify:api": "node scripts/smoke-api.mjs",
     "verify:ui": "node scripts/smoke-ui.mjs",
     "verify:e2e": "node scripts/e2e-frontend.mjs",
@@ -35,18 +36,8 @@
     "cloud:console:install": "bash scripts/install-cloud-console-agent.sh"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.1.1",
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0",
-    "concurrently": "^9.2.1",
     "express": "^5.2.1",
-    "lucide-react": "^0.556.0",
-    "react": "^19.2.1",
-    "react-dom": "^19.2.1",
-    "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1",
-    "typescript": "^5.9.3",
-    "vite": "^7.2.4",
+    "playwright": "^1.60.0",
     "web-push": "^3.6.7",
     "ws": "^8.21.0"
   },
@@ -55,6 +46,16 @@
     "@types/node": "^25.0.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
-    "playwright": "^1.60.0"
+    "@vitejs/plugin-react": "^5.1.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "concurrently": "^9.2.1",
+    "lucide-react": "^0.556.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4"
   }
 }
