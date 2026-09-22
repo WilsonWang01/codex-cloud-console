@@ -1,211 +1,168 @@
 # Codex Cloud Console
 
-A self-hosted web console for operating a persistent Codex worker and
-repository automations on AWS EC2.
+**把服务器上的 Codex 变成一个浏览器工作台：对话写代码、查看改动、运行自动化、追踪任务结果。**
 
-Codex Cloud Console brings threads, repository status, automation runs, health
-signals, approvals, generated files, and live operation events into one
-browser interface. It is designed for individual developers and small teams
-that want to keep their development environment in their own AWS account.
+在自己的电脑或 EC2 上运行 Codex，通过网页管理多个项目和会话。代码、工作区与任务记录保存在你管理的主机上；模型请求仍会发送给配置的模型服务，并非离线运行。
 
-> [!IMPORTANT]
-> This is an independent community project. It is not an official product of,
-> or affiliated with, OpenAI or Amazon Web Services.
+[快速开始](#快速开始) · [日常使用](#日常使用) · [部署与接入](docs/setup.md) · [常见问题](#常见问题)
 
-## Why this project exists
+> [!NOTE]
+> 独立社区项目，非 OpenAI 或 AWS 官方产品。它是自托管 Codex 的 Web 控制台，不是 OpenAI 托管的 Codex Cloud 服务，也不承诺覆盖 Codex App 的全部功能。
 
-Long-running development agents need more than a terminal. Operators need to
-know which repository and thread own a task, whether a run is still active,
-what changed, whether the underlying service is healthy, and how to recover
-without weakening the host. This project provides that operational layer while
-keeping the worker and its data self-hosted.
+## 能做什么
 
-## Features
+| 你想做的事 | 在这里怎么完成 |
+| --- | --- |
+| 让 Codex 分析项目、修 Bug、补测试、写文档 | 选择项目，在对话中提交任务，实时查看回复、命令及工具事件 |
+| 做调研并保留产物 | 使用已配置的联网、MCP 或 Skills 能力，查看生成的文件和图片附件 |
+| 管理多个代码仓库 | 克隆 GitHub 仓库或创建空项目；按项目管理会话、搜索历史、重命名、分支和归档 |
+| 调整模型与执行边界 | 切换模型、推理强度、联网和权限模式；查看账号、额度与上下文状态 |
+| 检查代码改动 | 查看未暂存、已暂存和 Base 分支差异；按需启动 Codex Review |
+| 直接处理文件和验证结果 | 在 Agent 页面浏览、编辑文件、执行命令、进行浏览器检查；相关能力需主机环境支持 |
+| 定期或由其他服务触发任务 | 对已配置的自动化手动运行、接入系统定时器、Webhook 或会话续跑，查看历史与日志 |
+| 发现需要处理的异常 | 在收件箱查看失败、待处理事项和账号问题；可配置浏览器及外部通知 |
 
-- Browser access to Codex app-server threads and turn events.
-- Repository-aware sessions, file browsing, uploads, and generated artifacts.
-- Searchable Codex plugin catalog with explicit install and uninstall controls.
-- Scheduled, manual, webhook, and heartbeat automation triggers.
-- Run history, audit events, attention queues, and optional notifications.
-- Production fail-closed behavior when the authoritative app-server source is
-  unavailable.
-- Atomic EC2 deployment with health checks and release rollback.
-- Loopback-only application server behind authenticated HTTPS.
-- Repeatable local, API, UI, and end-to-end verification commands.
+典型用途：远程开发工作台、代码维护与验收、资料调研、仓库数据更新，以及由外部系统触发的 Codex 工作流。部署在持续运行的服务器上后，关闭浏览器不等于停止已接受的任务；重新打开对应会话可以查看状态。
 
-See [Architecture](docs/architecture.md) for the system boundaries and AWS
-deployment shape.
+## 快速开始
 
-## Security model
+### 1. 准备运行环境
 
-This console can initiate development-agent operations and must be treated as
-a privileged administration surface.
-
-- Keep the Node service bound to `127.0.0.1`.
-- Put Caddy or another authenticated HTTPS reverse proxy in front of it.
-- Restrict the EC2 security group; do not expose port `8787` publicly.
-- Configure a random `CODEX_CLOUD_WEBHOOK_TOKEN` for external triggers.
-- Prefer an EC2 instance profile and Systems Manager over long-lived AWS keys.
-- Mount only repositories and credentials needed by the worker.
-
-Read [SECURITY.md](SECURITY.md) before using the project with non-test data.
-
-## Requirements
-
-- Node.js 22 or newer
-- A working Codex CLI/app-server installation on the host
-- Linux for the reference systemd deployment
-- Caddy or an equivalent authenticated HTTPS reverse proxy for remote access
-
-## Local development
+- Node.js **22+**、npm、Git。
+- 主机上已安装可运行 `app-server` 的 Codex CLI，安装方法见 [Codex CLI 官方文档](https://learn.chatgpt.com/docs/codex/cli)。
+- 在**运行控制台的同一个系统用户**下完成 Codex 登录。登录你的笔记本，不等于服务器上的 Codex 也已登录。
 
 ```bash
+node --version
+codex --version
+codex login
+codex login status
+```
+
+### 2. 启动控制台
+
+```bash
+git clone https://github.com/WilsonWang01/codex-cloud-console.git
+cd codex-cloud-console
 npm ci
 npm run dev
 ```
 
-Open `http://127.0.0.1:5174`.
+打开 **[http://127.0.0.1:5174](http://127.0.0.1:5174)**。前端默认使用 `5174`，API 使用 `127.0.0.1:8787`；端口占用时以终端输出为准。控制台会自行启动 Codex app-server，无需再手动启动一份。
 
-The local server stores disposable state under `.codex-cloud-state/` and
-`.codex-cloud-local/`, both of which are ignored by Git.
+这是连接本机 Codex 的开发入口，不是云端演示站，也不会创建 EC2 实例。想从其他设备访问，请先阅读[服务器部署](docs/setup.md#服务器部署)，不要直接把开发端口暴露到公网。
 
-## EC2 deployment
+### 3. 添加项目并开始第一项任务
 
-The reference layout uses `/home/ubuntu/codex-cloud`:
+1. 点击侧边栏“项目”旁的 **+**，填写项目名称。
+2. 填入 GitHub 仓库地址以克隆项目；留空则创建空 Git 工作区。私有仓库需要主机上的 Git 已有访问权限。
+3. 选中项目，检查输入框下方的**模型、推理强度和权限**。
+4. 发送一个明确的任务，例如：
 
-```text
-/home/ubuntu/codex-cloud/
-├── console-current -> releases/console/<release-id>
-├── releases/console/
-├── workspace/
-├── logs/
-├── state/
-└── worktrees/
-```
+   ```text
+   先只分析，不修改代码：梳理这个项目的运行方式、核心模块和现有测试，列出最值得优先修复的 3 个问题。
+   ```
 
-Create a server-only environment file from
-[`ops/codex-cloud-console.env.example`](ops/codex-cloud-console.env.example),
-then install the systemd service:
+仓库中的 `sample-*` 是配置示例，不代表已经克隆了可运行项目。现有目录的接入方式见[项目配置](docs/setup.md#项目与自动化配置)。
 
-```bash
-sudo install -m 600 ops/codex-cloud-console.env.example /etc/codex-cloud-console.env
-sudo editor /etc/codex-cloud-console.env
-sudo bash ops/install-systemd.sh
-```
+> [!WARNING]
+> 当前新会话默认使用 `gpt-5.6-terra` / `medium`，权限默认是 **全权限 / 不请求审批**。首次接入重要仓库时，先切到“只读”或“工作区写入”，检查仓库指令并做好备份。真实任务会消耗账号额度，服务器和第三方服务也可能产生费用。
 
-The installer validates the environment, builds with `npm ci` in a new release
-directory, atomically switches `console-current`, and rolls back if the strict
-health check fails. Workspace and state directories remain outside releases.
+## 日常使用
 
-For resilient EC2 access without opening inbound SSH, see
-[AWS instance access](docs/aws-instance-access.md).
+### 对话、文件和调研
 
-## Configuration
+选中项目后直接输入任务；用附件按钮上传截图或文件，也可以在输入框中使用 `@` 引用文件、用 `$` 选择可用 Skill。生成的图片和文件会随消息展示，具体生成能力取决于模型、账号和工具配置。
 
-Important server-side variables include:
+可以从这些任务开始：
 
-| Variable | Purpose |
+- **修复问题**：“根据附件中的报错定位原因，修复后运行相关测试，列出修改文件和验证结果。”
+- **审查项目**：“检查当前改动中的逻辑漏洞和边界条件，按严重程度列出问题，先不要修改。”
+- **资料调研**：“调研这个技术方案，给出来源、适用条件和风险，将报告写入 `docs/research.md`。”
+
+长任务可以在运行中补充指令或请求停止。草稿会保存；出现多页面编辑冲突时，先检查差异，再选择保留本机内容或载入云端草稿。
+
+### 模型和常用指令
+
+点击输入框下方的模型与推理强度即可调整，也可以输入 `/` 打开命令菜单。这些是**本控制台的快捷入口**，不等同于终端 CLI 的所有命令。
+
+| 入口 | 用途 |
 | --- | --- |
-| `CODEX_CLOUD_ROOT` | Root for workspace, logs, state, and releases |
-| `CODEX_WORKSPACE_ROOT` | Parent directory containing managed repositories |
-| `CODEX_CLOUD_PUBLIC_ORIGIN` | Canonical authenticated HTTPS origin |
-| `CODEX_CLOUD_WEBHOOK_TOKEN` | Token required by automation webhooks |
-| `CODEX_PUBLIC_IP` / `CODEX_PRIVATE_IP` | Optional display-only instance metadata |
-| `AWS_REGION` | Region displayed by the console |
-| `CODEX_ALLOW_LOCAL_FALLBACK` | Development-only fallback; leave unset in production |
-| `CODEX_ENABLE_CLI_DEBUG` | Opt-in raw CLI diagnostics |
-| `CODEX_ENABLE_LOCAL_REVIEW_READ` | Opt-in local review reads |
-| `CODEX_ENABLE_LOCAL_REVIEW_MUTATION` | Opt-in local review mutations |
-| `CODEX_PLUGIN_CATALOG_CACHE_TTL_MS` | Plugin catalog cache lifetime; defaults to five minutes |
-| `CODEX_AUTOMATION_RECOVERY_ENABLED` | Continue eligible interrupted app-server runs after restart; defaults to enabled |
-| `CODEX_AUTOMATION_RECOVERY_MAX_AGE_MS` | Only recover runs active within this window; defaults to 30 minutes |
-| `CODEX_AUTOMATION_RECOVERY_MAX_ATTEMPTS` | Bounded automatic continuation attempts per lineage; defaults to one |
-| `CODEX_AUTOMATION_RECOVERY_STARTUP_DELAY_MS` | Startup grace period before recovery; trigger requests wait behind this gate; defaults to one second |
+| `/model`、`/reasoning` | 选择模型和推理强度 |
+| `/permissions`、`/search` | 调整权限或切换联网搜索 |
+| `/status`、`/account` | 查看连接、上下文、账号与用量状态 |
+| `/mcp`、`/plugins`、`/capabilities` | 查看工具能力、处理 MCP 登录、管理可用插件 |
+| `/goal`、`/compact`、`/auto-compact` | 设置会话目标、手动压缩、配置自动压缩 |
+| `/session`、`/fork`、`/archive` | 切换、分支或归档会话 |
+| `/review`、`/diff` | 打开 Review 面板或查看相对远端的差异 |
 
-The checked-in values are documentation placeholders. Never commit a populated
-environment file.
+部分入口需要先建立正式 Codex 会话。模型是否可用，以服务器账号和 app-server 返回结果为准；修改显示名称或升级控制台不会授予模型权限。
 
-Repositories can also be added through the console. Their definitions are
-stored under the configured state directory, not in the source checkout.
+### 查看改动与运行 Review
 
-## Verification
+1. 输入 `/review` 打开面板，仅查看变更**不会自动启动模型审查**。
+2. 切换“未暂存”“已暂存”或“Base 分支”，选择文件查看 diff。
+3. 需要模型审查时，点击“运行 Review”，随后查看发现的问题。
+4. 管理员启用本地 Review 操作后，可暂存、取消暂存或还原文件/hunk，也可在具备 GitHub 授权时发布 PR 评论。还原需要确认；“还原全部”会删除未跟踪的文件和目录。
 
-Run the isolated checks before opening a pull request:
+本地 Git 写操作和 PR 集成默认受配置开关限制，见[可选能力](docs/setup.md#可选能力)。
+
+### 自动化与外部调用
+
+进入“自动化”，选择**已经配置好的任务**，点击“Codex 运行”，或查看历史运行、关联会话和日志。有系统定时器的任务可以暂停或恢复；手动任务没有定时器。
+
+其他服务可通过 HTTP 触发同一套任务流程：
+
+| 方式 | 适合场景 |
+| --- | --- |
+| 手动运行 | 临时维护、一次验收 |
+| systemd timer | 定时调研、定期更新和检查 |
+| Webhook | 外部 CI、业务事件、其他自动化服务触发 |
+| Heartbeat | 向指定的现有会话提交后续任务 |
+
+**目前不是可视化任务编排器**：任务定义、提示词和系统定时器需预先配置；Heartbeat 是续跑接口，本身不负责定时。完整请求示例见[自动化接入](docs/setup.md#自动化接入)。
+
+## 数据与部署
+
+本地开发默认数据位置：
+
+| 位置 | 内容 |
+| --- | --- |
+| `.codex-cloud-state/` | 控制台会话索引、草稿、自动化运行与通知等状态 |
+| `.codex-cloud-local/` | 工作区、worktrees、日志等本地运行文件 |
+| `$CODEX_HOME`，默认 `~/.codex` | Codex 自身的登录、会话和配置数据 |
+| 浏览器本地存储 | 尚未同步的草稿及部分界面设置 |
+
+**这些不是可以随意清除的缓存。** 更新代码前备份运行数据；不要把登录凭据、环境文件、附件或真实任务记录提交到 GitHub。自托管也不等于多租户隔离，不应直接对不受信任的用户开放。
+
+EC2 参考部署使用 systemd 常驻服务、认证 HTTPS 和独立的数据目录。安装器在新目录构建并精简运行依赖，健康检查失败时回滚；成功后默认只保留一个发布目录。部署会重启服务，应先处理运行中的任务。
+
+- [服务器部署、更新与本机便捷入口](docs/setup.md)
+- [通过 SSM / SSH 访问 EC2](docs/aws-instance-access.md)
+- [架构与信任边界](docs/architecture.md)
+- [安全要求](SECURITY.md)
+
+## 常见问题
+
+**需要 AWS 才能用吗？** 不需要。本地即可运行；EC2 是仓库提供的 Linux/systemd 部署参考，不是使用前提。
+
+**网页登录和 Codex 登录是一回事吗？** 不是。前者保护控制台入口，后者让服务器上的 Codex 调用模型。出现浏览器用户名/密码框时，使用部署者配置的 HTTPS 入口凭据，而非 AWS 或 ChatGPT 密码。
+
+**不想每次输入网页密码怎么办？** 自己信任的电脑可配置[本机代理入口](docs/setup.md#本机便捷入口)，由本机持有 HTTPS 凭据。这不取消远端认证，也不能保证 AWS、Codex 或 MCP 的登录永不过期。
+
+**为什么模型选得了却用不了？** 先查看 `/account` 和 `/status`，核对服务器 CLI、实际登录账号及模型标识。以实际错误和云端模型列表为准，不要仅根据聊天回复判断当前底层模型。
+
+**为什么出现 app-server 或 MCP 初始化错误？** 在服务器上以服务用户检查 `codex --version`、`codex login status` 和 MCP 配置。服务用户的 PATH、CODEX_HOME 或缺失的 MCP 启动程序都可能影响会话；不要通过删除整个 Codex 数据目录“重置”。
+
+## 开发与验证
 
 ```bash
-npm run verify:local
+npm run verify:local      # 协议、normalizer、构建、回归与安全测试
+npm run verify:runtime    # 验证仅安装生产依赖时的运行包
 ```
 
-This validates the generated app-server schema, normalizers, TypeScript build,
-and regression suite.
+浏览器隔离验收、云端验收及真实模型测试的边界见[验证说明](docs/setup.md#验证)。项目仍处于 1.0 之前；参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [GOVERNANCE.md](GOVERNANCE.md)。
 
-After deploying to a controlled test instance:
+## 许可证
 
-```bash
-npm run verify:cloud
-```
-
-For the full browser pass with replayable Playwright artifacts:
-
-```bash
-npm run verify:cloud:full
-```
-
-When the bundled Playwright browser is unavailable, point the verification
-scripts at an installed browser:
-
-```bash
-PLAYWRIGHT_CHROMIUM_CHANNEL=chrome npm run verify:ui
-# Or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to an absolute browser path.
-```
-
-Real model turns are opt-in because they can incur usage:
-
-```bash
-CODEX_CLOUD_E2E_REAL_TURN=1 npm run verify:e2e
-```
-
-## Automation webhooks
-
-External callers use the same automation pipeline as scheduled and manual
-runs. Configure the public origin and webhook token, then send a stable
-idempotency key:
-
-```bash
-curl -X POST "$CODEX_CLOUD_URL/api/automations/sample-maintenance/webhook" \
-  -H "x-codex-cloud-token: $CODEX_CLOUD_WEBHOOK_TOKEN" \
-  -H "Idempotency-Key: sample-maintenance-$(date +%F)" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "runner":"app-server",
-    "worktree":true,
-    "completionContract": {
-      "version": 1,
-      "type": "exact-final-line",
-      "marker": "MAINTENANCE_RUN_COMPLETE"
-    }
-  }'
-```
-
-Use `/api/automations/:id/heartbeat` with a session ID to continue an existing
-thread instead of creating an isolated run.
-
-`completionContract` is optional in an app-server trigger body or automation
-configuration. When declared, the run completes only when the last non-empty
-line of the current turn output exactly matches the marker.
-The contract supports only the fixed `exact-final-line` type and an 8–80
-character uppercase ASCII marker; regular expressions, scripts, commands, and
-predicates are rejected rather than evaluated. A recovery run inherits the
-persisted contract snapshot. Missing markers fail closed, remain idempotently
-terminal for the original key, and appear in the attention inbox. Retry such a
-task only after review and with a new idempotency key.
-
-## Project status
-
-The project is pre-1.0 and currently maintainer-led. Interfaces and deployment
-details may change between releases. See [GOVERNANCE.md](GOVERNANCE.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md) to participate.
-
-## License
-
-Licensed under the [Apache License 2.0](LICENSE).
+[Apache License 2.0](LICENSE)。第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
