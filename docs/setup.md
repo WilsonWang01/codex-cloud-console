@@ -176,6 +176,8 @@ sudo systemctl restart codex-cloud-console.service
 
 这只隔离个人执行器到工作数据的方向。现有 `ubuntu` 工作执行器有 sudo，能读取个人状态；在迁移工作执行器到低权限用户并验收前，不要把个人空间用于需要防范工作任务读取的秘密。服务重启会打断运行中任务，先检查任务再操作；回滚控制台时停用个人 drop-in 即可，**不删除** `/var/lib/codex-personal`。
 
+已有 Caddy 同时承载其他站点时，不能用仓库 `ops/Caddyfile` 整体覆盖。可运行 `node ops/extend-caddy-automation-routes.mjs /etc/caddy/Caddyfile /tmp/codex-caddy-candidate` 生成候选文件；脚本要求旧路由完全不变，仅增加自动化结果查询和取消匹配器，并用 `caddy validate` 校验。先备份原配置，再由管理员原子替换并 reload；失败时恢复原配置。不要在日志或工单中输出完整 Caddyfile，里面可能含登录验证哈希。
+
 ## 本机便捷入口
 
 已有认证 HTTPS 服务时，可以在自己的受信任电脑上保存入口凭据，由本机代理代为认证。这不是免认证后门，也不会让 Codex、AWS 或 MCP 的授权永不过期。
