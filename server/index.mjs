@@ -562,8 +562,8 @@ function normalizeSession(item, repoId) {
     codexSessionId: item?.codexSessionId ? String(item.codexSessionId) : null,
     model: item?.model ? String(item.model) : null,
     reasoning: item?.reasoning ? String(item.reasoning) : null,
-    sandbox: item?.sandbox ? String(item.sandbox) : repoId === personalRepoId ? "read-only" : null,
-    approval: item?.approval ? String(item.approval) : repoId === personalRepoId ? "on-request" : null,
+    sandbox: repoId === personalRepoId ? personalSessionRuntime(item || {}).sandbox : item?.sandbox ? String(item.sandbox) : null,
+    approval: repoId === personalRepoId ? "on-request" : item?.approval ? String(item.approval) : null,
     search: typeof item?.search === "boolean" ? item.search : null,
     pendingTurnRuntime: normalizePendingTurnRuntime(item?.pendingTurnRuntime, item),
     tokenUsage: normalizeTokenUsage(item?.tokenUsage),
@@ -894,9 +894,17 @@ function runtimeFromAppServerSettings(result = {}, fallback = {}) {
 
 async function refreshSessionRuntimeFromAppServer(repo, session, options = {}) {
   if (!session?.codexSessionId) return session;
-  const response = await codexAppServerRequest("thread/resume", { threadId: session.codexSessionId, cwd: repo.path }, options.timeout || 20_000);
+  const permissions = repo.kind === "personal" ? personalSessionRuntime(session) : null;
+  if (permissions && (activeTurns.has(makeSessionKey(repo.id, session.id)) || activeCompactions.has(makeSessionKey(repo.id, session.id)))) return session;
+  const response = await codexAppServerRequest("thread/resume", {
+    threadId: session.codexSessionId, cwd: repo.path,
+    ...(permissions ? { sandbox: permissions.sandbox, approvalPolicy: permissions.approval } : {}),
+  }, options.timeout || 20_000);
   if (!response.ok) return session;
-  const appServerRuntime = runtimeFromAppServerSettings(response.result || {}, session);
+  const appServerRuntime = {
+    ...runtimeFromAppServerSettings(response.result || {}, session),
+    ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
+  };
   const runtime = mergeAppServerRuntimeWithPending(session, appServerRuntime);
   return (await updateSessionRuntime(repo.id, session.id, runtime, { makeActive: false })) || session;
 }
@@ -1218,7 +1226,10 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
 
 async function importAppServerThreadSession(repo, threadId, title = "新会话") {
   if (!threadId) return null;
-  const response = await codexAppServerRequest("thread/resume", { threadId, cwd: repo.path }, 20_000);
+  const response = await codexAppServerRequest("thread/resume", {
+    threadId, cwd: repo.path,
+    ...(repo.kind === "personal" ? { sandbox: "read-only", approvalPolicy: "on-request" } : {}),
+  }, 20_000);
   if (!response.ok) return null;
   const returnedThread = response.result?.thread || response.result?.data?.thread || response.result?.data || {};
   const returnedThreadId = String(returnedThread?.id || response.result?.threadId || "").trim();
@@ -3105,7 +3116,12 @@ function handleAppServerNotification(rpcMessage) {
     const runtime = runtimeFromAppServerSettings(params, job?.runtime || {});
     if (routeOwner) {
       findStoredSessionByThreadId(owner.threadId || job?.threadId || "")
-        .then(({ session }) => mergeAppServerRuntimeWithPending(session || {}, runtime, { clearPending: Boolean(job) }))
+        .then(({ session }) => {
+          const permissions = routeOwner.repoId === personalRepoId ? personalSessionRuntime(job?.runtime || session || {}) : null;
+          return mergeAppServerRuntimeWithPending(session || {}, {
+            ...runtime, ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
+          }, { clearPending: Boolean(job) });
+        })
         .then((mergedRuntime) => updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, mergedRuntime, { makeActive: false }))
         .catch((error) => {
           if (job) emitJobEvent(job, "error", { message: `设置同步失败: ${error.message}` });

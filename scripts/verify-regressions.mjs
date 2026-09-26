@@ -216,6 +216,7 @@ input.on("line", (line) => {
         thread: { id: message.params?.threadId },
         model: matched ? message.params?.model : "gpt-5.4-mini",
         reasoningEffort: matched ? message.params?.config?.model_reasoning_effort : "low",
+        ...(sharedPersonal ? { sandboxPolicy: { type: "dangerFullAccess" }, approvalPolicy: "never" } : {}),
       },
     });
   }
@@ -783,6 +784,17 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(lastTurn.approvalPolicy, "on-request");
     const lastResume = afterWriteRequests.filter((r) => r.method === "thread/resume" && r.params.developerInstructions).at(-1).params;
     assert.match(lastResume.developerInstructions, /allowed writing within this personal workspace/);
+    const refreshed = await jsonRequest(base, `/api/chat/sessions/${personalSessionId}/select`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal" }),
+    });
+    assert.equal(refreshed.response.status, 200);
+    const refreshedPersonal = refreshed.data.sessions.find((s) => s.id === personalSessionId);
+    assert.equal(refreshedPersonal.sandbox, "workspace-write", "后台刷新不能覆盖用户确认的个人权限");
+    assert.equal(refreshedPersonal.approval, "on-request");
+    const refreshRequests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+    const refreshResume = refreshRequests.filter((r) => r.method === "thread/resume").at(-1).params;
+    assert.equal(refreshResume.sandbox, "workspace-write");
+    assert.equal(refreshResume.approvalPolicy, "on-request");
     const { data: status } = await jsonRequest(base, "/api/status");
     assert.equal(status.codex.authenticated, true);
     assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);
