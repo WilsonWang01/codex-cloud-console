@@ -2,6 +2,7 @@ export type Repo = {
   id: string;
   kind?: "work" | "personal";
   executionAvailable?: boolean;
+  runtimeMode?: "shared" | "dedicated" | "disabled";
   name: string;
   path: string;
   remote: string;

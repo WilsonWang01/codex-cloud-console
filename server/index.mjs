@@ -42,8 +42,7 @@ const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "
 const personalRuntime = personalRuntimeConfig(process.env);
 const personalRoot = personalRuntime.enabled ? personalRuntime.root : process.env.CODEX_PERSONAL_ROOT || path.join(cloudRoot, "personal");
 const personalRepoId = "_personal";
-const personalPreviewEnabled = process.env.NODE_ENV !== "production" && process.env.CODEX_PERSONAL_PREVIEW === "1";
-const personalExecutionAvailable = personalRuntime.enabled || personalPreviewEnabled;
+const personalExecutionAvailable = personalRuntime.mode !== "disabled";
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
 const stateRoot =
   process.env.CODEX_STATE_ROOT ||
@@ -1769,6 +1768,7 @@ function appServerThreadParams(repo, runtime) {
     config: {
       model_reasoning_effort: runtime.reasoning,
       tools: { web_search: runtime.search },
+      ...(repo.kind === "personal" ? { features: { memories: false } } : {}),
     },
   };
 }
@@ -2824,7 +2824,7 @@ async function resolveThreadForJob(job) {
 
 async function startTurnJob(repo, session, runtime, message, attachments = [], storedMessage = message, options = {}) {
   if (repo.kind === "personal") {
-    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行未启用：独立 worker 尚未完成配置与验收"), { statusCode: 503 });
+    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行已被管理员停用"), { statusCode: 503 });
     runtime = runtimeForRepo(repo, runtime);
   }
   const key = makeSessionKey(repo.id, session.id);
@@ -3741,6 +3741,7 @@ function accountLoginFlowFromResponse(response = {}, repoId = "") {
 }
 
 function accountLoginMatchesScope(flow, repoId = "") {
+  if (!personalRuntime.enabled) return true;
   return repoId === personalRepoId
     ? flow?.repoId === personalRepoId
     : flow?.repoId !== personalRepoId;
@@ -3804,10 +3805,9 @@ function summarizeAppServerStatus(results, repo = null) {
   const gaps = [];
   const appHost = appServerClientForRepo(repo).status();
   const allRequestsFailed = Object.values(results).every((value) => !value.ok);
+  // The host stderr ring contains past failures, including failures before login.
   const authProblem = codexAuthProblemFromSources(
-    appHost.lastError,
-    (appHost.stderrTail || []).join("\n"),
-    Object.values(results).map((value) => value.error || value.stderr || "").join("\n"),
+    Object.values(results).filter((value) => !value.ok).map((value) => value.error || "").join("\n"),
   ) || (results.account?.ok && !account ? "Codex 账号未登录" : null);
   const usageLimit = codexUsageLimitFromSources(
     appHost.lastError,
@@ -3847,6 +3847,7 @@ function summarizeAppServerStatus(results, repo = null) {
     ok: failedCriticalKeys.length === 0,
     source: failedCriticalKeys.length ? "app-server-partial" : "app-server",
     authoritative: failedCriticalKeys.length === 0,
+    runtimeScope: runtimeScopeForRepo(repo),
     partial: failedCriticalKeys.length > 0,
     failedCriticalKeys,
     capabilityWarnings,
@@ -3918,7 +3919,7 @@ function appStatusRequestList(repo) {
 async function computeCodexAppStatus(repo, timeout = 12_000) {
   const results = await codexAppServerBatchRequest(appStatusRequestList(repo), timeout, repo);
   if (!results.plugins?.ok) {
-    results.plugins = await codexAppServerRequest("plugin/list", { cwds: [repo.path] }, Math.min(timeout, 12_000));
+    results.plugins = await codexAppServerRequest("plugin/list", { cwds: [repo.path] }, Math.min(timeout, 12_000), repo);
   }
   return summarizeAppServerStatus(results, repo);
 }
@@ -3934,6 +3935,7 @@ async function readPluginCatalog(repo, options = {}) {
     "plugin/list",
     { cwds: [repo.path], forceRefetch: options.forceRefetch === true },
     options.forceRefetch === true ? 45_000 : 20_000,
+    repo,
   )
     .then((response) => {
       if (!response.ok) throw new Error(response.error || "Plugin catalog is unavailable");
@@ -3967,13 +3969,18 @@ function refreshAppStatusAfterPluginChange(repo) {
   startAppStatusRefresh(repo).catch(() => null);
 }
 
+function runtimeScopeForRepo(repo) {
+  return repo?.kind === "personal" && personalRuntime.enabled ? "personal-worker" : "shared";
+}
+
 async function readStoredAppStatusCache(repo) {
   const existing = appStatusCacheByRepo.get(repo.id);
   if (existing) return existing;
   try {
     const parsed = JSON.parse(await fs.readFile(codexAppStatusCachePath, "utf8"));
     const item = parsed?.repos?.[repo.id] || parsed?.[repo.id] || null;
-    if (item?.data?.ok === true && item.data.source === "app-server" && item.data.authoritative === true) {
+    if (item?.data?.ok === true && item.data.source === "app-server" && item.data.authoritative === true
+      && (repo.kind !== "personal" || item.data.runtimeScope === runtimeScopeForRepo(repo))) {
       const cached = {
         data: item.data,
         cachedAt: Date.parse(item.cachedAt || item.data.cachedAt || "") || 0,
@@ -4148,10 +4155,10 @@ async function runCodexDiagnostics(repo) {
     }),
     timedDiagnostic("codex-auth", "Codex 账号", async () => {
       const [status, accountProbe] = await Promise.all([
-        repo.kind === "personal" ? Promise.resolve({ authenticated: false, mode: "unknown", detail: "个人专用账号未登录" }) : getCodexStatus(),
+        repo.kind === "personal" && personalRuntime.enabled ? Promise.resolve({ authenticated: false, mode: "unknown", detail: "个人专用账号未登录" }) : getCodexStatus(),
         appServerProbe("account/read", {}, 10_000, repo),
       ]);
-      const authProblem = codexAuthProblemFromSources(accountProbe.error, status.detail);
+      const authProblem = codexAuthProblemFromSources(accountProbe.error, accountProbe.ok ? "" : status.detail);
       const effective = codexStatusFromAccountProbe(status, accountProbe, authProblem);
       return {
         ok: effective.authenticated,
@@ -4228,6 +4235,7 @@ async function runCodexDiagnostics(repo) {
     generatedAt,
     repoId: repo.id,
     appHost,
+    runtimeScope: runtimeScopeForRepo(repo),
     summary: {
       total: checks.length,
       ok: checks.filter((check) => check.tone === "ok").length,
@@ -4280,6 +4288,7 @@ function normalizeDiagnosticsSnapshot(value = {}) {
     ok: Boolean(value.ok),
     generatedAt,
     repoId: String(value.repoId || "").slice(0, 120),
+    runtimeScope: String(value.runtimeScope || "").slice(0, 40),
     summary: {
       total: Number(summary.total ?? checks.length),
       ok: Number(summary.ok ?? checks.filter((check) => check.tone === "ok").length),
@@ -4293,6 +4302,9 @@ function normalizeDiagnosticsSnapshot(value = {}) {
 async function readDiagnosticsState() {
   const parsed = await readJsonState(diagnosticsStatePath, { version: 1, latest: null });
   const latest = normalizeDiagnosticsSnapshot(parsed?.latest || parsed);
+  if (latest?.repoId === personalRepoId && latest.runtimeScope !== runtimeScopeForRepo({ kind: "personal" })) {
+    return { version: 1, latest: null };
+  }
   return { version: 1, latest };
 }
 
@@ -4566,7 +4578,7 @@ async function getRepo(repo) {
   if (repo.kind === "personal") {
     const socket = personalRuntime.enabled ? await fs.stat(personalRuntime.socketPath).catch(() => null) : null;
     const workerOnline = Boolean(socket?.isSocket());
-    return { ...repo, present: true, executionAvailable: personalPreviewEnabled || workerOnline, branch: "", commit: "", dirty: false, statusText: workerOnline ? "个人空间 · 独立低权限执行器" : "个人空间 · 仅上下文隔离", lastCommit: "非 Git 空间" };
+    return { ...repo, present: true, runtimeMode: personalRuntime.mode, executionAvailable: personalRuntime.mode === "shared" || workerOnline, branch: "", commit: "", dirty: false, statusText: personalRuntime.enabled ? "个人空间 · 独立低权限执行器" : "个人空间 · 共用账号", lastCommit: "非 Git 空间" };
   }
 
   const [branch, commit, status, lastCommit] = await Promise.all([
@@ -6862,6 +6874,7 @@ async function getCodexStatus() {
 function codexStatusFromAccountProbe(codexStatus = {}, accountProbeResult = null, authProblem = "") {
   if (authProblem) return { ...codexStatus, authenticated: false, detail: authProblem, source: "app-server-auth-error" };
   const account = accountProbeResult?.ok ? accountProbeResult.result?.account || null : null;
+  if (accountProbeResult?.ok && !account) return { ...codexStatus, authenticated: false, mode: "unknown", detail: "Codex 账号未登录", source: "app-server-account" };
   if (!account) return codexStatus;
   const email = account.email || account.login || account.name || "";
   const plan = account.planType || account.plan || "";
@@ -7098,8 +7111,6 @@ async function getStatus({ applyAttentionState = true } = {}) {
   const localMode = repoStatus.some((repo) => !repo.present);
   const appHost = getAppServerClient().status();
   const codexAuthProblem = codexAuthProblemFromSources(
-    appHost.lastError,
-    (appHost.stderrTail || []).join("\n"),
     appServerProbeResult.error,
     accountProbeResult.error,
   );
@@ -7324,8 +7335,6 @@ async function getStatusForRoute() {
 function buildHealthSnapshot({ codexStatus, repoStatus, appServerProbeResult, accountProbeResult = null }) {
   const appHost = getAppServerClient().status();
   const codexAuthProblem = codexAuthProblemFromSources(
-    appHost.lastError,
-    (appHost.stderrTail || []).join("\n"),
     appServerProbeResult?.error,
     accountProbeResult?.error,
   );
@@ -8632,7 +8641,7 @@ app.get("/api/codex/app-status", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
   const { data, cache } = await getCodexAppStatusForRoute(repo);
   res.setHeader("x-codex-app-status-cache", cache);
-  res.status(data.ok === false || data.authoritative !== true || data.partial === true ? 503 : 200).json(data);
+  res.status(data.ok === false || data.authoritative !== true || data.partial === true ? 503 : 200).json({ ...data, accountLogin: accountLoginSnapshot(repo.id) });
 });
 
 app.get("/api/codex/plugins", async (req, res) => {
@@ -9800,7 +9809,7 @@ app.delete("/api/uploads", async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
-  if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
+  if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行已被管理员停用" });
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
   const runtime = normalizeRuntime(req.body, session);
@@ -9825,10 +9834,7 @@ app.post("/api/chat", async (req, res) => {
   }
 
   const job = await startTurnJob(repo, session, runtime, message, [], message);
-  const result = await Promise.race([
-    job.promise,
-    new Promise((resolve) => setTimeout(() => resolve({ ok: false, code: 124, error: "Codex turn timed out" }), codexTurnTimeoutMs)),
-  ]);
+  const result = await job.promise;
 
   res.json({
     ok: result.ok,
@@ -9842,7 +9848,7 @@ app.post("/api/chat", async (req, res) => {
 app.post("/api/chat/stream", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
-  if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
+  if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行已被管理员停用" });
   if (repo.kind === "personal" && Array.isArray(req.body?.attachments) && req.body.attachments.length) {
     return res.status(403).json({ ok: false, error: "个人空间暂不支持附件" });
   }

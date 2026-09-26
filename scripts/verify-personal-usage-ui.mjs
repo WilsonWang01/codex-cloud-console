@@ -13,7 +13,8 @@ vm.runInContext(ts.transpileModule(source.slice(start, end), { compilerOptions: 
 const status = JSON.parse(JSON.stringify(fixture.statusFixture));
 status.health.ok = true;
 status.health.layers.appServer = { ok: true, running: true };
-status.repos.push({ id: "_personal", name: "个人助理", kind: "personal", executionAvailable: false, path: "/tmp/personal", remote: "", accent: "teal", present: true, branch: "", commit: "", dirty: false, statusText: "个人空间", lastCommit: "非 Git 空间" });
+status.repos.push({ id: "_personal", name: "个人助理", kind: "personal", runtimeMode: "shared", executionAvailable: true, path: "/tmp/personal", remote: "", accent: "teal", present: true, branch: "", commit: "", dirty: false, statusText: "个人空间 · 共用账号", lastCommit: "非 Git 空间" });
+status.diagnostics = { repoId: "sample-app", generatedAt: new Date().toISOString(), ok: false, summary: { total: 1, ok: 0, warn: 0, danger: 1 }, checks: [{ id: "old-work-auth", label: "其他项目的历史诊断", tone: "danger", ok: false, summary: "旧登录错误", detail: "", durationMs: 0 }] };
 const sessions = ["sample-app", "_personal"].map((repoId) => ({
   id: `${repoId}-session`, repoId, title: `${repoId} 对话`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   messageCount: 0, isDraft: true, draft: { input: "", attachments: [], revision: 0 }, model: "gpt-5.6-terra", reasoning: "medium",
@@ -52,7 +53,7 @@ await context.route("**/api/**", async (route) => {
     personalLoginFlow = { loginId: "personal-login", type: "chatgptDeviceCode", status: "pending", userCode: "TEST-CODE", verificationUrl: "https://login.example.test/device" };
     return send({ ok: true, flow: personalLoginFlow, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: [personalLoginFlow] } });
   }
-  if (url.pathname === "/api/codex/app-status") return send({ ok: true, authoritative: true, partial: false, account: null, accountLogin: { active: repoId === "_personal" ? personalLoginFlow : null, latest: personalLoginFlow, flows: personalLoginFlow ? [personalLoginFlow] : [] }, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: {}, gaps: [] });
+  if (url.pathname === "/api/codex/app-status") return send({ ok: true, source: "app-server", authoritative: true, partial: false, account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" }, auth: { ok: true }, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: personalLoginFlow ? [personalLoginFlow] : [] }, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: {}, gaps: [] });
   if (url.pathname === "/api/codex/models") return send({ ok: true, models: [{ id: "gpt-5.6-terra", label: "GPT-5.6-Terra", supportedReasoningEfforts: ["medium"] }] });
   const draft = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft$/);
   if (draft) {
@@ -81,6 +82,7 @@ try {
   assert.equal(await page.locator(".send-button").isDisabled(), true);
   const composer = page.locator(".composer-shell textarea");
   await composer.fill("独立个人草稿");
+  assert.equal(await page.locator(".send-button").isEnabled(), true);
   await page.locator(".space-switch").getByRole("button", { name: "工作" }).click();
   await page.locator(".session-current[data-session-id='sample-app-session']").waitFor();
   assert.equal(await composer.inputValue(), "");
@@ -122,7 +124,7 @@ try {
         await page.getByRole("button", { name: "打开侧边栏" }).click();
         await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
         await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
-        await page.getByText("仅草稿", { exact: true }).waitFor();
+        await page.getByText("个人助理 · 共用账号 · 独立对话", { exact: true }).waitFor();
         await page.screenshot({ path: new URL("personal-390.png", out).pathname, fullPage: true });
         await page.getByRole("button", { name: "打开侧边栏" }).click();
         await page.locator(".space-switch").getByRole("button", { name: "工作" }).click();
@@ -138,14 +140,16 @@ try {
   await page.locator(".personal-scope-notice").waitFor();
   await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
   assert.match(page.url(), /#\/project\/_personal/);
-  assert.equal(await page.getByText("仅草稿", { exact: true }).count(), 1);
+  assert.equal(await page.getByText("仅草稿", { exact: true }).count(), 0);
   await page.evaluate(() => { window.open = () => null; });
   await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.getByText("登录有效 · 与工作空间共用账号", { exact: true }).waitFor();
+  assert.equal(await page.getByText("其他项目的历史诊断", { exact: true }).count(), 0);
   await page.getByRole("button", { name: "重新登录" }).first().click();
   const authorizationLink = page.getByRole("link", { name: "打开授权页" }).first();
   await authorizationLink.waitFor();
   assert.equal(await authorizationLink.getAttribute("href"), "https://login.example.test/device");
   assert.equal(await authorizationLink.getAttribute("rel"), "noopener noreferrer");
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间禁止未配置执行", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "弹窗被拦截时仍可打开个人账号授权链接"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

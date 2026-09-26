@@ -155,8 +155,8 @@ test("恢复超时保留原线程且不会新建线程", async () => {
   assert.deepEqual(calls, ["thread/resume"]);
 });
 
-test("个人账号登录流程与工作账号分开", () => {
-  const context = { accountLoginFlows: new Map(), personalRepoId: "_personal" };
+test("专用 worker 的个人账号登录流程与工作账号分开", () => {
+  const context = { accountLoginFlows: new Map(), personalRepoId: "_personal", personalRuntime: { enabled: true } };
   vm.createContext(context);
   vm.runInContext(section(source, "function rememberAccountLoginFlow(", "function summarizeAppServerStatus("), context);
   context.accountLoginFlowFromResponse({ loginId: "work-login" }, "sample-app");
@@ -167,6 +167,37 @@ test("个人账号登录流程与工作账号分开", () => {
   assert.equal(context.accountLoginSnapshot("_personal").latest.status, "completed");
   assert.equal(context.accountLoginSnapshot("sample-app").active.status, "pending");
   assert.equal(context.completeAccountLoginFlow({ loginId: "work-login", success: true }, "_personal"), null);
+});
+
+test("共享运行时的登录完成事件可更新个人空间且两侧复用同一登录流程", () => {
+  const context = { accountLoginFlows: new Map(), personalRepoId: "_personal", personalRuntime: { enabled: false } };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function rememberAccountLoginFlow(", "function summarizeAppServerStatus("), context);
+  context.accountLoginFlowFromResponse({ loginId: "shared-login" }, "_personal");
+  assert.equal(context.accountLoginSnapshot("sample-app").active.loginId, "shared-login");
+  context.completeAccountLoginFlow({ loginId: "shared-login", success: true });
+  assert.equal(context.accountLoginSnapshot("_personal").latest.status, "completed");
+  assert.equal(context.accountLoginSnapshot("sample-app").active, null);
+});
+
+test("当前账号状态不被历史 stderr 误判，但本次认证失败仍须显示", () => {
+  const context = {
+    groupedSkillsFromEntries: () => [], countInstalledPlugins: () => ({}),
+    appServerClientForRepo: () => ({ status: () => ({ lastError: "token_invalidated", stderrTail: ["token_invalidated"] }) }),
+    codexUsageLimitFromSources: () => null, mcpAuthNeedsLogin: () => false,
+    sanitizeCloudPathText: (value) => value, defaultRuntime: {},
+    appServerLiveSnapshot: () => ({}), accountLoginSnapshot: () => ({}), mcpOauthResults: [], runtimeScopeForRepo: () => "shared",
+  };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function codexAuthProblemFromSources(", "function mcpAuthNeedsLogin("), context);
+  vm.runInContext(section(source, "function summarizeAppServerStatus(", "function appStatusRequestList("), context);
+  vm.runInContext(section(source, "function codexStatusFromAccountProbe(", "async function getLogs("), context);
+  const results = Object.fromEntries(["account", "rateLimits", "accountUsage", "mcp", "skills", "features", "config", "plugins", "permissions", "provider", "appList"].map((key) => [key, { ok: true, result: {}, stderr: "token_invalidated" }]));
+  results.account.result.account = { type: "chatgpt" };
+  assert.equal(context.summarizeAppServerStatus(results).auth.ok, true);
+  results.rateLimits = { ok: false, error: "token_invalidated" };
+  assert.equal(context.summarizeAppServerStatus(results).auth.ok, false);
+  assert.equal(context.codexStatusFromAccountProbe({ authenticated: true }, { ok: true, result: { account: null } }).authenticated, false);
 });
 
 test("草稿串行写入版本递增，跨页面冲突保留本机文本", async () => {

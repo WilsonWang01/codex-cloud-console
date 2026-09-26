@@ -6946,6 +6946,11 @@ pre {
   line-height: 1.45;
 }
 .personal-scope-notice svg { flex: 0 0 auto; }
+.personal-scope-notice[data-mode="shared"] {
+  border-left-color: #6f9290;
+  color: #465b5a;
+  background: #f1f5f4;
+}
 @media (max-width: 820px) {
   .space-switch button { min-height: 44px; }
   .personal-scope-notice { margin: 0 4px 8px; }

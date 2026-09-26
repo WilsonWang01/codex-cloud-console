@@ -113,6 +113,9 @@ import fsSync from "node:fs";
 import readline from "node:readline";
 const initDelay = Number(process.env.FAKE_INIT_DELAY_MS || 0);
 const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
+const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
+const threads = [];
+if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", (line) => {
@@ -121,6 +124,13 @@ input.on("line", (line) => {
   if (!message.id) return;
   const send = (payload, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(payload) + "\\n"), delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
+  if (sharedPersonal && message.method === "account/read") return send({ id: message.id, result: { account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" } } });
+  if (sharedPersonal && message.method === "thread/list") return send({ id: message.id, result: { data: threads.filter((thread) => message.params.cwd.includes(thread.cwd)), nextCursor: null } });
+  if (sharedPersonal && message.method === "thread/start") {
+    const thread = { id: "shared-thread-" + threads.length, cwd: message.params.cwd, preview: "fixture", createdAt: 1, updatedAt: 1 };
+    threads.push(thread);
+    return send({ id: message.id, result: { thread } });
+  }
   if (message.method === "model/list") return send({
     id: message.id,
     result: {
@@ -698,6 +708,69 @@ await check("external automation interrupted by restart waits for reconciliation
   }
 });
 
+await check("personal and work reuse authentication without sharing threads or stale worker status", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-shared-personal-"));
+  const fake = await writeFakeCodex(root);
+  const cloudRoot = path.join(root, "cloud");
+  const stateRoot = path.join(root, "state");
+  const bin = path.join(root, "bin");
+  const capturePath = path.join(root, "requests.jsonl");
+  const port = await freePort();
+  await fs.mkdir(path.join(cloudRoot, "workspace", "sample-app"), { recursive: true });
+  await fs.mkdir(stateRoot, { recursive: true });
+  await fs.mkdir(bin, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "login" ]; then echo "Logged in using ChatGPT"; exit 0; fi\nif [ "$1" = "--version" ]; then echo "fixture"; exit 0; fi\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(stateRoot, "codex-app-status-cache.json"), JSON.stringify({ repos: { _personal: { cachedAt: new Date().toISOString(), data: { ok: true, source: "app-server", authoritative: true, runtimeScope: "personal-worker", account: null, auth: { ok: false, issue: "old worker login" } } } } }));
+  const child = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], {
+    cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot,
+      CODEX_WORKSPACE_ROOT: path.join(cloudRoot, "workspace"), CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"),
+      CODEX_PERSONAL_MODE: "shared", CODEX_PERSONAL_ROOT: path.join(cloudRoot, "personal"), CODEX_PERSONAL_WORKER: "1",
+      CODEX_CLOUD_WEBHOOK_TOKEN: "shared-test-token-only", CODEX_TURN_TIMEOUT_MS: "2000", CODEX_ALLOW_LOCAL_FALLBACK: "0",
+      FAKE_SHARED_PERSONAL: "1", FAKE_CAPTURE_PATH: capturePath, PATH: `${bin}:${process.env.PATH}` },
+  });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForOutput(child, /listening on/i);
+    const accountStates = [];
+    const sessions = [];
+    for (const repoId of ["sample-app", "_personal"]) {
+      const { data: account } = await jsonRequest(base, `/api/codex/app-status?repoId=${repoId}`);
+      assert.equal(account.auth.ok, true, JSON.stringify(account));
+      assert.equal(account.runtimeScope, "shared");
+      accountStates.push(account.account);
+      const { response, data } = await jsonRequest(base, "/api/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId, message: "outcome contract regression" }) });
+      assert.equal(response.status, 200, JSON.stringify(data));
+      assert.equal(data.ok, true, JSON.stringify(data));
+      sessions.push(data);
+    }
+    assert.deepEqual(accountStates[0], accountStates[1]);
+    assert.notEqual(sessions[0].codexSessionId, sessions[1].codexSessionId);
+    const crossSpace = await jsonRequest(base, `/api/chat/sessions/${sessions[1].sessionId}/select`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app" }) });
+    assert.equal(crossSpace.response.status, 404);
+    for (const [index, repoId] of ["sample-app", "_personal"].entries()) {
+      const { data } = await jsonRequest(base, `/api/chat/sessions?repoId=${repoId}`);
+      assert.equal(data.sessions.length, 1);
+      assert.equal(data.sessions[0].codexSessionId, sessions[index].codexSessionId);
+    }
+    const requests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(requests.filter((r) => r.method === "initialize").length, 1);
+    assert.equal(requests.filter((r) => r.method === "account/login/start").length, 0);
+    const starts = requests.filter((r) => r.method === "thread/start");
+    assert.equal(starts[0].params.cwd, path.join(cloudRoot, "workspace", "sample-app"));
+    assert.equal(starts[1].params.cwd, path.join(cloudRoot, "personal"));
+    assert.equal(starts[1].params.sandbox, "read-only");
+    assert.equal(starts[1].params.config.features.memories, false);
+    assert.match(starts[1].params.developerInstructions, /only this conversation/);
+    const { data: status } = await jsonRequest(base, "/api/status");
+    assert.equal(status.codex.authenticated, true);
+    assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);
+  } finally {
+    await stopProcess(child);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 await check("session sync failure preserves drafts and upload cleanup is verified", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-session-regression-"));
   const fakePath = await writeFakeCodex(tempRoot);
@@ -853,7 +926,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_STATE_ROOT: stateRoot,
       CODEX_HOME: codexHome,
       CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
-      CODEX_PERSONAL_PREVIEW: "0",
+      CODEX_PERSONAL_MODE: "disabled",
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
       CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS: "250",
       CODEX_TURN_TIMEOUT_MS: "300",

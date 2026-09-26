@@ -10,6 +10,15 @@ import { appServerRequestScope, personalRuntimeConfig } from "../server/personal
 
 const workerPath = fileURLToPath(new URL("../server/personal-worker.mjs", import.meta.url));
 
+test("personal runtime shares the existing account by default and supports explicit modes", () => {
+  assert.equal(personalRuntimeConfig({ NODE_ENV: "production" }).mode, "shared");
+  const shared = personalRuntimeConfig({ NODE_ENV: "production", CODEX_PERSONAL_WORKER: "1", CODEX_PERSONAL_MODE: "shared" }, "darwin");
+  assert.equal(shared.enabled, false);
+  assert.equal(shared.mode, "shared");
+  assert.equal(personalRuntimeConfig({ CODEX_PERSONAL_MODE: "disabled" }).mode, "disabled");
+  assert.throws(() => personalRuntimeConfig({ CODEX_PERSONAL_MODE: "typo" }), /Invalid/);
+});
+
 test("personal runtime requires a dedicated Linux home and socket", () => {
   const enabled = personalRuntimeConfig({ NODE_ENV: "production", CODEX_PERSONAL_WORKER: "1" }, "linux");
   assert.equal(enabled.enabled, true);

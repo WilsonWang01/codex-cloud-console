@@ -4,7 +4,9 @@ const defaultPersonalHome = "/var/lib/codex-personal";
 const defaultSocket = "/run/codex-personal/worker.sock";
 
 export function personalRuntimeConfig(env = process.env, platform = process.platform) {
-  const enabled = env.NODE_ENV === "production" && env.CODEX_PERSONAL_WORKER === "1";
+  const mode = env.CODEX_PERSONAL_MODE || (env.NODE_ENV === "production" && env.CODEX_PERSONAL_WORKER === "1" ? "dedicated" : "shared");
+  if (!["shared", "dedicated", "disabled"].includes(mode)) throw new Error("Invalid CODEX_PERSONAL_MODE");
+  const enabled = mode === "dedicated";
   const home = path.resolve(env.CODEX_PERSONAL_HOME || defaultPersonalHome);
   const root = path.resolve(env.CODEX_PERSONAL_ROOT || (enabled ? path.join(home, "workspace") : ""));
   const socketPath = path.resolve(env.CODEX_PERSONAL_SOCKET || defaultSocket);
@@ -15,7 +17,7 @@ export function personalRuntimeConfig(env = process.env, platform = process.plat
   if (enabled && (!socketPath.startsWith("/run/codex-personal/") || socketPath === "/run/codex-personal/")) {
     throw new Error("Personal worker socket must be under /run/codex-personal");
   }
-  return { enabled, home, root, socketPath };
+  return { mode, enabled, home, root, socketPath };
 }
 
 export function appServerRequestScope(params = {}, personalRoot = "") {

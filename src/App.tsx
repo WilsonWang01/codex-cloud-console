@@ -6087,7 +6087,7 @@ export function App() {
               pushNotificationBusy={pushNotificationBusy}
               browserPushEndpoint={browserPushEndpoint}
               browserPushReadiness={browserPushReadiness}
-              diagnostics={codexDiagnostics || status.diagnostics || null}
+              diagnostics={[codexDiagnostics, status.diagnostics].find((item) => item?.repoId === selectedRepo.id) || null}
               diagnosticsBusy={diagnosticsBusy}
               onExternalNotificationTest={() => runExternalNotificationAction("test")}
               onExternalNotificationCheck={() => runExternalNotificationAction("check")}
@@ -9239,13 +9239,13 @@ function CloudChat({
         </div>
       )}
 
-      {repo.kind === "personal" && <div className="personal-scope-notice" role="status">
+      {repo.kind === "personal" && <div className="personal-scope-notice" data-mode={repo.runtimeMode} role="status">
         <UserRound size={16} />
         <span>{repo.executionAvailable
-          ? repo.statusText?.includes("独立低权限")
+          ? repo.runtimeMode === "dedicated"
             ? "个人空间使用独立低权限执行器，当前仅允许只读任务；现有工作执行器仍有主机管理权限，请勿把它当作双向保密边界。"
-            : "个人空间预览：会话独立，执行仅只读；尚未建立独立系统用户的权限隔离，请勿提交敏感资料。"
-          : "个人空间已建立独立会话与草稿；执行需先配置并验收独立 worker，当前可先整理草稿。"}</span>
+            : "个人助理 · 共用账号 · 独立对话"
+          : "个人空间执行暂未启用，草稿仍会保留。"}</span>
       </div>}
 
       <div className="chat-window" aria-busy={historyLoading}>
@@ -10598,7 +10598,7 @@ function SettingsView({
         <Metric label="云端工作区" value={status.instance.root ? "已连接" : "未配置"} title={status.instance.root} icon={<HardDrive size={16} />} />
         <Metric label="公网 IP" value={status.instance.publicIp} icon={<Cloud size={16} />} />
         <Metric label="私网 IP" value={status.instance.privateIp} icon={<Wifi size={16} />} />
-        <Metric label="Codex 认证" value={status.codex.mode} icon={<ShieldCheck size={16} />} />
+        <Metric label="Codex 认证" value={codexAuthOk ? appStatus.account?.type === "apiKey" ? "API key" : "ChatGPT subscription" : appStatusPending ? "同步中" : "未登录"} icon={<ShieldCheck size={16} />} />
       </div>
       {Boolean(status.capabilityWarnings?.length) && (
         <div className="settings-copy warning-copy">
@@ -10621,7 +10621,7 @@ function SettingsView({
         </div>
         <p>
           {diagnostics
-            ? `最近 ${timeLabel(diagnostics.generatedAt)} · ${diagnostics.summary.ok} 正常 · ${diagnostics.summary.warn} 提醒 · ${diagnostics.summary.danger} 问题`
+            ? `上次诊断 ${timeLabel(diagnostics.generatedAt)} · ${diagnostics.summary.ok} 正常 · ${diagnostics.summary.warn} 提醒 · ${diagnostics.summary.danger} 问题`
             : "检查 Codex CLI 版本、登录状态、云端协议、会话列表和 MCP/plugin/skills 等能力。"}
         </p>
         {diagnostics && (
@@ -10656,10 +10656,10 @@ function SettingsView({
         </div>
         <div className="mini-list">
           <span>
-            {appStatus.account?.email || "未知账号"} · {appStatus.account?.planType || status.codex.mode || "未知套餐"}
+            {appStatus.account?.email || "未知账号"} · {appStatus.account?.planType || appStatus.account?.type || "未知套餐"}
           </span>
           <span className={codexAuthOk ? "" : "warn-text"}>
-            {codexAuthOk ? "登录有效" : appStatus.auth?.issue || status.codex.detail || "需要重新登录 Codex"}
+            {codexAuthOk ? repo.kind === "personal" && repo.runtimeMode === "shared" ? "登录有效 · 与工作空间共用账号" : "登录有效" : appStatusPending ? "同步中" : appStatus.auth?.issue || "需要重新登录 Codex"}
           </span>
           <span className={usageLimit ? "warn-text" : ""} title={usageLimit?.message || usageLimit?.body || quotaText}>
             额度 {appStatusPending ? "同步中" : quotaText}

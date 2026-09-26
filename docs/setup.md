@@ -160,11 +160,19 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 调用明细按 UTC 日期追加到 `state/api-request-metrics/*.ndjson`，默认清理超过 30 天的**新增指标日志**；令牌元数据在 `state/api-clients.json`，自动化运行和旧任务仍在原状态文件中。用量仅在协议提供完整单轮快照时记账，缺失的运行显示“未知”，不据此估算费用。升级部署前备份整个状态目录；本次没有授权自动清理已有任务、会话或附件。
 
 > [!WARNING]
-> 真实审批已替换旧版会话级自动同意。无人值守任务遇到命令、文件或权限请求会暂停等待操作人，超时后拒绝；部署新版后端前检查任务与通知路径并安排验收。个人空间的 `CODEX_PERSONAL_PREVIEW=1` 仅供非生产开发。生产执行只有在专用 worker 安装并通过验收后才开启；旧工作执行器有 sudo，仍非双向隔离。
+> 真实审批已替换旧版会话级自动同意。无人值守任务遇到命令、文件或权限请求会暂停等待操作人，超时后拒绝；部署新版后端前检查任务与通知路径并安排验收。个人空间默认共用现有登录与 app-server，不额外创建账号；项目目录、会话与草稿分开。个人执行继续采用只读与按需审批。
+
+### 个人空间共用登录（默认）
+
+未设置个人运行模式时，新安装默认 `shared`。`CODEX_PERSONAL_MODE=shared` 显式复用工作账号；`disabled` 仅保留个人草稿；`dedicated` 使用下节的独立 worker。旧部署的 `CODEX_PERSONAL_WORKER=1` 仍解释为专用模式，除非显式指定新的模式，避免升级时静默切换已有个人历史。
+
+共享模式的个人目录默认为 `$CODEX_CLOUD_ROOT/personal`，不需要复制 `auth.json`，退出或重新登录会影响同一账号的个人和工作空间。个人线程显式关闭 Codex 自动 memories，避免自动加载账号级记忆。全局模型配置、Skills、MCP 与账号额度共用，因此空间切换是上下文组织方式，不是对不受信任任务的保密边界。
+
+从专用 worker 切换前，先备份状态和服务 drop-in，检查两侧运行任务以及专用 worker 的历史和文件。**有个人历史时不能仅改目录就切换**，必须先设计历史迁移或保留原入口；无个人历史的部署可将 drop-in 改为 `CODEX_PERSONAL_MODE=shared`，并把 `CODEX_PERSONAL_ROOT` 改为主服务可访问的独立个人目录。验收后可停用闲置 worker，但保留它的数据目录以便恢复。重启控制台会影响运行任务。
 
 ### 个人空间专用 worker
 
-可选安装仅适用于 Linux/systemd 的单机部署。先备份控制台 `state`、当前发布目录与服务配置，确认没有运行中的对话和自动化。安装脚本只新建 `codex-personal` 系统用户、私有 `/var/lib/codex-personal` 和 Unix Socket 服务；不复制现有 `~/.codex`、工作目录或登录凭据，也不创建 AWS 资源。
+仅在明确需要独立账号和执行权限时选择，非默认登录流程。可选安装仅适用于 Linux/systemd 的单机部署。先备份控制台 `state`、当前发布目录与服务配置，确认没有运行中的对话和自动化。安装脚本只新建 `codex-personal` 系统用户、私有 `/var/lib/codex-personal` 和 Unix Socket 服务；不复制现有 `~/.codex`、工作目录或登录凭据，也不创建 AWS 资源。
 
 ```bash
 sudo bash /home/ubuntu/codex-cloud/console-current/ops/install-personal-worker.sh
