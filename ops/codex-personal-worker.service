@@ -16,6 +16,7 @@ Environment=HOME=/var/lib/codex-personal
 Environment=CODEX_HOME=/var/lib/codex-personal/.codex
 Environment=CODEX_PERSONAL_SOCKET=/run/codex-personal/worker.sock
 Environment=CODEX_PERSONAL_CODEX_BIN=/usr/local/bin/codex
+ExecStartPre=/usr/bin/node /usr/local/libexec/codex-personal-isolation-check.mjs
 ExecStart=/usr/bin/node /usr/local/libexec/codex-personal-worker.mjs
 Restart=on-failure
 RestartSec=5

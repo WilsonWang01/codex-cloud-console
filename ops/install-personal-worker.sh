@@ -31,7 +31,7 @@ install -m 0644 "${SOURCE_ROOT}/ops/codex-personal-worker.service" /etc/systemd/
 install -m 0644 "${SOURCE_ROOT}/ops/codex-cloud-console-personal.conf" /etc/systemd/system/codex-cloud-console.service.d/personal.conf
 systemctl daemon-reload
 systemctl enable --now codex-personal-worker.service
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
   if systemctl is-active --quiet codex-personal-worker.service && test -S /run/codex-personal/worker.sock; then
     echo "Personal worker installed. The console drop-in takes effect on its next restart."
     exit 0
