@@ -25,6 +25,7 @@ export function runUsageFromProtocol(value) {
 
 export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
   const buckets = new Map();
+  const terminalStatuses = new Set(["completed", "failed", "interrupted", "canceled", "cancelled"]);
   for (const run of runs) {
     if (!run.clientId || (clientId && run.clientId !== clientId)) continue;
     const time = Date.parse(run.startedAt || "");
@@ -39,6 +40,10 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
     bucket.runs += 1;
     if (run.status === "completed") bucket.completed += 1;
     if (["failed", "interrupted"].includes(run.status)) bucket.failed += 1;
+    if (!terminalStatuses.has(run.status)) {
+      buckets.set(key, bucket);
+      continue;
+    }
     if (run.usage?.status === "complete") {
       bucket.knownRuns += 1;
       bucket.inputTokens += run.usage.inputTokens;
