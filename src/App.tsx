@@ -471,6 +471,17 @@ type CodexAccountLoginState = {
   flows?: CodexAccountLoginFlow[];
 };
 
+function codexVerificationUrl(flow?: Pick<CodexAccountLoginFlow, "verificationUrl" | "authUrl"> | null) {
+  for (const value of [flow?.verificationUrl, flow?.authUrl]) {
+    if (!value) continue;
+    try {
+      const url = new URL(value);
+      if (url.protocol === "https:") return url.href;
+    } catch { /* Invalid authorization URLs are not opened. */ }
+  }
+  return "";
+}
+
 type CodexAppStatus = {
   ok: boolean;
   source?: string;
@@ -3806,7 +3817,8 @@ export function App() {
 
   const startCodexAccountLogin = async (type: "chatgptDeviceCode" | "chatgpt" = "chatgptDeviceCode") => {
     if (codexAccountBusy) return;
-    const loginTab = window.open("about:blank", "_blank", "noopener,noreferrer");
+    const loginTab = window.open("about:blank", "_blank");
+    if (loginTab) loginTab.opener = null;
     setCodexAccountBusy("login");
     try {
       const result = await api<{
@@ -3821,11 +3833,10 @@ export function App() {
         body: JSON.stringify({ type, repoId: selectedRepoIdRef.current }),
       });
       const flow = result.flow || null;
-      const loginUrl = flow?.verificationUrl || flow?.authUrl || result.result?.verificationUrl || result.result?.authUrl || "";
-      if (loginUrl && loginTab) {
-        loginTab.location.href = loginUrl;
-      } else if (loginUrl) {
-        window.open(loginUrl, "_blank", "noopener,noreferrer");
+      const loginUrl = codexVerificationUrl(flow) || codexVerificationUrl(result.result);
+      const opened = Boolean(loginUrl && loginTab && !loginTab.closed);
+      if (opened && loginTab) {
+        loginTab.location.replace(loginUrl);
       } else {
         loginTab?.close();
       }
@@ -3836,7 +3847,9 @@ export function App() {
       pushEvent({
         tone: "ok",
         title: "Codex 登录",
-        body: flow?.userCode ? `已打开授权页，输入验证码 ${flow.userCode}` : "已打开 Codex 登录授权页",
+        body: flow?.userCode
+          ? `${opened ? "已打开授权页" : "请点页面中的授权链接"}，输入验证码 ${flow.userCode}`
+          : opened ? "已打开 Codex 登录授权页" : "请点页面中的授权链接完成登录",
       });
       window.setTimeout(loadCodexAppStatus, 2500);
     } catch (error) {
@@ -9589,6 +9602,9 @@ function CloudChat({
                           取消授权
                         </button>
                       </div>
+                      {codexVerificationUrl(activeAccountLogin) && (
+                        <a href={codexVerificationUrl(activeAccountLogin)} target="_blank" rel="noopener noreferrer">打开授权页</a>
+                      )}
                       <span>在打开的 OpenAI 页面完成授权后，这里会自动刷新账号状态。</span>
                     </div>
                   )}
@@ -10669,6 +10685,9 @@ function SettingsView({
                   取消授权
                 </button>
               </div>
+              {codexVerificationUrl(activeAccountLogin) && (
+                <a href={codexVerificationUrl(activeAccountLogin)} target="_blank" rel="noopener noreferrer">打开授权页</a>
+              )}
               <span>在打开的 OpenAI 页面完成授权后，云端 Codex 会自动刷新账号状态。</span>
             </div>
           )}

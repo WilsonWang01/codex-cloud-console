@@ -25,6 +25,7 @@ let pending = [{
 }];
 let decision = null;
 let createdToken = "";
+let personalLoginFlow = null;
 const errors = [];
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -47,7 +48,11 @@ await context.route("**/api/**", async (route) => {
     runBuckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", runs: 2, completed: 1, failed: 0, knownRuns: 1, unknownRuns: 1, inputTokens: 100, outputTokens: 20, totalTokens: 120 }],
     requests: [{ id: "request-1", clientId: "client-a", automationId: status.automations[0].id, trigger: "webhook", status: 200, runId: "run-1", deduplicated: false, durationMs: 5, time: new Date().toISOString() }],
   });
-  if (url.pathname === "/api/codex/app-status") return send({ ok: true, authoritative: true, partial: false, account: null, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: {}, gaps: [] });
+  if (url.pathname === "/api/codex/account/login") {
+    personalLoginFlow = { loginId: "personal-login", type: "chatgptDeviceCode", status: "pending", userCode: "TEST-CODE", verificationUrl: "https://login.example.test/device" };
+    return send({ ok: true, flow: personalLoginFlow, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: [personalLoginFlow] } });
+  }
+  if (url.pathname === "/api/codex/app-status") return send({ ok: true, authoritative: true, partial: false, account: null, accountLogin: { active: repoId === "_personal" ? personalLoginFlow : null, latest: personalLoginFlow, flows: personalLoginFlow ? [personalLoginFlow] : [] }, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: {}, gaps: [] });
   if (url.pathname === "/api/codex/models") return send({ ok: true, models: [{ id: "gpt-5.6-terra", label: "GPT-5.6-Terra", supportedReasoningEfforts: ["medium"] }] });
   const draft = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft$/);
   if (draft) {
@@ -134,6 +139,13 @@ try {
   await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
   assert.match(page.url(), /#\/project\/_personal/);
   assert.equal(await page.getByText("仅草稿", { exact: true }).count(), 1);
+  await page.evaluate(() => { window.open = () => null; });
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.getByRole("button", { name: "重新登录" }).first().click();
+  const authorizationLink = page.getByRole("link", { name: "打开授权页" }).first();
+  await authorizationLink.waitFor();
+  assert.equal(await authorizationLink.getAttribute("href"), "https://login.example.test/device");
+  assert.equal(await authorizationLink.getAttribute("rel"), "noopener noreferrer");
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间禁止未配置执行", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间禁止未配置执行", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "弹窗被拦截时仍可打开个人账号授权链接"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }
