@@ -2,7 +2,7 @@ import { CheckCircle2, ExternalLink, Link2, Loader2, RefreshCw, Search } from "l
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type ConnectedApp = { id: string; name: string; description: string; installUrl: string | null; accessible: boolean; enabled: boolean; callable: boolean | null };
-type Catalog = { ok: boolean; apps: ConnectedApp[]; runtimeScope: string; runtimeVerified: boolean; error?: string };
+type Catalog = { ok: boolean; apps: ConnectedApp[]; runtimeScope: string; runtimeVerified: boolean; directoryError?: string; error?: string };
 
 function safeAuthorizationUrl(value: string | null) {
   try {
@@ -56,6 +56,8 @@ export default function ConnectedServices({ repoId }: { repoId: string }) {
     <p className="personal-permission-note">仅连接本次任务需要的服务。授权范围由官方页面列出；发送、修改、删除及付费操作仍需单独确认。连接可能与同账号的工作空间共用，不代表仅对个人空间授权。</p>
     <label className="plugin-search"><Search size={15} /><input aria-label="搜索服务" placeholder="搜索 Gmail、Outlook、日历、文档…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     {error && <p className="detail-error" role="alert">{error}</p>}
+    {catalog?.directoryError && <p className="warn-text" role="alert">{catalog.directoryError}</p>}
+    <a className="mini-action" href="https://chatgpt.com/apps" target="_blank" rel="noopener noreferrer"><ExternalLink size={14} />打开官方服务目录</a>
     {loading && <p role="status">正在核对账号服务…</p>}
     {catalog && !catalog.runtimeVerified && <p className="warn-text">工具状态暂未确认，不能据此判断服务已可调用。</p>}
     <div className="connected-service-list">
@@ -69,7 +71,7 @@ export default function ConnectedServices({ repoId }: { repoId: string }) {
         </article>;
       })}
     </div>
-    {!loading && !error && apps.length === 0 && <p className="empty-copy">{query ? "没有匹配的服务。" : "当前账号未返回服务目录。可在 Codex 设置中检查 App 配置，或连接已配置的 MCP 服务。"}</p>}
+    {!loading && !error && apps.length === 0 && <p className="empty-copy">{query ? "没有匹配的服务。" : "当前没有可展示的服务。可前往官方目录管理连接，或查看已配置的 MCP 服务。"}</p>}
     <p className="personal-permission-note">这里读取的是云端账号服务，不会自动获得本机软件、通讯录或设备权限。断开连接可前往对应官方管理页。</p>
   </section>;
 }

@@ -5980,7 +5980,7 @@ export function App() {
               input={chatInput}
               attachments={chatAttachments}
               uploadingAttachments={uploadingAttachments}
-              runtime={chatRuntime}
+              runtime={selectedRepo.kind === "personal" ? { ...chatRuntime, sandbox: chatRuntime.sandbox === "workspace-write" ? "workspace-write" : "read-only", approval: "on-request" } : chatRuntime}
               modelOptions={codexModels}
               onRefreshModels={() => loadCodexModels(true)}
               appStatus={codexAppStatus}
@@ -9182,7 +9182,7 @@ function CloudChat({
           </div>
           <div>
             <p className="eyebrow">云端会话</p>
-            <h2>云端 Codex</h2>
+            <h2>{repo.kind === "personal" ? "个人助理" : "云端 Codex"}</h2>
           </div>
         </div>
         <div className="thread-actions">

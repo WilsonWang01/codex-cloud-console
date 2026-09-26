@@ -49,7 +49,14 @@ test("服务调用状态不可读取时保留未知，分页异常不返回伪�
   assert.equal(catalog.runtimeVerified, false);
   assert.equal(catalog.apps[0].callable, null);
   await assert.rejects(readConnectedApps(async () => ({ ok: true, result: { data: [], nextCursor: "repeat" } })), /分页未完成/);
-  await assert.rejects(readConnectedApps(async () => ({ ok: false, error: "offline" })), /offline/);
+  const denied = await readConnectedApps(async (method) => method === "app/list" ? { ok: false, error: "403 Forbidden <html>upstream error</html>" } : { ok: true, result: { apps: [{ id: "installed-mail", runtimeName: "Mail", enabled: true, callable: true }] } });
+  assert.match(denied.directoryError, /403/);
+  assert.doesNotMatch(denied.directoryError, /<html>/);
+  assert.equal(denied.apps[0].callable, true);
+  assert.equal(denied.apps[0].installUrl, null);
+  const unavailable = await readConnectedApps(async () => ({ ok: false, error: "offline" }));
+  assert.equal(unavailable.runtimeVerified, false);
+  assert.ok(unavailable.directoryError);
 });
 
 test("personal runtime shares the existing account by default and supports explicit modes", () => {

@@ -30,6 +30,7 @@ let personalLoginFlow = null;
 let includeNewModel = false;
 let selectedRuntime = null;
 let appsFailure = false;
+let appsDirectoryDenied = false;
 let submittedMessages = 0;
 const errors = [];
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
@@ -42,7 +43,7 @@ await context.route("**/api/**", async (route) => {
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
-  if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", apps: [
+  if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", directoryError: appsDirectoryDenied ? "上游拒绝了云端服务目录请求（403）。" : "", apps: [
     { id: "mail", name: "Gmail", description: "整理邮件", installUrl: "https://chatgpt.com/apps/gmail/mail", accessible: false, enabled: true, callable: false },
     { id: "calendar", name: "Calendar", description: "查看日程", installUrl: "https://chatgpt.com/apps/calendar/cal", accessible: true, enabled: true, callable: true },
     { id: "invalid", name: "Untrusted", description: "不可信授权链接", installUrl: "javascript:alert(1)", accessible: false, enabled: false, callable: null },
@@ -132,8 +133,12 @@ try {
   await page.getByText("服务暂不可用", { exact: true }).waitFor();
   assert.equal(await page.locator(".connected-service-row").count(), 0);
   appsFailure = false;
+  appsDirectoryDenied = true;
   await page.getByRole("button", { name: "刷新连接" }).click();
   await mailAuthorization.waitFor();
+  await page.getByText("上游拒绝了云端服务目录请求（403）。", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("link", { name: "打开官方服务目录" }).getAttribute("href"), "https://chatgpt.com/apps");
+  appsDirectoryDenied = false;
   await page.getByRole("button", { name: "关闭面板" }).click();
   await page.setViewportSize({ width: 1280, height: 900 });
   await composer.fill("独立个人草稿");
