@@ -6951,7 +6951,34 @@ pre {
   color: #465b5a;
   background: #f1f5f4;
 }
+.personal-scope-notice { align-items: center; flex-wrap: wrap; }
+.personal-scope-actions { display: flex; gap: 8px; margin-left: auto; }
+.personal-guide { width: min(100%, 720px); margin: 24px auto; }
+.personal-guide h3 { font-size: 20px; margin: 0 0 16px; }
+.personal-task-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 20px; }
+.personal-task-list button { display: flex; align-items: center; gap: 12px; text-align: left; min-width: 0; padding: 16px 8px; border: 0; border-bottom: 1px solid var(--border); background: transparent; cursor: pointer; }
+.personal-task-list button:hover { background: var(--surface); }
+.personal-task-list svg { flex: 0 0 auto; color: var(--muted); }
+.personal-task-list span { display: grid; gap: 5px; min-width: 0; }
+.personal-task-list strong { font-size: 14px; }
+.personal-task-list small { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.connected-services-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.connected-services { min-width: 0; }
+.personal-permission-note { font-size: 12px; color: var(--muted); line-height: 1.6; margin: 12px 0; }
+.connected-service-list { display: grid; }
+.connected-service-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--border); }
+.connected-service-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.connected-service-row strong { font-size: 14px; }
+.connected-service-row small { font-size: 12px; color: var(--muted); }
+.connected-service-row a { text-decoration: none; }
 @media (max-width: 820px) {
   .space-switch button { min-height: 44px; }
   .personal-scope-notice { margin: 0 4px 8px; }
+  .personal-scope-actions { width: 100%; margin-left: 0; }
+  .personal-scope-actions button, .connected-services .mini-action { min-height: 44px; }
+  .personal-guide { margin: 16px auto; }
+  .personal-guide h3 { font-size: 18px; }
+  .personal-task-list { grid-template-columns: minmax(0, 1fr); }
+  .connected-service-row { grid-template-columns: 20px minmax(0, 1fr); }
+  .connected-service-row > a, .connected-service-row > small { grid-column: 2; justify-self: start; }
 }

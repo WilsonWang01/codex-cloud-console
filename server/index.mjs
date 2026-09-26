@@ -20,7 +20,8 @@ import { notificationAttempt, pendingNotificationChannels } from "./notification
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageFromProtocol } from "./run-usage.mjs";
-import { appServerRequestScope, personalRuntimeConfig } from "./personal-runtime.mjs";
+import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
+import { readConnectedApps } from "./connected-apps.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
@@ -832,7 +833,7 @@ function normalizeRuntime(input = {}, session = {}) {
 
 function runtimeForRepo(repo, runtime) {
   return repo.kind === "personal"
-    ? { ...runtime, sandbox: "read-only", approval: "on-request" }
+    ? personalSessionRuntime(runtime)
     : runtime;
 }
 
@@ -1763,7 +1764,7 @@ function appServerThreadParams(repo, runtime) {
     personality: "pragmatic",
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
-      ...(repo.kind === "personal" ? ["Use only this conversation and the personal workspace as context. Do not inspect work repositories, host credentials, metadata endpoints, or local administration services. Personal execution is read-only."] : []),
+      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime)] : []),
     ].join("\n"),
     config: {
       model_reasoning_effort: runtime.reasoning,
@@ -8666,6 +8667,20 @@ app.get("/api/codex/plugins", async (req, res) => {
   }
 });
 
+app.get("/api/codex/apps", async (req, res) => {
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    const data = await readConnectedApps(
+      (method, params) => codexAppServerRequest(method, params, 20_000, repo),
+      { refresh: req.query?.refresh === "1" },
+    );
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, repoId: repo.id, runtimeScope: runtimeScopeForRepo(repo), ...data });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ ok: false, error: sanitizeCloudPathText(error.message || "服务目录读取失败", 320) });
+  }
+});
+
 app.post("/api/codex/plugins/install", async (req, res) => {
   try {
     const repo = getRepoById(req.body?.repoId);
@@ -8765,16 +8780,18 @@ app.post("/api/codex/account/logout", async (req, res) => {
 });
 
 app.post("/api/codex/mcp/oauth-login", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
   const name = String(req.body?.name || req.query?.name || "").trim();
   if (!name) return res.status(400).json({ ok: false, error: "MCP server name is required" });
-  const response = await codexAppServerRequest("mcpServer/oauth/login", { name }, 20_000);
+  const response = await codexAppServerRequest("mcpServer/oauth/login", { name }, 20_000, repo);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
   const authorizationUrl = response.result?.authorizationUrl || response.result?.authorization_url || "";
   res.json({ ok: true, name, authorizationUrl });
 });
 
-app.post("/api/codex/mcp/reload", async (_req, res) => {
-  const response = await codexAppServerRequest("config/mcpServer/reload", undefined, 20_000);
+app.post("/api/codex/mcp/reload", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
+  const response = await codexAppServerRequest("config/mcpServer/reload", undefined, 20_000, repo);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
   res.json({ ok: true });
 });
@@ -9348,6 +9365,10 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
 
   const requestedRuntime = runtimeForRepo(repo, normalizeRuntime(req.body, session));
   const storedRuntime = runtimeForRepo(repo, normalizeRuntime({}, session));
+  if ((requestedRuntime.sandbox !== storedRuntime.sandbox || requestedRuntime.approval !== storedRuntime.approval)
+      && (activeTurns.has(makeSessionKey(repo.id, session.id)) || activeCompactions.has(makeSessionKey(repo.id, session.id)))) {
+    return res.status(409).json({ ok: false, error: "当前会话正在运行，请等待完成后再修改权限" });
+  }
   const turnRuntimeChanged =
     requestedRuntime.model !== storedRuntime.model || requestedRuntime.reasoning !== storedRuntime.reasoning;
   const modelList = await getModelListForRoute();

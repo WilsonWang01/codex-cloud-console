@@ -124,6 +124,8 @@ input.on("line", (line) => {
   if (!message.id) return;
   const send = (payload, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(payload) + "\\n"), delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
+  if (message.method === "app/list") return send({ id: message.id, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true, installUrl: "https://chatgpt.com/apps/mail/mail" }], nextCursor: null } });
+  if (message.method === "app/installed") return send({ id: message.id, result: { apps: [{ id: "mail", enabled: true, callable: true }] } });
   if (sharedPersonal && message.method === "account/read") return send({ id: message.id, result: { account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" } } });
   if (sharedPersonal && message.method === "thread/list") return send({ id: message.id, result: { data: threads.filter((thread) => message.params.cwd.includes(thread.cwd)), nextCursor: null } });
   if (sharedPersonal && message.method === "thread/start") {
@@ -764,6 +766,23 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(starts[1].params.sandbox, "read-only");
     assert.equal(starts[1].params.config.features.memories, false);
     assert.match(starts[1].params.developerInstructions, /only this conversation/);
+    const personalSessionId = sessions[1].sessionId;
+    const writable = await jsonRequest(base, `/api/chat/sessions/${personalSessionId}/runtime`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sandbox: "workspace-write", model: "gpt-5.6-terra", reasoning: "medium" }),
+    });
+    assert.equal(writable.response.status, 200, JSON.stringify(writable.data));
+    assert.equal(writable.data.runtime.sandbox, "workspace-write");
+    const writeTurn = await jsonRequest(base, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sessionId: personalSessionId, message: "outcome contract regression" }),
+    });
+    assert.equal(writeTurn.data.ok, true);
+    const afterWriteRequests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+    const lastTurn = afterWriteRequests.filter((r) => r.method === "turn/start").at(-1).params;
+    assert.equal(lastTurn.sandboxPolicy.type, "workspaceWrite");
+    assert.deepEqual(lastTurn.sandboxPolicy.writableRoots, [path.join(cloudRoot, "personal")]);
+    assert.equal(lastTurn.approvalPolicy, "on-request");
+    const lastResume = afterWriteRequests.filter((r) => r.method === "thread/resume" && r.params.developerInstructions).at(-1).params;
+    assert.match(lastResume.developerInstructions, /allowed writing within this personal workspace/);
     const { data: status } = await jsonRequest(base, "/api/status");
     assert.equal(status.codex.authenticated, true);
     assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);
@@ -1103,6 +1122,17 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(personalSession.response.status, 200);
     assert.equal(personalSession.data.sessions.find((session) => session.id === personalSession.data.activeSessionId)?.sandbox, "read-only");
+    const personalRuntimePath = `/api/chat/sessions/${personalSession.data.activeSessionId}/runtime`;
+    const personalRuntime = await jsonRequest(baseUrl, personalRuntimePath, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sandbox: "workspace-write", approval: "never" }) });
+    assert.equal(personalRuntime.response.status, 200);
+    assert.equal(personalRuntime.data.runtime.sandbox, "workspace-write");
+    assert.equal(personalRuntime.data.runtime.approval, "on-request");
+    const rejectedFullAccess = await jsonRequest(baseUrl, personalRuntimePath, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sandbox: "danger-full-access" }) });
+    assert.equal(rejectedFullAccess.data.runtime.sandbox, "read-only");
+    const apps = await jsonRequest(baseUrl, "/api/codex/apps?repoId=sample-app&refresh=1");
+    assert.equal(apps.response.status, 200);
+    assert.equal(apps.data.apps[0].callable, true);
+    assert.equal(apps.data.apps[0].installUrl, "https://chatgpt.com/apps/mail/mail");
     const crossSpaceSelection = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(personalSession.data.activeSessionId)}/select`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app" }),
     });

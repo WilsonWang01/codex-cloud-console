@@ -6,9 +6,51 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
-import { appServerRequestScope, personalRuntimeConfig } from "../server/personal-runtime.mjs";
+import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "../server/personal-runtime.mjs";
+import { appAuthorizationUrl, readConnectedApps } from "../server/connected-apps.mjs";
 
 const workerPath = fileURLToPath(new URL("../server/personal-worker.mjs", import.meta.url));
+
+test("个人权限保留显式工作区写入，但不继承全权限或关闭审批", () => {
+  const original = { model: "gpt-5.6-terra", sandbox: "danger-full-access", approval: "never" };
+  assert.equal(personalSessionRuntime(original).sandbox, "read-only");
+  assert.equal(original.sandbox, "danger-full-access");
+  const writable = personalSessionRuntime({ ...original, sandbox: "workspace-write" });
+  assert.equal(writable.sandbox, "workspace-write");
+  assert.equal(writable.approval, "on-request");
+  assert.match(personalDeveloperInstructions(writable), /allowed writing within this personal workspace/);
+  assert.doesNotMatch(personalDeveloperInstructions(writable), /currently has read-only/);
+  assert.match(personalDeveloperInstructions(original), /currently has read-only/);
+  assert.match(personalDeveloperInstructions(writable), /Before sending an email/);
+});
+
+test("服务目录分页、实际可调用状态和授权链接边界", async () => {
+  const calls = [];
+  const catalog = await readConnectedApps(async (method, params) => {
+    calls.push({ method, params });
+    if (method === "app/installed") return { ok: true, result: { apps: [{ id: "mail", enabled: true, callable: true }, { id: "disabled", enabled: false, callable: true }] } };
+    return { ok: true, result: { data: params.cursor ? [{ id: "disabled", name: "Calendar", isAccessible: true, isEnabled: false }] : [
+      { id: "mail", name: "Mail", isAccessible: true, isEnabled: true, installUrl: "https://chatgpt.com/apps/mail/mail" },
+      { id: "pending", name: "Docs", isAccessible: true, isEnabled: true, installUrl: "https://evil.test/authorize" },
+    ], nextCursor: params.cursor ? null : "page-2" } };
+  }, { refresh: true });
+  assert.equal(catalog.apps.length, 3);
+  assert.equal(catalog.apps[0].callable, true);
+  assert.equal(catalog.apps[1].callable, false);
+  assert.equal(catalog.apps[1].installUrl, null);
+  assert.equal(catalog.apps[2].callable, false);
+  assert.equal(calls[0].params.forceRefetch, true);
+  assert.equal(calls[1].params.forceRefetch, false);
+  for (const url of ["javascript:alert(1)", "http://chatgpt.com/apps/mail", "https://chatgpt.com.evil.test/apps/mail", "https://user@chatgpt.com/apps/mail", "https://chatgpt.com:444/apps/mail", "https://chatgpt.com/other"]) assert.equal(appAuthorizationUrl(url), null);
+});
+
+test("服务调用状态不可读取时保留未知，分页异常不返回伪完整目录", async () => {
+  const catalog = await readConnectedApps(async (method) => method === "app/installed" ? { ok: false, error: "unsupported" } : { ok: true, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true }], nextCursor: null } });
+  assert.equal(catalog.runtimeVerified, false);
+  assert.equal(catalog.apps[0].callable, null);
+  await assert.rejects(readConnectedApps(async () => ({ ok: true, result: { data: [], nextCursor: "repeat" } })), /分页未完成/);
+  await assert.rejects(readConnectedApps(async () => ({ ok: false, error: "offline" })), /offline/);
+});
 
 test("personal runtime shares the existing account by default and supports explicit modes", () => {
   assert.equal(personalRuntimeConfig({ NODE_ENV: "production" }).mode, "shared");

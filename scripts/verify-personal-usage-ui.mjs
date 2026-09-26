@@ -29,6 +29,8 @@ let createdToken = "";
 let personalLoginFlow = null;
 let includeNewModel = false;
 let selectedRuntime = null;
+let appsFailure = false;
+let submittedMessages = 0;
 const errors = [];
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -40,6 +42,11 @@ await context.route("**/api/**", async (route) => {
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
+  if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", apps: [
+    { id: "mail", name: "Gmail", description: "整理邮件", installUrl: "https://chatgpt.com/apps/gmail/mail", accessible: false, enabled: true, callable: false },
+    { id: "calendar", name: "Calendar", description: "查看日程", installUrl: "https://chatgpt.com/apps/calendar/cal", accessible: true, enabled: true, callable: true },
+    { id: "invalid", name: "Untrusted", description: "不可信授权链接", installUrl: "javascript:alert(1)", accessible: false, enabled: false, callable: null },
+  ] });
   if (url.pathname === "/api/approvals") return send({ ok: true, pending });
   if (url.pathname === "/api/approvals/approval-test/decision") { decision = body; pending = []; return send({ ok: true }); }
   if (url.pathname === "/api/clients") {
@@ -59,6 +66,7 @@ await context.route("**/api/**", async (route) => {
   if (url.pathname === "/api/codex/models") return send({ ok: true, source: "app-server", authoritative: true, models: [{ id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium"] }, ...(includeNewModel ? [{ id: "gpt-6-astra", displayName: "GPT-6 Astra", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium", "ultra"] }] : [])] });
   if (url.pathname.endsWith("/runtime") && req.method() === "PATCH") {
     selectedRuntime = body;
+    Object.assign(sessions.find((item) => item.repoId === repoId), body);
     return send({ ok: true, runtime: body });
   }
   const draft = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft$/);
@@ -70,7 +78,7 @@ await context.route("**/api/**", async (route) => {
   }
   if (url.pathname === "/api/chat/sessions" || url.pathname === "/api/chat/history") return send({ ok: true, authoritative: true, repoId, activeSessionId: `${repoId}-session`, sessions: sessions.filter((item) => item.repoId === repoId), messages: [] });
   if (url.pathname === "/api/chat/active") return send({ ok: true, turn: null, compact: null });
-  if (url.pathname === "/api/chat/stream") return send({ ok: false, error: "personal execution unavailable" }, 503);
+  if (url.pathname === "/api/chat/stream") { submittedMessages += 1; return send({ ok: false, error: "personal execution unavailable" }, 503); }
   return send({ ok: true, entries: [], items: [], sessions: [], runs: [], events: [], matches: [] });
 });
 
@@ -87,6 +95,47 @@ try {
   assert.match(page.url(), /_personal/);
   assert.equal(await page.locator(".send-button").isDisabled(), true);
   const composer = page.locator(".composer-shell textarea");
+  await page.getByRole("button", { name: /整理邮件待办/ }).click();
+  assert.match(await composer.inputValue(), /不要代我发送邮件/);
+  assert.equal(submittedMessages, 0);
+  await page.getByRole("button", { name: "任务建议", exact: true }).click();
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.locator(".command-panel").getByRole("button", { name: /调研一个问题/ }).click();
+  assert.match(await composer.inputValue(), /不要代我发送邮件/);
+  await page.getByRole("button", { name: "关闭面板" }).click();
+  await page.getByRole("button", { name: /^权限：/ }).click();
+  assert.equal(await page.locator(".choice-list").getByRole("button", { name: /全权限/ }).count(), 0);
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: /^允许写入个人工作区/ }).click();
+  assert.equal(selectedRuntime, null);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: /^允许写入个人工作区/ }).click();
+  await page.getByRole("button", { name: /^权限：工作区写入/ }).waitFor();
+  assert.equal(selectedRuntime.sandbox, "workspace-write");
+  assert.equal(selectedRuntime.approval, "on-request");
+  await page.getByRole("button", { name: "连接服务", exact: true }).click();
+  const mailAuthorization = page.getByRole("link", { name: "连接Gmail" });
+  await mailAuthorization.waitFor();
+  assert.equal(await mailAuthorization.getAttribute("href"), "https://chatgpt.com/apps/gmail/mail");
+  assert.equal(await mailAuthorization.getAttribute("rel"), "noopener noreferrer");
+  assert.match(await page.locator(".connected-service-row").filter({ hasText: "Calendar" }).innerText(), /可调用/);
+  assert.equal(await page.getByRole("link", { name: "连接Untrusted" }).count(), 0);
+  await page.getByRole("textbox", { name: "搜索服务" }).fill("Gmail");
+  assert.equal(await page.locator(".connected-service-row").count(), 1);
+  await page.getByRole("textbox", { name: "搜索服务" }).fill("");
+  await page.screenshot({ path: new URL("connections-desktop.png", out).pathname, fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("connections-390.png", out).pathname, fullPage: true });
+  appsFailure = true;
+  await page.getByRole("button", { name: "刷新连接" }).click();
+  await page.getByText("服务暂不可用", { exact: true }).waitFor();
+  assert.equal(await page.locator(".connected-service-row").count(), 0);
+  appsFailure = false;
+  await page.getByRole("button", { name: "刷新连接" }).click();
+  await mailAuthorization.waitFor();
+  await page.getByRole("button", { name: "关闭面板" }).click();
+  await page.setViewportSize({ width: 1280, height: 900 });
   await composer.fill("独立个人草稿");
   assert.equal(await page.locator(".send-button").isEnabled(), true);
   await page.locator(".space-switch").getByRole("button", { name: "工作" }).click();

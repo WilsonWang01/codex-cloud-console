@@ -1,5 +1,6 @@
 import { DraftPersistence } from "./draft-persistence";
 import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
+import PersonalAssistantGuide from "./PersonalAssistantGuide";
 import {
   Activity,
   BriefcaseBusiness,
@@ -22,6 +23,7 @@ import {
   HardDrive,
   History,
   Loader2,
+  Link2,
   Menu,
   MessageSquare,
   Paperclip,
@@ -50,6 +52,7 @@ import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent
 const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = lazy(() => import("./CodexPluginManager"));
 const LazyUsageView = lazy(() => import("./UsageView"));
+const LazyConnectedServices = lazy(() => import("./ConnectedServices"));
 
 type RunEvent = {
   id: string;
@@ -3916,7 +3919,7 @@ export function App() {
       const result = await api<{ ok: boolean; authorizationUrl?: string; error?: string }>("/api/codex/mcp/oauth-login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: serverName }),
+        body: JSON.stringify({ name: serverName, repoId: selectedRepoIdRef.current }),
       });
       if (!result.authorizationUrl) throw new Error(result.error || "MCP OAuth 没有返回登录链接");
       try {
@@ -3947,7 +3950,7 @@ export function App() {
     if (busyAction) return;
     setBusyAction("mcp-reload");
     try {
-      await api("/api/codex/mcp/reload", { method: "POST" });
+      await api("/api/codex/mcp/reload", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId: selectedRepoIdRef.current }) });
       await loadCodexAppStatus();
       pushEvent({ tone: "ok", title: "MCP", body: "已重新加载 MCP 服务器状态" });
     } catch (error) {
@@ -8431,7 +8434,7 @@ function CloudChat({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [commandIndex, setCommandIndex] = useState(0);
   const [draggingAttachments, setDraggingAttachments] = useState(false);
-  const [activePanel, setActivePanel] = useState<"model" | "reasoning" | "goal" | "status" | "auto" | "sessions" | "capabilities" | "permissions" | "diff" | "review" | null>(null);
+  const [activePanel, setActivePanel] = useState<"model" | "reasoning" | "goal" | "status" | "auto" | "sessions" | "capabilities" | "permissions" | "diff" | "review" | "guide" | "connections" | null>(null);
   const [diffResult, setDiffResult] = useState<GitDiffResponse | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState("");
@@ -8806,7 +8809,9 @@ function CloudChat({
     };
   }, [inlineTrigger?.query, mentionMode, repo.id]);
   const permissionProfiles = repo.kind === "personal" ? [{
-    id: "personal-read-only", label: "个人空间只读", description: "预览模式固定为只读并逐次请求额外权限。", sandbox: "read-only", approval: "on-request",
+    id: "personal-read-only", label: "个人空间只读", description: "默认权限。可查资料、阅读文件，不能直接保存产物。", sandbox: "read-only", approval: "on-request",
+  }, {
+    id: "personal-workspace-write", label: "允许写入个人工作区", description: "可保存草稿与产物；不会开放全主机权限，额外权限仍需审批。", sandbox: "workspace-write", approval: "on-request",
   }] : [
     {
       id: "read-only",
@@ -8830,6 +8835,11 @@ function CloudChat({
       approval: "never",
     },
   ];
+  const choosePersonalTask = (prompt: string) => {
+    if (input.trim() && !window.confirm("替换当前未发送的草稿？取消可保留原草稿。")) return;
+    onInput(prompt);
+    setActivePanel(null);
+  };
   const slashCommands: SlashCommand[] = [
     {
       id: "status",
@@ -9257,12 +9267,17 @@ function CloudChat({
         <UserRound size={16} />
         <span>{repo.executionAvailable
           ? repo.runtimeMode === "dedicated"
-            ? "个人空间使用独立低权限执行器，当前仅允许只读任务；现有工作执行器仍有主机管理权限，请勿把它当作双向保密边界。"
+            ? "个人助理 · 独立执行器 · 独立对话"
             : "个人助理 · 共用账号 · 独立对话"
           : "个人空间执行暂未启用，草稿仍会保留。"}</span>
+        <div className="personal-scope-actions">
+          <button type="button" className="mini-action" onClick={() => setActivePanel("guide")}><Sparkles size={14} />任务建议</button>
+          <button type="button" className="mini-action" onClick={() => setActivePanel("connections")}><Link2 size={14} />连接服务</button>
+        </div>
       </div>}
 
       <div className="chat-window" aria-busy={historyLoading}>
+        {repo.kind === "personal" && !historyLoading && !historyError && messages.length === 0 && <PersonalAssistantGuide onChoose={choosePersonalTask} />}
         {historyLoading && messages.length === 0 && (
           <article className="chat-bubble codex compact">
             <span className="chat-avatar">
@@ -9392,11 +9407,19 @@ function CloudChat({
                 {activePanel === "permissions" && "权限"}
                 {activePanel === "diff" && "Diff"}
                 {activePanel === "review" && "Review"}
+                {activePanel === "guide" && "个人助理"}
+                {activePanel === "connections" && "连接服务"}
               </strong>
-              <button className="icon-command" onClick={() => setActivePanel(null)} type="button">
+              <button className="icon-command" onClick={() => setActivePanel(null)} type="button" aria-label="关闭面板">
                 ×
               </button>
             </div>
+
+            {activePanel === "guide" && <PersonalAssistantGuide onChoose={choosePersonalTask} />}
+            {activePanel === "connections" && <>
+              <Suspense fallback={<p role="status">正在加载服务…</p>}><LazyConnectedServices key={repo.id} repoId={repo.id} /></Suspense>
+              <button className="mini-action" type="button" onClick={() => setActivePanel("capabilities")}><SlidersHorizontal size={14} />MCP 与其他工具</button>
+            </>}
 
             {activePanel === "status" && (
               <div className="context-status-panel">
@@ -9517,7 +9540,9 @@ function CloudChat({
                   <button
                     key={profile.id}
                     className={cx(runtime.sandbox === profile.sandbox && runtime.approval === profile.approval && "selected")}
+                    disabled={busy || Boolean(busyAction) || historyLoading}
                     onClick={() => {
+                      if (repo.kind === "personal" && profile.sandbox === "workspace-write" && runtime.sandbox !== "workspace-write" && !window.confirm("允许此会话创建和修改个人工作区内的文件？后续消息生效；不会授予邮箱、日历或全主机权限。删除数据或付费操作仍需另行确认。")) return;
                       onRuntime((current) => ({ ...current, sandbox: profile.sandbox, approval: profile.approval }));
                       setActivePanel(null);
                     }}
@@ -9562,8 +9587,8 @@ function CloudChat({
                     {appStatusPending ? "同步额度中" : quotaText}
                   </strong>
                   <span>权限</span>
-                  <strong title={`${appStatus.config.sandbox} · approval ${appStatus.config.approval}`}>
-                    {appStatusPending ? "同步权限中" : permissionRuntimeLabel(appStatus.config.sandbox, appStatus.config.approval)}
+                  <strong title={`${runtime.sandbox} · approval ${runtime.approval}`}>
+                    {permissionRuntimeLabel(runtime.sandbox, runtime.approval)}
                   </strong>
                   <span>服务</span>
                   <strong>
