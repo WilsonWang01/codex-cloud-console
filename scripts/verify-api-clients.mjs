@@ -54,16 +54,19 @@ test("request curve separates accepted, errors, and replays without request bodi
   const time = "2026-09-26T06:10:00.000Z";
   await store.record({ clientId: "a", automationId: "research", trigger: "webhook", status: 200, runId: "run-1", time });
   await store.record({ clientId: "a", automationId: "research", trigger: "webhook", status: 200, runId: "run-1", deduplicated: true, time });
+  await store.record({ clientId: "a", automationId: "research", trigger: "result", status: 200, runId: "run-1", time });
+  await store.record({ clientId: "b", automationId: "research", trigger: "result", status: 404, time });
+  await store.record({ clientId: "a", automationId: "research", trigger: "cancel", status: 202, runId: "run-1", time });
   await store.record({ clientId: "b", automationId: "research", trigger: "webhook", status: 429, time });
   const result = await store.usage({ from: Date.parse("2026-09-26T06:00:00Z"), to: Date.parse("2026-09-26T07:00:00Z") });
-  assert.deepEqual(result.buckets.map(({ clientId, requests, accepted, errors, replayed }) => ({ clientId, requests, accepted, errors, replayed })), [
-    { clientId: "a", requests: 2, accepted: 1, errors: 0, replayed: 1 },
-    { clientId: "b", requests: 1, accepted: 0, errors: 1, replayed: 0 },
+  assert.deepEqual(result.buckets.map(({ clientId, requests, accepted, errors, replayed, polls, pollErrors, controls }) => ({ clientId, requests, accepted, errors, replayed, polls, pollErrors, controls })), [
+    { clientId: "a", requests: 2, accepted: 1, errors: 0, replayed: 1, polls: 1, pollErrors: 0, controls: 1 },
+    { clientId: "b", requests: 1, accepted: 0, errors: 1, replayed: 0, polls: 1, pollErrors: 1, controls: 0 },
   ]);
   assert.equal(JSON.stringify(state).includes("prompt"), false);
   const log = await fs.readFile(path.join(root, "metrics", "2026-09-26.ndjson"), "utf8");
   assert.equal(log.includes("prompt"), false);
-  assert.equal(log.trim().split("\n").length, 3);
+  assert.equal(log.trim().split("\n").length, 6);
 });
 
 test("partial metric lines are reported and do not swallow later requests", async (t) => {

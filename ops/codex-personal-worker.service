@@ -1,0 +1,38 @@
+[Unit]
+Description=Codex Cloud personal worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-personal
+Group=codex-personal-console
+WorkingDirectory=/var/lib/codex-personal
+StateDirectory=codex-personal
+StateDirectoryMode=0700
+RuntimeDirectory=codex-personal
+RuntimeDirectoryMode=0750
+Environment=HOME=/var/lib/codex-personal
+Environment=CODEX_HOME=/var/lib/codex-personal/.codex
+Environment=CODEX_PERSONAL_SOCKET=/run/codex-personal/worker.sock
+Environment=CODEX_PERSONAL_CODEX_BIN=/usr/local/bin/codex
+ExecStart=/usr/bin/node /usr/local/libexec/codex-personal-worker.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codex-personal /run/codex-personal
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+IPAddressDeny=127.0.0.0/8 ::1/128 169.254.169.254/32 fd00:ec2::254/128
+MemoryMax=768M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

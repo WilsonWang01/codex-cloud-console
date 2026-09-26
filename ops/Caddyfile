@@ -25,6 +25,20 @@ http://{$CODEX_CLOUD_PUBLIC_IP} {
 	handle @automation_trigger {
 		reverse_proxy 127.0.0.1:8787
 	}
+	@automation_result {
+		method GET
+		path_regexp automation_result ^/api/automations/[^/]+/runs/[^/]+$
+	}
+	handle @automation_result {
+		reverse_proxy 127.0.0.1:8787
+	}
+	@automation_cancel {
+		method POST
+		path_regexp automation_cancel ^/api/automations/[^/]+/runs/[^/]+/cancel$
+	}
+	handle @automation_cancel {
+		reverse_proxy 127.0.0.1:8787
+	}
 	handle {
 		basicauth {
 			{$CODEX_CLOUD_BASIC_USER} {$CODEX_CLOUD_BASIC_HASH}

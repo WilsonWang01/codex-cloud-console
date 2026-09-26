@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
+import net from "node:net";
 
 function unquoteProtocolValue(value = "") {
   const text = String(value || "").trim();
@@ -39,6 +40,7 @@ export class CodexAppServerClient extends EventEmitter {
     env = process.env,
     command = "codex",
     args = ["app-server", "--listen", "stdio://"],
+    socketPath = null,
     clientInfo = { name: "codex_cloud_console", title: "Codex Cloud Console", version: "0.1.0" },
     onServerRequest = () => null,
     initializeTimeoutMs = Number(process.env.CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS || 90_000),
@@ -48,6 +50,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.env = env;
     this.command = command;
     this.args = args;
+    this.socketPath = socketPath;
     this.clientInfo = clientInfo;
     this.onServerRequest = onServerRequest;
     this.initializeTimeoutMs = initializeTimeoutMs;
@@ -90,21 +93,23 @@ export class CodexAppServerClient extends EventEmitter {
     this.lastError = null;
     this.startedAt = new Date().toISOString();
     const generation = ++this.generation;
-    const child = spawn(this.command, this.args, {
-      cwd: this.cwd,
-      env: this.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child = this.socketPath
+      ? net.createConnection({ path: this.socketPath })
+      : spawn(this.command, this.args, {
+          cwd: this.cwd,
+          env: this.env,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
     this.child = child;
 
-    child.stdout.on("data", (chunk) => this.handleStdout(chunk, child, generation));
-    child.stderr.on("data", (chunk) => {
+    (this.socketPath ? child : child.stdout).on("data", (chunk) => this.handleStdout(chunk, child, generation));
+    (this.socketPath ? null : child.stderr)?.on("data", (chunk) => {
       if (!this.isCurrent(child, generation)) return;
       this.stderr += chunk.toString();
       this.stderr = this.stderr.slice(-16_000);
     });
     child.on("error", (error) => this.handleExit(child, generation, error));
-    child.on("close", (code, signal) => this.handleExit(child, generation, null, code, signal));
+    child.on("close", (code, signal) => this.handleExit(child, generation, null, this.socketPath ? null : code, signal));
 
     this.readyPromise = new Promise((resolve, reject) => {
       this.sendRequest("initialize", {
@@ -155,16 +160,18 @@ export class CodexAppServerClient extends EventEmitter {
     this.child = null;
     this.readyPromise = null;
     this.rejectPendingGeneration(generation, "codex app-server stopped");
-    const exitPromise = child.exitCode !== null
+    const exitPromise = (this.socketPath ? child.destroyed : child.exitCode !== null)
       ? Promise.resolve()
       : new Promise((resolve) => child.once("close", resolve));
-    if (!child.killed) child.kill("SIGTERM");
+    if (this.socketPath) child.end();
+    else if (!child.killed) child.kill("SIGTERM");
     if (!waitForExit) return exitPromise;
     return Promise.race([
       exitPromise,
       new Promise((resolve) => {
         const timer = setTimeout(() => {
-          if (child.exitCode === null) child.kill("SIGKILL");
+          if (this.socketPath) child.destroy();
+          else if (child.exitCode === null) child.kill("SIGKILL");
           resolve();
         }, Math.max(50, Number(graceMs || 1_000)));
         timer.unref?.();
@@ -253,8 +260,9 @@ export class CodexAppServerClient extends EventEmitter {
   write(payload, context = {}) {
     const child = context.child || this.child;
     const generation = context.generation ?? this.generation;
-    if (!this.isCurrent(child, generation) || !child.stdin.writable) throw new Error("codex app-server stdin is closed");
-    child.stdin.write(`${JSON.stringify(payload)}\n`);
+    const input = this.socketPath ? child : child.stdin;
+    if (!this.isCurrent(child, generation) || !input.writable) throw new Error("codex app-server stdin is closed");
+    input.write(`${JSON.stringify(payload)}\n`);
   }
 
   handleStdout(chunk, child, generation) {

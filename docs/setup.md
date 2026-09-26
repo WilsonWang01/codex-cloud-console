@@ -74,7 +74,7 @@ Codex 数据另存于服务用户的 `CODEX_HOME`。代码回滚不等于数据�
 
 Node 服务保持监听 `127.0.0.1:8787`，公网前面放置有身份认证的 HTTPS 代理。参考 [ops/Caddyfile](../ops/Caddyfile)；域名、证书联系邮箱、Basic Auth 用户和密码哈希需要按实际环境配置。
 
-Caddy 的环境变量需在 **Caddy 服务**中设置，不会自动继承控制台的 EnvironmentFile。参考配置只让自动化 Webhook/Heartbeat 绕过网页登录，这两个接口仍由专用令牌保护；其他页面和 API 保持入口认证。
+Caddy 的环境变量需在 **Caddy 服务**中设置，不会自动继承控制台的 EnvironmentFile。参考配置让自动化 Webhook/Heartbeat，以及精确匹配的运行结果 GET、取消 POST 绕过网页登录；这四类请求仍必须携带专用令牌，其他页面和 API 保持入口认证。更改代理规则后需在测试环境校验路径匹配与认证。
 
 不要开放公网 `5174` 或 `8787`。EC2 主机管理入口可参考 [SSM / SSH 指南](aws-instance-access.md)。
 
@@ -129,7 +129,7 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 同一业务事件重试时复用幂等键，新任务使用新键。工作区隔离依赖至少已有一次提交、能够解析 `HEAD` 的 Git 仓库；刚创建的空项目需先完成初始提交。不要把隔离工作区视为权限沙箱。结果可在“自动化”的运行历史、关联会话和日志中查看。
 
-需要继续现有会话时，用 `/api/automations/my-app-review/heartbeat`，在请求体里提供属于该项目的 `sessionId`。这个接口只提交一次续跑，周期由调用方负责。
+需要继续现有会话时，用 `/api/automations/my-app-review/heartbeat`。旧共享令牌请求可提供属于该项目的 `sessionId`；独立调用方默认选择**本调用方、此自动化**最近一条带会话的运行，仅在它已完成且原线程和隔离工作树仍可验证时继续。独立调用方若显式提供 `sessionId`，也必须属于自己的运行；没有历史运行时从新隔离工作树开始。前一运行失败或待核对时先人工检查，不能自动续跑。Heartbeat 只提交一次任务，周期由调用方负责。
 
 可选 `completionContract` 示例：
 
@@ -151,12 +151,30 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 在已通过网页登录认证的控制台打开“调用与用量”，输入服务名、勾选它允许触发的自动化，再创建令牌。令牌只显示一次；服务端只保存 SHA-256 摘要，需在调用方自己的安全配置中保存明文。创建令牌不会运行模型，实际触发 Webhook/Heartbeat 会运行既有自动化，需先确认模型额度和任务影响。
 
-调用方使用 `x-codex-cloud-token` 提交令牌，并为每个业务事件提供 8–160 字符的 `Idempotency-Key`。同一服务重试同一事件时复用该键；同键不同请求会返回 409，失败终态也不会被静默重跑。令牌仅能触发创建时选择的自动化，不能查看管理页面或批准自己的任务。管理页面必须保留入口认证；参考 Caddy 配置只为两个触发接口绕过网页登录。旧共享令牌仍兼容，统计中标记为 `legacy-shared`，不会被当作某个新服务。
+调用方使用 `x-codex-cloud-token` 提交令牌，并为每个业务事件提供 8–160 字符的 `Idempotency-Key`。同一服务重试同一事件时复用该键；同键不同请求会返回 409，失败终态也不会被静默重跑。独立调用方不能指定 `worktree:false`；所授权仓库需要可解析 `HEAD` 的 Git 提交。令牌仅能触发创建时选择的自动化、读取和请求取消自己的运行，不能查看管理页面或批准自己的任务。旧共享令牌仍兼容，统计中标记为 `legacy-shared`，不会被当作某个新服务。
+
+触发响应中的 `run.resultPath` 是只含任务 ID 的结果地址。调用方携带**同一令牌**向该路径发送 GET，读取状态、摘要、已知 token 用量及错误；向 `${resultPath}/cancel` 发送 POST 可请求取消。运行中的取消返回 202，只有模型确认中断后才进入 `canceled`，已发生的外部动作不能撤销。结果查询每个令牌每分钟最多 60 次，超限返回 429 和 `Retry-After`。跨调用方结果/取消返回 404，撤销令牌后返回 401；未认证查询不进入应用层请求曲线，避免公网请求撑大指标文件。
+
+独立令牌的项目范围、隔离工作树和并发限制**不是操作系统沙箱**：当前执行器仍与控制台共用系统用户、Codex 进程和环境。不要把令牌给不受信任的服务，也不要让外部输入直接驱动有高权限的任意命令；对外开放前需要独立 worker、最小权限和出站边界验收。旧共享令牌权限更宽，应迁移为独立令牌并按需撤销。
 
 调用明细按 UTC 日期追加到 `state/api-request-metrics/*.ndjson`，默认清理超过 30 天的**新增指标日志**；令牌元数据在 `state/api-clients.json`，自动化运行和旧任务仍在原状态文件中。用量仅在协议提供完整单轮快照时记账，缺失的运行显示“未知”，不据此估算费用。升级部署前备份整个状态目录；本次没有授权自动清理已有任务、会话或附件。
 
 > [!WARNING]
-> 真实审批已替换旧版会话级自动同意。无人值守任务遇到命令、文件或权限请求会暂停等待操作人，超时后拒绝；部署新版后端前检查任务与通知路径并安排验收。个人空间的 `CODEX_PERSONAL_PREVIEW=1` 仅供非生产开发，不能提供工作与个人数据的权限隔离；生产环境保持执行关闭，直到独立 worker 通过验收。
+> 真实审批已替换旧版会话级自动同意。无人值守任务遇到命令、文件或权限请求会暂停等待操作人，超时后拒绝；部署新版后端前检查任务与通知路径并安排验收。个人空间的 `CODEX_PERSONAL_PREVIEW=1` 仅供非生产开发。生产执行只有在专用 worker 安装并通过验收后才开启；旧工作执行器有 sudo，仍非双向隔离。
+
+### 个人空间专用 worker
+
+可选安装仅适用于 Linux/systemd 的单机部署。先备份控制台 `state`、当前发布目录与服务配置，确认没有运行中的对话和自动化。安装脚本只新建 `codex-personal` 系统用户、私有 `/var/lib/codex-personal` 和 Unix Socket 服务；不复制现有 `~/.codex`、工作目录或登录凭据，也不创建 AWS 资源。
+
+```bash
+sudo bash /home/ubuntu/codex-cloud/console-current/ops/install-personal-worker.sh
+sudo systemctl status codex-personal-worker.service --no-pager
+sudo systemctl restart codex-cloud-console.service
+```
+
+安装脚本为控制台添加 `CODEX_PERSONAL_WORKER=1` drop-in。个人 worker 的 `HOME/CODEX_HOME` 与工作账号分开，服务使用 `ProtectHome=yes`、只允许写自己的状态目录，阻断实例元数据地址与本机 TCP 管理端口。切到“个人”，在设置里为**个人空间**单独执行设备码登录；工作空间的登录保持不变。安装后先用无秘密夹具核对专用账号、Socket、工作目录不可读、元数据和本机管理端口不可达，再做一次可计费的最小模型任务。未登录时个人任务会明确失败，不会自动借用工作账号。
+
+这只隔离个人执行器到工作数据的方向。现有 `ubuntu` 工作执行器有 sudo，能读取个人状态；在迁移工作执行器到低权限用户并验收前，不要把个人空间用于需要防范工作任务读取的秘密。服务重启会打断运行中任务，先检查任务再操作；回滚控制台时停用个人 drop-in 即可，**不删除** `/var/lib/codex-personal`。
 
 ## 本机便捷入口
 
@@ -198,7 +216,9 @@ node scripts/local-cloud-console-proxy.mjs
 | `CODEX_ENABLE_CLI_DEBUG=1` | 启用原始 CLI 调试，生产环境默认关闭 |
 | `CODEX_ALLOW_LOCAL_FALLBACK=1` | 仅用于开发降级，生产环境不要开启 |
 | `CODEX_PLUGIN_CATALOG_CACHE_TTL_MS` | 插件目录缓存时长，默认 5 分钟 |
-| `CODEX_AUTOMATION_RECOVERY_ENABLED` | 默认启用有限的自动化中断恢复，设为 `0` 可关闭；恢复可能继续产生任务副作用 |
+| `CODEX_AUTOMATION_MAX_CONCURRENT` / `CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT` | app-server 自动化在单个控制台进程内的并发上限，默认全局 2、每调用方 1；超限返回 429，不是跨进程预算锁 |
+| `CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT` | 可选 UTC 日已知 token 软门槛，默认关闭；已用量达阈值返回 429，用量未知返回 409，进行中返回 429。单次运行可超额，不能当作费用硬上限 |
+| `CODEX_AUTOMATION_RECOVERY_ENABLED` | 默认启用旧版内部自动化的有限恢复；Webhook/Heartbeat 中断后转入待核对，不会靠提示词自动重放外部动作。设为 `0` 可关闭内部恢复 |
 | `CODEX_AUTOMATION_RECOVERY_MAX_AGE_MS` | 恢复窗口默认 30 分钟 |
 | `CODEX_AUTOMATION_RECOVERY_MAX_ATTEMPTS` | 每条恢复链默认最多 1 次自动续跑 |
 | `CODEX_AUTOMATION_RECOVERY_STARTUP_DELAY_MS` | 恢复前启动等待，默认 1 秒 |
@@ -223,6 +243,7 @@ npx vite --host 127.0.0.1 --port 5174 --strictPort
 
 ```bash
 npm run verify:safety:ui
+npm run verify:personal:ui
 ```
 
 如端口被占用，前端改用其他端口，并为测试设置对应的 `CODEX_CLOUD_SAFETY_UI_URL`。截图保存在被 Git 忽略的 `docs/research/`。

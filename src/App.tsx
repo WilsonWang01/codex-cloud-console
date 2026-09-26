@@ -1670,12 +1670,15 @@ function connectionState(status: ConsoleStatus, cloudConnection: CloudConnection
 }
 
 function attentionTone(status: string) {
-  if (/failed|error|interrupted|attention/i.test(status)) return "danger";
+  if (/failed|error|interrupted|needs_reconciliation|attention/i.test(status)) return "danger";
   if (/running|queued|active/i.test(status)) return "active";
   return "neutral";
 }
 
 function runStatusLabel(status: string) {
+  if (status === "needs_reconciliation") return "待核对";
+  if (status === "canceling") return "取消中";
+  if (status === "canceled" || status === "cancelled") return "已取消";
   if (/archived/i.test(status)) return "已归档";
   if (/failed|error/i.test(status)) return "失败";
   if (/interrupted/i.test(status)) return "已中断";
@@ -3228,8 +3231,11 @@ export function App() {
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [chatRuntime, setChatRuntime] = useState<ChatRuntime>(defaultChatRuntime);
   const [codexModels, setCodexModels] = useState<CodexModelOption[]>([]);
-  const [codexAppStatus, setCodexAppStatus] = useState<CodexAppStatus>(fallbackAppStatus);
+  const [codexAppStatusRecord, setCodexAppStatus] = useState<CodexAppStatus>(fallbackAppStatus);
+  const [codexAppStatusRepoId, setCodexAppStatusRepoId] = useState("");
+  const codexAppStatus = codexAppStatusRepoId === selectedRepoId ? codexAppStatusRecord : fallbackAppStatus;
   const [codexAppStatusLoading, setCodexAppStatusLoading] = useState(true);
+  const visibleCodexAppStatusLoading = codexAppStatusLoading || codexAppStatusRepoId !== selectedRepoId;
   const [threadGoal, setThreadGoal] = useState<ThreadGoal | null>(null);
   const [goalDraft, setGoalDraft] = useState("");
   const [goalBudgetDraft, setGoalBudgetDraft] = useState("");
@@ -3308,6 +3314,7 @@ export function App() {
     initialRoute.repoId && initialRoute.sessionId ? { repoId: initialRoute.repoId, sessionId: initialRoute.sessionId } : null,
   );
   const codexAppStatusLoadedRef = useRef(false);
+  const codexAppStatusRepoIdRef = useRef("");
   const streamScope = useRef(new ConversationStreamScope()).current;
   const reconnectBackoff = useRef({ failures: 0, after: 0 });
   const lastNotifiedAttentionId = useRef("");
@@ -3753,6 +3760,10 @@ export function App() {
   const loadCodexAppStatus = useCallback(async () => {
     const repoId = selectedRepoIdRef.current;
     const requestSeq = ++codexAppStatusLoadSeq.current;
+    if (codexAppStatusRepoIdRef.current !== repoId) {
+      codexAppStatusLoadedRef.current = false;
+      setCodexAppStatusLoading(true);
+    }
     if (!codexAppStatusLoadedRef.current) setCodexAppStatusLoading(true);
     try {
       const params = new URLSearchParams({ repoId });
@@ -3762,11 +3773,16 @@ export function App() {
         throw new Error(nextStatus.gaps?.[0] || nextStatus.auth?.issue || "云端 Codex 能力状态不是 app-server 权威响应");
       }
       codexAppStatusLoadedRef.current = true;
+      codexAppStatusRepoIdRef.current = repoId;
+      setCodexAppStatusRepoId(repoId);
       setCodexAppStatus(nextStatus);
     } catch (error) {
       if (requestSeq !== codexAppStatusLoadSeq.current || selectedRepoIdRef.current !== repoId) return;
+      const hadMatchingStatus = codexAppStatusRepoIdRef.current === repoId;
+      codexAppStatusRepoIdRef.current = repoId;
+      setCodexAppStatusRepoId(repoId);
       setCodexAppStatus((current) => ({
-        ...current,
+        ...(hadMatchingStatus ? current : fallbackAppStatus),
         ok: false,
         gaps: [error instanceof Error ? error.message : "无法读取云端 Codex 能力状态"],
       }));
@@ -3802,7 +3818,7 @@ export function App() {
       }>("/api/codex/account/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type }),
+        body: JSON.stringify({ type, repoId: selectedRepoIdRef.current }),
       });
       const flow = result.flow || null;
       const loginUrl = flow?.verificationUrl || flow?.authUrl || result.result?.verificationUrl || result.result?.authUrl || "";
@@ -3838,7 +3854,7 @@ export function App() {
       const result = await api<{ ok: boolean; accountLogin?: CodexAccountLoginState; error?: string }>("/api/codex/account/login/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ loginId }),
+        body: JSON.stringify({ loginId, repoId: selectedRepoIdRef.current }),
       });
       setCodexAppStatus((current) => ({ ...current, accountLogin: result.accountLogin || current.accountLogin }));
       pushEvent({ tone: "info", title: "Codex 登录", body: "已取消等待中的授权流程" });
@@ -3854,7 +3870,11 @@ export function App() {
     if (codexAccountBusy) return;
     setCodexAccountBusy("logout");
     try {
-      await api("/api/codex/account/logout", { method: "POST" });
+      await api("/api/codex/account/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId: selectedRepoIdRef.current }),
+      });
       await loadCodexAppStatus();
       pushEvent({ tone: "info", title: "Codex 登录", body: "已退出 Codex 账号" });
     } catch (error) {
@@ -5936,7 +5956,7 @@ export function App() {
               runtime={chatRuntime}
               modelOptions={codexModels}
               appStatus={codexAppStatus}
-              appStatusLoading={codexAppStatusLoading}
+              appStatusLoading={visibleCodexAppStatusLoading}
               tokenUsage={threadTokenUsage}
               compactStatus={compactStatus}
               goal={threadGoal}
@@ -6036,7 +6056,7 @@ export function App() {
               repo={selectedRepo}
               repoSelectionReady={repoSelectionReady}
               appStatus={codexAppStatus}
-              appStatusLoading={codexAppStatusLoading}
+              appStatusLoading={visibleCodexAppStatusLoading}
               onRefresh={() => {
                 refresh();
                 loadCodexAppStatus();
@@ -7460,8 +7480,8 @@ function RunThread({
 }
 
 function runStatusTone(status: string) {
-  if (["failed", "blocked", "cancelled"].includes(status)) return "warn";
-  if (["queued", "running"].includes(status)) return "active";
+  if (["failed", "blocked", "cancelled", "canceled", "needs_reconciliation"].includes(status)) return "warn";
+  if (["queued", "running", "canceling"].includes(status)) return "active";
   if (status === "archived") return "neutral";
   return "ok";
 }
@@ -9208,7 +9228,11 @@ function CloudChat({
 
       {repo.kind === "personal" && <div className="personal-scope-notice" role="status">
         <UserRound size={16} />
-        <span>{repo.executionAvailable ? "个人空间预览：会话独立，执行仅只读；尚未建立独立系统用户的权限隔离，请勿提交敏感资料。" : "个人空间已建立独立会话与草稿；执行需先配置并验收独立 worker，当前可先整理草稿。"}</span>
+        <span>{repo.executionAvailable
+          ? repo.statusText?.includes("独立低权限")
+            ? "个人空间使用独立低权限执行器，当前仅允许只读任务；现有工作执行器仍有主机管理权限，请勿把它当作双向保密边界。"
+            : "个人空间预览：会话独立，执行仅只读；尚未建立独立系统用户的权限隔离，请勿提交敏感资料。"
+          : "个人空间已建立独立会话与草稿；执行需先配置并验收独立 worker，当前可先整理草稿。"}</span>
       </div>}
 
       <div className="chat-window" aria-busy={historyLoading}>
@@ -10515,7 +10539,7 @@ function SettingsView({
     },
   ];
   const activeAccountLogin = appStatus.accountLogin?.active || null;
-  const codexAuthOk = appStatus.auth?.ok !== false && status.codex.authenticated;
+  const codexAuthOk = appStatus.auth?.ok !== false && Boolean(appStatus.account);
   const usageLimit = appStatus.usageLimit || status.usageLimit || null;
   const accountUsage = appStatus.accountUsage?.summary;
   const lifetimeTokens = Number(accountUsage?.lifetimeTokens || 0);

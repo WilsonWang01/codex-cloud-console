@@ -141,11 +141,18 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
       for (const row of rows) {
         const hour = row.time.slice(0, 13) + ":00:00Z";
         const key = `${hour}:${row.clientId}`;
-        const bucket = buckets.get(key) || { hour, clientId: row.clientId, requests: 0, accepted: 0, errors: 0, replayed: 0 };
-        bucket.requests += 1;
-        if (row.status >= 200 && row.status < 300 && !row.deduplicated) bucket.accepted += 1;
-        if (row.status >= 400) bucket.errors += 1;
-        if (row.deduplicated) bucket.replayed += 1;
+        const bucket = buckets.get(key) || { hour, clientId: row.clientId, requests: 0, accepted: 0, errors: 0, replayed: 0, polls: 0, pollErrors: 0, controls: 0 };
+        if (row.trigger === "cancel") {
+          bucket.controls += 1;
+        } else if (row.trigger === "result") {
+          bucket.polls += 1;
+          if (row.status >= 400) bucket.pollErrors += 1;
+        } else {
+          bucket.requests += 1;
+          if (row.status >= 200 && row.status < 300 && !row.deduplicated) bucket.accepted += 1;
+          if (row.status >= 400) bucket.errors += 1;
+          if (row.deduplicated) bucket.replayed += 1;
+        }
         buckets.set(key, bucket);
       }
       return { buckets: [...buckets.values()].sort((a, b) => a.hour.localeCompare(b.hour)), requests: rows.slice(-500).reverse(), droppedRequests };

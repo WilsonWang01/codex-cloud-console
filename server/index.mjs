@@ -15,10 +15,16 @@ import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mj
 import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "./run-safety.mjs";
 import { createApprovalBroker, approvalDigest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
+import { clientCanReadRun, externalRunView, scopedHeartbeatSource } from "./external-automation.mjs";
+import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
+import { createRunAdmission } from "./run-admission.mjs";
+import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageFromProtocol } from "./run-usage.mjs";
+import { appServerRequestScope, personalRuntimeConfig } from "./personal-runtime.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
+const serializeNotificationDelivery = createKeyedQueue();
 
 const app = express();
 app.set("trust proxy", "loopback");
@@ -33,9 +39,11 @@ const cloudRoot = process.env.CODEX_CLOUD_ROOT || defaultCloudRoot;
 const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || path.dirname(cloudRoot), ".codex");
 const generatedImagesRoot = process.env.CODEX_GENERATED_IMAGES_ROOT || path.join(codexHome, "generated_images");
 const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "workspace");
-const personalRoot = process.env.CODEX_PERSONAL_ROOT || path.join(cloudRoot, "personal");
+const personalRuntime = personalRuntimeConfig(process.env);
+const personalRoot = personalRuntime.enabled ? personalRuntime.root : process.env.CODEX_PERSONAL_ROOT || path.join(cloudRoot, "personal");
 const personalRepoId = "_personal";
 const personalPreviewEnabled = process.env.NODE_ENV !== "production" && process.env.CODEX_PERSONAL_PREVIEW === "1";
+const personalExecutionAvailable = personalRuntime.enabled || personalPreviewEnabled;
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
 const stateRoot =
   process.env.CODEX_STATE_ROOT ||
@@ -68,7 +76,8 @@ app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
-  if (/^\/api\/automations\/[^/]+\/(webhook|heartbeat)$/.test(req.path)) return next();
+  if (/^\/api\/automations\/[^/]+\/(webhook|heartbeat)$/.test(req.path) ||
+    /^\/api\/automations\/[^/]+\/runs\/[^/]+\/cancel$/.test(req.path)) return next();
   const origin = String(req.get("origin") || "").replace(/\/+$/, "");
   const localOrigin = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(origin);
   if ((origin && origin !== publicOrigin && !localOrigin) || req.get("sec-fetch-site") === "cross-site") {
@@ -141,6 +150,7 @@ let appServerSkillsChangedAt = null;
 let appServerAppListUpdated = null;
 let appServerRemoteControl = null;
 let appServerClient;
+let personalAppServerClient;
 let serverEventSeq = 0;
 let chatStoreWriteQueue = Promise.resolve();
 let automationRunsWriteQueue = Promise.resolve();
@@ -174,7 +184,12 @@ const automationTriggerRateWindowMs = Number(process.env.CODEX_AUTOMATION_TRIGGE
 const automationTriggerRateMax = Number(process.env.CODEX_AUTOMATION_TRIGGER_RATE_MAX || 12);
 const automationTriggerIdempotencyTtlMs = Number(process.env.CODEX_AUTOMATION_IDEMPOTENCY_TTL_MS || 24 * 60 * 60 * 1000);
 const automationTriggerRateByKey = new Map();
+const automationResultRateByClient = new Map();
 const automationTriggerIdempotency = new Map();
+const runAdmission = createRunAdmission({
+  maxGlobal: process.env.CODEX_AUTOMATION_MAX_CONCURRENT || 2,
+  maxPerClient: process.env.CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT || 1,
+});
 const apiClientStore = createApiClientStore({
   read: () => readJsonState(apiClientsPath, { version: 1, clients: [] }),
   write: (state) => atomicWriteJson(apiClientsPath, state),
@@ -324,6 +339,8 @@ const personalRootOverlapsWork = repos.some((repo) => {
 });
 if (repos.some((repo) => repo.id === personalRepoId) || personalRootOverlapsWork) {
   console.warn("Personal space ID or path overlaps a work repository; personal space is unavailable");
+} else if (personalRuntime.enabled) {
+  repos.push({ id: personalRepoId, name: "个人助理", kind: "personal", path: personalRoot, remote: "", accent: "teal" });
 } else {
   await fs.mkdir(personalRoot, { recursive: true, mode: 0o700 });
   const personalStat = await fs.lstat(personalRoot);
@@ -445,17 +462,30 @@ async function loadCustomRepos() {
   }
 }
 
-async function codexAppServerRequest(method, params = {}, timeout = 20_000) {
+async function codexAppServerRequest(method, params = {}, timeout = 20_000, repo = null) {
+  const client = repo ? appServerClientForRepo(repo) : await appServerClientForRequest(params);
   try {
-    const result = await getAppServerClient().request(method, params, timeout);
-    return { ok: true, result, stderr: getAppServerClient().status().stderrTail.join("\n") };
+    const result = await client.request(method, params, timeout);
+    return { ok: true, result, stderr: client.status().stderrTail.join("\n") };
   } catch (error) {
     return {
       ok: false,
       error: appServerErrorMessage(error, "Codex app-server request failed"),
-      stderr: getAppServerClient().status().stderrTail.join("\n"),
+      stderr: client.status().stderrTail.join("\n"),
     };
   }
+}
+
+async function appServerClientForRequest(params = {}) {
+  if (!personalRuntime.enabled) return getAppServerClient();
+  if (appServerRequestScope(params, personalRoot) === "personal") return getPersonalAppServerClient();
+  const threadId = String(params.threadId || "");
+  if (!threadId) return getAppServerClient();
+  const owner = threadOwners.get(threadId);
+  if (owner?.repoId === personalRepoId) return getPersonalAppServerClient();
+  if (owner?.repoId) return getAppServerClient();
+  const { session } = await findStoredSessionByThreadId(threadId);
+  return session?.repoId === personalRepoId ? getPersonalAppServerClient() : getAppServerClient();
 }
 
 function appServerUnavailableError(operation, error = "") {
@@ -1734,7 +1764,7 @@ function appServerThreadParams(repo, runtime) {
     personality: "pragmatic",
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
-      ...(repo.kind === "personal" ? ["This is a limited personal-space preview. Use only this conversation and the personal workspace as context. Do not inspect work repositories or host credentials. Do not run shell commands or modify files."] : []),
+      ...(repo.kind === "personal" ? ["Use only this conversation and the personal workspace as context. Do not inspect work repositories, host credentials, metadata endpoints, or local administration services. Personal execution is read-only."] : []),
     ].join("\n"),
     config: {
       model_reasoning_effort: runtime.reasoning,
@@ -2271,6 +2301,22 @@ async function appServerRequestResult(method, params = {}) {
   }
 }
 
+function personalAppServerRequestResult(method, params = {}) {
+  const job = findTurnJob(params) || findCompactJob(params);
+  if (!job || job.repoId !== personalRepoId) throw new Error("Personal worker request has no active personal turn");
+  return appServerRequestResult(method, params);
+}
+
+function personalAppServerNotification(message) {
+  if (message.method === "account/login/completed") {
+    completeAccountLoginFlow(message.params || {}, personalRepoId);
+    return;
+  }
+  const job = findTurnJob(message.params || {}) || findCompactJob(message.params || {});
+  if (job?.repoId !== personalRepoId) return;
+  handleAppServerNotification(message);
+}
+
 function guardianActionSummary(action = {}) {
   const type = String(action?.type || "unknown");
   if (type === "command") return `command: ${compactSingleLine(action.command || "shell", 180)}`;
@@ -2351,16 +2397,51 @@ function getAppServerClient() {
     });
   });
   appServerClient.on("exit", ({ message }) => {
-    approvalBroker.closeAll(message || "Codex app-server stopped");
+    if (personalRuntime.enabled) {
+      for (const repo of repos.filter((item) => item.kind !== "personal")) {
+        approvalBroker.closeForRepo(repo.id, message || "Codex app-server stopped");
+      }
+    } else {
+      approvalBroker.closeAll(message || "Codex app-server stopped");
+    }
     auditAppServerLifecycle("app-server-error", message || "Codex app-server stopped", appServerClient.status());
-    for (const job of [...activeTurns.values()]) {
+    for (const job of [...activeTurns.values()].filter((item) => item.repoId !== personalRepoId || !personalRuntime.enabled)) {
       finishTurnJob(job, false, 1, message || "Codex app-server stopped");
     }
-    for (const job of [...activeCompactions.values()]) {
+    for (const job of [...activeCompactions.values()].filter((item) => item.repoId !== personalRepoId || !personalRuntime.enabled)) {
       finishCompactJob(job, false, message || "Codex app-server stopped");
     }
   });
   return appServerClient;
+}
+
+function getPersonalAppServerClient() {
+  if (!personalRuntime.enabled) return getAppServerClient();
+  if (personalAppServerClient) return personalAppServerClient;
+  personalAppServerClient = new CodexAppServerClient({
+    cwd: personalRuntime.home,
+    socketPath: personalRuntime.socketPath,
+    onServerRequest: personalAppServerRequestResult,
+  });
+  personalAppServerClient.on("notification", personalAppServerNotification);
+  personalAppServerClient.on("exit", ({ message }) => {
+    approvalBroker.closeForRepo(personalRepoId, message || "Personal app-server stopped");
+    for (const job of [...activeTurns.values()].filter((item) => item.repoId === personalRepoId)) {
+      finishTurnJob(job, false, 1, message || "Personal app-server stopped");
+    }
+    for (const job of [...activeCompactions.values()].filter((item) => item.repoId === personalRepoId)) {
+      finishCompactJob(job, false, message || "Personal app-server stopped");
+    }
+  });
+  return personalAppServerClient;
+}
+
+function appServerClientForRepo(repo) {
+  return repo?.kind === "personal" ? getPersonalAppServerClient() : getAppServerClient();
+}
+
+function appServerClientForJob(job) {
+  return appServerClientForRepo(job?.repo);
 }
 
 function makeSessionKey(repoId, sessionId) {
@@ -2689,7 +2770,7 @@ function interruptTimedOutTurn(job, message) {
   if (job.completed || job.finishing) return;
   job.cancelRequested = true;
   const interrupt = job.threadId && job.turnId
-    ? getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
+    ? appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
     : Promise.resolve();
   interrupt.finally(() => {
     finishTurnJob(job, false, 124, message).catch((error) => {
@@ -2720,7 +2801,7 @@ function armTurnJobTimeout(job) {
 }
 
 async function resolveThreadForJob(job) {
-  const client = getAppServerClient();
+  const client = appServerClientForJob(job);
   if (job.threadId) {
     try {
       await client.request("thread/resume", { threadId: job.threadId, ...appServerThreadParams(job.repo, job.runtime) }, 30_000);
@@ -2743,7 +2824,7 @@ async function resolveThreadForJob(job) {
 
 async function startTurnJob(repo, session, runtime, message, attachments = [], storedMessage = message, options = {}) {
   if (repo.kind === "personal") {
-    if (!personalPreviewEnabled) throw Object.assign(new Error("个人空间执行未启用：独立 worker 尚未完成配置与验收"), { statusCode: 503 });
+    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行未启用：独立 worker 尚未完成配置与验收"), { statusCode: 503 });
     runtime = runtimeForRepo(repo, runtime);
   }
   const key = makeSessionKey(repo.id, session.id);
@@ -2765,15 +2846,15 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
       await resolveThreadForJob(job);
       if (job.completed) return;
       if (job.cancelRequested) {
-        await getAppServerClient().request("thread/archive", { threadId: job.threadId }, 20_000).catch(() => null);
+        await appServerClientForJob(job).request("thread/archive", { threadId: job.threadId }, 20_000).catch(() => null);
         await finishTurnJob(job, false, 130, "Turn cancelled before start");
         return;
       }
-      const result = await getAppServerClient().request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments), 30_000);
+      const result = await appServerClientForJob(job).request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments), 30_000);
       job.turnId = result?.turn?.id || null;
       if (job.completed) {
         if (job.threadId && job.turnId) {
-          await getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+          await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
         }
         return;
       }
@@ -2786,7 +2867,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
       );
       rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
       if (job.cancelRequested && job.threadId && job.turnId) {
-        await getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+        await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
       }
       emitJobEvent(job, "status", { text: job.turnId ? `已启动 turn ${job.turnId.slice(0, 8)}` : "已启动 app-server turn" });
     } catch (error) {
@@ -2797,6 +2878,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
 }
 
 async function startReviewJob(repo, session, runtime, target = { type: "uncommittedChanges" }, delivery = "inline") {
+  if (repo.kind === "personal") throw Object.assign(new Error("个人空间不是 Git 项目，不能运行代码审查"), { statusCode: 400 });
   const key = makeSessionKey(repo.id, session.id);
   const existing = activeTurns.get(key);
   if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
@@ -2813,7 +2895,7 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
     try {
       await resolveThreadForJob(job);
       if (job.completed) return;
-      const result = await getAppServerClient().request(
+      const result = await appServerClientForJob(job).request(
         "review/start",
         {
           threadId: job.threadId,
@@ -2825,7 +2907,7 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
       job.turnId = result?.turn?.id || result?.reviewTurnId || null;
       if (job.completed) {
         if (job.threadId && job.turnId) {
-          await getAppServerClient().request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+          await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
         }
         return;
       }
@@ -2896,7 +2978,7 @@ async function startCompactJob(repo, session, runtime) {
       if (!job.threadId) throw new Error("先发送一条消息建立 app-server thread，再压缩上下文。");
       await resolveThreadForJob(job);
       emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}，正在启动上下文压缩...` });
-      await getAppServerClient().request("thread/compact/start", { threadId: job.threadId }, 30_000);
+      await appServerClientForJob(job).request("thread/compact/start", { threadId: job.threadId }, 30_000);
       emitJobEvent(job, "status", { text: "正在压缩上下文..." });
     } catch (error) {
       await finishCompactJob(job, false, error.message || "主动压缩失败");
@@ -3489,18 +3571,18 @@ function handleAppServerNotification(rpcMessage) {
   }
 }
 
-async function appServerProbe(method, params = {}, timeout = 20_000) {
-  const response = await codexAppServerRequest(method, params, timeout);
+async function appServerProbe(method, params = {}, timeout = 20_000, repo = null) {
+  const response = await codexAppServerRequest(method, params, timeout, repo);
   return response.ok
     ? { ok: true, result: response.result || null }
     : { ok: false, error: response.error || "request failed" };
 }
 
-async function codexAppServerBatchRequest(requests, timeout = 60_000) {
+async function codexAppServerBatchRequest(requests, timeout = 60_000, repo = null) {
   const perRequestTimeout = Math.min(Math.max(Number(timeout || 0), 3_000), 60_000);
   const entries = await Promise.all(
     requests.map(async (request) => {
-      const response = await codexAppServerRequest(request.method, request.params || {}, request.timeout || perRequestTimeout);
+      const response = await codexAppServerRequest(request.method, request.params || {}, request.timeout || perRequestTimeout, repo);
       return [
         request.key,
         response.ok
@@ -3643,11 +3725,12 @@ function rememberAccountLoginFlow(flow = {}) {
   return next;
 }
 
-function accountLoginFlowFromResponse(response = {}) {
+function accountLoginFlowFromResponse(response = {}, repoId = "") {
   const loginId = String(response.loginId || "").trim();
   if (!loginId) return null;
   return rememberAccountLoginFlow({
     loginId,
+    repoId,
     type: String(response.type || "unknown"),
     status: "pending",
     authUrl: response.authUrl || null,
@@ -3657,14 +3740,21 @@ function accountLoginFlowFromResponse(response = {}) {
   });
 }
 
-function completeAccountLoginFlow(params = {}) {
+function accountLoginMatchesScope(flow, repoId = "") {
+  return repoId === personalRepoId
+    ? flow?.repoId === personalRepoId
+    : flow?.repoId !== personalRepoId;
+}
+
+function completeAccountLoginFlow(params = {}, repoId = "") {
   const loginId = String(params.loginId || "").trim();
   const fallback = [...accountLoginFlows.values()]
-    .filter((flow) => flow.status === "pending")
+    .filter((flow) => flow.status === "pending" && accountLoginMatchesScope(flow, repoId))
     .sort((a, b) => new Date(b.updatedAt || b.startedAt || 0) - new Date(a.updatedAt || a.startedAt || 0))[0];
   const targetId = loginId || fallback?.loginId || "";
   if (!targetId) return null;
   const existing = accountLoginFlows.get(targetId);
+  if (existing && !accountLoginMatchesScope(existing, repoId)) return null;
   if (!params.success && existing?.status === "canceled") {
     return rememberAccountLoginFlow({
       loginId: targetId,
@@ -3690,8 +3780,9 @@ function cancelAccountLoginFlow(loginId, result = {}) {
   });
 }
 
-function accountLoginSnapshot() {
+function accountLoginSnapshot(repoId = "") {
   const flows = [...accountLoginFlows.values()]
+    .filter((flow) => accountLoginMatchesScope(flow, repoId))
     .sort((a, b) => new Date(b.updatedAt || b.startedAt || 0) - new Date(a.updatedAt || a.startedAt || 0))
     .slice(0, 8);
   return {
@@ -3701,7 +3792,7 @@ function accountLoginSnapshot() {
   };
 }
 
-function summarizeAppServerStatus(results) {
+function summarizeAppServerStatus(results, repo = null) {
   const account = results.account.result?.account || null;
   const rateLimits = results.rateLimits.result?.rateLimits || null;
   const accountUsage = results.accountUsage?.result || null;
@@ -3711,13 +3802,13 @@ function summarizeAppServerStatus(results) {
   const config = results.config.result?.config || {};
   const plugins = countInstalledPlugins(results.plugins);
   const gaps = [];
-  const appHost = getAppServerClient().status();
+  const appHost = appServerClientForRepo(repo).status();
   const allRequestsFailed = Object.values(results).every((value) => !value.ok);
   const authProblem = codexAuthProblemFromSources(
     appHost.lastError,
     (appHost.stderrTail || []).join("\n"),
     Object.values(results).map((value) => value.error || value.stderr || "").join("\n"),
-  );
+  ) || (results.account?.ok && !account ? "Codex 账号未登录" : null);
   const usageLimit = codexUsageLimitFromSources(
     appHost.lastError,
     (appHost.stderrTail || []).join("\n"),
@@ -3797,7 +3888,7 @@ function summarizeAppServerStatus(results) {
     },
     appHost,
     live: appServerLiveSnapshot(),
-    accountLogin: accountLoginSnapshot(),
+    accountLogin: accountLoginSnapshot(repo?.id || ""),
     mcpOauthResults,
     rawErrors: Object.fromEntries(
       Object.entries(results)
@@ -3825,11 +3916,11 @@ function appStatusRequestList(repo) {
 }
 
 async function computeCodexAppStatus(repo, timeout = 12_000) {
-  const results = await codexAppServerBatchRequest(appStatusRequestList(repo), timeout);
+  const results = await codexAppServerBatchRequest(appStatusRequestList(repo), timeout, repo);
   if (!results.plugins?.ok) {
     results.plugins = await codexAppServerRequest("plugin/list", { cwds: [repo.path] }, Math.min(timeout, 12_000));
   }
-  return summarizeAppServerStatus(results);
+  return summarizeAppServerStatus(results, repo);
 }
 
 async function readPluginCatalog(repo, options = {}) {
@@ -3914,7 +4005,7 @@ async function writeStoredAppStatusCache(repo, data) {
 }
 
 function fastCodexAppStatusFallback(repo, error = "") {
-  const appHost = getAppServerClient().status();
+  const appHost = appServerClientForRepo(repo).status();
   const issue = error ? `云端能力后台同步中: ${String(error).slice(0, 240)}` : null;
   return {
     ok: false,
@@ -3942,7 +4033,7 @@ function fastCodexAppStatusFallback(repo, error = "") {
     auth: { ok: Boolean(appHost.running && !appHost.lastError), issue },
     appHost,
     live: appServerLiveSnapshot(),
-    accountLogin: accountLoginSnapshot(),
+    accountLogin: accountLoginSnapshot(repo?.id || ""),
     mcpOauthResults,
     rawErrors: issue ? { status: issue } : {},
     gaps: issue ? [issue] : [],
@@ -4044,7 +4135,7 @@ async function timedDiagnostic(id, label, fn, tone = null) {
 
 async function runCodexDiagnostics(repo) {
   const generatedAt = new Date().toISOString();
-  const appHost = getAppServerClient().status();
+  const appHost = appServerClientForRepo(repo).status();
   const checks = [];
   const [codexVersion, codexStatus, schemaCheck, appServerResults, threadList] = await Promise.all([
     timedDiagnostic("codex-version", "Codex CLI", async () => {
@@ -4057,8 +4148,8 @@ async function runCodexDiagnostics(repo) {
     }),
     timedDiagnostic("codex-auth", "Codex 账号", async () => {
       const [status, accountProbe] = await Promise.all([
-        getCodexStatus(),
-        appServerProbe("account/read", {}, 10_000),
+        repo.kind === "personal" ? Promise.resolve({ authenticated: false, mode: "unknown", detail: "个人专用账号未登录" }) : getCodexStatus(),
+        appServerProbe("account/read", {}, 10_000, repo),
       ]);
       const authProblem = codexAuthProblemFromSources(accountProbe.error, status.detail);
       const effective = codexStatusFromAccountProbe(status, accountProbe, authProblem);
@@ -4088,6 +4179,7 @@ async function runCodexDiagnostics(repo) {
           { key: "provider", method: "modelProvider/capabilities/read", params: {} },
         ],
         45_000,
+        repo,
       );
       const failed = Object.entries(results).filter(([, value]) => !value.ok);
       return {
@@ -4123,8 +4215,8 @@ async function runCodexDiagnostics(repo) {
   ]);
   checks.push(codexVersion, codexStatus, schemaCheck, appServerResults, threadList);
 
-  const appStatusResults = await codexAppServerBatchRequest(appStatusRequestList(repo));
-  const appStatus = summarizeAppServerStatus(appStatusResults);
+  const appStatusResults = await codexAppServerBatchRequest(appStatusRequestList(repo), 60_000, repo);
+  const appStatus = summarizeAppServerStatus(appStatusResults, repo);
   const gapChecks = appStatus.gaps.map((gap, index) =>
     diagnosticCheck(`gap-${index + 1}`, "已知能力差异", false, gap, "", gap.includes("Realtime") || gap.includes("App list") ? "warn" : "danger"),
   );
@@ -4457,7 +4549,7 @@ function compactLines(text, max = 120) {
 }
 
 async function getRepo(repo) {
-  const present = await exists(repo.path);
+  const present = repo.kind === "personal" && personalRuntime.enabled ? true : await exists(repo.path);
   if (!present) {
     return {
       ...repo,
@@ -4472,7 +4564,9 @@ async function getRepo(repo) {
   }
 
   if (repo.kind === "personal") {
-    return { ...repo, present: true, executionAvailable: personalPreviewEnabled, branch: "", commit: "", dirty: false, statusText: "个人空间 · 仅上下文隔离", lastCommit: "非 Git 空间" };
+    const socket = personalRuntime.enabled ? await fs.stat(personalRuntime.socketPath).catch(() => null) : null;
+    const workerOnline = Boolean(socket?.isSocket());
+    return { ...repo, present: true, executionAvailable: personalPreviewEnabled || workerOnline, branch: "", commit: "", dirty: false, statusText: workerOnline ? "个人空间 · 独立低权限执行器" : "个人空间 · 仅上下文隔离", lastCommit: "非 Git 空间" };
   }
 
   const [branch, commit, status, lastCommit] = await Promise.all([
@@ -4665,6 +4759,7 @@ function normalizeAutomationRun(run = {}) {
     recoveryAttempt: Math.max(0, Math.floor(Number(run.recoveryAttempt || 0))),
     recoveryRunId: run.recoveryRunId ? String(run.recoveryRunId) : null,
     recoverySkippedReason: run.recoverySkippedReason ? String(run.recoverySkippedReason).slice(0, 320) : null,
+    cancelRequestedAt: run.cancelRequestedAt ? String(run.cancelRequestedAt) : null,
     completionContract,
     completionOutcome,
     completionCheckedAt: run.completionCheckedAt ? String(run.completionCheckedAt) : null,
@@ -4717,9 +4812,13 @@ async function writeAutomationRunsWithinQueue(store) {
   await atomicWriteJson(automationRunsPath, { version: 1, runs });
 }
 
-async function upsertAutomationRun(run, event = null) {
+async function upsertAutomationRun(run, event = null, { budgetLimit = null } = {}) {
   return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns();
+    const budget = checkKnownTokenBudget(store.runs, { limit: budgetLimit });
+    if (!budget.ok) {
+      throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
+    }
     const index = store.runs.findIndex((item) => item.id === run.id);
     const current = index >= 0 ? store.runs[index] : null;
     const normalized = normalizeAutomationRun({
@@ -4753,6 +4852,34 @@ async function appendAutomationRunEvent(runId, patch = {}, event = null) {
   });
 }
 
+async function requestAutomationRunCancellation(runId, automationId, clientId) {
+  return enqueueWrite("automation", async () => {
+    const store = await readAutomationRuns();
+    const index = store.runs.findIndex((item) => item.id === runId);
+    const current = index >= 0 ? store.runs[index] : null;
+    if (!clientCanReadRun({ id: clientId }, automationId, current)) {
+      throw Object.assign(new Error("Run not found"), { statusCode: 404 });
+    }
+    if (["completed", "failed", "canceled", "needs_reconciliation"].includes(current.status)) {
+      return { run: current, pending: false };
+    }
+    if (current.status === "canceling") return { run: current, pending: true };
+    if (!["queued", "running"].includes(current.status)) {
+      throw Object.assign(new Error("Run cannot be canceled in its current state"), { statusCode: 409 });
+    }
+    const next = normalizeAutomationRun({
+      ...current,
+      status: "canceling",
+      cancelRequestedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      events: mergeAutomationRunEvents(current.events || [], [{ time: new Date().toISOString(), type: "cancel-requested", text: "Cancellation requested; already completed actions remain" }]),
+    });
+    store.runs[index] = next;
+    await writeAutomationRunsWithinQueue(store);
+    return { run: next, pending: true };
+  });
+}
+
 async function appendAutomationRunEventWithRetry(runId, patch = {}, event = null, attempts = 3) {
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -4773,22 +4900,27 @@ async function appendAutomationRunEventWithRetry(runId, patch = {}, event = null
 async function reconcileStaleAutomationRuns(reason = "控制台重启时 app-server 自动化任务仍在运行") {
   const store = await readAutomationRuns();
   const staleRuns = store.runs.filter(
-    (run) => run.runner === "app-server" && ["queued", "running"].includes(run.status) && !activeAutomationRuns.has(run.id),
+    (run) => run.runner === "app-server" && (
+      (["queued", "running", "canceling"].includes(run.status) && !activeAutomationRuns.has(run.id)) ||
+      (run.status === "interrupted" && run.interruptionKind === "console-restart" &&
+        ["webhook", "heartbeat"].includes(run.trigger) && !run.recoveryRunId)
+    ),
   );
   for (const runRecord of staleRuns) {
     const interruptedAt = new Date().toISOString();
+    const needsReconciliation = ["webhook", "heartbeat"].includes(runRecord.trigger) || runRecord.status === "canceling";
     await appendAutomationRunEvent(
       runRecord.id,
       {
-        status: "interrupted",
+        status: needsReconciliation ? "needs_reconciliation" : "interrupted",
         finishedAt: interruptedAt,
-        error: null,
-        summary: reason,
+        error: needsReconciliation ? "服务重启前的外部动作结果未知，核对后再决定是否用新键重试。" : null,
+        summary: needsReconciliation ? "外部任务状态待核对，未自动续跑。" : reason,
         interruptionKind: "console-restart",
         interruptedAt,
         interruptedLastActiveAt: runRecord.updatedAt || runRecord.startedAt,
       },
-      { type: "interrupted", text: reason },
+      { type: needsReconciliation ? "needs-reconciliation" : "interrupted", text: needsReconciliation ? "外部动作状态不明，未自动续跑" : reason },
     );
   }
   if (staleRuns.length > 0) {
@@ -4836,6 +4968,7 @@ function automationRunHasOnlyExpiredUsageLimit(run = {}, auditEvents = []) {
 }
 
 function automationRunInterruptedByConsoleRestart(run = {}) {
+  if (run.status === "needs_reconciliation") return false;
   const text = [run.error, run.summary, ...(Array.isArray(run.events) ? run.events.map((event) => event?.text || "") : [])]
     .filter(Boolean)
     .join("\n");
@@ -4885,6 +5018,7 @@ function automationInboxBuckets(runs, auditEvents = []) {
   for (const run of runs) {
     if (run.status === "archived") archived.push(run);
     else if (["queued", "running"].includes(run.status)) active.push(run);
+    else if (run.status === "needs_reconciliation") needsAttention.push(run);
     else if (
       automationRunInterruptedByConsoleRestart(run) ||
       automationRunHasOnlyExpiredUsageLimit(run, auditEvents) ||
@@ -5698,9 +5832,9 @@ function attentionTargetHash(item = {}) {
   return "#/inbox";
 }
 
-async function sendPushNotifications(state, item, reason = "attention") {
+async function sendPushNotifications(state, item, reason = "attention", subscriptionIds = null) {
   const push = normalizePushState(state.push || {});
-  const subscriptions = Object.values(push.subscriptions || {});
+  const subscriptions = Object.values(push.subscriptions || {}).filter((subscription) => !subscriptionIds || subscriptionIds.includes(subscription.id));
   if (!subscriptions.length) return { ok: false, status: "no-subscriptions", sent: 0, failed: 0 };
   webPush.setVapidDetails(pushSubject, push.vapidPublicKey, push.vapidPrivateKey);
   const payload = JSON.stringify({
@@ -5754,6 +5888,9 @@ function normalizeNotificationDelivery(value = {}) {
           ok: channel.ok !== false,
           status: channel.status ? String(channel.status).slice(0, 80) : null,
           error: channel.error ? compactSingleLine(channel.error, 360) : null,
+          attempts: Math.max(0, Math.min(5, Math.floor(Number(channel.attempts || 0)))),
+          lastAttemptAt: channel.lastAttemptAt ? String(channel.lastAttemptAt) : null,
+          nextAttemptAt: channel.nextAttemptAt ? String(channel.nextAttemptAt) : null,
         }))
         .filter((channel) => channel.channelId)
     : [];
@@ -5875,11 +6012,11 @@ async function externalNotificationStatus(state = null) {
       const nested = channelResults
         .filter((result) => result.channelId === channel.id)
         .map((result) => ({
-          deliveredAt: item.deliveredAt,
+          deliveredAt: result.lastAttemptAt || item.deliveredAt,
           ok: result.ok,
           error: result.error,
         }));
-      if (item.channelId === channel.id) nested.push(item);
+      if (!nested.length && item.channelId === channel.id) nested.push(item);
       return nested;
     });
     const lastDelivery = deliveries
@@ -5896,7 +6033,7 @@ async function externalNotificationStatus(state = null) {
   return {
     configured: channels.some((channel) => channel.enabled),
     channels,
-    deliveredCount: Object.keys(current.delivered || {}).length,
+    deliveredCount: Object.values(current.delivered || {}).filter((item) => item.ok).length,
     lastCheckAt: current.lastCheckAt,
     lastSentAt: current.lastSentAt,
     lastError: current.lastError,
@@ -5905,16 +6042,20 @@ async function externalNotificationStatus(state = null) {
 }
 
 async function notifyAttentionItems(items, reason = "attention") {
+  return serializeNotificationDelivery("attention", () => notifyAttentionItemsWithinQueue(items, reason));
+}
+
+async function notifyAttentionItemsWithinQueue(items, reason = "attention") {
   const state = await ensurePushState(await readNotificationState());
   const channels = notificationChannels().filter((channel) => channel.enabled);
-  const hasPushSubscriptions = Object.keys(state.push?.subscriptions || {}).length > 0;
-  if (hasPushSubscriptions) {
+  for (const subscription of Object.values(state.push?.subscriptions || {})) {
     channels.push({
-      id: "push",
+      id: `push:${subscription.id}`,
       label: "Browser push",
       enabled: true,
-      target: `${Object.keys(state.push.subscriptions || {}).length} browser(s)`,
+      target: subscription.id,
       type: "push",
+      subscriptionId: subscription.id,
     });
   }
   state.lastCheckAt = new Date().toISOString();
@@ -5922,35 +6063,49 @@ async function notifyAttentionItems(items, reason = "attention") {
     await writeNotificationState(state);
     return { ok: false, skipped: true, reason: "not-configured", sent: [], failed: [] };
   }
-  const candidates = (items || []).filter((item) => item.tone !== "neutral" && !item.acknowledged && !state.delivered[item.id]).slice(0, 5);
+  const candidates = (items || []).filter((item) => item.tone !== "neutral" && !item.acknowledged && pendingNotificationChannels(channels, state.delivered[item.id]).length).slice(0, 5);
   const sent = [];
   const failed = [];
   for (const item of candidates) {
     const channelResults = [];
-    for (const channel of channels) {
+    for (const channel of pendingNotificationChannels(channels, state.delivered[item.id])) {
+      let result;
       try {
-        const result = channel.type === "push" ? await sendPushNotifications(state, item, reason) : await sendNotificationToChannel(channel, item, reason);
-        channelResults.push({ channelId: channel.id, ok: Boolean(result.ok), status: result.status, error: result.ok ? null : result.error || result.status });
+        result = channel.type === "push"
+          ? await sendPushNotifications(state, item, reason, [channel.subscriptionId])
+          : await sendNotificationToChannel(channel, item, reason);
       } catch (error) {
-        channelResults.push({ channelId: channel.id, ok: false, error: error.message || "send failed" });
+        result = { ok: false, error: error.message || "send failed" };
       }
-    }
-    const okResult = channelResults.find((result) => result.ok);
-    if (okResult) {
-      const deliveredAt = new Date().toISOString();
+      const prior = state.delivered[item.id];
+      const previousChannels = Array.isArray(prior?.channels) ? [...prior.channels] : [];
+      if (!previousChannels.length && prior?.ok && prior.channelId) {
+        previousChannels.push({ channelId: prior.channelId, ok: true, attempts: 1 });
+      }
+      const index = previousChannels.findIndex((entry) => entry.channelId === channel.id);
+      const channelResult = { channelId: channel.id, ...notificationAttempt(index >= 0 ? previousChannels[index] : null, {
+        ok: Boolean(result.ok), status: result.status, error: result.error || result.status,
+      }) };
+      if (index >= 0) previousChannels[index] = channelResult;
+      else previousChannels.push(channelResult);
+      const firstSuccess = previousChannels.find((entry) => entry.ok);
       state.delivered[item.id] = normalizeNotificationDelivery({
         itemId: item.id,
-        channelId: okResult.channelId,
+        channelId: firstSuccess?.channelId || "",
         title: item.title,
-        ok: true,
-        deliveredAt,
-        channels: channelResults,
+        ok: Boolean(firstSuccess),
+        deliveredAt: new Date().toISOString(),
+        channels: previousChannels,
       });
-      state.lastSentAt = state.delivered[item.id].deliveredAt;
+      if (channelResult.ok) state.lastSentAt = channelResult.lastAttemptAt;
+      else state.lastError = `${channel.id}: ${channelResult.error}`;
+      await writeNotificationState(state);
+      channelResults.push(channelResult);
+    }
+    if (channelResults.some((result) => result.ok)) {
       sent.push({ itemId: item.id, title: item.title, channels: channelResults });
-    } else {
-      const message = channelResults.map((result) => `${result.channelId}: ${result.error}`).join("; ");
-      state.lastError = message;
+    }
+    if (channelResults.some((result) => !result.ok)) {
       failed.push({ itemId: item.id, title: item.title, channels: channelResults });
     }
   }
@@ -6179,6 +6334,18 @@ function consumeAutomationTriggerRate(req, automationId) {
   return { ok: true, retryAfterMs: 0 };
 }
 
+function consumeAutomationResultRate(clientId) {
+  const now = Date.now();
+  const recent = (automationResultRateByClient.get(clientId) || []).filter((time) => now - time < 60_000);
+  if (recent.length >= 60) {
+    automationResultRateByClient.set(clientId, recent);
+    return Math.ceil((60_000 - (now - recent[0])) / 1000);
+  }
+  recent.push(now);
+  automationResultRateByClient.set(clientId, recent);
+  return 0;
+}
+
 function automationTriggerIdempotencyKey(req, automationId, trigger, clientId = "legacy-shared") {
   const raw = String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim();
   if (!raw) return { key: "", error: null };
@@ -6202,7 +6369,7 @@ async function refreshAutomationTriggerPayload(payload) {
   const runId = String(payload?.run?.id || "").trim();
   if (!runId) return payload;
   const stored = (await readAutomationRuns().catch(() => ({ runs: [] }))).runs.find((run) => run.id === runId);
-  return stored ? { ...payload, run: stored } : payload;
+  return stored ? { ...payload, run: externalRunView(stored, stored.automationId) } : payload;
 }
 
 function automationTriggerRequestHash(req, automation, trigger, completionContract) {
@@ -6222,7 +6389,7 @@ function automationTriggerRequestHash(req, automation, trigger, completionContra
   })).digest("hex");
 }
 
-function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash = null, triggerRequestHash = null, completionContract = null) {
+function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash = null, triggerRequestHash = null, completionContract = null, heartbeatSource = null) {
   return {
     trigger,
     clientId,
@@ -6230,7 +6397,8 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
     triggerRequestHash,
     completionContract,
     prompt: req.body?.prompt,
-    sessionId: req.body?.sessionId,
+    sessionId: heartbeatSource?.sessionId || req.body?.sessionId,
+    heartbeatWorktreePath: heartbeatSource?.worktreePath || null,
     worktree: req.body?.worktree !== false,
   };
 }
@@ -6260,35 +6428,40 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   if (heartbeatSessionId && (!heartbeatSession || heartbeatSession.repoId !== repo.id)) {
     throw new Error("Heartbeat session does not belong to this automation repo");
   }
+  const releaseAdmission = runAdmission.reserve(options.clientId || "console");
   const useWorktree = heartbeatSession ? false : options.worktree !== false;
-  let worktreePath = null;
-  let runRecord = await upsertAutomationRun({
-    id: runId,
-    automationId: automation.id,
-    repoId: repo.id,
-    name: automation.name,
-    trigger: options.trigger || "manual",
-    clientId: options.clientId || null,
-    triggerIdempotencyHash: options.triggerIdempotencyHash || null,
-    triggerRequestHash: options.triggerRequestHash || null,
-    recoveryOfRunId: options.recoveryOfRunId || null,
-    recoveryRootRunId: options.recoveryRootRunId || null,
-    recoveryAttempt: options.recoveryAttempt || 0,
-    completionContract,
-    completionOutcome: completionContract ? "pending" : null,
-    runner: "app-server",
-    status: "queued",
-    worktreePolicy: options.executionPolicy || (heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd"),
-    model: runtime.model,
-    reasoning: runtime.reasoning,
-    prompt,
-  }, { type: "queued", text: heartbeatSession ? "Heartbeat turn queued" : "Automation run queued" });
-
+  let worktreePath = options.heartbeatWorktreePath || null;
+  let runRecord;
+  let job = null;
+  let settlementRegistered = false;
   try {
+    runRecord = await upsertAutomationRun({
+      id: runId,
+      automationId: automation.id,
+      repoId: repo.id,
+      name: automation.name,
+      trigger: options.trigger || "manual",
+      clientId: options.clientId || null,
+      triggerIdempotencyHash: options.triggerIdempotencyHash || null,
+      triggerRequestHash: options.triggerRequestHash || null,
+      recoveryOfRunId: options.recoveryOfRunId || null,
+      recoveryRootRunId: options.recoveryRootRunId || null,
+      recoveryAttempt: options.recoveryAttempt || 0,
+      completionContract,
+      completionOutcome: completionContract ? "pending" : null,
+      runner: "app-server",
+      status: "queued",
+      worktreePolicy: options.executionPolicy || (heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd"),
+      model: runtime.model,
+      reasoning: runtime.reasoning,
+      prompt,
+    }, { type: "queued", text: heartbeatSession ? "Heartbeat turn queued" : "Automation run queued" }, {
+      budgetLimit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
+    });
     if (heartbeatSession) {
       runRecord = await appendAutomationRunEvent(
         runId,
-        { worktreePath: repo.path, status: "running", sessionId: heartbeatSession.id, threadId: heartbeatSession.codexSessionId || null },
+        { worktreePath: worktreePath || repo.path, status: "running", sessionId: heartbeatSession.id, threadId: heartbeatSession.codexSessionId || null },
         { type: "heartbeat", text: `Using existing session ${heartbeatSession.id}` },
       );
     } else if (useWorktree) {
@@ -6298,13 +6471,27 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       runRecord = await appendAutomationRunEvent(runId, { worktreePath: repo.path, status: "running" }, { type: "worktree", text: `Using repository cwd ${repo.path}` });
     }
     const runRepo = { ...repo, path: worktreePath || repo.path };
+    const beforeStart = (await readAutomationRuns()).runs.find((item) => item.id === runId);
+    if (beforeStart?.cancelRequestedAt) {
+      const canceled = await appendAutomationRunEvent(runId, {
+        status: "canceled", finishedAt: new Date().toISOString(), error: "任务在启动模型前取消；已创建的工作目录未自动删除。",
+      }, { type: "canceled", text: "Canceled before Codex turn started" });
+      releaseAdmission();
+      return canceled;
+    }
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
-    const job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
+    job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
     });
     activeAutomationRuns.set(runId, job);
-    await appendAutomationRunEvent(runId, { threadId: job.threadId, sessionId: session.id, status: "running" }, { type: "thread", text: "Started Codex app-server automation thread" });
+    if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {
+      job.cancelRequested = true;
+      if (job.threadId && job.turnId) {
+        appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+      }
+    }
+    await appendAutomationRunEvent(runId, { threadId: job.threadId, sessionId: session.id }, { type: "thread", text: "Started Codex app-server automation thread" });
     job.emitter.on("event", (payload) => {
       if (!["status", "tool", "error", "done", "session", "tokenUsage"].includes(payload.event)) return;
       const text =
@@ -6324,11 +6511,13 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
             error: result.error || job.error || "自动化任务失败",
           };
       const completed = result.ok && completion.satisfied;
-      const error = completed ? null : completion.error || result.error || job.error || "自动化任务失败";
+      const canceled = job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
+      const error = completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
+      const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await appendAutomationRunEventWithRetry(
         runId,
         {
-          status: completed ? "completed" : "failed",
+          status: canceled ? "canceled" : completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           summary: job.output || "",
@@ -6336,24 +6525,10 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           error,
           completionOutcome: completion.outcome,
           completionCheckedAt: completionContract ? new Date().toISOString() : null,
+          ...(diffStat ? { diffStat } : {}),
         },
-        { type: completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: completed ? "自动化任务已完成" : error },
+        { type: canceled ? "canceled" : completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: completed ? "自动化任务已完成" : error },
       );
-      activeAutomationRuns.delete(runId);
-      const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
-      if (diffStat) {
-        await appendAutomationRunEvent(runId, { diffStat }, { type: "diff", text: "检测到工作区变更，需要检查" }).catch((diffError) => {
-          appendAuditEvent({
-            source: "automation",
-            type: "automation-diff-persistence-failed",
-            repoId: repo.id,
-            sessionId: session.id,
-            threadId: job.threadId,
-            summary: `自动化任务 ${runId} 已写入终态，但工作区差异保存失败`,
-            detail: jsonDetail({ runId, error: diffError.message || String(diffError) }),
-          }).catch(() => null);
-        });
-      }
     }).catch((persistenceError) => {
       const message = `自动化任务 ${runId} 的终态写入失败，已保留为可重启恢复状态：${persistenceError.message || persistenceError}`;
       console.error(message);
@@ -6366,21 +6541,34 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         summary: message,
         detail: jsonDetail({ runId, error: persistenceError.message || String(persistenceError) }),
       }).catch(() => null);
+    }).finally(() => {
+      activeAutomationRuns.delete(runId);
+      releaseAdmission();
     });
+    settlementRegistered = true;
     return { ...runRecord, threadId: job.threadId, sessionId: session.id, status: "running" };
   } catch (error) {
-    await appendAutomationRunEvent(
-      runId,
-      {
-        status: "failed",
-        finishedAt: new Date().toISOString(),
-        worktreePath,
-        error: error.message,
-        completionOutcome: completionContract ? "turn-failed" : null,
-        completionCheckedAt: completionContract ? new Date().toISOString() : null,
-      },
-      { type: "error", text: error.message },
-    );
+    if (!settlementRegistered) {
+      if (job) {
+        void job.promise.finally(() => {
+          activeAutomationRuns.delete(runId);
+          releaseAdmission();
+        }).catch(() => null);
+      } else {
+        releaseAdmission();
+      }
+    }
+    await appendAutomationRunEvent(runId, job ? {
+      status: "needs_reconciliation",
+      error: `任务已启动但运行记录更新失败：${error.message}`,
+    } : {
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      worktreePath,
+      error: error.message,
+      completionOutcome: completionContract ? "turn-failed" : null,
+      completionCheckedAt: completionContract ? new Date().toISOString() : null,
+    }, { type: job ? "needs-reconciliation" : "error", text: error.message }).catch(() => null);
     throw error;
   }
 }
@@ -6425,6 +6613,7 @@ async function recoverInterruptedAutomationRuns() {
     .filter((run) =>
       run.runner === "app-server" &&
       run.status === "interrupted" &&
+      !["webhook", "heartbeat"].includes(run.trigger) &&
       run.interruptionKind === "console-restart" &&
       !run.recoverySkippedReason &&
       Number(run.recoveryAttempt || 0) < automationRecoveryMaxAttempts &&
@@ -8529,26 +8718,31 @@ app.post("/api/codex/diagnostics", async (req, res) => {
 });
 
 app.post("/api/codex/account/login", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
   const requestedType = String(req.body?.type || req.query?.type || "chatgptDeviceCode");
   const type = requestedType === "chatgpt" ? "chatgpt" : "chatgptDeviceCode";
   const params = type === "chatgpt" ? { type, codexStreamlinedLogin: true } : { type };
-  const response = await codexAppServerRequest("account/login/start", params, 20_000);
+  const response = await codexAppServerRequest("account/login/start", params, 20_000, repo);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
-  const flow = accountLoginFlowFromResponse(response.result || {});
-  res.json({ ok: true, flow, result: response.result || null, accountLogin: accountLoginSnapshot() });
+  const flow = accountLoginFlowFromResponse(response.result || {}, repo.id);
+  res.json({ ok: true, flow, result: response.result || null, accountLogin: accountLoginSnapshot(repo.id) });
 });
 
 app.post("/api/codex/account/login/cancel", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
   const loginId = String(req.body?.loginId || req.query?.loginId || "").trim();
   if (!loginId) return res.status(400).json({ ok: false, error: "loginId is required" });
-  const response = await codexAppServerRequest("account/login/cancel", { loginId }, 20_000);
+  const flow = accountLoginFlows.get(loginId);
+  if (!flow || !accountLoginMatchesScope(flow, repo.id)) return res.status(404).json({ ok: false, error: "Login flow not found" });
+  const response = await codexAppServerRequest("account/login/cancel", { loginId }, 20_000, repo);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
-  const flow = cancelAccountLoginFlow(loginId, response.result || {});
-  res.json({ ok: true, flow, result: response.result || null, accountLogin: accountLoginSnapshot() });
+  const updated = cancelAccountLoginFlow(loginId, response.result || {});
+  res.json({ ok: true, flow: updated, result: response.result || null, accountLogin: accountLoginSnapshot(repo.id) });
 });
 
-app.post("/api/codex/account/logout", async (_req, res) => {
-  const response = await codexAppServerRequest("account/logout", undefined, 20_000);
+app.post("/api/codex/account/logout", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId || req.query?.repoId);
+  const response = await codexAppServerRequest("account/logout", undefined, 20_000, repo);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
   res.json({ ok: true, result: response.result || null });
 });
@@ -8579,8 +8773,8 @@ app.post("/api/codex/mcp/oauth-callback-relay", async (req, res) => {
   res.send(result.body || "");
 });
 
-app.get("/api/codex/app-host/status", (_req, res) => {
-  const client = getAppServerClient();
+app.get("/api/codex/app-host/status", (req, res) => {
+  const client = req.query?.repoId === personalRepoId ? getPersonalAppServerClient() : getAppServerClient();
   res.json({
     ok: true,
     appHost: client.status(),
@@ -8929,7 +9123,7 @@ app.post("/api/codex/turn-steer", async (req, res) => {
   if (!message) return res.status(400).json({ ok: false, error: "Message is required" });
   const active = activeTurns.get(`${repo.id}:${session.id}`);
   if (!active) return res.status(409).json({ ok: false, error: "当前没有正在运行的 turn。" });
-  await getAppServerClient().request("turn/steer", {
+  await appServerClientForRepo(repo).request("turn/steer", {
     threadId: active.threadId,
     expectedTurnId: active.turnId,
     input: [{ type: "text", text: message, text_elements: [] }],
@@ -8943,7 +9137,7 @@ app.post("/api/codex/turn-interrupt", async (req, res) => {
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
   const active = activeTurns.get(`${repo.id}:${session.id}`);
   if (!active) return res.status(409).json({ ok: false, error: "当前没有正在运行的 turn。" });
-  await getAppServerClient().request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId }, 20_000);
+  await appServerClientForRepo(repo).request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId }, 20_000);
   emitJobEvent(active, "status", { text: "已请求打断当前 turn" });
   res.json({ ok: true, sessionId: session.id, threadId: active.threadId, turnId: active.turnId });
 });
@@ -9300,7 +9494,7 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
     }
     activeTurn.cancelRequested = true;
     if (activeTurn.threadId && activeTurn.turnId) {
-      await getAppServerClient()
+      await appServerClientForRepo(repo)
         .request("turn/interrupt", { threadId: activeTurn.threadId, turnId: activeTurn.turnId }, 20_000)
         .catch(() => null);
     }
@@ -9606,12 +9800,12 @@ app.delete("/api/uploads", async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
-  if (repo.kind === "personal" && !personalPreviewEnabled) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
+  if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
   const runtime = normalizeRuntime(req.body, session);
 
-  if (!(await exists(repo.path))) {
+  if (!(repo.kind === "personal" && personalRuntime.enabled) && !(await exists(repo.path))) {
     if (!allowLocalFallback) {
       return res.status(503).json({
         ok: false,
@@ -9648,7 +9842,7 @@ app.post("/api/chat", async (req, res) => {
 app.post("/api/chat/stream", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
-  if (repo.kind === "personal" && !personalPreviewEnabled) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
+  if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
   if (repo.kind === "personal" && Array.isArray(req.body?.attachments) && req.body.attachments.length) {
     return res.status(403).json({ ok: false, error: "个人空间暂不支持附件" });
   }
@@ -10165,9 +10359,70 @@ app.get("/api/automations/inbox", async (_req, res) => {
   res.json({ ok: true, source: "local-run-store+app-server-thread-verification", ...automationInboxBuckets(runs, auditEvents) });
 });
 
+app.get("/api/automations/:id/runs/:runId", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    if (!req.apiClient || res.statusCode === 429) return;
+    apiClientStore.record({
+      clientId: req.apiClient?.id || "unknown",
+      automationId: req.params.id,
+      trigger: "result",
+      status: res.statusCode,
+      runId: res.locals.runId || null,
+      durationMs: Date.now() - startedAt,
+    }).catch((error) => console.error(`API result metric write failed: ${error.message}`));
+  });
+  req.apiClient = await authenticateAutomationTrigger(req);
+  if (!req.apiClient) return res.status(401).json({ ok: false, error: "Automation client token is required" });
+  const retryAfter = consumeAutomationResultRate(req.apiClient.id);
+  if (retryAfter) {
+    res.setHeader("Retry-After", String(retryAfter));
+    return res.status(429).json({ ok: false, error: "Automation result polling limit exceeded" });
+  }
+  const run = (await readAutomationRuns()).runs.find((item) => item.id === req.params.runId);
+  if (!clientCanReadRun(req.apiClient, req.params.id, run)) {
+    return res.status(404).json({ ok: false, error: "Run not found" });
+  }
+  res.locals.runId = run.id;
+  return res.json({ ok: true, run: externalRunView(run, req.params.id) });
+});
+
+app.post("/api/automations/:id/runs/:runId/cancel", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    if (!req.apiClient) return;
+    apiClientStore.record({
+      clientId: req.apiClient?.id || "unknown", automationId: req.params.id,
+      trigger: "cancel", status: res.statusCode, runId: res.locals.runId || null,
+      durationMs: Date.now() - startedAt,
+    }).catch((error) => console.error(`API cancel metric write failed: ${error.message}`));
+  });
+  req.apiClient = await authenticateAutomationTrigger(req);
+  if (!req.apiClient) return res.status(401).json({ ok: false, error: "Automation client token is required" });
+  const run = (await readAutomationRuns()).runs.find((item) => item.id === req.params.runId);
+  if (!clientCanReadRun(req.apiClient, req.params.id, run)) {
+    return res.status(404).json({ ok: false, error: "Run not found" });
+  }
+  res.locals.runId = run.id;
+  const { run: updated, pending } = await requestAutomationRunCancellation(run.id, req.params.id, req.apiClient.id);
+  if (!pending) return res.json({ ok: true, run: externalRunView(updated, req.params.id) });
+  const job = activeAutomationRuns.get(run.id);
+  if (job && !job.completed) {
+    job.cancelRequested = true;
+    if (job.threadId && job.turnId) {
+      appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000)
+        .catch((error) => appendAutomationRunEvent(run.id, {}, { type: "cancel-warning", text: `Interrupt request uncertain: ${error.message}` }).catch(() => null));
+    }
+  }
+  return res.status(202).json({ ok: true, run: externalRunView(updated, req.params.id) });
+});
+
 async function handleAutomationTriggerRequest(req, res, trigger) {
   const startedAt = Date.now();
   res.on("finish", () => {
+    if (!req.apiClient) return;
     apiClientStore.record({
       clientId: req.apiClient?.id || "unknown",
       automationId: req.params.id,
@@ -10178,20 +10433,18 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
       durationMs: Date.now() - startedAt,
     }).catch((error) => console.error(`API request metric write failed: ${error.message}`));
   });
+  req.apiClient = await authenticateAutomationTrigger(req);
+  if (!req.apiClient) {
+    return res.status(401).json({ ok: false, error: "Automation trigger token is required" });
+  }
   const rawKey = String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim();
   if (!rawKey) return processAutomationTriggerRequest(req, res, trigger);
-  return serializeAutomationTrigger(`${req.params.id}:${trigger}:${rawKey}`, () => processAutomationTriggerRequest(req, res, trigger));
+  const key = automationTriggerIdempotencyKey(req, req.params.id, trigger, req.apiClient.id);
+  if (key.error) return res.status(400).json({ ok: false, error: key.error });
+  return serializeAutomationTrigger(key.key, () => processAutomationTriggerRequest(req, res, trigger));
 }
 
 async function processAutomationTriggerRequest(req, res, trigger) {
-  req.apiClient = await authenticateAutomationTrigger(req);
-  if (!req.apiClient) {
-    return res.status(401).json({
-      ok: false,
-      error: "Automation trigger token is required",
-      hint: "Set CODEX_CLOUD_WEBHOOK_TOKEN and send it as x-codex-cloud-token.",
-    });
-  }
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
   if (!String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim() &&
@@ -10238,10 +10491,10 @@ async function processAutomationTriggerRequest(req, res, trigger) {
       if (stored.triggerRequestHash && stored.triggerRequestHash !== triggerRequestHash) {
         return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能用于不同请求" });
       }
-      if (!stored.triggerRequestHash && !automationCompletionContractsEqual(stored.completionContract, completionContract)) {
-        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能更改 completionContract" });
+      if (!stored.triggerRequestHash) {
+        return res.status(409).json({ ok: false, error: "历史运行缺少请求摘要，无法验证幂等重放；请先核对原任务" });
       }
-      const payload = { ok: true, run: stored, output: `${automation.name}: ${trigger} app-server run already accepted` };
+      const payload = { ok: true, run: externalRunView(stored, automation.id), output: `${automation.name}: ${trigger} app-server run already accepted` };
       automationTriggerIdempotency.set(idempotency.key, {
         promise: Promise.resolve(payload),
         payload,
@@ -10253,21 +10506,63 @@ async function processAutomationTriggerRequest(req, res, trigger) {
       return res.json({ ...payload, deduplicated: true, recovered: true });
     }
   }
+  const repo = getRepoById(automation.repoId);
+  const scopedClient = !["legacy-shared", "local-development"].includes(req.apiClient.id);
+  if (scopedClient && req.body?.worktree === false) {
+    return res.status(400).json({ ok: false, error: "API client runs require a detached worktree" });
+  }
+  let heartbeatSource = null;
+  if (scopedClient && trigger === "heartbeat") {
+    const requestedSessionId = String(req.body?.sessionId || "").trim();
+    const source = scopedHeartbeatSource((await readAutomationRuns()).runs, {
+      clientId: req.apiClient.id, automationId: automation.id, repoId: repo.id, sessionId: requestedSessionId,
+    });
+    if (requestedSessionId && !source) {
+      return res.status(403).json({ ok: false, error: "Heartbeat session is outside this API client's automation scope" });
+    }
+    if (source) {
+      if (source.status !== "completed") {
+        return res.status(409).json({ ok: false, error: "Previous run needs review before this session can continue" });
+      }
+      try {
+        const previousSession = (await readChatStore()).sessions[source.sessionId];
+        if (!source.threadId || previousSession?.repoId !== repo.id || previousSession.codexSessionId !== source.threadId) {
+          throw new Error("Previous Codex thread is unavailable or has changed");
+        }
+        if (!(await fs.lstat(source.worktreePath)).isDirectory()) throw new Error("Previous worktree was replaced");
+        const executionRepo = await recoveryExecutionRepo(repo, source, worktreesRoot);
+        if (executionRepo.path === await fs.realpath(repo.path)) throw new Error("Previous run used the repository cwd");
+        heartbeatSource = { sessionId: source.sessionId, worktreePath: executionRepo.path };
+      } catch (error) {
+        return res.status(409).json({ ok: false, error: `Heartbeat worktree is unavailable: ${error.message}` });
+      }
+    }
+  }
   const rate = consumeAutomationTriggerRate(req, automation.id);
   if (!rate.ok) {
     res.setHeader("Retry-After", String(Math.ceil(rate.retryAfterMs / 1000)));
     return res.status(429).json({ ok: false, error: "Automation trigger rate limit exceeded", retryAfterMs: rate.retryAfterMs });
   }
-  const repo = getRepoById(automation.repoId);
   const runPromise = startAppServerAutomationRun(
     automation,
     repo,
-    automationTriggerOptions(req, trigger, req.apiClient.id, triggerIdempotencyHash, triggerRequestHash, completionContract),
-  ).then((runRecord) => ({
-    ok: true,
-    run: runRecord,
-    output: `${automation.name}: ${trigger} app-server run started`,
-  }));
+    automationTriggerOptions(req, trigger, req.apiClient.id, triggerIdempotencyHash, triggerRequestHash, completionContract, heartbeatSource),
+  ).then((runRecord) => {
+    appendAuditEvent({
+      source: "automation",
+      type: "automation-trigger",
+      repoId: repo.id,
+      sessionId: runRecord.sessionId || null,
+      threadId: runRecord.threadId || null,
+      summary: `${trigger}: ${automation.id}`,
+      detail: jsonDetail({ runId: runRecord.id, automationId: automation.id, trigger, worktreePolicy: runRecord.worktreePolicy }),
+    }).catch(() => null);
+    return {
+      ok: true,
+      run: externalRunView(runRecord, automation.id),
+      output: `${automation.name}: ${trigger} app-server run started`,
+    };
+  });
   if (idempotency.key) {
     automationTriggerIdempotency.set(idempotency.key, {
       promise: runPromise,
@@ -10278,8 +10573,7 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   }
   try {
     const payload = await runPromise;
-    const runRecord = payload.run;
-    res.locals.runId = runRecord.id;
+    res.locals.runId = payload.run.id;
     if (idempotency.key) {
       automationTriggerIdempotency.set(idempotency.key, {
         promise: Promise.resolve(payload),
@@ -10288,19 +10582,11 @@ async function processAutomationTriggerRequest(req, res, trigger) {
         expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
       });
     }
-    appendAuditEvent({
-      source: "automation",
-      type: "automation-trigger",
-      repoId: repo.id,
-      sessionId: runRecord.sessionId || null,
-      threadId: runRecord.threadId || null,
-      summary: `${trigger}: ${automation.id}`,
-      detail: jsonDetail({ runId: runRecord.id, automationId: automation.id, trigger, worktreePolicy: runRecord.worktreePolicy }),
-    }).catch(() => null);
     return res.json(payload);
   } catch (error) {
     if (idempotency.key) automationTriggerIdempotency.delete(idempotency.key);
-    return res.status(500).json({ ok: false, error: error.message, output: error.message });
+    if (error.statusCode === 429) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
+    return res.status([409, 429].includes(error.statusCode) ? error.statusCode : 500).json({ ok: false, error: error.message, output: error.message });
   }
 }
 
@@ -10335,7 +10621,8 @@ app.post("/api/automations/:id/run", async (req, res) => {
       });
       return res.json({ ok: true, run: runRecord, output: `${automation.name}: app-server automation run started` });
     } catch (error) {
-      return res.status(500).json({ ok: false, error: error.message, output: error.message });
+      if (error.statusCode === 429) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
+      return res.status([409, 429].includes(error.statusCode) ? error.statusCode : 500).json({ ok: false, error: error.message, output: error.message });
     }
   }
 

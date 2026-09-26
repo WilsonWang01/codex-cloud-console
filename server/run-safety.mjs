@@ -17,10 +17,20 @@ export function createKeyedQueue() {
 
 export function retainAutomationRuns(runs, { now, idempotencyTtlMs, recoveryMaxAgeMs, historyLimit = 200 }) {
   let historyCount = 0;
+  const latestClientSessions = new Set();
+  const retainedClientSessions = new Set();
+  for (const run of [...runs].sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))) {
+    if (!run.clientId || !run.sessionId) continue;
+    const key = `${run.clientId}:${run.automationId}`;
+    if (latestClientSessions.has(key)) continue;
+    latestClientSessions.add(key);
+    retainedClientSessions.add(run);
+  }
   return [...runs].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).filter((run) => {
-    if (["queued", "running"].includes(run.status)) return true;
+    if (["queued", "running", "canceling", "needs_reconciliation"].includes(run.status)) return true;
     if (run.triggerIdempotencyHash && Date.parse(run.startedAt) >= now - idempotencyTtlMs) return true;
     if (run.status === "interrupted" && Date.parse(run.interruptedLastActiveAt || run.updatedAt) >= now - recoveryMaxAgeMs) return true;
+    if (retainedClientSessions.has(run)) return true;
     return historyCount++ < historyLimit;
   });
 }

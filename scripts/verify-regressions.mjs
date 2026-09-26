@@ -80,6 +80,18 @@ async function runCaptured(command, args, options = {}) {
   });
 }
 
+async function initializeGitFixture(repoRoot) {
+  await fs.writeFile(path.join(repoRoot, "README.md"), "fixture repository\n");
+  for (const args of [
+    ["-C", repoRoot, "init", "-q"],
+    ["-C", repoRoot, "add", "README.md"],
+    ["-C", repoRoot, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Initial fixture"],
+  ]) {
+    const result = await runCaptured("git", args);
+    assert.equal(result.code, 0, result.stderr);
+  }
+}
+
 async function jsonRequest(baseUrl, pathname, options = {}) {
   const response = await fetch(new URL(pathname, baseUrl), options);
   const text = await response.text();
@@ -195,22 +207,23 @@ input.on("line", (line) => {
   }
   if (message.method === "turn/start") {
     const requestText = JSON.stringify(message.params || {});
+    const turnId = requestText.includes("cancel regression") ? "turn-cancel-regression" : "turn-regression";
     const progressRegression = requestText.includes("progress regression");
     const recoveryRegression = requestText.includes("继续上一轮因服务重启中断的自动化任务");
     const outcomeContractRegression = requestText.includes("outcome contract regression");
-    send({ id: message.id, result: { turn: { id: "turn-regression" } } });
+    send({ id: message.id, result: { turn: { id: turnId } } });
     if (progressRegression) {
       for (const delay of [150, 300, 450]) {
         send({ method: "item/mcpToolCall/progress", params: {
           threadId: "thread-regression",
-          turnId: "turn-regression",
+          turnId,
           itemId: "progress-regression",
           message: "progress regression activity",
         } }, delay);
       }
       send({ method: "turn/completed", params: {
         threadId: "thread-regression",
-        turn: { id: "turn-regression", status: "completed" },
+        turn: { id: turnId, status: "completed" },
       } }, 650);
     }
     if (outcomeContractRegression) {
@@ -223,7 +236,7 @@ input.on("line", (line) => {
           : "业务结果已核验\\r\\nCONTRACT_PASS_COMPLETE\\r\\n\\r\\n";
       send({ method: "item/agentMessage/delta", params: {
         threadId: message.params?.threadId,
-        turnId: "turn-regression",
+        turnId,
         delta: output,
       } }, 40);
       if (requestText.includes("late event")) {
@@ -236,7 +249,7 @@ input.on("line", (line) => {
       }
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
-        turn: { id: "turn-regression", status: "completed" },
+        turn: { id: turnId, status: "completed" },
       } }, 80);
     } else if (recoveryRegression) {
       const output = requestText.includes("RECOVERY_REGRESSION_COMPLETE")
@@ -244,13 +257,23 @@ input.on("line", (line) => {
         : "恢复回合结束，但没有业务完成标记";
       send({ method: "item/agentMessage/delta", params: {
         threadId: message.params?.threadId,
-        turnId: "turn-regression",
+        turnId,
         delta: output,
       } }, 40);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
-        turn: { id: "turn-regression", status: "completed" },
+        turn: { id: turnId, status: "completed" },
       } }, 80);
+    }
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    send({ id: message.id, result: {} });
+    if (message.params?.turnId === "turn-cancel-regression") {
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId,
+        turn: { id: message.params?.turnId, status: "interrupted" },
+      } }, 20);
     }
     return;
   }
@@ -448,7 +471,7 @@ await check("automation completion contracts fail closed without changing legacy
   }
 });
 
-await check("startup recovery continues one recent interrupted automation in the same session", async () => {
+await check("external automation interrupted by restart waits for reconciliation without repeating actions", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-automation-recovery-"));
   const fakePath = await writeFakeCodex(tempRoot);
   const binDir = path.join(tempRoot, "bin");
@@ -613,50 +636,30 @@ await check("startup recovery continues one recent interrupted automation in the
       },
       body: JSON.stringify({ prompt: "startup retry must wait for recovery", worktree: false, completionContract: recoveryContract }),
     });
-    assert.equal(startupReplay.response.status, 200);
-    assert.equal(startupReplay.data.deduplicated, true);
+    assert.equal(startupReplay.response.status, 409);
+    assert.match(startupReplay.data.error, /缺少请求摘要/);
     let storedRuns = [];
-    let recoveryRun = null;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      storedRuns = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
-      recoveryRun = storedRuns.find((run) => run.recoveryOfRunId === "run-recovery-source") || null;
-      if (recoveryRun?.status === "completed") break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    assert.ok(recoveryRun, "recent interrupted automation was not recovered");
-    assert.equal(recoveryRun.status, "completed");
-    assert.equal(recoveryRun.sessionId, "sess-recovery");
-    assert.equal(recoveryRun.threadId, "thread-recovery");
-    assert.equal(recoveryRun.worktreePolicy, "detached-worktree");
-    assert.equal(recoveryRun.worktreePath, await fs.realpath(originalWorktree));
-    assert.equal(recoveryRun.trigger, "webhook");
-    assert.equal(recoveryRun.triggerIdempotencyHash, recoveryHash);
-    assert.equal(recoveryRun.recoveryRootRunId, "run-recovery-source");
-    assert.equal(recoveryRun.recoveryAttempt, 1);
-    assert.deepEqual(recoveryRun.completionContract, recoveryContract);
-    assert.equal(recoveryRun.completionOutcome, "passed");
-    assert.match(recoveryRun.summary, /RECOVERY_REGRESSION_COMPLETE\s*$/);
-    assert.equal(startupReplay.data.run?.id, recoveryRun.id);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    storedRuns = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
     const recoveredSource = storedRuns.find((run) => run.id === "run-recovery-source");
-    assert.equal(recoveredSource.status, "interrupted");
+    assert.equal(recoveredSource.status, "needs_reconciliation");
     assert.equal(recoveredSource.interruptionKind, "console-restart");
-    assert.equal(recoveredSource.recoveryRunId, recoveryRun.id);
+    assert.equal(recoveredSource.recoveryRunId, null);
+    assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-source"), false);
     assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-old"), false);
     assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-attempted"), false);
+
+    const inbox = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/inbox");
+    assert.ok(inbox.data.needsAttention.some((run) => run.id === recoveredSource.id));
 
     const captured = (await fs.readFile(capturePath, "utf8"))
       .trim()
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line));
-    assert.ok(captured.some((request) => request.method === "thread/resume" && request.params?.threadId === "thread-recovery"));
-    for (const request of captured.filter((item) => ["thread/resume", "turn/start"].includes(item.method))) {
-      assert.equal(request.params.cwd, await fs.realpath(originalWorktree));
-    }
+    assert.equal(captured.some((request) => request.method === "thread/resume" && request.params?.threadId === "thread-recovery"), false);
     assert.equal(captured.some((request) => request.method === "thread/start"), false);
-    assert.ok(captured.some((request) =>
-      request.method === "turn/start" && JSON.stringify(request.params || {}).includes("不要重复已经完成的写入")
-    ));
+    assert.equal(captured.some((request) => request.method === "turn/start"), false);
 
     const replay = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/sample-research/webhook", {
       method: "POST",
@@ -667,9 +670,7 @@ await check("startup recovery continues one recent interrupted automation in the
       },
       body: JSON.stringify({ prompt: "startup retry must wait for recovery", worktree: false, completionContract: recoveryContract }),
     });
-    assert.equal(replay.response.status, 200);
-    assert.equal(replay.data.deduplicated, true);
-    assert.equal(replay.data.run?.id, recoveryRun.id);
+    assert.equal(replay.response.status, 409);
 
     const conflictingReplay = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/sample-research/webhook", {
       method: "POST",
@@ -688,8 +689,8 @@ await check("startup recovery continues one recent interrupted automation in the
     await waitForOutput(secondServer, /listening on/i);
     await new Promise((resolve) => setTimeout(resolve, 300));
     const afterSecondRestart = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
-    assert.equal(afterSecondRestart.filter((run) => run.recoveryOfRunId === "run-recovery-source").length, 1);
-    assert.equal(afterSecondRestart.filter((run) => run.recoveryRootRunId === "run-recovery-source").length, 1);
+    assert.equal(afterSecondRestart.filter((run) => run.recoveryOfRunId === "run-recovery-source").length, 0);
+    assert.equal(afterSecondRestart.find((run) => run.id === "run-recovery-source")?.status, "needs_reconciliation");
   } finally {
     await stopProcess(firstServer);
     await stopProcess(secondServer);
@@ -745,6 +746,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   });
   await new Promise((resolve) => benxingUpstream.listen(benxingPort, "127.0.0.1", resolve));
   await fs.mkdir(path.join(repoRoot, ".codex-cloud", "uploads", "test"), { recursive: true });
+  await initializeGitFixture(repoRoot);
   await fs.mkdir(emptyRepoRoot, { recursive: true });
   await fs.mkdir(outsideRoot, { recursive: true });
   await fs.mkdir(path.dirname(generatedImagePath), { recursive: true });
@@ -853,6 +855,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
       CODEX_PERSONAL_PREVIEW: "0",
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
+      CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS: "250",
       CODEX_TURN_TIMEOUT_MS: "300",
       CODEX_ALLOW_LOCAL_FALLBACK: "0",
       BENXING_SITE_ORIGIN: `http://127.0.0.1:${benxingPort}`,
@@ -1243,30 +1246,107 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "POST", headers: scopedHeaders, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
     });
     assert.equal(missingKey.response.status, 400);
+    const repoCwdDenied = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-repo-cwd-denied-0001" },
+      body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+    });
+    assert.equal(repoCwdDenied.response.status, 400);
+    assert.match(repoCwdDenied.data.error, /detached worktree/);
+    const scopedPrompt = "outcome contract regression legacy no contract";
+    const scopedBody = JSON.stringify({ prompt: scopedPrompt });
     const clientTrigger = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
-      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: scopedBody,
     });
     assert.equal(clientTrigger.response.status, 200);
     assert.equal(clientTrigger.data.run.clientId, newClient.data.client.id);
+    assert.equal(clientTrigger.data.run.resultPath, `/api/automations/sample-on-demand/runs/${clientTrigger.data.run.id}`);
+    assert.equal("prompt" in clientTrigger.data.run, false);
+    assert.equal("worktreePath" in clientTrigger.data.run, false);
+    assert.equal("sessionId" in clientTrigger.data.run, false);
+    const scopedResult = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, { headers: scopedHeaders });
+    assert.equal(scopedResult.response.status, 200);
+    assert.equal(scopedResult.data.run.id, clientTrigger.data.run.id);
+    assert.equal("prompt" in scopedResult.data.run, false);
+    assert.equal("worktreePath" in scopedResult.data.run, false);
+    let scopedCompleted;
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const result = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, { headers: scopedHeaders });
+      scopedCompleted = result.data.run;
+      if (scopedCompleted?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(scopedCompleted?.status, "completed");
+    const originalClientRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === clientTrigger.data.run.id);
+    assert.notEqual(originalClientRun.worktreePath, repoRoot);
+    const chatStateFile = path.join(stateRoot, "chat-history.json");
+    const chatBeforeTamper = await fs.readFile(chatStateFile, "utf8");
+    const chatWithMissingThread = JSON.parse(chatBeforeTamper);
+    chatWithMissingThread.sessions[originalClientRun.sessionId].codexSessionId = null;
+    await fs.writeFile(chatStateFile, JSON.stringify(chatWithMissingThread));
+    const missingThreadHeartbeat = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/heartbeat", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-missing-thread-0001" }, body: scopedBody,
+    });
+    assert.equal(missingThreadHeartbeat.response.status, 409);
+    await fs.writeFile(chatStateFile, chatBeforeTamper);
+    await new Promise((resolve) => setTimeout(resolve, 275));
+    const heartbeat = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/heartbeat", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-heartbeat-0001" }, body: scopedBody,
+    });
+    assert.equal(heartbeat.response.status, 200, JSON.stringify(heartbeat.data));
+    const heartbeatRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === heartbeat.data.run.id);
+    assert.equal(heartbeatRun.sessionId, originalClientRun.sessionId);
+    assert.equal(await fs.realpath(heartbeatRun.worktreePath), await fs.realpath(originalClientRun.worktreePath));
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const result = await jsonRequest(baseUrl, heartbeat.data.run.resultPath, { headers: scopedHeaders });
+      if (result.data.run?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const competingClient = await jsonRequest(baseUrl, "/api/clients", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "other-regression-service", automationIds: ["sample-on-demand"] }),
+    });
+    assert.equal(competingClient.response.status, 201);
+    const competingHeartbeat = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/heartbeat", {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token, "idempotency-key": "scoped-cross-session-0001", "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: originalClientRun.sessionId, prompt: scopedPrompt }),
+    });
+    assert.equal(competingHeartbeat.response.status, 403);
+    const competingResult = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, {
+      headers: { "x-codex-cloud-token": competingClient.data.token },
+    });
+    assert.equal(competingResult.response.status, 404);
+    const competingCancel = await jsonRequest(baseUrl, `${clientTrigger.data.run.resultPath}/cancel`, {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
+    });
+    assert.equal(competingCancel.response.status, 404);
+    const unauthorizedResult = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath);
+    assert.equal(unauthorizedResult.response.status, 401);
     const clientReplay = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
-      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: scopedBody,
     });
     assert.equal(clientReplay.data.deduplicated, true);
     const clientConflict = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
-      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "changed task", worktree: false }),
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "changed task" }),
     });
     assert.equal(clientConflict.response.status, 409);
+    const pollBurst = await Promise.all(Array.from({ length: 70 }, () => jsonRequest(baseUrl, clientTrigger.data.run.resultPath, { headers: scopedHeaders })));
+    assert.ok(pollBurst.some((result) => result.response.status === 429));
+    assert.ok(pollBurst.some((result) => result.response.status === 200));
     const revokedClient = await jsonRequest(baseUrl, `/api/clients/${newClient.data.client.id}/revoke`, { method: "POST" });
     assert.equal(revokedClient.response.status, 200);
+    const revokedResult = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, { headers: scopedHeaders });
+    assert.equal(revokedResult.response.status, 401);
     const rejectedAfterRevoke = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
       method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0002" }, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
     });
     assert.equal(rejectedAfterRevoke.response.status, 401);
     const clientsAfter = await jsonRequest(baseUrl, "/api/clients");
     assert.equal(JSON.stringify(clientsAfter.data).includes(newClient.data.token), false);
-    const usageAfter = await jsonRequest(baseUrl, `/api/clients/usage?clientId=${newClient.data.client.id}`);
+    const usageAfter = await jsonRequest(baseUrl, `/api/clients/usage?to=${encodeURIComponent(new Date(Date.now() + 5_000).toISOString())}`);
     assert.equal(usageAfter.response.status, 200);
     assert.ok(usageAfter.data.buckets.some((bucket) => bucket.clientId === newClient.data.client.id && bucket.requests >= 3));
+    assert.ok(usageAfter.data.buckets.some((bucket) => bucket.clientId === newClient.data.client.id && bucket.polls >= 1));
+    assert.equal(usageAfter.data.buckets.some((bucket) => bucket.clientId === "unknown"), false);
     const triggerHeaders = {
       "x-codex-cloud-token": "regression-token-123456",
       "idempotency-key": "regression-idempotency-1",
@@ -1347,10 +1427,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       headers: { ...triggerHeaders, "idempotency-key": interruptedKey },
       body: triggerBody,
     });
-    assert.equal(retriedInterruptedTrigger.response.status, 200);
-    assert.equal(retriedInterruptedTrigger.data.ok, true);
-    assert.equal(retriedInterruptedTrigger.data.deduplicated, true);
-    assert.equal(retriedInterruptedTrigger.data.run?.id, "run-sample-research-interrupted-regression");
+    assert.equal(retriedInterruptedTrigger.response.status, 409);
+    assert.match(retriedInterruptedTrigger.data.error, /缺少请求摘要/);
 
     const persistedAutomationRuns = await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8");
     assert.equal(persistedAutomationRuns.includes(progressTriggerKey), false);
@@ -1376,6 +1454,51 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(emptyThreadState.data.authoritative, true);
     const finalStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
     assert.equal(Object.values(finalStore.sessions).some((session) => session.repoId === "sample-service"), false);
+
+    const admissionFirst = await jsonRequest(baseUrl, "/api/automations/sample-research/run", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runner: "app-server", prompt: "progress regression admission first", worktree: false }),
+    });
+    assert.equal(admissionFirst.response.status, 200);
+    const admissionBlocked = await jsonRequest(baseUrl, "/api/automations/sample-hourly/run", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runner: "app-server", prompt: "admission second", worktree: false }),
+    });
+    assert.equal(admissionBlocked.response.status, 429);
+    assert.ok(Number(admissionBlocked.response.headers.get("retry-after")) > 0);
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const runStore = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"));
+      if (runStore.runs.find((run) => run.id === admissionFirst.data.run.id)?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
+    const admissionRetry = await jsonRequest(baseUrl, "/api/automations/sample-hourly/run", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runner: "app-server", prompt: "outcome contract regression legacy no contract", worktree: false }),
+    });
+    assert.equal(admissionRetry.response.status, 200);
+    const cancelStart = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token, "idempotency-key": "cancel-regression-0001", "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "progress regression cancel regression" }),
+    });
+    assert.equal(cancelStart.response.status, 200);
+    const cancelAccepted = await jsonRequest(baseUrl, `${cancelStart.data.run.resultPath}/cancel`, {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
+    });
+    assert.equal(cancelAccepted.response.status, 202);
+    assert.equal(cancelAccepted.data.run.status, "canceling");
+    assert.ok(cancelAccepted.data.run.cancelRequestedAt);
+    let canceledRun;
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      const result = await jsonRequest(baseUrl, cancelStart.data.run.resultPath, { headers: { "x-codex-cloud-token": competingClient.data.token } });
+      canceledRun = result.data.run;
+      if (canceledRun?.status === "canceled") break;
+      await new Promise((resolve) => setTimeout(resolve, 70));
+    }
+    assert.equal(canceledRun?.status, "canceled", JSON.stringify({ run: canceledRun, requests: (await fs.readFile(capturePath, "utf8")).trim().split("\n").slice(-8) }));
+    const cancelAgain = await jsonRequest(baseUrl, `${cancelStart.data.run.resultPath}/cancel`, {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
+    });
+    assert.equal(cancelAgain.response.status, 200);
 
     const chatStatePath = path.join(stateRoot, "chat-history.json");
     const validChatState = await fs.readFile(chatStatePath, "utf8");

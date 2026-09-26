@@ -33,6 +33,19 @@ test("decline, timeout, and disconnect fail closed", async () => {
   assert.equal(broker.list().length, 0);
 });
 
+test("personal worker disconnect declines only personal approvals", async () => {
+  const broker = createApprovalBroker();
+  const personal = broker.request("item/fileChange/requestApproval", { threadId: "personal" }, { repoId: "_personal" });
+  const work = broker.request("item/fileChange/requestApproval", { threadId: "work" }, { repoId: "sample-app" });
+  broker.closeForRepo("_personal", "Personal worker disconnected");
+  assert.deepEqual(await personal, { decision: "decline" });
+  assert.equal(broker.list().length, 1);
+  assert.equal(broker.list()[0].owner.repoId, "sample-app");
+  const [item] = broker.list();
+  broker.decide(item.id, { decision: "accept", digest: item.digest });
+  assert.deepEqual(await work, { decision: "accept" });
+});
+
 test("grants contain only the requested permission and only this turn", async () => {
   const broker = createApprovalBroker();
   const params = { permissions: { network: { enabled: true }, fileSystem: null } };

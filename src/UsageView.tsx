@@ -3,7 +3,7 @@ import { Activity, Copy, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-rea
 import type { Automation } from "./types";
 
 type Client = { id: string; name: string; tokenPrefix: string; automationIds: string[]; createdAt: string; expiresAt: string | null; revokedAt: string | null; lastUsedAt: string | null };
-type RequestBucket = { hour: string; clientId: string; requests: number; accepted: number; errors: number; replayed: number };
+type RequestBucket = { hour: string; clientId: string; requests: number; accepted: number; errors: number; replayed: number; polls?: number; pollErrors?: number; controls?: number };
 type RunBucket = { hour: string; clientId: string; runs: number; completed: number; failed: number; knownRuns: number; unknownRuns: number; inputTokens: number; outputTokens: number; totalTokens: number };
 type RequestRow = { id: string; clientId: string; automationId: string; trigger: string; status: number; runId: string | null; deduplicated: boolean; durationMs: number; time: string };
 type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; droppedRequests: number };
@@ -20,7 +20,7 @@ export default function UsageView({ automations }: { automations: Automation[] }
   const [usage, setUsage] = useState<Usage>({ buckets: [], runBuckets: [], requests: [], droppedRequests: 0 });
   const [rangeDays, setRangeDays] = useState(7);
   const [clientId, setClientId] = useState("");
-  const [chartMode, setChartMode] = useState<"requests" | "tokens">("requests");
+  const [chartMode, setChartMode] = useState<"requests" | "polls" | "tokens">("requests");
   const [newName, setNewName] = useState("");
   const [newScopes, setNewScopes] = useState<string[]>([]);
   const [createdToken, setCreatedToken] = useState("");
@@ -68,17 +68,18 @@ export default function UsageView({ automations }: { automations: Automation[] }
   };
 
   const chart = useMemo(() => {
-    const values = new Map<string, { requests: number; tokens: number }>();
+    const values = new Map<string, { requests: number; polls: number; tokens: number }>();
     const keyFor = (hour: string) => rangeDays === 1 ? hour : hour.slice(0, 10);
     for (const row of usage.buckets) {
       const key = keyFor(row.hour);
-      const value = values.get(key) || { requests: 0, tokens: 0 };
+      const value = values.get(key) || { requests: 0, polls: 0, tokens: 0 };
       value.requests += row.requests;
+      value.polls += row.polls || 0;
       values.set(key, value);
     }
     for (const row of usage.runBuckets) {
       const key = keyFor(row.hour);
-      const value = values.get(key) || { requests: 0, tokens: 0 };
+      const value = values.get(key) || { requests: 0, polls: 0, tokens: 0 };
       value.tokens += row.totalTokens;
       values.set(key, value);
     }
@@ -86,7 +87,7 @@ export default function UsageView({ automations }: { automations: Automation[] }
     return Array.from({ length: count }, (_, index) => {
       const date = new Date(Date.now() - (count - index - 1) * (rangeDays === 1 ? 3_600_000 : 86_400_000));
       const key = rangeDays === 1 ? date.toISOString().slice(0, 13) + ":00:00Z" : date.toISOString().slice(0, 10);
-      return { key, label: rangeDays === 1 ? key.slice(11, 13) : key.slice(5), ...(values.get(key) || { requests: 0, tokens: 0 }) };
+      return { key, label: rangeDays === 1 ? key.slice(11, 13) : key.slice(5), ...(values.get(key) || { requests: 0, polls: 0, tokens: 0 }) };
     });
   }, [rangeDays, usage.buckets, usage.runBuckets]);
 
@@ -94,6 +95,8 @@ export default function UsageView({ automations }: { automations: Automation[] }
   const totalRequests = usage.buckets.reduce((sum, row) => sum + row.requests, 0);
   const accepted = usage.buckets.reduce((sum, row) => sum + row.accepted, 0);
   const errors = usage.buckets.reduce((sum, row) => sum + row.errors, 0);
+  const polls = usage.buckets.reduce((sum, row) => sum + (row.polls || 0), 0);
+  const controls = usage.buckets.reduce((sum, row) => sum + (row.controls || 0), 0);
   const totalTokens = usage.runBuckets.reduce((sum, row) => sum + row.totalTokens, 0);
   const knownRuns = usage.runBuckets.reduce((sum, row) => sum + row.knownRuns, 0);
   const unknownRuns = usage.runBuckets.reduce((sum, row) => sum + row.unknownRuns, 0);
@@ -119,11 +122,13 @@ export default function UsageView({ automations }: { automations: Automation[] }
         <div><span>请求</span><strong>{totalRequests.toLocaleString()}</strong></div>
         <div><span>接受任务</span><strong>{accepted.toLocaleString()}</strong></div>
         <div><span>请求错误</span><strong>{errors.toLocaleString()}</strong></div>
+        <div><span>结果查询</span><strong>{polls.toLocaleString()}</strong></div>
+        <div><span>取消请求</span><strong>{controls.toLocaleString()}</strong></div>
         <div><span>已知 token</span><strong>{totalTokens.toLocaleString()}</strong><small>{unknownRuns ? `${unknownRuns} 次运行用量未知` : `${knownRuns} 次运行已计量`}</small></div>
       </div>
       <section className="usage-section" aria-label="调用曲线">
-        <div className="usage-section-head"><h2>趋势</h2><div className="usage-segmented" role="group" aria-label="曲线指标"><button type="button" className={chartMode === "requests" ? "selected" : ""} onClick={() => setChartMode("requests")}>请求</button><button type="button" className={chartMode === "tokens" ? "selected" : ""} onClick={() => setChartMode("tokens")}>Token</button></div></div>
-        <div className="usage-chart" role="img" aria-label={`${chartMode === "requests" ? "请求" : "Token"} 趋势`}>{chart.map((point) => <div className="usage-chart-column" key={point.key} title={`${point.key}: ${point[chartMode].toLocaleString()}`}><div className="usage-chart-bar" style={{ height: `${Math.max(point[chartMode] ? 5 : 1, point[chartMode] / peak * 100)}%` }} /><small>{point.label}</small></div>)}</div>
+        <div className="usage-section-head"><h2>趋势</h2><div className="usage-segmented" role="group" aria-label="曲线指标"><button type="button" className={chartMode === "requests" ? "selected" : ""} onClick={() => setChartMode("requests")}>请求</button><button type="button" className={chartMode === "polls" ? "selected" : ""} onClick={() => setChartMode("polls")}>查询</button><button type="button" className={chartMode === "tokens" ? "selected" : ""} onClick={() => setChartMode("tokens")}>Token</button></div></div>
+        <div className="usage-chart" role="img" aria-label={`${chartMode === "requests" ? "请求" : chartMode === "polls" ? "查询" : "Token"} 趋势`}>{chart.map((point) => <div className="usage-chart-column" key={point.key} title={`${point.key}: ${point[chartMode].toLocaleString()}`}><div className="usage-chart-bar" style={{ height: `${Math.max(point[chartMode] ? 5 : 1, point[chartMode] / peak * 100)}%` }} /><small>{point.label}</small></div>)}</div>
         {usage.droppedRequests > 0 && <p className="usage-note">有 {usage.droppedRequests} 条损坏的请求明细未计入，曲线可能不完整。</p>}
         {unknownRuns > 0 && <p className="usage-note">Token 仅统计 {knownRuns} 次有完整单轮快照的运行；未知用量未计入，不代表零消耗。</p>}
       </section>
@@ -134,7 +139,7 @@ export default function UsageView({ automations }: { automations: Automation[] }
         <div className="usage-create"><input aria-label="调用方名称" placeholder="服务名称" value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={80} /><div className="usage-scopes">{automations.map((automation) => <label key={automation.id}><input type="checkbox" checked={newScopes.includes(automation.id)} onChange={(event) => setNewScopes((current) => event.target.checked ? [...current, automation.id] : current.filter((id) => id !== automation.id))} />{automation.name}</label>)}</div><button type="button" disabled={busy || !newName.trim() || !newScopes.length} onClick={() => void createClient()}><Plus size={16} />创建令牌</button></div>
         {createdToken && <div className="usage-token" role="status"><strong>新令牌仅显示一次</strong><code>{createdToken}</code><button type="button" onClick={() => void navigator.clipboard.writeText(createdToken)} aria-label="复制新令牌"><Copy size={16} /></button><button type="button" onClick={() => setCreatedToken("")}>关闭</button></div>}
       </section>
-      <section className="usage-section" aria-label="请求明细"><div className="usage-section-head"><h2>最近请求</h2><Activity size={18} /></div><div className="usage-requests">{usage.requests.map((row) => <div className="usage-request" key={row.id}><time>{new Date(row.time).toLocaleString()}</time><strong>{clients.find((client) => client.id === row.clientId)?.name || (row.clientId === "legacy-shared" ? "旧共享令牌" : row.clientId)}</strong><span>{row.automationId}</span><span>{row.status}{row.deduplicated ? " · 重放" : ""}</span><small>{row.runId || "未接受任务"}</small></div>)}</div>{!usage.requests.length && <p className="usage-empty">所选范围暂无请求。</p>}</section>
+      <section className="usage-section" aria-label="请求明细"><div className="usage-section-head"><h2>最近请求</h2><Activity size={18} /></div><div className="usage-requests">{usage.requests.map((row) => <div className="usage-request" key={row.id}><time>{new Date(row.time).toLocaleString()}</time><strong>{clients.find((client) => client.id === row.clientId)?.name || (row.clientId === "legacy-shared" ? "旧共享令牌" : row.clientId)}</strong><span>{row.automationId} · {row.trigger === "result" ? "结果查询" : row.trigger === "cancel" ? "取消" : row.trigger}</span><span>{row.status}{row.deduplicated ? " · 重放" : ""}</span><small>{row.runId || "未接受任务"}</small></div>)}</div>{!usage.requests.length && <p className="usage-empty">所选范围暂无请求。</p>}</section>
     </div>
   );
 }

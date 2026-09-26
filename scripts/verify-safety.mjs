@@ -118,6 +118,17 @@ test("历史裁剪保留运行任务、TTL 内的幂等凭据和可恢复记录"
   assert.equal(retained.filter((row) => row.id.startsWith("history-")).length, 200);
 });
 
+test("历史裁剪保留各调用方最近的会话归属，旧记录仍受数量上限约束", () => {
+  const old = new Date(Date.now() - 48 * 60 * 60_000).toISOString();
+  const rows = [
+    { id: "latest-a", clientId: "client-a", automationId: "research", sessionId: "session-a", status: "failed", updatedAt: old, startedAt: old },
+    { id: "older-a", clientId: "client-a", automationId: "research", sessionId: "session-old", status: "completed", updatedAt: "2026-01-01T00:00:00Z", startedAt: "2026-01-01T00:00:00Z" },
+    { id: "latest-b", clientId: "client-b", automationId: "research", sessionId: "session-b", status: "completed", updatedAt: old, startedAt: old },
+  ];
+  const retained = retainAutomationRuns(rows, { now: Date.now(), idempotencyTtlMs: 60_000, recoveryMaxAgeMs: 60_000, historyLimit: 0 });
+  assert.deepEqual(retained.map((run) => run.id), ["latest-a", "latest-b"]);
+});
+
 test("恢复原 worktree，缺失或越界目录不会回退主仓库", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-safety-"));
   try {
@@ -135,13 +146,27 @@ test("恢复原 worktree，缺失或越界目录不会回退主仓库", async ()
 
 test("恢复超时保留原线程且不会新建线程", async () => {
   const calls = [];
-  const context = { getAppServerClient: () => ({ request: async (method) => { calls.push(method); throw new Error("timeout"); } }), appServerThreadParams: () => ({}), emitJobEvent() {}, rememberOwner() {}, updateSessionRuntime: async () => assert.fail("must not replace thread") };
+  const context = { appServerClientForJob: () => ({ request: async (method) => { calls.push(method); throw new Error("timeout"); } }), appServerThreadParams: () => ({}), emitJobEvent() {}, rememberOwner() {}, updateSessionRuntime: async () => assert.fail("must not replace thread") };
   vm.createContext(context);
   vm.runInContext(section(source, "async function resolveThreadForJob(", "async function startTurnJob("), context);
   const job = { threadId: "original", repo: {}, runtime: {} };
   await assert.rejects(context.resolveThreadForJob(job), /已保留原会话/);
   assert.equal(job.threadId, "original");
   assert.deepEqual(calls, ["thread/resume"]);
+});
+
+test("个人账号登录流程与工作账号分开", () => {
+  const context = { accountLoginFlows: new Map(), personalRepoId: "_personal" };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function rememberAccountLoginFlow(", "function summarizeAppServerStatus("), context);
+  context.accountLoginFlowFromResponse({ loginId: "work-login" }, "sample-app");
+  context.accountLoginFlowFromResponse({ loginId: "personal-login" }, "_personal");
+  assert.equal(context.accountLoginSnapshot("sample-app").active.loginId, "work-login");
+  assert.equal(context.accountLoginSnapshot("_personal").active.loginId, "personal-login");
+  context.completeAccountLoginFlow({ loginId: "personal-login", success: true }, "_personal");
+  assert.equal(context.accountLoginSnapshot("_personal").latest.status, "completed");
+  assert.equal(context.accountLoginSnapshot("sample-app").active.status, "pending");
+  assert.equal(context.completeAccountLoginFlow({ loginId: "work-login", success: true }, "_personal"), null);
 });
 
 test("草稿串行写入版本递增，跨页面冲突保留本机文本", async () => {
