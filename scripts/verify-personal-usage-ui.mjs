@@ -32,6 +32,9 @@ let selectedRuntime = null;
 let appsFailure = false;
 let appsDirectoryDenied = false;
 let submittedMessages = 0;
+let queueFlow = false;
+let releaseJobEvents = null;
+let steeredMessages = [];
 let uploadedCount = 0;
 let personalFilesDeleted = 0;
 let personalFiles = [
@@ -69,6 +72,19 @@ await context.route("**/api/**", async (route) => {
     if (req.method() === "DELETE") { personalFacts = personalFacts.filter((item) => item.id !== id); return send({ ok: true, fact }); }
   }
   if (url.pathname === "/api/uploads" && req.method() === "POST") { uploadedCount += 1; return send({ ok: true, files: body.files.map((file, index) => ({ name: file.name, path: `.codex-cloud/uploads/2026-09-26/${uploadedCount}-${index}-${file.name}`, mimeType: file.type, size: 12, kind: file.type.startsWith("image/") ? "image" : "file", source: "personal-upload" })) }); }
+  if (url.pathname === "/api/chat/queue" && queueFlow) {
+    const session = sessions.find((item) => item.id === body.sessionId && item.repoId === repoId);
+    if (!session) return send({ ok: false, error: "not found" }, 404);
+    if (req.method() === "POST") {
+      session.queuedTurn = { id: "queued-ui-1", message: body.message, preview: body.message, status: "queued", createdAt: new Date().toISOString() };
+      return send({ ok: true, queuedTurn: session.queuedTurn }, 202);
+    }
+    const queuedTurn = session.queuedTurn;
+    session.draft = { ...session.draft, input: queuedTurn.message, revision: session.draft.revision + 1 };
+    session.queuedTurn = null;
+    return send({ ok: true, queuedTurn, draft: session.draft });
+  }
+  if (url.pathname === "/api/codex/turn-steer" && queueFlow) { steeredMessages.push(body.message); return send({ ok: true }); }
   if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", directoryError: appsDirectoryDenied ? "上游拒绝了云端服务目录请求（403）。" : "", apps: [
     { id: "mail", name: "Gmail", description: "整理邮件", installUrl: "https://chatgpt.com/apps/gmail/mail", accessible: false, enabled: true, callable: false },
     { id: "calendar", name: "Calendar", description: "查看日程", installUrl: "https://chatgpt.com/apps/calendar/cal", accessible: true, enabled: true, callable: true },
@@ -111,8 +127,15 @@ await context.route("**/api/**", async (route) => {
     return send({ ok: true, repoId, sessionId: session.id, draft: session.draft });
   }
   if (url.pathname === "/api/chat/sessions" || url.pathname === "/api/chat/history") return send({ ok: true, authoritative: true, repoId, activeSessionId: `${repoId}-session`, sessions: sessions.filter((item) => item.repoId === repoId), messages: [] });
-  if (url.pathname === "/api/chat/active") return send({ ok: true, turn: null, compact: null });
-  if (url.pathname === "/api/chat/stream") { submittedMessages += 1; return send({ ok: false, error: "personal execution unavailable" }, 503); }
+  if (url.pathname === "/api/chat/active") return send({ ok: true, turn: queueFlow ? { id: "active-queue-ui", kind: "turn", repoId: "_personal", sessionId: "_personal-session", threadId: "thread-ui", turnId: "turn-ui", startedAt: new Date().toISOString(), completed: false, events: [] } : null, compact: null, queuedTurn: sessions.find((item) => item.id === url.searchParams.get("sessionId"))?.queuedTurn || null });
+  if (url.pathname === "/api/chat/job-events" && queueFlow) {
+    await new Promise((resolve) => { releaseJobEvents = resolve; });
+    return route.fulfill({ status: 200, contentType: "text/event-stream", body: `event: done\ndata: {"ok":true,"sessionId":"_personal-session"}\n\n` });
+  }
+  if (url.pathname === "/api/chat/stream") {
+    submittedMessages += 1;
+    return send({ ok: false, error: "personal execution unavailable" }, 503);
+  }
   return send({ ok: true, entries: [], items: [], sessions: [], runs: [], events: [], matches: [] });
 });
 
@@ -354,6 +377,24 @@ try {
   await page.screenshot({ path: new URL("personal-390-short.png", out).pathname });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   assert.match(await composer.inputValue(), /独立个人草稿[\s\S]*@results\/demo.md/);
+  queueFlow = true;
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector(".composer-shell textarea")?.getAttribute("placeholder") === "排队下一条消息");
+  await composer.fill("下一个待办");
+  await page.getByRole("button", { name: "排队下一条消息" }).click();
+  await page.getByText("下一条已排队").waitFor();
+  assert.equal(sessions.find((item) => item.repoId === "_personal").queuedTurn.message, "下一个待办");
+  await page.screenshot({ path: new URL("personal-queued-390-short.png", out).pathname });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  assert.ok(await page.locator(".composer-shell").evaluate((element) => element.getBoundingClientRect().bottom <= innerHeight));
+  await page.getByRole("button", { name: "撤回到草稿" }).click();
+  await page.waitForFunction(() => !document.querySelector(".queued-turn-banner"));
+  assert.equal(await composer.inputValue(), "下一个待办");
+  await page.getByRole("button", { name: "立即补充本轮" }).click();
+  assert.deepEqual(steeredMessages, ["下一个待办"]);
+  queueFlow = false;
+  releaseJobEvents?.();
+  await page.getByText("云端 Codex 任务已完成。").waitFor();
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日结果直达预览与继续修改草稿"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

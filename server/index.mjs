@@ -1,6 +1,6 @@
 import express from "express";
 import { EventEmitter } from "node:events";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -145,6 +145,8 @@ const allowedApproval = new Set(["untrusted", "on-failure", "on-request", "never
 const pushSubject = process.env.CODEX_CLOUD_PUSH_SUBJECT || process.env.WEB_PUSH_SUBJECT || "mailto:codex-cloud@example.invalid";
 const activeTurns = new Map();
 const activeCompactions = new Map();
+const queuedTurnDispatches = new Set();
+const removingSessions = new Set();
 const activeAutomationRuns = new Map();
 const threadOwners = new Map();
 const turnOwners = new Map();
@@ -554,6 +556,31 @@ function sessionTitle(message = "") {
   return title ? title.slice(0, 38) : "新会话";
 }
 
+const queuedTurnStatuses = new Set(["queued", "dispatching", "paused", "needs_reconciliation"]);
+
+function normalizeQueuedTurn(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = String(value.id || "").slice(0, 100);
+  const message = String(value.message || "").trim().slice(0, 120_000);
+  if (!id || !message) return null;
+  return {
+    id,
+    message,
+    runtime: normalizeRuntime(value.runtime || {}),
+    status: queuedTurnStatuses.has(value.status) ? value.status : "needs_reconciliation",
+    createdAt: String(value.createdAt || new Date().toISOString()),
+    updatedAt: String(value.updatedAt || value.createdAt || new Date().toISOString()),
+    reason: value.reason ? String(value.reason).slice(0, 320) : null,
+  };
+}
+
+function queuedTurnSummary(value) {
+  const queued = normalizeQueuedTurn(value);
+  if (!queued) return null;
+  const { message, runtime, ...summary } = queued;
+  return { ...summary, preview: message.slice(0, 160) };
+}
+
 function normalizeSession(item, repoId) {
   const createdAt = String(item?.createdAt || new Date().toISOString());
   const messages = Array.isArray(item?.messages) ? item.messages.map(normalizeChatMessage).filter((message) => message.text) : [];
@@ -577,6 +604,7 @@ function normalizeSession(item, repoId) {
     goal: item?.goal && typeof item.goal === "object" ? item.goal : null,
     compactedAt: item?.compactedAt ? String(item.compactedAt) : null,
     draft: normalizeChatDraft(item?.draft),
+    queuedTurn: normalizeQueuedTurn(item?.queuedTurn),
   };
 }
 
@@ -616,7 +644,7 @@ function isEmptyDraftSession(session = {}) {
   const messageCount = Array.isArray(session.messages) ? session.messages.length : Number(session.messageCount || 0);
   const draft = normalizeChatDraft(session.draft || {});
   const hasDraftContent = Boolean(draft.input.trim() || draft.attachments.length);
-  return !session.codexSessionId && messageCount === 0 && !hasDraftContent && (!title || title === "新会话" || title === "新对话");
+  return !session.codexSessionId && !session.queuedTurn && messageCount === 0 && !hasDraftContent && (!title || title === "新会话" || title === "新对话");
 }
 
 function isLocalDraftSession(session = {}) {
@@ -948,6 +976,12 @@ async function readChatStore() {
   return { version: 2, activeByRepo, sessions };
 }
 
+async function readStoredSessionForJob(repoId, id) {
+  const session = await enqueueWrite("chat", async () => (await readChatStore()).sessions[id] || null);
+  if (session?.repoId !== repoId) throw Object.assign(new Error("Unknown session"), { statusCode: 404 });
+  return session;
+}
+
 async function mutateChatStore(mutator) {
   return enqueueWrite("chat", async () => {
     const store = await readChatStore();
@@ -957,6 +991,72 @@ async function mutateChatStore(mutator) {
       await atomicWriteJson(chatHistoryPath, { version: 2, activeByRepo: store.activeByRepo, sessions: store.sessions });
     }
     return result;
+  });
+}
+
+async function updateQueuedTurn(repoId, sessionId, queueId, update) {
+  return mutateChatStore((store) => {
+    const session = store.sessions[sessionId];
+    if (session?.repoId !== repoId || session.queuedTurn?.id !== queueId) return null;
+    session.queuedTurn = update ? normalizeQueuedTurn({ ...session.queuedTurn, ...update, updatedAt: new Date().toISOString() }) : null;
+    return session.queuedTurn;
+  });
+}
+
+async function pauseQueuedTurn(repoId, sessionId, reason) {
+  return mutateChatStore((store) => {
+    const session = store.sessions[sessionId];
+    if (session?.repoId !== repoId || session.queuedTurn?.status !== "queued") return null;
+    session.queuedTurn = normalizeQueuedTurn({ ...session.queuedTurn, status: "paused", reason, updatedAt: new Date().toISOString() });
+    return session.queuedTurn;
+  });
+}
+
+async function dispatchQueuedTurn(repoId, sessionId) {
+  const key = makeSessionKey(repoId, sessionId);
+  if (queuedTurnDispatches.has(key)) return;
+  queuedTurnDispatches.add(key);
+  try {
+    const claimed = await mutateChatStore((store) => {
+      const session = store.sessions[sessionId];
+      if (session?.repoId !== repoId || session.queuedTurn?.status !== "queued") return null;
+      if (activeTurns.has(key) || activeCompactions.has(key) || removingSessions.has(key)) return null;
+      session.queuedTurn = normalizeQueuedTurn({ ...session.queuedTurn, status: "dispatching", updatedAt: new Date().toISOString() });
+      return { session: normalizeSession(session, repoId), queuedTurn: session.queuedTurn };
+    });
+    if (!claimed) return;
+    const { session, queuedTurn } = claimed;
+    try {
+      const repo = getRepoById(repoId);
+      await startTurnJob(repo, session, queuedTurn.runtime, queuedTurn.message, [], queuedTurn.message, {
+        makeSessionActive: false,
+        queuedTurnId: queuedTurn.id,
+      });
+    } catch {
+      await updateQueuedTurn(repoId, sessionId, queuedTurn.id, {
+        status: "needs_reconciliation",
+        reason: "排队消息未能确认启动。请核对会话记录，再决定是否重发。",
+      });
+    }
+  } finally {
+    queuedTurnDispatches.delete(key);
+  }
+}
+
+async function reconcileQueuedTurnsOnStartup() {
+  await mutateChatStore((store) => {
+    for (const session of Object.values(store.sessions)) {
+      const queued = session.queuedTurn;
+      if (!queued || !["queued", "dispatching"].includes(queued.status)) continue;
+      session.queuedTurn = normalizeQueuedTurn({
+        ...queued,
+        status: queued.status === "dispatching" ? "needs_reconciliation" : "paused",
+        reason: queued.status === "dispatching"
+          ? "控制台重启时这条消息可能已提交。请核对会话记录，系统不会自动重发。"
+          : "控制台重启后排队已暂停。请核对上一轮结果，再决定是否发送。",
+        updatedAt: new Date().toISOString(),
+      });
+    }
   });
 }
 
@@ -1191,6 +1291,26 @@ async function removeStoredThreadSession(threadId) {
   return mutateChatStore((store) => {
     const session = Object.values(store.sessions || {}).find((item) => item.codexSessionId === threadId) || null;
     if (!session) return null;
+    if (removingSessions.has(makeSessionKey(session.repoId, session.id))) return sessionSummary(session);
+    const draft = normalizeChatDraft(session.draft);
+    if (session.queuedTurn || draft.input.trim() || draft.attachments.length) {
+      const now = new Date().toISOString();
+      const replacement = normalizeSession({
+        ...session,
+        id: sessionId(),
+        codexSessionId: null,
+        title: `${session.queuedTurn ? "待核对" : "已归档草稿"}: ${session.title}`,
+        createdAt: now,
+        updatedAt: now,
+        queuedTurn: session.queuedTurn ? {
+          ...session.queuedTurn,
+          status: "needs_reconciliation",
+          reason: "原云端线程已归档。请核对历史结果，再撤回到草稿决定是否重发。",
+        } : null,
+      }, session.repoId);
+      store.sessions[replacement.id] = replacement;
+      if (store.activeByRepo[session.repoId] === session.id) store.activeByRepo[session.repoId] = replacement.id;
+    }
     delete store.sessions[session.id];
     if (store.activeByRepo[session.repoId] === session.id) {
       const replacement = Object.values(store.sessions || {})
@@ -1322,6 +1442,7 @@ function sessionSummary(item) {
     goal: item.goal || null,
     compactedAt: item.compactedAt || null,
     draft: normalizeChatDraft(item.draft || {}),
+    queuedTurn: queuedTurnSummary(item.queuedTurn),
   };
 }
 
@@ -1331,7 +1452,8 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
   if (options.pruneMissing) {
     for (const session of Object.values(store.sessions)) {
       if (session.repoId !== repo.id || !session.codexSessionId) continue;
-      if (listedThreadIds.has(session.codexSessionId)) continue;
+      const draft = normalizeChatDraft(session.draft);
+      if (listedThreadIds.has(session.codexSessionId) || session.queuedTurn || draft.input.trim() || draft.attachments.length) continue;
       delete store.sessions[session.id];
     }
   }
@@ -2847,12 +2969,20 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
     runtime = runtimeForRepo(repo, runtime);
   }
   const key = makeSessionKey(repo.id, session.id);
+  const storedQueuedTurn = (await readStoredSessionForJob(repo.id, session.id)).queuedTurn;
+  if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+  if (options.queuedTurnId ? storedQueuedTurn?.id !== options.queuedTurnId || storedQueuedTurn.status !== "dispatching" : Boolean(storedQueuedTurn)) {
+    throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
+  }
   const existing = activeTurns.get(key);
   if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
+  const compact = activeCompactions.get(key);
+  if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
 
   const job = createServerJob("turn", repo, session, runtime);
   job.makeSessionActive = options.makeSessionActive !== false;
   job.requireExistingThread = options.requireExistingThread === true;
+  job.queuedTurnId = options.queuedTurnId || null;
   job.message = message;
   job.storedMessage = storedMessage;
   activeTurns.set(key, job);
@@ -2899,8 +3029,15 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
 async function startReviewJob(repo, session, runtime, target = { type: "uncommittedChanges" }, delivery = "inline") {
   if (repo.kind === "personal") throw Object.assign(new Error("个人空间不是 Git 项目，不能运行代码审查"), { statusCode: 400 });
   const key = makeSessionKey(repo.id, session.id);
+  const storedQueuedTurn = (await readStoredSessionForJob(repo.id, session.id)).queuedTurn;
+  if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+  if (storedQueuedTurn) {
+    throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
+  }
   const existing = activeTurns.get(key);
   if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
+  const compact = activeCompactions.get(key);
+  if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
 
   const job = createServerJob("turn", repo, session, runtime);
   job.message = "Codex review";
@@ -2971,16 +3108,39 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   }
   job.completed = true;
   job.finishing = false;
+  if (job.queuedTurnId) {
+    await updateQueuedTurn(job.repoId, job.sessionId, job.queuedTurnId, ok ? null : {
+      status: "needs_reconciliation",
+      reason: "排队消息执行未成功。请核对会话记录，系统不会自动重发。",
+    }).catch((queueError) => {
+      emitJobEvent(job, "error", { message: `排队状态保存失败: ${queueError.message}` });
+    });
+  } else if (!ok) {
+    await pauseQueuedTurn(job.repoId, job.sessionId, "上一轮未成功，排队已暂停。请核对结果后再发送。").catch((queueError) => {
+      emitJobEvent(job, "error", { message: `排队状态保存失败: ${queueError.message}` });
+    });
+  }
   if (activeTurns.get(job.key) === job) activeTurns.delete(job.key);
   clearJobOwners(job);
   emitJobEvent(job, "done", { ok, code, sessionId: job.sessionId, codexSessionId: job.threadId, turnId: job.turnId, error });
   job.resolve?.({ ok, code, error });
+  if (ok && !job.queuedTurnId) {
+    setImmediate(() => dispatchQueuedTurn(job.repoId, job.sessionId).catch((queueError) => {
+      console.warn(`Queued turn dispatch failed: ${queueError.message}`);
+    }));
+  }
 }
 
 async function startCompactJob(repo, session, runtime) {
   const key = makeSessionKey(repo.id, session.id);
   const existing = activeCompactions.get(key);
   if (existing && !existing.completed) return existing;
+  const queuedTurn = (await readStoredSessionForJob(repo.id, session.id)).queuedTurn;
+  if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+  if (queuedTurn) throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
+  if (activeTurns.get(key) && !activeTurns.get(key).completed) {
+    throw Object.assign(new Error("当前会话仍在回复，请先等待或停止"), { statusCode: 409 });
+  }
   const job = createServerJob("compact", repo, session, runtime);
   activeCompactions.set(key, job);
   job.timeoutTimer = setTimeout(() => {
@@ -4682,7 +4842,7 @@ function redactAutomationPrompt(value) {
 const automationCompletionContractVersion = 1;
 const automationCompletionContractType = "exact-final-line";
 const automationCompletionMarkerPattern = /^[A-Z][A-Z0-9_:-]{7,79}$/;
-const automationCompletionOutcomeValues = new Set(["pending", "passed", "missing", "invalid", "turn-failed"]);
+const automationCompletionOutcomeValues = new Set(["pending", "passed", "missing", "invalid", "turn-failed", "artifact-missing", "artifact-mismatch", "artifact-unknown"]);
 
 function invalidAutomationCompletionContract(message, strict) {
   if (strict) throw new Error(message);
@@ -4694,9 +4854,9 @@ function normalizeAutomationCompletionContract(value, { strict = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return invalidAutomationCompletionContract("completionContract 必须是对象", strict);
   }
-  const allowedKeys = new Set(["version", "type", "marker"]);
+  const allowedKeys = new Set(["version", "type", "marker", "artifactPath", "artifactSha256"]);
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
-    return invalidAutomationCompletionContract("completionContract 只允许 version、type 和 marker 字段", strict);
+    return invalidAutomationCompletionContract("completionContract 包含不支持的字段", strict);
   }
   const version = value.version;
   const type = typeof value.type === "string" ? value.type.trim() : "";
@@ -4710,7 +4870,21 @@ function normalizeAutomationCompletionContract(value, { strict = false } = {}) {
   if (!automationCompletionMarkerPattern.test(marker)) {
     return invalidAutomationCompletionContract("completionContract.marker 必须是 8–80 位大写 ASCII 标记", strict);
   }
-  return { version, type, marker };
+  const artifactPath = value.artifactPath === undefined ? "" : String(value.artifactPath || "").trim().replaceAll("\\", "/");
+  const artifactSha256 = value.artifactSha256 === undefined ? "" : String(value.artifactSha256 || "").trim().toLowerCase();
+  if (value.artifactPath !== undefined && (
+    typeof value.artifactPath !== "string" || !artifactPath || artifactPath.length > 500 || artifactPath.startsWith("/") || /^[a-z]:/i.test(artifactPath) ||
+    artifactPath.includes("\0") || artifactPath.split("/").some((segment) => segment === "..") ||
+    path.posix.normalize(artifactPath) === "."
+  )) return invalidAutomationCompletionContract("completionContract.artifactPath 必须是工作区内的相对文件路径", strict);
+  if (value.artifactSha256 !== undefined && (typeof value.artifactSha256 !== "string" || !artifactPath || !/^[a-f0-9]{64}$/.test(artifactSha256))) {
+    return invalidAutomationCompletionContract("completionContract.artifactSha256 必须是文件的 SHA-256", strict);
+  }
+  return {
+    version, type, marker,
+    ...(artifactPath ? { artifactPath } : {}),
+    ...(artifactSha256 ? { artifactSha256 } : {}),
+  };
 }
 
 function automationCompletionContractsEqual(left, right) {
@@ -4719,7 +4893,9 @@ function automationCompletionContractsEqual(left, right) {
   if (!normalizedLeft || !normalizedRight) return normalizedLeft === normalizedRight;
   return normalizedLeft.version === normalizedRight.version &&
     normalizedLeft.type === normalizedRight.type &&
-    normalizedLeft.marker === normalizedRight.marker;
+    normalizedLeft.marker === normalizedRight.marker &&
+    normalizedLeft.artifactPath === normalizedRight.artifactPath &&
+    normalizedLeft.artifactSha256 === normalizedRight.artifactSha256;
 }
 
 function automationCompletionContractForRequest(req, automation) {
@@ -4742,6 +4918,7 @@ function promptWithAutomationCompletionContract(prompt, contract) {
   return [
     prompt,
     "",
+    ...(contract.artifactPath ? [`交付文件必须位于当前工作区的 ${contract.artifactPath}。`] : []),
     "系统完成契约：仅当你已核验原任务的业务结果确实完成时，才在最终回复的最后一个非空行输出以下标记。",
     "不得把标记放入代码块、解释文字或中间进度；无法确认完成时不得输出。",
     contract.marker,
@@ -4765,6 +4942,34 @@ function automationCompletionOutcome(contract, output) {
   return satisfied
     ? { outcome: "passed", satisfied: true, error: null }
     : { outcome: "missing", satisfied: false, error: `完成契约未满足：最终回复最后一行缺少精确标记 ${contract.marker}` };
+}
+
+async function verifyAutomationArtifact(contract, repo) {
+  if (!contract?.artifactPath) return { satisfied: true, outcome: "passed", error: null };
+  try {
+    const filePath = await assertRepoPathAccess(repo, contract.artifactPath);
+    const before = await fs.lstat(filePath);
+    if (!before.isFile() || before.size === 0) {
+      return { satisfied: false, outcome: "artifact-missing", error: "交付文件不存在、为空或不是普通文件" };
+    }
+    if (contract.artifactSha256) {
+      const hash = crypto.createHash("sha256");
+      for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+      const after = await fs.lstat(filePath);
+      if (after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
+        return { satisfied: false, outcome: "artifact-unknown", error: "交付文件在校验期间发生变化，需要人工核对" };
+      }
+      if (hash.digest("hex") !== contract.artifactSha256) {
+        return { satisfied: false, outcome: "artifact-mismatch", error: "交付文件 SHA-256 与要求不一致" };
+      }
+    }
+    return { satisfied: true, outcome: "passed", error: null };
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error?.code) || error?.source === "invalid-repository-path") {
+      return { satisfied: false, outcome: "artifact-missing", error: "交付文件不存在或不在工作区内" };
+    }
+    return { satisfied: false, outcome: "artifact-unknown", error: "交付文件校验失败，需要人工核对" };
+  }
 }
 
 function normalizeAutomationRun(run = {}) {
@@ -6531,13 +6736,17 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       appendAutomationRunEvent(runId, { threadId: job.threadId || null }, { type: payload.event, text }).catch(() => null);
     });
     job.promise.then(async (result) => {
-      const completion = result.ok
+      const markerCompletion = result.ok
         ? automationCompletionOutcome(completionContract, job.output)
         : {
             outcome: completionContract ? "turn-failed" : null,
             satisfied: false,
             error: result.error || job.error || "自动化任务失败",
           };
+      const artifact = result.ok && markerCompletion.satisfied
+        ? await verifyAutomationArtifact(completionContract, runRepo)
+        : null;
+      const completion = artifact && !artifact.satisfied ? artifact : markerCompletion;
       const completed = result.ok && completion.satisfied;
       const canceled = job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
       const error = completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
@@ -6545,7 +6754,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       await appendAutomationRunEventWithRetry(
         runId,
         {
-          status: canceled ? "canceled" : completed ? "completed" : "failed",
+          status: canceled ? "canceled" : completed ? "completed" : completion.outcome === "artifact-unknown" ? "needs_reconciliation" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           summary: job.output || "",
@@ -9075,40 +9284,56 @@ app.post("/api/codex/thread-fork", async (req, res) => {
 
 app.post("/api/codex/thread-archive", async (req, res) => {
   const repo = getRepoById(req.body?.repoId);
-  const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
-  if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "当前会话还没有 app-server thread。" });
-  const response = await codexAppServerRequest("thread/archive", { threadId: session.codexSessionId }, 20_000);
-  if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
-  await mutateChatStore((store) => {
-    delete store.sessions[session.id];
-    const remaining = Object.values(store.sessions)
-      .filter((item) => item.repoId === repo.id)
-      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-    store.activeByRepo[repo.id] = remaining[0]?.id || "";
-  });
-  const summary = await getRepoSessions(repo.id, { sync: false });
-  const active = summary.activeSessionId
-    ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
-    : await ensureChatSession(repo.id);
-  const messages = active ? await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs }) : [];
-  res.json({ ok: true, repoId: repo.id, activeSessionId: active?.id || summary.activeSessionId || "", sessions: summary.sessions, messages });
+  const session = await resolveChatSessionForRequest(repo.id, req.body?.sessionId);
+  if (!session) return res.status(404).json({ ok: false, error: "Unknown session" });
+  const key = makeSessionKey(repo.id, session.id);
+  if (removingSessions.has(key)) return res.status(409).json({ ok: false, error: "会话正在归档或删除" });
+  removingSessions.add(key);
+  try {
+    const current = (await readChatStore()).sessions[session.id];
+    if (!current || current.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+    if (current.queuedTurn) return res.status(409).json({ ok: false, error: "请先撤回排队消息，再归档会话" });
+    if (activeTurns.has(key) || activeCompactions.has(key)) return res.status(409).json({ ok: false, error: "会话仍在运行，请先等待或停止" });
+    if (!current.codexSessionId) return res.status(400).json({ ok: false, error: "当前会话还没有 app-server thread。" });
+    const response = await codexAppServerRequest("thread/archive", { threadId: current.codexSessionId }, 20_000, repo);
+    if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
+    await mutateChatStore((store) => {
+      delete store.sessions[session.id];
+      const remaining = Object.values(store.sessions)
+        .filter((item) => item.repoId === repo.id)
+        .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      store.activeByRepo[repo.id] = remaining[0]?.id || "";
+    });
+    const summary = await getRepoSessions(repo.id, { sync: false });
+    const active = summary.activeSessionId
+      ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
+      : await ensureChatSession(repo.id);
+    const messages = active ? await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs }) : [];
+    res.json({ ok: true, repoId: repo.id, activeSessionId: active?.id || summary.activeSessionId || "", sessions: summary.sessions, messages });
+  } finally {
+    removingSessions.delete(key);
+  }
 });
 
 app.post("/api/codex/thread-compact", async (req, res) => {
-  const repo = getRepoById(req.body?.repoId);
-  const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
-  if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "先发送一条消息建立 app-server thread，再压缩上下文。" });
-  const runtime = normalizeRuntime(req.body, session);
-  const job = await startCompactJob(repo, session, runtime);
-  const result = await job.promise;
-  res.status(result.ok ? 200 : 500).json({
-    ok: result.ok,
-    error: result.error || job.error || null,
-    sessionId: session.id,
-    threadId: session.codexSessionId,
-    tokenUsage: job.latestTokenUsage || session.tokenUsage || null,
-  });
-  if (result.ok) patchThreadStateCache(session, { tokenUsage: job.latestTokenUsage || session.tokenUsage || null });
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
+    if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "先发送一条消息建立 app-server thread，再压缩上下文。" });
+    const runtime = normalizeRuntime(req.body, session);
+    const job = await startCompactJob(repo, session, runtime);
+    const result = await job.promise;
+    res.status(result.ok ? 200 : 500).json({
+      ok: result.ok,
+      error: result.error || job.error || null,
+      sessionId: session.id,
+      threadId: session.codexSessionId,
+      tokenUsage: job.latestTokenUsage || session.tokenUsage || null,
+    });
+    if (result.ok) patchThreadStateCache(session, { tokenUsage: job.latestTokenUsage || session.tokenUsage || null });
+  } catch (error) {
+    sendRouteError(res, error);
+  }
 });
 
 app.post("/api/codex/thread-compact/stream", async (req, res) => {
@@ -9185,7 +9410,7 @@ app.post("/api/codex/turn-steer", async (req, res) => {
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
   if (!message) return res.status(400).json({ ok: false, error: "Message is required" });
   const active = activeTurns.get(`${repo.id}:${session.id}`);
-  if (!active) return res.status(409).json({ ok: false, error: "当前没有正在运行的 turn。" });
+  if (!active || !active.turnId) return res.status(409).json({ ok: false, error: "当前 turn 尚未准备好接收补充指令。" });
   await appServerClientForRepo(repo).request("turn/steer", {
     threadId: active.threadId,
     expectedTurnId: active.turnId,
@@ -9193,6 +9418,77 @@ app.post("/api/codex/turn-steer", async (req, res) => {
   }, 20_000);
   emitJobEvent(active, "status", { text: "已向当前 turn 补充指令" });
   res.json({ ok: true, sessionId: session.id, threadId: active.threadId, turnId: active.turnId });
+});
+
+app.post("/api/chat/queue", async (req, res) => {
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    if (repo.kind === "personal" && !personalExecutionAvailable) {
+      return res.status(503).json({ ok: false, error: "个人空间执行已被管理员停用" });
+    }
+    const session = await resolveChatSessionForRequest(repo.id, req.body?.sessionId);
+    if (!session) return res.status(404).json({ ok: false, error: "Unknown session" });
+    const active = activeTurns.get(makeSessionKey(repo.id, session.id));
+    if (!active || active.completed) return res.status(409).json({ ok: false, error: "当前没有运行中的回复，请直接发送消息" });
+    const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    const invalidAttachments = Object.prototype.hasOwnProperty.call(req.body || {}, "attachments") &&
+      (!Array.isArray(req.body.attachments) || req.body.attachments.length > 0);
+    if (!message || message.length > 120_000 || invalidAttachments) {
+      return res.status(400).json({ ok: false, error: "排队只支持 1 到 120000 字的纯文本消息" });
+    }
+    const runtime = runtimeForRepo(repo, normalizeRuntime(req.body, session));
+    const queuedTurn = await mutateChatStore((store) => {
+      const current = store.sessions[session.id];
+      if (current?.repoId !== repo.id) throw Object.assign(new Error("Unknown session"), { statusCode: 404 });
+      if (removingSessions.has(makeSessionKey(repo.id, session.id))) {
+        throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+      }
+      const existing = current.queuedTurn;
+      if (existing) {
+        if (existing.message === message && JSON.stringify(existing.runtime) === JSON.stringify(runtime)) return existing;
+        throw Object.assign(new Error("此会话已有一条排队消息；请先撤回或等待完成"), { statusCode: 409 });
+      }
+      const now = new Date().toISOString();
+      current.queuedTurn = normalizeQueuedTurn({ id: crypto.randomUUID(), message, runtime, status: "queued", createdAt: now, updatedAt: now });
+      return current.queuedTurn;
+    });
+    void dispatchQueuedTurn(repo.id, session.id).catch((error) => console.warn(`Queued turn dispatch failed: ${error.message}`));
+    res.status(202).json({ ok: true, repoId: repo.id, sessionId: session.id, queuedTurn: queuedTurnSummary(queuedTurn) });
+  } catch (error) {
+    sendRouteError(res, error);
+  }
+});
+
+app.delete("/api/chat/queue", async (req, res) => {
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const session = await resolveChatSessionForRequest(repo.id, req.body?.sessionId);
+    if (!session) return res.status(404).json({ ok: false, error: "Unknown session" });
+    const removed = await mutateChatStore((store) => {
+      const current = store.sessions[session.id];
+      if (current?.repoId !== repo.id || !current.queuedTurn) return null;
+      if (current.queuedTurn.status === "dispatching") {
+        throw Object.assign(new Error("消息可能已开始执行，请先核对当前任务"), { statusCode: 409 });
+      }
+      const queued = current.queuedTurn;
+      const draft = normalizeChatDraft(current.draft);
+      const nextInput = draft.input.trim() === queued.message
+        ? draft.input
+        : [draft.input.trimEnd(), queued.message].filter(Boolean).join("\n\n");
+      if (nextInput.length > 120_000) {
+        throw Object.assign(new Error("草稿空间不足，请先处理现有草稿后再撤回排队"), { statusCode: 409 });
+      }
+      current.draft = normalizeChatDraft({
+        ...draft, input: nextInput, revision: draft.revision + 1, updatedAt: new Date().toISOString(),
+      });
+      current.queuedTurn = null;
+      return { queuedTurn: queued, draft: current.draft };
+    });
+    if (!removed) return res.status(404).json({ ok: false, error: "没有可撤回的排队消息" });
+    res.json({ ok: true, repoId: repo.id, sessionId: session.id, queuedTurn: queuedTurnSummary(removed.queuedTurn), draft: removed.draft });
+  } catch (error) {
+    sendRouteError(res, error);
+  }
 });
 
 app.post("/api/codex/turn-interrupt", async (req, res) => {
@@ -9547,63 +9843,71 @@ app.post("/api/chat/sessions/:id/draft/attachments", async (req, res) => {
 
 app.delete("/api/chat/sessions/:id", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
-  const store = await readChatStore();
-  const session = store.sessions[req.params.id];
-  if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
-  const activeTurn = activeTurns.get(makeSessionKey(repo.id, session.id));
-  const activeCompact = activeCompactions.get(makeSessionKey(repo.id, session.id));
-  if (activeTurn || activeCompact) {
-    if (String(req.query?.force || "") !== "1") {
-      return res.status(409).json({ ok: false, error: "Session has an active Codex job; interrupt it before deletion" });
+  const key = makeSessionKey(repo.id, req.params.id);
+  if (removingSessions.has(key)) return res.status(409).json({ ok: false, error: "会话正在归档或删除" });
+  removingSessions.add(key);
+  try {
+    const store = await readChatStore();
+    const session = store.sessions[req.params.id];
+    if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+    if (session.queuedTurn) return res.status(409).json({ ok: false, error: "请先撤回排队消息，再删除会话" });
+    const activeTurn = activeTurns.get(key);
+    const activeCompact = activeCompactions.get(key);
+    if (activeTurn || activeCompact) {
+      if (String(req.query?.force || "") !== "1") {
+        return res.status(409).json({ ok: false, error: "Session has an active Codex job; interrupt it before deletion" });
+      }
+      if (activeCompact) {
+        return res.status(409).json({ ok: false, error: "Active compaction cannot be deleted safely; wait for it to finish" });
+      }
+      activeTurn.cancelRequested = true;
+      if (activeTurn.threadId && activeTurn.turnId) {
+        await appServerClientForRepo(repo)
+          .request("turn/interrupt", { threadId: activeTurn.threadId, turnId: activeTurn.turnId }, 20_000)
+          .catch(() => null);
+      }
+      await Promise.race([activeTurn.promise, new Promise((resolve) => setTimeout(resolve, 10_000))]);
+      if (!activeTurn.completed) {
+        return res.status(409).json({ ok: false, error: "Session cancellation is still pending; retry deletion shortly" });
+      }
     }
-    if (activeCompact) {
-      return res.status(409).json({ ok: false, error: "Active compaction cannot be deleted safely; wait for it to finish" });
+    let archived = false;
+    if (session.codexSessionId) {
+      const response = await codexAppServerRequest("thread/archive", { threadId: session.codexSessionId }, 20_000, repo);
+      if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
+      archived = true;
     }
-    activeTurn.cancelRequested = true;
-    if (activeTurn.threadId && activeTurn.turnId) {
-      await appServerClientForRepo(repo)
-        .request("turn/interrupt", { threadId: activeTurn.threadId, turnId: activeTurn.turnId }, 20_000)
-        .catch(() => null);
-    }
-    await Promise.race([activeTurn.promise, new Promise((resolve) => setTimeout(resolve, 10_000))]);
-    if (!activeTurn.completed) {
-      return res.status(409).json({ ok: false, error: "Session cancellation is still pending; retry deletion shortly" });
-    }
+    const uploadCleanup = repo.kind === "personal"
+      ? { deleted: [], errors: [], retained: [...sessionUploadedAttachmentPaths(repo, session)].map((filePath) => path.relative(repo.path, filePath)) }
+      : await cleanupSessionUploadFiles(repo, session, store);
+    await mutateChatStore((current) => {
+      const currentSession = current.sessions[req.params.id];
+      if (!currentSession || currentSession.repoId !== repo.id) return;
+      const previousActiveId = current.activeByRepo[repo.id] || "";
+      delete current.sessions[req.params.id];
+      const remaining = Object.values(current.sessions)
+        .filter((item) => item.repoId === repo.id)
+        .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      current.activeByRepo[repo.id] = previousActiveId && current.sessions[previousActiveId] ? previousActiveId : remaining[0]?.id || "";
+    });
+    const summary = await getRepoSessions(repo.id, { sync: false, allowLocalActive: true });
+    const active = summary.activeSessionId
+      ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
+      : null;
+    const messages = active ? await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs }) : [];
+    res.json({
+      ok: true,
+      repoId: repo.id,
+      deletedSessionId: session.id,
+      activeSessionId: active?.id || summary.activeSessionId || "",
+      sessions: summary.sessions,
+      messages,
+      archived,
+      uploadCleanup,
+    });
+  } finally {
+    removingSessions.delete(key);
   }
-  let archived = false;
-  if (session.codexSessionId) {
-    const response = await codexAppServerRequest("thread/archive", { threadId: session.codexSessionId }, 20_000);
-    if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
-    archived = true;
-  }
-  const uploadCleanup = repo.kind === "personal"
-    ? { deleted: [], errors: [], retained: [...sessionUploadedAttachmentPaths(repo, session)].map((filePath) => path.relative(repo.path, filePath)) }
-    : await cleanupSessionUploadFiles(repo, session, store);
-  await mutateChatStore((current) => {
-    const currentSession = current.sessions[req.params.id];
-    if (!currentSession || currentSession.repoId !== repo.id) return;
-    const previousActiveId = current.activeByRepo[repo.id] || "";
-    delete current.sessions[req.params.id];
-    const remaining = Object.values(current.sessions)
-      .filter((item) => item.repoId === repo.id)
-      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-    current.activeByRepo[repo.id] = previousActiveId && current.sessions[previousActiveId] ? previousActiveId : remaining[0]?.id || "";
-  });
-  const summary = await getRepoSessions(repo.id, { sync: false, allowLocalActive: true });
-  const active = summary.activeSessionId
-    ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
-    : null;
-  const messages = active ? await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs }) : [];
-  res.json({
-    ok: true,
-    repoId: repo.id,
-    deletedSessionId: session.id,
-    activeSessionId: active?.id || summary.activeSessionId || "",
-    sessions: summary.sessions,
-    messages,
-    archived,
-    uploadCleanup,
-  });
 });
 
 app.get("/api/chat/history", async (req, res) => {
@@ -9664,6 +9968,7 @@ app.get("/api/chat/active", async (req, res) => {
       threadState: null,
       turn: null,
       compact: null,
+      queuedTurn: null,
     });
   }
   if (!session) {
@@ -9678,6 +9983,7 @@ app.get("/api/chat/active", async (req, res) => {
       threadState: authoritativeEmptyThreadState(repo.id),
       turn: null,
       compact: null,
+      queuedTurn: null,
     });
   }
   const key = makeSessionKey(repo.id, session.id);
@@ -9723,6 +10029,7 @@ app.get("/api/chat/active", async (req, res) => {
     },
     turn: summarize(turn),
     compact: summarize(compact),
+    queuedTurn: queuedTurnSummary(session.queuedTurn),
   });
 });
 
@@ -11008,6 +11315,10 @@ if (removedStateTempFiles.length) {
 
 await reconcileStaleAutomationRuns().catch((error) => {
   console.warn(`Automation run reconciliation failed: ${error.message}`);
+});
+
+await reconcileQueuedTurnsOnStartup().catch((error) => {
+  console.warn(`Queued turn reconciliation failed: ${error.message}`);
 });
 
 function startExternalNotificationWatcher() {

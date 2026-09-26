@@ -7035,6 +7035,14 @@ pre {
 .personal-fact-editor button { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
 .personal-fact-editor button:disabled { opacity: .5; cursor: default; }
 .composer-shell { position: relative; }
+.queued-turn-banner { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 7px 10px; border: 1px solid var(--border); border-bottom: 0; border-radius: 6px 6px 0 0; background: var(--surface-muted); }
+.queued-turn-banner > span { display: grid; gap: 1px; min-width: 0; flex: 1; }
+.queued-turn-banner strong { font-size: 13px; }
+.queued-turn-banner small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queued-turn-banner .mini-action { min-height: 36px; flex-shrink: 0; white-space: nowrap; }
+.composer-busy-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 7px; color: var(--muted); font-size: 12px; }
+.composer-busy-actions .mini-action { display: inline-flex; align-items: center; gap: 5px; min-height: 36px; white-space: nowrap; }
+.steer-inline { display: none; }
 .chat-new-progress { position: absolute; top: -48px; left: 50%; z-index: 8; display: inline-flex; align-items: center; gap: 4px; min-height: 38px; padding: 6px 12px; transform: translateX(-50%); border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); box-shadow: 0 3px 12px #0002; white-space: nowrap; cursor: pointer; }
 .personal-admin-back { grid-column: 1 / -1; display: inline-flex; align-items: center; gap: 5px; justify-self: start; min-height: 44px; margin: 12px 0 0 16px; border: 0; background: transparent; cursor: pointer; }
 @media (max-width: 820px) {
@@ -7070,6 +7078,7 @@ pre {
   .session-content-grid .composer-shell .send-button,
   .session-content-grid .composer-shell .clear-chat { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
   .session-content-grid .composer-shell .composer { grid-template-columns: minmax(0, 1fr) 44px 44px 44px; padding: 7px; }
+  .queued-turn-banner .mini-action, .composer-busy-actions .mini-action { min-height: 44px; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer button { min-height: 44px; height: auto; }
   .command-panel-backdrop { display: block; position: fixed; inset: 0; z-index: 59; width: 100vw; height: var(--app-visual-height, 100dvh); padding: 0; border: 0; border-radius: 0; background: rgba(15, 23, 42, .22); }
@@ -7080,4 +7089,12 @@ pre {
 
 @media (max-width: 820px) and (max-height: 600px) {
   .workspace:has(.personal-scope-notice) .pending-approvals { max-height: min(18dvh, 75px); }
+  .session-content-grid .personal-scope-notice { min-height: 30px; padding-block: 2px; }
+  .session-content-grid .personal-scope-actions, .session-content-grid .personal-connection-brief { display: none; }
+  .session-content-grid .composer-shell:has(.steer-inline) .attach-button { display: none; }
+  .session-content-grid .composer-shell .steer-inline { display: grid; grid-area: attach; place-items: center; width: 44px; min-width: 44px; height: 44px; min-height: 44px; padding: 0; border-radius: 50%; }
+  .session-content-grid .composer-busy-actions { display: none; }
+  .session-content-grid .composer-shell:has(.steer-inline) .composer-footer { display: none; }
+  .session-content-grid .queued-turn-banner { min-height: 44px; padding-block: 0; }
+  .session-content-grid .queued-turn-banner small { display: none; }
 }

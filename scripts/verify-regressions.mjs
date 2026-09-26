@@ -202,6 +202,13 @@ input.on("line", (line) => {
       },
     });
   }
+  if (message.method === "thread/read" && String(message.params?.threadId || "").startsWith("thread-external-archive-")) {
+    send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [] } } });
+    return send({ method: "thread/archived", params: { threadId: message.params.threadId } }, 20);
+  }
+  if (message.method === "thread/archive" && message.params?.threadId === "thread-archive-race") {
+    return send({ id: message.id, result: {} }, 250);
+  }
   if (message.method === "thread/list") {
     const cwd = Array.isArray(message.params?.cwd) ? message.params.cwd.join(" ") : "";
     if (cwd.includes("sample-service")) return send({ id: message.id, result: { data: [], nextCursor: null } });
@@ -224,12 +231,25 @@ input.on("line", (line) => {
     const requestText = JSON.stringify(message.params || {});
     const turnId = requestText.includes("cancel regression") ? "turn-cancel-regression" : "turn-regression";
     const progressRegression = requestText.includes("progress regression");
+    const queuedFirstRegression = requestText.includes("progress regression queue first");
+    const queueRegressionNext = requestText.includes("queue regression next");
     const personalDeletionRegression = requestText.includes("personal deletion regression");
     const recoveryRegression = requestText.includes("继续上一轮因服务重启中断的自动化任务");
     const outcomeContractRegression = requestText.includes("outcome contract regression");
     send({ id: message.id, result: { turn: { id: turnId } } });
-    if (progressRegression) {
-      for (const delay of [150, 300, 450]) {
+    if (queueRegressionNext) {
+      send({ method: "item/agentMessage/delta", params: {
+        threadId: message.params?.threadId,
+        turnId,
+        delta: "queued response complete",
+      } }, 40);
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId,
+        turn: { id: turnId, status: "completed" },
+      } }, 80);
+    } else if (progressRegression) {
+      const progressDelays = queuedFirstRegression ? Array.from({ length: 16 }, (_, index) => 150 * (index + 1)) : [150, 300, 450];
+      for (const delay of progressDelays) {
         send({ method: "item/mcpToolCall/progress", params: {
           threadId: "thread-regression",
           turnId,
@@ -240,7 +260,7 @@ input.on("line", (line) => {
       send({ method: "turn/completed", params: {
         threadId: "thread-regression",
         turn: { id: turnId, status: "completed" },
-      } }, 650);
+      } }, queuedFirstRegression ? 2_600 : 650);
     }
     if (personalDeletionRegression) {
       send({ method: "turn/completed", params: {
@@ -367,6 +387,12 @@ await check("automation completion contracts fail closed without changing legacy
   const runsPath = path.join(stateRoot, "automation-runs.json");
   const passContract = { version: 1, type: "exact-final-line", marker: "CONTRACT_PASS_COMPLETE" };
   const missingContract = { version: 1, type: "exact-final-line", marker: "CONTRACT_MISSING_COMPLETE" };
+  const artifactBody = "verified artifact\n";
+  const artifactContract = {
+    ...passContract,
+    artifactPath: "results/report.md",
+    artifactSha256: crypto.createHash("sha256").update(artifactBody).digest("hex"),
+  };
 
   await fs.mkdir(repoRoot, { recursive: true });
   await fs.mkdir(stateRoot, { recursive: true });
@@ -433,6 +459,28 @@ await check("automation completion contracts fail closed without changing legacy
     const passedAfterLateEvents = (JSON.parse(await fs.readFile(runsPath, "utf8"))).runs.find((run) => run.id === passedRun.id);
     assert.equal(passedAfterLateEvents.status, "completed");
     assert.equal(passedAfterLateEvents.completionOutcome, "passed");
+
+    await fs.mkdir(path.join(repoRoot, "results"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, "results", "report.md"), artifactBody);
+    const artifactPassed = await trigger("artifact-pass-0001", "outcome contract regression artifact pass", artifactContract);
+    assert.equal(artifactPassed.response.status, 200);
+    assert.equal((await waitForRun(artifactPassed.data.run.id, "completed")).completionOutcome, "passed");
+    await fs.rm(path.join(repoRoot, "results", "report.md"));
+    const artifactMissing = await trigger("artifact-missing-0001", "outcome contract regression artifact missing", artifactContract);
+    assert.equal(artifactMissing.response.status, 200);
+    assert.equal((await waitForRun(artifactMissing.data.run.id, "failed")).completionOutcome, "artifact-missing");
+    await fs.writeFile(path.join(repoRoot, "results", "report.md"), "different content\n");
+    const artifactMismatch = await trigger("artifact-mismatch-0001", "outcome contract regression artifact mismatch", artifactContract);
+    assert.equal(artifactMismatch.response.status, 200);
+    assert.equal((await waitForRun(artifactMismatch.data.run.id, "failed")).completionOutcome, "artifact-mismatch");
+    await fs.rm(path.join(repoRoot, "results", "report.md"));
+    await fs.symlink(path.join(tempRoot, "outside.md"), path.join(repoRoot, "results", "report.md"));
+    await fs.writeFile(path.join(tempRoot, "outside.md"), artifactBody);
+    const artifactEscape = await trigger("artifact-escape-0001", "outcome contract regression artifact escape", artifactContract);
+    assert.equal(artifactEscape.response.status, 200);
+    assert.equal((await waitForRun(artifactEscape.data.run.id, "failed")).completionOutcome, "artifact-missing");
+    const invalidArtifactPath = await trigger("artifact-invalid-0001", "outcome contract regression artifact invalid", { ...passContract, artifactPath: "../outside.md" });
+    assert.equal(invalidArtifactPath.response.status, 400);
 
     const changedContractReplay = await trigger(
       "contract-pass-0001",
@@ -545,6 +593,30 @@ await check("external automation interrupted by restart waits for reconciliation
       updatedAt: recent,
       messages: [],
       codexSessionId: "thread-recovery-attempted",
+    },
+    "sess-queue-waiting": {
+      id: "sess-queue-waiting", repoId: "sample-app", title: "Queued before restart",
+      createdAt: recent, updatedAt: recent, messages: [], codexSessionId: "thread-queue-waiting",
+      queuedTurn: { id: "queue-waiting", message: "queue must wait after restart", status: "queued", createdAt: recent },
+    },
+    "sess-queue-dispatching": {
+      id: "sess-queue-dispatching", repoId: "sample-app", title: "Started before restart",
+      createdAt: recent, updatedAt: recent, messages: [], codexSessionId: "thread-queue-dispatching",
+      queuedTurn: { id: "queue-dispatching", message: "queue may already have started", status: "dispatching", createdAt: recent },
+    },
+    "sess-external-draft": {
+      id: "sess-external-draft", repoId: "sample-app", title: "External draft",
+      createdAt: recent, updatedAt: recent, messages: [], codexSessionId: "thread-external-archive-draft",
+      draft: { input: "preserve an unsent draft", attachments: [], revision: 1 },
+    },
+    "sess-external-queue": {
+      id: "sess-external-queue", repoId: "sample-app", title: "External queue",
+      createdAt: recent, updatedAt: recent, messages: [], codexSessionId: "thread-external-archive-queue",
+      queuedTurn: { id: "queue-external", message: "do not resend after external archive", status: "queued", createdAt: recent },
+    },
+    "sess-archive-race": {
+      id: "sess-archive-race", repoId: "sample-app", title: "Archive race",
+      createdAt: recent, updatedAt: recent, messages: [], codexSessionId: "thread-archive-race",
     },
   };
   const sourceRuns = [
@@ -670,6 +742,9 @@ await check("external automation interrupted by restart waits for reconciliation
     assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-source"), false);
     assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-old"), false);
     assert.equal(storedRuns.some((run) => run.recoveryOfRunId === "run-recovery-attempted"), false);
+    const recoveredQueues = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
+    assert.equal(recoveredQueues["sess-queue-waiting"].queuedTurn.status, "paused");
+    assert.equal(recoveredQueues["sess-queue-dispatching"].queuedTurn.status, "needs_reconciliation");
 
     const inbox = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/inbox");
     assert.ok(inbox.data.needsAttention.some((run) => run.id === recoveredSource.id));
@@ -713,6 +788,46 @@ await check("external automation interrupted by restart waits for reconciliation
     const afterSecondRestart = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
     assert.equal(afterSecondRestart.filter((run) => run.recoveryOfRunId === "run-recovery-source").length, 0);
     assert.equal(afterSecondRestart.find((run) => run.id === "run-recovery-source")?.status, "needs_reconciliation");
+    const queuesAfterSecondRestart = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
+    assert.equal(queuesAfterSecondRestart["sess-queue-waiting"].queuedTurn.status, "paused");
+    assert.equal(queuesAfterSecondRestart["sess-queue-dispatching"].queuedTurn.status, "needs_reconciliation");
+    for (const [sessionId, title] of [["sess-external-draft", "已归档草稿"], ["sess-external-queue", "待核对"]]) {
+      const notified = await jsonRequest(`http://127.0.0.1:${port}/`, `/api/codex/thread-read?repoId=sample-app&sessionId=${sessionId}`);
+      assert.equal(notified.response.status, 200);
+      let migrated = null;
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const current = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
+        migrated = Object.values(current).find((session) => session.title.startsWith(`${title}:`) && session.id !== sessionId);
+        if (migrated) {
+          assert.equal(current[sessionId], undefined);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(migrated, `${sessionId} was not preserved after external archive`);
+      assert.equal(migrated.codexSessionId, null);
+      if (sessionId === "sess-external-draft") assert.equal(migrated.draft.input, "preserve an unsent draft");
+      else {
+        assert.equal(migrated.queuedTurn.message, "do not resend after external archive");
+        assert.equal(migrated.queuedTurn.status, "needs_reconciliation");
+      }
+    }
+    const archiveRequest = jsonRequest(`http://127.0.0.1:${port}/`, "/api/codex/thread-archive", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: "sess-archive-race" }),
+    });
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const captured = await fs.readFile(capturePath, "utf8");
+      if (captured.includes('"threadId":"thread-archive-race"')) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const duringArchive = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: "sess-archive-race", message: "must not restart archived session" }),
+    });
+    assert.equal(duringArchive.response.status, 409);
+    assert.equal((await archiveRequest).response.status, 200);
+    assert.equal(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions["sess-archive-race"], undefined);
   } finally {
     await stopProcess(firstServer);
     await stopProcess(secondServer);
@@ -1143,6 +1258,102 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(commandAudit.detail.includes(cloudRoot), false);
     assert.equal(JSON.parse(commandAudit.detail).command, "rg --files 隔离工作区");
     assert.equal(statusData.automations.some((automation) => automation.model === "gpt-5.5"), false);
+    const queueSession = await jsonRequest(baseUrl, "/api/chat/sessions", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", title: "Queue regression" }),
+    });
+    const queueSessionId = queueSession.data.activeSessionId;
+    const prematureQueue = await jsonRequest(baseUrl, "/api/chat/queue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId, message: "must not start first" }),
+    });
+    assert.equal(prematureQueue.response.status, 409);
+    const firstQueuedStream = await fetch(new URL("/api/chat/stream", baseUrl), {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId, message: "progress regression queue first" }),
+    });
+    assert.equal(firstQueuedStream.status, 200);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const active = await jsonRequest(baseUrl, `/api/chat/active?repoId=sample-app&sessionId=${queueSessionId}`);
+      if (active.data.turn?.turnId) break;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    const enqueue = (message) => jsonRequest(baseUrl, "/api/chat/queue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId, message }),
+    });
+    const queued = await enqueue("queue regression next");
+    assert.equal(queued.response.status, 202);
+    const repeated = await enqueue("queue regression next");
+    assert.equal(repeated.data.queuedTurn.id, queued.data.queuedTurn.id);
+    const attachmentQueue = await jsonRequest(baseUrl, "/api/chat/queue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId, message: "attachment must not vanish", attachments: [{ path: "notes.txt" }] }),
+    });
+    assert.equal(attachmentQueue.response.status, 400);
+    const conflicting = await enqueue("queue regression different");
+    assert.equal(conflicting.response.status, 409);
+    const bypassQueue = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId, message: "must not jump ahead" }),
+    });
+    assert.equal(bypassQueue.response.status, 409);
+    const compactWhileQueued = await jsonRequest(baseUrl, "/api/codex/thread-compact", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId }),
+    });
+    assert.equal(compactWhileQueued.response.status, 409);
+    const queuedActive = await jsonRequest(baseUrl, `/api/chat/active?repoId=sample-app&sessionId=${queueSessionId}`);
+    assert.equal(queuedActive.data.queuedTurn?.status, "queued");
+    assert.equal(Object.hasOwn(queuedActive.data.queuedTurn, "message"), false);
+    assert.equal(queuedActive.data.queuedTurn.preview, "queue regression next");
+    const deleteQueuedSession = await jsonRequest(baseUrl, `/api/chat/sessions/${queueSessionId}?repoId=sample-app`, { method: "DELETE" });
+    assert.equal(deleteQueuedSession.response.status, 409);
+    const archiveQueuedSession = await jsonRequest(baseUrl, "/api/codex/thread-archive", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId }),
+    });
+    assert.equal(archiveQueuedSession.response.status, 409);
+    await firstQueuedStream.text();
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+      if (!stored.sessions[queueSessionId]?.queuedTurn) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const queueRequests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(queueRequests.filter((request) => request.method === "turn/start" && JSON.stringify(request.params).includes("queue regression next")).length, 1);
+    const afterQueue = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    assert.equal(afterQueue.sessions[queueSessionId]?.queuedTurn, null);
+    const canceledSession = await jsonRequest(baseUrl, "/api/chat/sessions", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", title: "Canceled queue regression" }),
+    });
+    const canceledSessionId = canceledSession.data.activeSessionId;
+    const canceledStream = await fetch(new URL("/api/chat/stream", baseUrl), {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: canceledSessionId, message: "progress regression cancel queue first" }),
+    });
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const active = await jsonRequest(baseUrl, `/api/chat/active?repoId=sample-app&sessionId=${canceledSessionId}`);
+      if (active.data.turn?.turnId) break;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    const pendingCancel = await jsonRequest(baseUrl, "/api/chat/queue", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: canceledSessionId, message: "queue regression canceled" }),
+    });
+    assert.equal(pendingCancel.response.status, 202);
+    const cancelQueue = await jsonRequest(baseUrl, "/api/chat/queue", {
+      method: "DELETE", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", sessionId: canceledSessionId }),
+    });
+    assert.equal(cancelQueue.response.status, 200);
+    assert.equal(cancelQueue.data.queuedTurn.preview, "queue regression canceled");
+    assert.equal(cancelQueue.data.draft.input, "queue regression canceled");
+    await canceledStream.text();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const canceledRequests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(canceledRequests.some((request) => request.method === "turn/start" && JSON.stringify(request.params).includes("queue regression canceled")), false);
     assert.equal(statusData.automations.some((automation) => automation.id === "sample-research"), true);
     assert.equal(statusData.automations.some((automation) => automation.id === "sample-hourly"), true);
     assert.equal(

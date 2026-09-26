@@ -59,7 +59,7 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
     await waitUntil(async () => await composer.getAttribute("placeholder") === "向云端 Codex 发送消息");
   };
   const command = async (value) => { await composer.fill(value); await composer.press("Enter"); };
-  const busy = () => page.getByRole("button", { name: "补充本轮回复", exact: true });
+  const busy = () => page.getByRole("button", { name: "排队下一条消息", exact: true });
 
   await command("/compact");
   await waitUntil(async () => (await records()).length === 1);
@@ -91,7 +91,8 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   assert.equal(await page.locator(".chat-bubble.streaming").filter({ hasText: "验收持续生成中" }).count(), 1);
   await page.screenshot({ path: new URL("desktop-streaming.png", out).pathname, fullPage: true });
   const failedSteer = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/codex/turn-steer" && response.status() === 409);
-  await command("验收失败的补充指令");
+  await composer.fill("验收失败的补充指令");
+  await page.locator(".composer-busy-actions").getByRole("button", { name: "立即补充本轮" }).click();
   await failedSteer;
   await waitUntil(() => page.evaluate(() => window.__streamHarness.steers === 1));
   assert.equal(await composer.inputValue(), "验收失败的补充指令");

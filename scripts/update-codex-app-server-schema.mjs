@@ -31,10 +31,11 @@ function parseMode(argv) {
 
 function runCodexGenerate(outDir) {
   const schemaVersion = process.env.CODEX_SCHEMA_CLI_VERSION || defaultCodexSchemaVersion;
-  const candidates = [
-    { command: "npx", args: ["-y", `@openai/codex@${schemaVersion}`, "app-server", "generate-ts", "--out", outDir] },
-  ];
-  if (process.env.CODEX_SCHEMA_ALLOW_GLOBAL === "1") {
+  const candidateBinary = process.env.CODEX_SCHEMA_CLI_BINARY;
+  const candidates = candidateBinary
+    ? [{ command: candidateBinary, args: ["app-server", "generate-ts", "--out", outDir] }]
+    : [{ command: "npx", args: ["-y", `@openai/codex@${schemaVersion}`, "app-server", "generate-ts", "--out", outDir] }];
+  if (!candidateBinary && process.env.CODEX_SCHEMA_ALLOW_GLOBAL === "1") {
     candidates.push({ command: "codex", args: ["app-server", "generate-ts", "--out", outDir] });
   }
 

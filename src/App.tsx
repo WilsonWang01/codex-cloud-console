@@ -15,6 +15,7 @@ import {
   Code2,
   Command,
   Copy,
+  CornerUpRight,
   FileText,
   FolderOpen,
   Gauge,
@@ -195,6 +196,15 @@ type ChatSession = {
   compactedAt?: string | null;
   runtimePending?: boolean;
   draft?: ChatDraft | null;
+  queuedTurn?: QueuedTurn | null;
+};
+
+type QueuedTurn = {
+  id: string;
+  preview: string;
+  status: "queued" | "dispatching" | "paused" | "needs_reconciliation";
+  reason?: string | null;
+  createdAt: string;
 };
 
 type ChatRuntime = {
@@ -242,6 +252,7 @@ type ActiveJobsResponse = {
   sessionId: string;
   turn: ActiveJob | null;
   compact: ActiveJob | null;
+  queuedTurn?: QueuedTurn | null;
 };
 
 const runtimeReasoning = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
@@ -3299,6 +3310,7 @@ export function App() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [pendingAction, setBusyAction] = useState<string | null>(null);
   const [streamAction, setStreamAction] = useState<"chat" | "compact" | null>(null);
+  const [queueRestoreBusy, setQueueRestoreBusy] = useState(false);
   const busyAction = pendingAction || streamAction;
   const [mcpLoginBusy, setMcpLoginBusy] = useState<string | null>(null);
   const [codexAccountBusy, setCodexAccountBusy] = useState<"login" | "cancel" | "logout" | null>(null);
@@ -4476,8 +4488,12 @@ export function App() {
       try {
         const result = await api<ActiveJobsResponse>(`/api/chat/active?${new URLSearchParams({ repoId, sessionId }).toString()}`, { signal: controller.signal });
         if (cancelled || selectedRepoIdRef.current !== repoId || activeSessionIdRef.current !== sessionId) return;
+        if (result.queuedTurn !== undefined) {
+          setChatSessions((current) => current.map((session) => session.id === sessionId ? { ...session, queuedTurn: result.queuedTurn } : session));
+        }
         if (result.turn) void attachToActiveJob("turn", result.turn, repoId, sessionId);
         else if (result.compact) void attachToActiveJob("compact", result.compact, repoId, sessionId);
+        else if (["queued", "dispatching"].includes(result.queuedTurn?.status || "")) timer = window.setTimeout(check, 1_000);
         else reconnectBackoff.current = { failures: 0, after: 0 };
       } catch {
         if (!cancelled) timer = window.setTimeout(check, delayStreamReconnect());
@@ -5219,7 +5235,7 @@ export function App() {
     }
   };
 
-  const sendChat = async (overrideMessage?: string, overrideAttachments?: UploadedAttachment[]) => {
+  const sendChat = async (overrideMessage?: string, overrideAttachments?: UploadedAttachment[], busyMode: "queue" | "steer" = "queue") => {
     if (isLoadingChatHistory || uploadInFlight.current || chatSubmissionInFlight.current) return;
     const usingOverride = overrideMessage !== undefined || overrideAttachments !== undefined;
     const message = (overrideMessage ?? chatInput).trim();
@@ -5246,17 +5262,21 @@ export function App() {
       }
       chatSubmissionInFlight.current = submissionId;
       try {
-        await api("/api/codex/turn-steer", {
+        const result = await api<{ queuedTurn: QueuedTurn }>(busyMode === "steer" ? "/api/codex/turn-steer" : "/api/chat/queue", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, message }),
+          body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, message, ...(busyMode === "queue" ? chatRuntime : {}) }),
         });
         if (chatLoadSeq.current === conversationSeq && selectedRepoIdRef.current === chatRepoId && activeSessionIdRef.current === activeSessionId) {
-          setChatMessages((current) => [...current, { id: `${Date.now()}-user-steer`, role: "user", text: message, time: new Date().toISOString() }]);
+          if (busyMode === "steer") {
+            setChatMessages((current) => [...current, { id: `${Date.now()}-user-steer`, role: "user", text: message, time: new Date().toISOString() }]);
+          } else {
+            setChatSessions((current) => current.map((session) => session.id === activeSessionId ? { ...session, queuedTurn: result.queuedTurn } : session));
+          }
         }
         await clearSubmittedDraft();
       } catch (error) {
-        pushEvent({ tone: "warn", title: "补充指令状态未确认", body: `${error instanceof Error ? error.message : "请求未完成"}。输入已保留，请先核对当前任务进展，避免重复发送。` });
+        pushEvent({ tone: "warn", title: busyMode === "steer" ? "补充指令状态未确认" : "排队状态未确认", body: `${error instanceof Error ? error.message : "请求未完成"}。输入已保留，请先核对当前任务进展，避免重复发送。` });
       } finally {
         releaseSubmission();
       }
@@ -5449,6 +5469,32 @@ export function App() {
     } finally {
       releaseSubmission();
       finishConversationStream(stream);
+    }
+  };
+
+  const restoreQueuedTurn = async () => {
+    const repoId = selectedRepo.id;
+    const sessionId = activeSessionId;
+    if (!sessionId || chatSubmissionInFlight.current || queueRestoreBusy) return;
+    setQueueRestoreBusy(true);
+    try {
+      await saveComposerDraft(repoId, sessionId, chatInputRef.current, chatAttachmentsRef.current);
+      const result = await api<{ queuedTurn: QueuedTurn; draft: ChatDraft }>("/api/chat/queue", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId, sessionId }),
+      });
+      composerDrafts.accept(repoId, sessionId, result.draft);
+      composerDrafts.remember(repoId, sessionId, result.draft);
+      setChatSessions((current) => current.map((session) => session.id === sessionId ? { ...session, queuedTurn: null } : session));
+      if (selectedRepoIdRef.current === repoId && activeSessionIdRef.current === sessionId) {
+        setChatInput(result.draft.input);
+        setChatAttachments(result.draft.attachments.map((item) => withAttachmentPreview(selectedRepo, item)));
+      }
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "撤回排队失败", body: error instanceof Error ? error.message : "请核对任务状态后重试" });
+    } finally {
+      setQueueRestoreBusy(false);
     }
   };
 
@@ -6066,6 +6112,9 @@ export function App() {
               onMcpLogin={startMcpLogin}
               onMcpReload={reloadMcpServers}
               onSend={() => sendChat()}
+              onSteer={() => sendChat(undefined, undefined, "steer")}
+              onRestoreQueued={restoreQueuedTurn}
+              queueRestoreBusy={queueRestoreBusy}
               onSubmitReviewComment={(message) => sendChat(message, [])}
               onInterrupt={interruptChat}
               onClear={clearChatHistory}
@@ -8482,6 +8531,9 @@ function CloudChat({
   onMcpLogin,
   onMcpReload,
   onSend,
+  onSteer,
+  onRestoreQueued,
+  queueRestoreBusy,
   onSubmitReviewComment,
   onInterrupt,
   onClear,
@@ -8548,6 +8600,9 @@ function CloudChat({
   onMcpLogin: (serverName: string) => void;
   onMcpReload: () => void;
   onSend: () => void;
+  onSteer: () => void;
+  onRestoreQueued: () => void;
+  queueRestoreBusy: boolean;
   onSubmitReviewComment: (message: string) => void;
   onInterrupt: () => void;
   onClear: () => void;
@@ -8627,6 +8682,7 @@ function CloudChat({
   const [renamingSessionId, setRenamingSessionId] = useState("");
   const [renameDraft, setRenameDraft] = useState("");
   const activeSession = sessions.find((session) => session.id === activeSessionId);
+  const queuedTurn = activeSession?.queuedTurn;
   const displaySessions = useMemo(() => visibleSessionList(sessions, activeSessionId), [activeSessionId, sessions]);
   const activeSessionTitle = sessionDisplayTitle(activeSession);
   const activeSessionSubtitle = historyLoading
@@ -9476,6 +9532,14 @@ function CloudChat({
         onDragOver={handleComposerDragOver}
         onDrop={handleComposerDrop}
       >
+        {queuedTurn && <div className="queued-turn-banner" role="status">
+          <ListTodo size={17} />
+          <span>
+            <strong>{queuedTurn.status === "queued" ? "下一条已排队" : queuedTurn.status === "dispatching" ? "排队消息正在启动" : "排队已暂停，需核对"}</strong>
+            <small>{queuedTurn.reason || queuedTurn.preview}</small>
+          </span>
+          {queuedTurn.status !== "dispatching" && <button type="button" className="mini-action" onClick={onRestoreQueued} disabled={queueRestoreBusy}>{queueRestoreBusy ? "撤回中…" : "撤回到草稿"}</button>}
+        </div>}
         {newProgress && <button className="chat-new-progress" type="button" onClick={() => {
           followChatRef.current = true;
           if (chatWindowRef.current) chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
@@ -10155,7 +10219,7 @@ function CloudChat({
             ref={fileInputRef}
             type="file"
             multiple
-            disabled={historyLoading}
+            disabled={historyLoading || queueRestoreBusy}
             className="hidden-file-input"
             onChange={(event) => {
               if (event.target.files) onFilesSelected(event.target.files);
@@ -10164,7 +10228,7 @@ function CloudChat({
           />
           <textarea
             value={input}
-            disabled={historyLoading}
+            disabled={historyLoading || queueRestoreBusy}
             onChange={(event) => onInput(event.target.value)}
             onPaste={(event) => {
               const files = filesFromTransfer(event.clipboardData);
@@ -10226,7 +10290,7 @@ function CloudChat({
             }}
             placeholder={
               busy
-                ? "补充本轮回复（立即生效）"
+                ? "排队下一条消息"
                 : busyAction === "compact"
                   ? "正在压缩上下文"
                   : repo.kind === "personal" ? repo.executionAvailable ? "向个人助理发送消息" : "个人空间暂未开放执行，可先保存草稿" : "向云端 Codex 发送消息"
@@ -10242,13 +10306,21 @@ function CloudChat({
           >
             {uploadingAttachments ? <Loader2 size={17} className="spin" /> : <Paperclip size={17} />}
           </button>
+          {busy && <button
+            className="icon-command steer-inline"
+            onClick={onSteer}
+            disabled={!input.trim() || attachments.length > 0 || uploadingAttachments || Boolean(queuedTurn && queuedTurn.status === "dispatching")}
+            title="立即补充本轮"
+            aria-label="立即补充本轮"
+            type="button"
+          ><CornerUpRight size={17} /></button>}
           <button
             className="primary-command send-button"
             onClick={onSend}
-            disabled={historyLoading || (repo.kind === "personal" && !repo.executionAvailable) || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
+            disabled={historyLoading || queueRestoreBusy || Boolean(queuedTurn) || (repo.kind === "personal" && !repo.executionAvailable) || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
             aria-label={
               busy
-                ? "补充本轮回复"
+                ? "排队下一条消息"
                 : busyAction === "compact"
                   ? "云端 Codex 正在处理"
                 : input.trim() || attachments.length > 0
@@ -10257,7 +10329,7 @@ function CloudChat({
             }
             type="button"
           >
-            {busy ? <Send size={17} /> : busyAction === "compact" ? <Loader2 size={17} className="spin" /> : <Send size={17} />}
+            {busy ? <ListTodo size={17} /> : busyAction === "compact" ? <Loader2 size={17} className="spin" /> : <Send size={17} />}
           </button>
           <button
             className="icon-command clear-chat"
@@ -10270,6 +10342,10 @@ function CloudChat({
             {busy ? <Pause size={17} /> : <Trash2 size={17} />}
           </button>
         </div>
+        {busy && <div className="composer-busy-actions">
+          <span>发送会排在当前回复之后</span>
+          <button className="mini-action" type="button" onClick={onSteer} disabled={!input.trim() || attachments.length > 0 || uploadingAttachments || Boolean(queuedTurn && queuedTurn.status === "dispatching")}><Send size={14} />立即补充本轮</button>
+        </div>}
         <div className="composer-footer app-composer-footer">
           <div className="composer-footer-left">
             {repo.kind === "personal" ? <button type="button" onClick={() => setActivePanel("sessionSettings")} aria-label={`会话设置：${activeModel?.displayName || runtime.model}，${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}`}><SlidersHorizontal size={15} />{activeModel?.displayName || runtime.model} · {permissionLabel(runtime.sandbox)}</button> : <>
