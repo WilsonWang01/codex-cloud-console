@@ -92,6 +92,17 @@ test("同一幂等键的检查和创建串行执行，失败后可重试", async
   assert.equal(await serialize("failed", () => "retried"), "retried");
 });
 
+test("独立调用方按令牌身份限流，旧共享入口仍按 IP 限流", () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(section(source, "function automationTriggerClientKey", "function consumeAutomationTriggerRate"), context);
+  const client = { apiClient: { id: "client-a" }, ip: "203.0.113.1" };
+  assert.equal(context.automationTriggerClientKey(client, "research"), "client:client-a:research");
+  assert.equal(context.automationTriggerClientKey({ ...client, ip: "203.0.113.2" }, "research"), "client:client-a:research");
+  assert.equal(context.automationTriggerClientKey({ apiClient: { id: "client-b" }, ip: client.ip }, "research"), "client:client-b:research");
+  assert.equal(context.automationTriggerClientKey({ apiClient: { id: "legacy-shared" }, ip: client.ip }, "research"), "ip:203.0.113.1:research");
+});
+
 test("历史裁剪保留运行任务、TTL 内的幂等凭据和可恢复记录", () => {
   const now = Date.now();
   const recent = new Date(now - 1000).toISOString();
@@ -219,12 +230,13 @@ test("会话回写拒绝旧项目、旧请求及错误项目响应", () => {
 test("项目切换清空编辑器且旧文件不能写入新项目", async () => {
   const context = {
     selectedRepo: { id: "A" }, selectedRepoIdRef: { current: "A" },
+    activeSessionIdRef: { current: "A-session" }, chatInputRef: { current: "draft" }, chatAttachmentsRef: { current: [] },
     selectedFile: { repoId: "A", path: "README.md", content: "original", contentHash: "hash" }, fileDraft: "edited",
-    flushComposerDraftRef: { current: async () => {} }, chatLoadSeq: { current: 0 }, fileReadSeq: { current: 0 }, hydratedDraftRef: { current: null },
+    flushComposerDraftRef: { current: async () => { context.flushedDraft = { repoId: context.selectedRepoIdRef.current, sessionId: context.activeSessionIdRef.current, input: context.chatInputRef.current }; } }, chatLoadSeq: { current: 0 }, fileReadSeq: { current: 0 }, hydratedDraftRef: { current: null },
     useCallback: (fn) => fn, pushEvent() {}, window: { localStorage: storage() },
     detachConversationStream() {},
     chatHistoryController: { current: null },
-    setSelectedRepoId: (id) => { context.selectedRepo = { id }; }, setSelectedFile: (file) => { context.selectedFile = file; }, setFileDraft: (draft) => { context.fileDraft = draft; },
+    setSelectedRepoId: (id) => { context.selectedRepo = { id }; }, setSelectedFile: (file) => { context.selectedFile = file; }, setFileDraft: (draft) => { context.fileDraft = draft; }, setIsLoadingChatHistory: (value) => { context.historyLoading = value; },
     api: async () => assert.fail("stale file must not be written"),
   };
   context.editorRef = { current: { file: context.selectedFile, draft: context.fileDraft } };
@@ -235,6 +247,8 @@ test("项目切换清空编辑器且旧文件不能写入新项目", async () =>
   vm.runInContext("switchRepoConversation('B')", context);
   assert.equal(context.selectedFile, null);
   assert.equal(context.fileDraft, "");
+  assert.deepEqual(context.flushedDraft, { repoId: "A", sessionId: "A-session", input: "draft" });
+  assert.equal(context.historyLoading, true);
   assert.match(context.window.localStorage.getItem("codex-cloud-editor:A:README.md"), /edited/);
   context.selectedFile = { repoId: "A", path: "README.md" };
   await vm.runInContext("saveAgentFile()", context);

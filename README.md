@@ -4,7 +4,7 @@
 
 在自己的电脑或 EC2 上运行 Codex，通过网页管理多个项目和会话。代码、工作区与任务记录保存在你管理的主机上；模型请求仍会发送给配置的模型服务，并非离线运行。
 
-[快速开始](#快速开始) · [日常使用](#日常使用) · [部署与接入](docs/setup.md) · [常见问题](#常见问题)
+[快速开始](#快速开始) · [日常使用](#日常使用) · [AWS 从零部署](docs/aws-getting-started.md) · [部署与接入](docs/setup.md) · [常见问题](#常见问题)
 
 > [!NOTE]
 > 独立社区项目，非 OpenAI 或 AWS 官方产品。它是自托管 Codex 的 Web 控制台，不是 OpenAI 托管的 Codex Cloud 服务，也不承诺覆盖 Codex App 的全部功能。
@@ -98,6 +98,12 @@ npm run dev
 
 部分入口需要先建立正式 Codex 会话。模型是否可用，以服务器账号和 app-server 返回结果为准；修改显示名称或升级控制台不会授予模型权限。
 
+### 个人空间与待审批
+
+侧栏顶部可在“个人 / 工作”之间切换。个人空间有独立的对话与草稿；**当前生产版本仅开放整理草稿，不开放模型执行**。独立低权限 worker、双向文件权限隔离尚未完成，不能在此保存敏感个人资料，也不要把空间切换当成操作系统级隔离。开发环境的有限预览需显式设置 `CODEX_PERSONAL_PREVIEW=1`，生产模式不会启用。
+
+Codex 请求执行命令、改文件、扩大权限或补充信息时，页面会显示待处理请求，操作人逐项确认或拒绝。无人处理、超时和断线默认拒绝；原本无人值守的自动化可能因此失败，升级线上服务前应检查任务是否依赖自动批准。
+
 ### 查看改动与运行 Review
 
 1. 输入 `/review` 打开面板，仅查看变更**不会自动启动模型审查**。
@@ -122,6 +128,31 @@ npm run dev
 
 **目前不是可视化任务编排器**：任务定义、提示词和系统定时器需预先配置；Heartbeat 是续跑接口，本身不负责定时。完整请求示例见[自动化接入](docs/setup.md#自动化接入)。
 
+“调用与用量”可按服务查看请求、运行与已知 token 趋势，创建范围限定到自动化的独立令牌，或撤销旧令牌。新令牌只显示一次；请求记录默认保留约 30 天。缺失完整单轮用量的运行标为“未知”，token 数不是美元账单。接入步骤见[独立调用方](docs/setup.md#独立调用方)，[验收与未完成项](docs/acceptance/2026-09-26-personal-api-mobile.md)列出当前边界。
+
+## 第一次部署到 AWS
+
+**已有服务器先复用；只是试用可以先本地运行。** 新账号按 [AWS 从注册到部署指南](docs/aws-getting-started.md)逐步完成：确认账号计划与费用 → 注册及 MFA → 选区域与配置 → 确认费用 → 创建 EC2 → SSM/SSH 连接 → 部署和 HTTPS → 备份与验收。
+
+| 使用场景 | 起步配置建议 | 注意事项 |
+| --- | --- | --- |
+| 轻量试用 | `t3.small`，2 vCPU / 2 GiB，30 GiB gp3 | 构建、浏览器容易触及内存限制 |
+| 日常个人使用 | **`t3.medium`，2 vCPU / 4 GiB，40 GiB gp3** | 推荐评估起点，Ubuntu x86_64；不是免费或性能保证 |
+| 较重浏览器/构建 | `t3.large`，2 vCPU / 8 GiB，60 GiB gp3 | 依据实测选择，并发还受 CPU 与模型额度限制 |
+
+实例规格见 [AWS T3](https://aws.amazon.com/ec2/instance-types/t3/)，容量与用途是本项目建议。完整费用还包括磁盘、公网 IP、流量、备份和模型服务，按区域用 [AWS Calculator](https://calculator.aws/) 估算，不只看实例单价。
+
+> [!WARNING]
+> 不要为了部署单台服务器或减少登录，默认创建 AWS Organizations 或配置 Control Tower。它们可能触发免费计划升级与赠金失效；预算提醒也不是实时费用硬上限。先阅读指南中的[费用边界](docs/aws-getting-started.md#费用与计划)，创建资源、升级套餐、停机或删除数据前确认影响。
+
+仓库附带 [codex-cloud-setup Skill](.agents/skills/codex-cloud-setup/SKILL.md)。在支持项目 Skill 的 Codex 中打开本仓库，可输入：
+
+```text
+$codex-cloud-setup 带我部署这个项目。先只读确认我是否已有账号和服务器，解释费用与推荐配置；任何收费、停机或删除操作先让我确认。
+```
+
+Skill 引导操作，不绕过注册、付款或登录确认；未自动发现时可让代理直接读取该 `SKILL.md`。详细命令继续以[部署文档](docs/setup.md)为准。
+
 ## 数据与部署
 
 本地开发默认数据位置：
@@ -141,6 +172,10 @@ EC2 参考部署使用 systemd 常驻服务、认证 HTTPS 和独立的数据目
 - [通过 SSM / SSH 访问 EC2](docs/aws-instance-access.md)
 - [架构与信任边界](docs/architecture.md)
 - [安全要求](SECURITY.md)
+
+## 规划中的能力
+
+[Personal Agent 统一方案](docs/personal-agent-roadmap.md)整合 Muse、Today、Grok Bot 对标与项目路线图。当前仅完成部分安全基础、个人空间壳、独立调用令牌与初步用量页面；独立 worker、持久任务队列、完整个人助理与真实外部产品适配尚未交付。**实现与验收状态以[验收报告](docs/acceptance/2026-09-26-personal-api-mobile.md)为准**；AWS 指南与配套 Skill 已随仓库提供。
 
 ## 常见问题
 

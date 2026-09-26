@@ -2,6 +2,7 @@ import { DraftPersistence } from "./draft-persistence";
 import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
 import {
   Activity,
+  BriefcaseBusiness,
   Bell,
   Bot,
   Brain,
@@ -39,6 +40,7 @@ import {
   Terminal,
   Timer,
   Trash2,
+  UserRound,
   Wifi,
   X,
 } from "lucide-react";
@@ -47,6 +49,7 @@ import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent
 
 const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = lazy(() => import("./CodexPluginManager"));
+const LazyUsageView = lazy(() => import("./UsageView"));
 
 type RunEvent = {
   id: string;
@@ -56,9 +59,21 @@ type RunEvent = {
   body: string;
 };
 
-type ActiveView = "inbox" | "automations" | "cli" | "agent" | "logs" | "settings";
+type ActiveView = "inbox" | "automations" | "cli" | "agent" | "logs" | "settings" | "usage";
 type CloudConnection = "checking" | "cloud" | "degraded" | "local" | "offline";
 type ActiveCodexJob = NonNullable<ConsoleStatus["activeJobs"]>[number];
+type PendingApproval = {
+  id: string;
+  method: string;
+  digest: string;
+  owner: { repoId: string | null; sessionId: string | null };
+  createdAt: string;
+  expiresAt: string;
+  params: Record<string, unknown> & {
+    questions?: Array<{ id: string; question: string; isSecret?: boolean; options?: Array<{ label: string }> }>;
+    message?: string;
+  };
+};
 
 type BrowserPushReadiness = {
   secureContext: boolean;
@@ -83,7 +98,7 @@ type AppRoute = {
 
 const defaultRepoId = "sample-app";
 const defaultAutomationId = "sample-maintenance";
-const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings"]);
+const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings", "usage"]);
 
 type GlobalSearchResult = {
   id: string;
@@ -3202,7 +3217,7 @@ export function App() {
   const [status, setStatus] = useState<ConsoleStatus>(fallbackStatus);
   const [cloudConnection, setCloudConnection] = useState<CloudConnection>("checking");
   const [selectedAutomationId, setSelectedAutomationId] = useState(initialRoute.automationId || defaultAutomationId);
-  const [selectedRepoId, setSelectedRepoId] = useState(initialRoute.repoId || defaultRepoId);
+  const [selectedRepoId, setSelectedRepoId] = useState(initialRoute.repoId || window.localStorage.getItem("codex-cloud-last-space-repo") || defaultRepoId);
   const [activeView, setActiveView] = useState<ActiveView>(initialRoute.view);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -3284,6 +3299,7 @@ export function App() {
   const chatRuntimeRef = useRef<ChatRuntime>(defaultChatRuntime);
   const statusRef = useRef<ConsoleStatus>(fallbackStatus);
   const selectedRepoIdRef = useRef(selectedRepoId);
+  const lastWorkRepoId = useRef(window.localStorage.getItem("codex-cloud-last-work-repo") || defaultRepoId);
   const activeSessionIdRef = useRef(activeSessionId);
   const chatInputRef = useRef(chatInput);
   const chatAttachmentsRef = useRef<UploadedAttachment[]>(chatAttachments);
@@ -3306,7 +3322,18 @@ export function App() {
     () => status.repos.find((item) => item.id === selectedRepoId) || status.repos[0],
     [selectedRepoId, status.repos],
   );
+  useEffect(() => {
+    if (!statusReady || !selectedRepo || selectedRepo.id !== selectedRepoId) return;
+    window.localStorage.setItem("codex-cloud-last-space-repo", selectedRepo.id);
+    if (selectedRepo.kind !== "personal") {
+      lastWorkRepoId.current = selectedRepo.id;
+      window.localStorage.setItem("codex-cloud-last-work-repo", selectedRepo.id);
+    }
+  }, [selectedRepo, selectedRepoId, statusReady]);
   const repoSelectionReady = statusReady && status.repos.some((item) => item.id === selectedRepoId);
+  useEffect(() => {
+    if (repoSelectionReady && selectedRepo.kind === "personal" && !["cli", "settings", "usage"].includes(activeView)) setActiveView("cli");
+  }, [activeView, repoSelectionReady, selectedRepo]);
   const selectedAutomation = useMemo(
     () =>
       status.automations.find((item) => item.id === selectedAutomationId && item.repoId === selectedRepoId) ||
@@ -3314,6 +3341,7 @@ export function App() {
       status.automations[0],
     [selectedAutomationId, selectedRepoId, status.automations],
   );
+  const selectedAutomationRepo = selectedAutomation ? status.repos.find((repo) => repo.id === selectedAutomation.repoId) : undefined;
   const selectedAutomationRuns = useMemo(
     () =>
       (status.automationRuns || [])
@@ -3388,6 +3416,7 @@ export function App() {
       setFileDraft("");
       void flushComposerDraftRef.current();
       chatLoadSeq.current += 1;
+      setIsLoadingChatHistory(true);
       setChatSessions([]);
       setActiveSessionId("");
       setChatMessages([]);
@@ -4158,7 +4187,8 @@ export function App() {
   useEffect(() => {
     const onHashChange = () => {
       const route = parseAppHash();
-      setActiveView(route.view);
+      const targetRepo = statusRef.current.repos.find((repo) => repo.id === (route.repoId || selectedRepoIdRef.current));
+      setActiveView(targetRepo?.kind === "personal" && !["cli", "settings", "usage"].includes(route.view) ? "cli" : route.view);
       if (route.automationId) setSelectedAutomationId(route.automationId);
       if (route.view === "cli" && route.sessionId && (!route.repoId || route.repoId === selectedRepoIdRef.current)) {
         void flushComposerDraft();
@@ -4826,7 +4856,7 @@ export function App() {
     const controller = new AbortController();
     setGlobalSessionSearchLoading(true);
     const timer = window.setTimeout(() => {
-      const params = new URLSearchParams({ q: search, limit: "12" });
+      const params = new URLSearchParams({ q: search, limit: "12", space: selectedRepo?.kind === "personal" ? "personal" : "work" });
       api<ChatSearchResponse>(`/api/chat/search?${params.toString()}`, { signal: controller.signal })
         .then((result) => {
           if (requestSeq !== globalSearchSeq.current || result.query !== search) return;
@@ -4844,7 +4874,7 @@ export function App() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [query]);
+  }, [query, selectedRepo?.kind]);
 
   const globalSearchResults = useMemo<GlobalSearchResult[]>(() => {
     const search = query.trim().toLowerCase();
@@ -4855,6 +4885,7 @@ export function App() {
     const pushSessionResult = (session: ChatSession) => {
       if (isDraftChatSession(session)) return;
       const repo = status.repos.find((item) => item.id === session.repoId);
+      if ((repo?.kind === "personal") !== (selectedRepo?.kind === "personal")) return;
       const resultId = `session:${session.repoId}:${session.id}`;
       if (sessionResultIds.has(resultId)) return;
       if (!matches(sessionDisplayTitle(session), session.id, session.codexSessionId, repo?.name, sessionSubtitle(session))) return;
@@ -4875,11 +4906,12 @@ export function App() {
       { view: "agent", label: "Agent", hint: "文件、终端和浏览器工具" },
       { view: "logs", label: "日志", hint: `${status.logs.length} 个最近日志` },
       { view: "settings", label: "设置", hint: "云端入口、权限和实例信息" },
+      { view: "usage", label: "调用与用量", hint: "外部服务请求和 token" },
     ];
-    for (const item of viewItems) {
+    for (const item of viewItems.filter((item) => selectedRepo?.kind !== "personal" || ["cli", "settings", "usage"].includes(item.view))) {
       if (matches(item.label, item.hint, item.view)) results.push({ id: `view:${item.view}`, kind: "view", label: item.label, hint: item.hint, view: item.view });
     }
-    for (const repo of status.repos) {
+    for (const repo of status.repos.filter((item) => (item.kind === "personal") === (selectedRepo?.kind === "personal"))) {
       if (matches(repo.name, repo.id, repo.remote, repo.branch, repo.path)) {
         results.push({
           id: `project:${repo.id}`,
@@ -4892,7 +4924,7 @@ export function App() {
     }
     for (const session of chatSessions) pushSessionResult(session);
     for (const session of globalSessionMatches) pushSessionResult(session);
-    for (const automation of status.automations) {
+    for (const automation of status.automations.filter((item) => selectedRepo?.kind !== "personal" || item.repoId === selectedRepo.id)) {
       const repo = status.repos.find((item) => item.id === automation.repoId);
       if (matches(automation.name, automation.id, automation.schedule, automation.prompt, repo?.name)) {
         results.push({
@@ -4905,7 +4937,7 @@ export function App() {
         });
       }
     }
-    for (const log of status.logs) {
+    for (const log of selectedRepo?.kind === "personal" ? [] : status.logs) {
       if (matches(log.name, log.job, log.tail.join(" "))) {
         results.push({
           id: `log:${log.name}`,
@@ -4917,7 +4949,7 @@ export function App() {
       }
     }
     return results.slice(0, 12);
-  }, [chatSessions, globalSessionMatches, query, status]);
+  }, [chatSessions, globalSessionMatches, query, selectedRepo, status]);
 
   const openGlobalSearchResult = (result: GlobalSearchResult) => {
     setQuery("");
@@ -5733,6 +5765,12 @@ export function App() {
         statusReady={statusReady}
         activeView={activeView}
         selectedRepoId={selectedRepoId}
+        onSelectSpace={(space) => {
+          const target = space === "personal"
+            ? status.repos.find((repo) => repo.kind === "personal")
+            : status.repos.find((repo) => repo.id === lastWorkRepoId.current && repo.kind !== "personal") || status.repos.find((repo) => repo.kind !== "personal");
+          if (target) { selectRepo(target.id); setActiveView("cli"); }
+        }}
         sessions={chatSessions}
         activeSessionId={activeSessionId}
         historyLoading={isLoadingChatHistory}
@@ -5758,7 +5796,8 @@ export function App() {
       )}
 
       <section className="workspace">
-        <TopBar
+        <div className="workspace-header">
+          <TopBar
           status={status}
           activeView={activeView}
           cloudConnection={cloudConnection}
@@ -5770,7 +5809,9 @@ export function App() {
           searchResults={globalSearchResults}
           searchLoading={globalSessionSearchLoading}
           onSearchSelect={openGlobalSearchResult}
-        />
+          />
+          <PendingApprovals />
+        </div>
 
         {activeView === "inbox" && (
           <div className="content-grid inbox-content-grid">
@@ -5798,6 +5839,8 @@ export function App() {
           </div>
         )}
 
+        {activeView === "usage" && <Suspense fallback={<div className="usage-view">加载用量中...</div>}><LazyUsageView automations={status.automations} /></Suspense>}
+
         {activeView === "automations" && (
           <div className="content-grid">
             <section className="panel automation-panel" aria-label="自动化任务">
@@ -5809,7 +5852,7 @@ export function App() {
                     key={automation.id}
                     automation={automation}
                     repo={status.repos.find((repo) => repo.id === automation.repoId)}
-                    selected={automation.id === selectedAutomation.id}
+                    selected={automation.id === selectedAutomation?.id}
                     onSelect={() => {
                       switchRepoConversation(automation.repoId);
                       setSelectedAutomationId(automation.id);
@@ -5819,11 +5862,11 @@ export function App() {
               </div>
             </section>
 
-            <section className="thread-panel">
+            {selectedAutomation && selectedAutomationRepo ? <section className="thread-panel">
               <RunThread
                 status={status}
                 automation={selectedAutomation}
-                repo={selectedRepo}
+                repo={selectedAutomationRepo}
                 runs={selectedAutomationRuns}
                 events={events}
                 busyAction={busyAction}
@@ -5847,17 +5890,17 @@ export function App() {
                   )
                 }
                 onPull={() =>
-                  runAction(`pull-${selectedRepo.id}`, "同步仓库", () =>
-                    api(`/api/repos/${selectedRepo.id}/pull`, { method: "POST" }),
+                  runAction(`pull-${selectedAutomationRepo.id}`, "同步仓库", () =>
+                    api(`/api/repos/${selectedAutomationRepo.id}/pull`, { method: "POST" }),
                   )
                 }
                 onOpenLog={openFullLog}
               />
-            </section>
+            </section> : <section className="thread-panel usage-empty">{selectedAutomation ? "自动化引用的项目不可用" : "暂无自动化任务"}</section>}
 
             <aside className="right-rail">
               <CloudStatus status={status} cloudConnection={cloudConnection} onOpenThread={openAttentionThread} />
-              <RepoCard repo={selectedRepo} />
+              {selectedAutomationRepo && <RepoCard repo={selectedAutomationRepo} />}
             </aside>
           </div>
         )}
@@ -6049,6 +6092,7 @@ function Sidebar({
   statusReady,
   activeView,
   selectedRepoId,
+  onSelectSpace,
   sessions,
   activeSessionId,
   historyLoading,
@@ -6064,6 +6108,7 @@ function Sidebar({
   statusReady: boolean;
   activeView: ActiveView;
   selectedRepoId: string;
+  onSelectSpace: (space: "personal" | "work") => void;
   sessions: ChatSession[];
   activeSessionId: string;
   historyLoading: boolean;
@@ -6076,6 +6121,8 @@ function Sidebar({
   onSelectRepo: (id: string) => void;
 }) {
   const [sessionsExpanded, setSessionsExpanded] = useState(false);
+  const isPersonal = status.repos.some((repo) => repo.id === selectedRepoId && repo.kind === "personal");
+  const hasPersonal = status.repos.some((repo) => repo.kind === "personal");
   const repoSessions = sessions
     .filter((session) => session.repoId === selectedRepoId)
     .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
@@ -6105,43 +6152,52 @@ function Sidebar({
         </button>
       </div>
 
+      <div className="space-switch" role="group" aria-label="空间">
+        <button type="button" className={cx(isPersonal && "selected")} disabled={!hasPersonal} onClick={choose(() => onSelectSpace("personal"))}><UserRound size={16} />个人</button>
+        <button type="button" className={cx(!isPersonal && "selected")} onClick={choose(() => onSelectSpace("work"))}><BriefcaseBusiness size={16} />工作</button>
+      </div>
+
       <nav className="nav-stack">
-        <button className={cx("nav-item", activeView === "inbox" && "active")} onClick={choose(() => onSelectView("inbox"))}>
+        {!isPersonal && <button className={cx("nav-item", activeView === "inbox" && "active")} onClick={choose(() => onSelectView("inbox"))}>
           <CheckCircle2 size={18} />
           <span>收件箱</span>
           <small>{statusReady ? attentionCount(status) : "..."}</small>
-        </button>
-        <button className={cx("nav-item", activeView === "automations" && "active")} onClick={choose(() => onSelectView("automations"))}>
+        </button>}
+        {!isPersonal && <button className={cx("nav-item", activeView === "automations" && "active")} onClick={choose(() => onSelectView("automations"))}>
           <Activity size={18} />
           <span>自动化</span>
           <small>{status.automations.length}</small>
+        </button>}
+        <button className={cx("nav-item", activeView === "usage" && "active")} onClick={choose(() => onSelectView("usage"))}>
+          <Gauge size={18} />
+          <span>调用与用量</span>
         </button>
         <button className={cx("nav-item", activeView === "cli" && "active")} onClick={choose(onNewChat)}>
           <MessageSquare size={18} />
           <span>新对话</span>
         </button>
-        <button className={cx("nav-item", activeView === "agent" && "active")} onClick={choose(() => onSelectView("agent"))}>
+        {!isPersonal && <button className={cx("nav-item", activeView === "agent" && "active")} onClick={choose(() => onSelectView("agent"))}>
           <SlidersHorizontal size={18} />
           <span>Agent</span>
-        </button>
-        <button className={cx("nav-item", activeView === "logs" && "active")} onClick={choose(() => onSelectView("logs"))}>
+        </button>}
+        {!isPersonal && <button className={cx("nav-item", activeView === "logs" && "active")} onClick={choose(() => onSelectView("logs"))}>
           <History size={18} />
           <span>日志</span>
-        </button>
+        </button>}
         <button className={cx("nav-item", activeView === "settings" && "active")} onClick={choose(() => onSelectView("settings"))}>
           <Settings2 size={18} />
           <span>设置</span>
         </button>
       </nav>
 
-      <div className="sidebar-section">
+      {!isPersonal && <div className="sidebar-section">
         <div className="sidebar-section-title">
           <p>项目</p>
           <button onClick={choose(onNewProject)} title="新建项目" type="button">
             <Plus size={14} />
           </button>
         </div>
-        {status.repos.map((repo) => (
+        {status.repos.filter((repo) => repo.kind !== "personal").map((repo) => (
           <button
             key={repo.id}
             className={cx("project-item", selectedRepoId === repo.id && "selected")}
@@ -6152,12 +6208,12 @@ function Sidebar({
             <ChevronRight size={15} />
           </button>
         ))}
-      </div>
+      </div>}
 
       <div className="sidebar-section thread-sidebar-section">
         <div className="sidebar-section-title">
           <span className="sidebar-section-heading">
-            <span>对话</span>
+            <span>{isPersonal ? "个人对话" : "对话"}</span>
             {projectSessions.length > 0 && <small>{projectSessions.length}</small>}
           </span>
           <button onClick={choose(onNewChat)} title="新建对话" type="button">
@@ -7047,6 +7103,115 @@ function PanelTitle({
         <RefreshCw size={18} className={cx(spinning && "spin")} />
       </button>
     </div>
+  );
+}
+
+function PendingApprovals() {
+  const [pending, setPending] = useState<PendingApproval[]>([]);
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [elicitation, setElicitation] = useState("{}");
+
+  const refresh = useCallback(async () => {
+    try {
+      const result = await api<{ pending: PendingApproval[] }>("/api/approvals", { cache: "no-store" });
+      setPending(Array.isArray(result.pending) ? result.pending : []);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法同步审批状态");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, 3000);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [refresh]);
+
+  const decide = async (item: PendingApproval, decision: "accept" | "decline") => {
+    if (busyId) return;
+    if (decision === "accept" && item.method === "item/permissions/requestApproval" &&
+      !window.confirm("仅批准此轮请求中显示的权限。确认继续吗？")) return;
+    const payload: Record<string, unknown> = { decision, digest: item.digest };
+    if (decision === "accept" && item.method === "item/tool/requestUserInput") {
+      const values: Record<string, string[]> = {};
+      for (const question of item.params.questions || []) {
+        const value = answers[`${item.id}:${question.id}`]?.trim();
+        if (!value) { setError(`请回答：${question.question}`); return; }
+        values[question.id] = [value];
+      }
+      payload.answers = values;
+    }
+    if (decision === "accept" && item.method === "mcpServer/elicitation/request") {
+      try {
+        const content = JSON.parse(elicitation) as unknown;
+        if (!content || typeof content !== "object" || Array.isArray(content)) throw new Error("请输入 JSON 对象");
+        payload.content = content;
+      } catch { setError("请输入有效的 JSON 对象"); return; }
+    }
+    setBusyId(item.id);
+    try {
+      await api(`/api/approvals/${encodeURIComponent(item.id)}/decision`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setAnswers({});
+      setElicitation("{}");
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "决定未提交");
+      await refresh();
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  if (!pending.length) return null;
+  return (
+    <section className="pending-approvals" aria-label="待处理请求" aria-live="polite">
+      <div className="pending-approvals-head"><ShieldCheck size={18} /><strong>待确认 · {pending.length}</strong></div>
+      {pending.map((item) => {
+        const questions = item.params.questions || [];
+        const inputRequest = item.method === "item/tool/requestUserInput";
+        const mcpRequest = item.method === "mcpServer/elicitation/request";
+        const label = inputRequest ? "补充信息" : mcpRequest ? "MCP 授权" : item.method.includes("permissions") ? "额外权限" : item.method.toLowerCase().includes("file") || item.method === "applyPatchApproval" ? "文件修改" : "命令执行";
+        return (
+          <div className="pending-approval" key={item.id}>
+            <div className="pending-approval-heading"><strong>{label}</strong><span>{item.owner.repoId || "当前任务"} · {new Date(item.expiresAt).toLocaleTimeString()} 过期</span></div>
+            {(typeof item.params.command === "string" || typeof item.params.reason === "string" || typeof item.params.grantRoot === "string") && <p className="pending-approval-summary">{String(item.params.command || item.params.reason || item.params.grantRoot)}</p>}
+            {item.params.message && <p>{item.params.message}</p>}
+            {inputRequest && questions.map((question) => (
+              <label className="pending-approval-question" key={question.id}>
+                <span>{question.question}</span>
+                {question.options?.length ? (
+                  <select value={answers[`${item.id}:${question.id}`] || ""} onChange={(event) => setAnswers((current) => ({ ...current, [`${item.id}:${question.id}`]: event.target.value }))}>
+                    <option value="">请选择</option>
+                    {question.options.map((option) => <option key={option.label} value={option.label}>{option.label}</option>)}
+                  </select>
+                ) : (
+                  <input type={question.isSecret ? "password" : "text"} autoComplete="off" value={answers[`${item.id}:${question.id}`] || ""} onChange={(event) => setAnswers((current) => ({ ...current, [`${item.id}:${question.id}`]: event.target.value }))} />
+                )}
+              </label>
+            ))}
+            {mcpRequest && item.params.mode !== "url" && <textarea aria-label="MCP 结构化回答" value={elicitation} onChange={(event) => setElicitation(event.target.value)} rows={3} />}
+            <details><summary>查看完整请求</summary><pre>{JSON.stringify(item.params, null, 2)}</pre></details>
+            <div className="pending-approval-actions">
+              <button type="button" disabled={Boolean(busyId)} onClick={() => void decide(item, "decline")}>拒绝</button>
+              {item.params.mode !== "url" && <button type="button" disabled={Boolean(busyId)} onClick={() => void decide(item, "accept")}>同意本次</button>}
+            </div>
+          </div>
+        );
+      })}
+      {error && <p className="pending-approval-error" role="alert">{error}</p>}
+    </section>
   );
 }
 
@@ -8299,6 +8464,8 @@ function CloudChat({
   const baseConnection = connectionState(status, cloudConnection);
   const connection = historyError
     ? { label: "会话服务降级", tone: "warn" as const, detail: historyError }
+    : repo.kind === "personal" && !repo.executionAvailable && cloudConnection !== "offline"
+      ? { label: "仅草稿", tone: "warn" as const, detail: "个人空间执行尚未开放" }
     : baseConnection;
   const attention = getAttentionSummary(status);
   const activeAccountLogin = appStatus.accountLogin?.active || null;
@@ -8591,7 +8758,9 @@ function CloudChat({
       controller.abort();
     };
   }, [inlineTrigger?.query, mentionMode, repo.id]);
-  const permissionProfiles = [
+  const permissionProfiles = repo.kind === "personal" ? [{
+    id: "personal-read-only", label: "个人空间只读", description: "预览模式固定为只读并逐次请求额外权限。", sandbox: "read-only", approval: "on-request",
+  }] : [
     {
       id: "read-only",
       label: "只读",
@@ -8804,6 +8973,7 @@ function CloudChat({
     },
   ];
   const filteredCommands = slashCommands.filter((command) => {
+    if (repo.kind === "personal" && ["review", "diff", "project"].includes(command.id)) return false;
     const haystack = `${command.id} ${command.label} ${command.hint} ${(command.aliases || []).join(" ")}`.toLowerCase();
     return haystack.includes(commandQuery);
   });
@@ -8847,6 +9017,7 @@ function CloudChat({
     const projectMode = query.startsWith("project:");
     const projectQuery = projectMode ? query.slice("project:".length) : query;
     const projectCandidates = status.repos
+      .filter((item) => (item.kind === "personal") === (repo.kind === "personal"))
       .filter((item) => !projectQuery || item.id.toLowerCase().includes(projectQuery) || item.name.toLowerCase().includes(projectQuery))
       .slice(0, 6)
       .map((item) => ({
@@ -9034,6 +9205,11 @@ function CloudChat({
           <span>{historyError}</span>
         </div>
       )}
+
+      {repo.kind === "personal" && <div className="personal-scope-notice" role="status">
+        <UserRound size={16} />
+        <span>{repo.executionAvailable ? "个人空间预览：会话独立，执行仅只读；尚未建立独立系统用户的权限隔离，请勿提交敏感资料。" : "个人空间已建立独立会话与草稿；执行需先配置并验收独立 worker，当前可先整理草稿。"}</span>
+      </div>}
 
       <div className="chat-window" aria-busy={historyLoading}>
         {historyLoading && messages.length === 0 && (
@@ -9774,7 +9950,7 @@ function CloudChat({
               }
               if (event.key === "Enter" && !event.shiftKey && !composing) {
                 event.preventDefault();
-                onSend();
+                if (repo.kind !== "personal" || repo.executionAvailable) onSend();
               }
             }}
             placeholder={
@@ -9782,13 +9958,13 @@ function CloudChat({
                 ? "继续补充当前回复"
                 : busyAction === "compact"
                   ? "正在压缩上下文"
-                  : "向云端 Codex 发送消息"
+                  : repo.kind === "personal" ? repo.executionAvailable ? "向个人助理发送消息" : "个人空间暂未开放执行，可先保存草稿" : "向云端 Codex 发送消息"
             }
           />
           <button
             className="icon-command attach-button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={historyLoading || Boolean(busyAction) || uploadingAttachments}
+            disabled={historyLoading || Boolean(busyAction) || uploadingAttachments || repo.kind === "personal"}
             title="上传截图或文件"
             aria-label={uploadingAttachments ? "正在上传附件" : "上传截图或文件"}
             type="button"
@@ -9798,7 +9974,7 @@ function CloudChat({
           <button
             className="primary-command send-button"
             onClick={onSend}
-            disabled={historyLoading || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
+            disabled={historyLoading || (repo.kind === "personal" && !repo.executionAvailable) || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
             aria-label={
               busy || busyAction === "compact"
                 ? "云端 Codex 正在处理"

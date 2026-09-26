@@ -1,5 +1,7 @@
 export type Repo = {
   id: string;
+  kind?: "work" | "personal";
+  executionAvailable?: boolean;
   name: string;
   path: string;
   remote: string;

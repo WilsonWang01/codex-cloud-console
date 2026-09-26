@@ -665,11 +665,22 @@ await check("startup recovery continues one recent interrupted automation in the
         "idempotency-key": recoveryKey,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ prompt: "explicit retry should deduplicate", worktree: false, completionContract: recoveryContract }),
+      body: JSON.stringify({ prompt: "startup retry must wait for recovery", worktree: false, completionContract: recoveryContract }),
     });
     assert.equal(replay.response.status, 200);
     assert.equal(replay.data.deduplicated, true);
     assert.equal(replay.data.run?.id, recoveryRun.id);
+
+    const conflictingReplay = await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/sample-research/webhook", {
+      method: "POST",
+      headers: {
+        "x-codex-cloud-token": "regression-token-123456",
+        "idempotency-key": recoveryKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ prompt: "different prompt", worktree: false, completionContract: recoveryContract }),
+    });
+    assert.equal(conflictingReplay.response.status, 409);
 
     await stopProcess(firstServer);
     firstServer = null;
@@ -840,6 +851,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_STATE_ROOT: stateRoot,
       CODEX_HOME: codexHome,
       CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
+      CODEX_PERSONAL_PREVIEW: "0",
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
       CODEX_TURN_TIMEOUT_MS: "300",
       CODEX_ALLOW_LOCAL_FALLBACK: "0",
@@ -897,6 +909,19 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(serializedStatus.includes("/bin/bash -lc"), false);
     assert.equal(serializedStatus.includes("shell: codex doctor"), true);
     assert.equal(serializedStatus.includes("terminal: deploy cloud console release"), true);
+    assert.ok(statusData.repos.some((repo) => repo.id === "_personal" && repo.kind === "personal" && repo.executionAvailable === false));
+    const blockedPersonalChat = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", message: "do not execute" }),
+    });
+    assert.equal(blockedPersonalChat.response.status, 503);
+    const blockedPersonalAttachment = await jsonRequest(baseUrl, "/api/chat/stream", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", message: "", attachments: [{ path: ".codex-cloud/uploads/test.txt" }] }),
+    });
+    assert.equal(blockedPersonalAttachment.response.status, 503);
+    const blockedPersonalWrite = await jsonRequest(baseUrl, "/api/files/write", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", path: "note.txt", content: "must not write" }),
+    });
+    assert.equal(blockedPersonalWrite.response.status, 403);
     const commandAudit = statusData.auditEvents.find((event) => event.id === "audit-regression-command-path");
     assert.ok(commandAudit);
     assert.equal(commandAudit.detail.includes(cloudRoot), false);
@@ -993,6 +1018,29 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(created.response.status, 200);
     const sessionId = created.data.activeSessionId;
     assert.equal(created.data.sessions.find((session) => session.id === sessionId)?.model, "gpt-5.6-terra");
+    const personalSession = await jsonRequest(baseUrl, "/api/chat/sessions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal" }),
+    });
+    assert.equal(personalSession.response.status, 200);
+    assert.equal(personalSession.data.sessions.find((session) => session.id === personalSession.data.activeSessionId)?.sandbox, "read-only");
+    const crossSpaceSelection = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(personalSession.data.activeSessionId)}/select`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app" }),
+    });
+    assert.equal(crossSpaceSelection.response.status, 404);
+    const personalExecution = await jsonRequest(baseUrl, "/api/chat/stream", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", message: "test" }),
+    });
+    assert.equal(personalExecution.response.status, 503);
+    const personalWrite = await jsonRequest(baseUrl, "/api/files/write", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", path: "test.txt", content: "test" }),
+    });
+    assert.equal(personalWrite.response.status, 403);
+    const personalTerminal = await jsonRequest(baseUrl, "/api/terminal/run", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", command: "pwd" }),
+    });
+    assert.equal(personalTerminal.response.status, 403);
+    const personalPull = await jsonRequest(baseUrl, "/api/repos/_personal/pull", { method: "POST" });
+    assert.equal(personalPull.response.status, 400);
     const invalidRepo = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1179,6 +1227,46 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       body: "{}",
     });
     assert.equal(tokenHeader.response.status, 404);
+    const newClient = await jsonRequest(baseUrl, "/api/clients", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "regression-service", automationIds: ["sample-on-demand"] }),
+    });
+    assert.equal(newClient.response.status, 201);
+    assert.equal(JSON.stringify(newClient.data.client).includes(newClient.data.token), false);
+    const scopedHeaders = { "x-codex-cloud-token": newClient.data.token, "content-type": "application/json" };
+    const outOfScope = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ worktree: false }),
+    });
+    assert.equal(outOfScope.response.status, 401);
+    const missingKey = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: scopedHeaders, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+    });
+    assert.equal(missingKey.response.status, 400);
+    const clientTrigger = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+    });
+    assert.equal(clientTrigger.response.status, 200);
+    assert.equal(clientTrigger.data.run.clientId, newClient.data.client.id);
+    const clientReplay = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+    });
+    assert.equal(clientReplay.data.deduplicated, true);
+    const clientConflict = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: JSON.stringify({ prompt: "changed task", worktree: false }),
+    });
+    assert.equal(clientConflict.response.status, 409);
+    const revokedClient = await jsonRequest(baseUrl, `/api/clients/${newClient.data.client.id}/revoke`, { method: "POST" });
+    assert.equal(revokedClient.response.status, 200);
+    const rejectedAfterRevoke = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0002" }, body: JSON.stringify({ prompt: "scoped fake task", worktree: false }),
+    });
+    assert.equal(rejectedAfterRevoke.response.status, 401);
+    const clientsAfter = await jsonRequest(baseUrl, "/api/clients");
+    assert.equal(JSON.stringify(clientsAfter.data).includes(newClient.data.token), false);
+    const usageAfter = await jsonRequest(baseUrl, `/api/clients/usage?clientId=${newClient.data.client.id}`);
+    assert.equal(usageAfter.response.status, 200);
+    assert.ok(usageAfter.data.buckets.some((bucket) => bucket.clientId === newClient.data.client.id && bucket.requests >= 3));
     const triggerHeaders = {
       "x-codex-cloud-token": "regression-token-123456",
       "idempotency-key": "regression-idempotency-1",
@@ -1250,6 +1338,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       updatedAt: new Date().toISOString(),
       finishedAt: new Date().toISOString(),
       triggerIdempotencyHash: interruptedHash,
+      triggerRequestHash: null,
     });
     await fs.writeFile(automationRunPath, JSON.stringify(interruptedStore), "utf8");
     await new Promise((resolve) => setTimeout(resolve, 400));
@@ -1260,8 +1349,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(retriedInterruptedTrigger.response.status, 200);
     assert.equal(retriedInterruptedTrigger.data.ok, true);
-    assert.equal(retriedInterruptedTrigger.data.deduplicated, undefined);
-    assert.notEqual(retriedInterruptedTrigger.data.run?.id, "run-sample-research-interrupted-regression");
+    assert.equal(retriedInterruptedTrigger.data.deduplicated, true);
+    assert.equal(retriedInterruptedTrigger.data.run?.id, "run-sample-research-interrupted-regression");
 
     const persistedAutomationRuns = await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8");
     assert.equal(persistedAutomationRuns.includes(progressTriggerKey), false);

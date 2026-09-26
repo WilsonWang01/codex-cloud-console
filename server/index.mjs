@@ -13,6 +13,9 @@ import { normalizeAppServerThreadMessages } from "./app-server-normalizers.mjs";
 import { pluginCatalogPage } from "./plugin-catalog.mjs";
 import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mjs";
 import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "./run-safety.mjs";
+import { createApprovalBroker, approvalDigest } from "./approval-broker.mjs";
+import { createApiClientStore } from "./api-clients.mjs";
+import { aggregateRunUsage, runUsageFromProtocol } from "./run-usage.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
@@ -30,6 +33,9 @@ const cloudRoot = process.env.CODEX_CLOUD_ROOT || defaultCloudRoot;
 const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || path.dirname(cloudRoot), ".codex");
 const generatedImagesRoot = process.env.CODEX_GENERATED_IMAGES_ROOT || path.join(codexHome, "generated_images");
 const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "workspace");
+const personalRoot = process.env.CODEX_PERSONAL_ROOT || path.join(cloudRoot, "personal");
+const personalRepoId = "_personal";
+const personalPreviewEnabled = process.env.NODE_ENV !== "production" && process.env.CODEX_PERSONAL_PREVIEW === "1";
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
 const stateRoot =
   process.env.CODEX_STATE_ROOT ||
@@ -43,6 +49,8 @@ const notificationStatePath = path.join(stateRoot, "notification-state.json");
 const diagnosticsStatePath = path.join(stateRoot, "diagnostics-state.json");
 const codexAppStatusCachePath = path.join(stateRoot, "codex-app-status-cache.json");
 const codexModelsCachePath = path.join(stateRoot, "codex-models-cache.json");
+const apiClientsPath = path.join(stateRoot, "api-clients.json");
+const apiRequestMetricsRoot = path.join(stateRoot, "api-request-metrics");
 const worktreesRoot = process.env.CODEX_WORKTREE_ROOT || path.join(cloudRoot, "worktrees");
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
@@ -167,6 +175,11 @@ const automationTriggerRateMax = Number(process.env.CODEX_AUTOMATION_TRIGGER_RAT
 const automationTriggerIdempotencyTtlMs = Number(process.env.CODEX_AUTOMATION_IDEMPOTENCY_TTL_MS || 24 * 60 * 60 * 1000);
 const automationTriggerRateByKey = new Map();
 const automationTriggerIdempotency = new Map();
+const apiClientStore = createApiClientStore({
+  read: () => readJsonState(apiClientsPath, { version: 1, clients: [] }),
+  write: (state) => atomicWriteJson(apiClientsPath, state),
+  metricsRoot: apiRequestMetricsRoot,
+});
 const configuredOwnerEntries = Number(process.env.CODEX_OWNER_INDEX_MAX || 5_000);
 const maxOwnerEntries = Number.isFinite(configuredOwnerEntries) ? Math.max(500, configuredOwnerEntries) : 5_000;
 
@@ -212,6 +225,7 @@ const defaultRepos = [
 
 const repos = parseBase64ArrayConfig("CODEX_CLOUD_REPOS_CONFIG_B64", defaultRepos).map((repo) => ({
   ...repo,
+  kind: "work",
   path: path.isAbsolute(String(repo.path || ""))
     ? String(repo.path)
     : path.join(workspaceRoot, String(repo.path || repo.id)),
@@ -303,6 +317,22 @@ const defaultAutomations = [
 const automations = parseBase64ArrayConfig("CODEX_CLOUD_AUTOMATIONS_CONFIG_B64", defaultAutomations);
 
 await loadCustomRepos();
+const personalRootOverlapsWork = repos.some((repo) => {
+  const workPath = path.resolve(repo.path);
+  const candidate = path.resolve(personalRoot);
+  return candidate === workPath || candidate.startsWith(`${workPath}${path.sep}`) || workPath.startsWith(`${candidate}${path.sep}`);
+});
+if (repos.some((repo) => repo.id === personalRepoId) || personalRootOverlapsWork) {
+  console.warn("Personal space ID or path overlaps a work repository; personal space is unavailable");
+} else {
+  await fs.mkdir(personalRoot, { recursive: true, mode: 0o700 });
+  const personalStat = await fs.lstat(personalRoot);
+  if (!personalStat.isDirectory() || (personalStat.mode & 0o077) !== 0) {
+    console.warn("Personal space path is not a private directory; personal space is unavailable");
+  } else {
+    repos.push({ id: personalRepoId, name: "个人助理", kind: "personal", path: personalRoot, remote: "", accent: "teal" });
+  }
+}
 
 function run(command, args = [], options = {}) {
   return new Promise((resolve) => {
@@ -389,6 +419,7 @@ function normalizeCustomRepo(item, index = 0) {
   const name = String(item?.name || id).trim().slice(0, 80) || id;
   return {
     id,
+    kind: "work",
     name,
     path: path.resolve(workspaceRoot, id),
     remote: repoDisplayRemote(item?.remote || item?.cloneUrl || ""),
@@ -501,8 +532,8 @@ function normalizeSession(item, repoId) {
     codexSessionId: item?.codexSessionId ? String(item.codexSessionId) : null,
     model: item?.model ? String(item.model) : null,
     reasoning: item?.reasoning ? String(item.reasoning) : null,
-    sandbox: item?.sandbox ? String(item.sandbox) : null,
-    approval: item?.approval ? String(item.approval) : null,
+    sandbox: item?.sandbox ? String(item.sandbox) : repoId === personalRepoId ? "read-only" : null,
+    approval: item?.approval ? String(item.approval) : repoId === personalRepoId ? "on-request" : null,
     search: typeof item?.search === "boolean" ? item.search : null,
     pendingTurnRuntime: normalizePendingTurnRuntime(item?.pendingTurnRuntime, item),
     tokenUsage: normalizeTokenUsage(item?.tokenUsage),
@@ -695,6 +726,7 @@ async function cleanupStaleStateTempFiles() {
     diagnosticsStatePath,
     codexAppStatusCachePath,
     codexModelsCachePath,
+    apiClientsPath,
   ].map((filePath) => path.basename(filePath)));
   const entries = await fs.readdir(stateRoot, { withFileTypes: true });
   const removed = [];
@@ -767,6 +799,12 @@ function normalizeRuntime(input = {}, session = {}) {
     approval: choice(input.approval, allowedApproval, base.approval),
     search: typeof input.search === "boolean" ? input.search : base.search,
   };
+}
+
+function runtimeForRepo(repo, runtime) {
+  return repo.kind === "personal"
+    ? { ...runtime, sandbox: "read-only", approval: "on-request" }
+    : runtime;
 }
 
 function normalizePendingTurnRuntime(value, session = {}) {
@@ -1694,7 +1732,10 @@ function appServerThreadParams(repo, runtime) {
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
-    developerInstructions: cloudRuntimeDeveloperInstructions(runtime),
+    developerInstructions: [
+      cloudRuntimeDeveloperInstructions(runtime),
+      ...(repo.kind === "personal" ? ["This is a limited personal-space preview. Use only this conversation and the personal workspace as context. Do not inspect work repositories or host credentials. Do not run shell commands or modify files."] : []),
+    ].join("\n"),
     config: {
       model_reasoning_effort: runtime.reasoning,
       tools: { web_search: runtime.search },
@@ -2197,7 +2238,7 @@ function recordAppServerRequestDecision(method, params = {}, decision) {
     turnId: owner.turnId || job?.turnId || null,
     itemId: owner.itemId || null,
     summary,
-    detail: jsonDetail({ method, decision, params }),
+    detail: jsonDetail({ method, decision, digest: approvalDigest(method, params) }),
   }).catch(() => null);
   if (job) {
     emitJobEvent(job, "approval", {
@@ -2207,52 +2248,27 @@ function recordAppServerRequestDecision(method, params = {}, decision) {
       threadId: owner.threadId || job.threadId || null,
       turnId: owner.turnId || job.turnId || null,
       itemId: owner.itemId || null,
-      detail: jsonDetail(params),
+      detail: jsonDetail({ digest: approvalDigest(method, params) }),
     });
   }
 }
 
-function appServerRequestResult(method, params = {}) {
-  const recordApproval = (decision) => recordAppServerRequestDecision(method, params, decision);
-  if (method === "item/commandExecution/requestApproval") {
-    recordApproval("acceptForSession");
-    return { decision: "acceptForSession" };
+const approvalBroker = createApprovalBroker({
+  timeoutMs: Number(process.env.CODEX_APPROVAL_TIMEOUT_MS || 5 * 60_000),
+});
+
+async function appServerRequestResult(method, params = {}) {
+  const job = findTurnJob(params) || findCompactJob(params);
+  recordAppServerRequestDecision(method, params, "pending");
+  try {
+    const result = await approvalBroker.request(method, params, { repoId: job?.repoId, sessionId: job?.sessionId });
+    const declined = result.decision === "decline" || Boolean(result.decision?.denied) || result.action === "decline";
+    recordAppServerRequestDecision(method, params, declined ? "declined" : "accepted");
+    return result;
+  } catch (error) {
+    recordAppServerRequestDecision(method, params, "rejected");
+    throw error;
   }
-  if (method === "item/fileChange/requestApproval") {
-    recordApproval("acceptForSession");
-    return { decision: "acceptForSession" };
-  }
-  if (method === "execCommandApproval") {
-    recordApproval("approved_for_session");
-    return { decision: "approved_for_session" };
-  }
-  if (method === "applyPatchApproval") {
-    recordApproval("approved_for_session");
-    return { decision: "approved_for_session" };
-  }
-  if (method === "item/permissions/requestApproval") {
-    recordApproval("permissions session");
-    return {
-      permissions: {
-        network: { enabled: true },
-        fileSystem: {
-          read: null,
-          write: null,
-          entries: [{ path: { type: "special", value: { kind: "root" } }, access: "write" }],
-        },
-      },
-      scope: "session",
-    };
-  }
-  if (method === "mcpServer/elicitation/request") {
-    recordApproval("decline");
-    return { action: "decline", content: null, _meta: null };
-  }
-  if (method === "item/tool/requestUserInput") {
-    recordApproval("empty answers");
-    return { answers: {} };
-  }
-  return null;
 }
 
 function guardianActionSummary(action = {}) {
@@ -2335,6 +2351,7 @@ function getAppServerClient() {
     });
   });
   appServerClient.on("exit", ({ message }) => {
+    approvalBroker.closeAll(message || "Codex app-server stopped");
     auditAppServerLifecycle("app-server-error", message || "Codex app-server stopped", appServerClient.status());
     for (const job of [...activeTurns.values()]) {
       finishTurnJob(job, false, 1, message || "Codex app-server stopped");
@@ -2646,6 +2663,7 @@ function createServerJob(kind, repo, session, runtime) {
     output: "",
     stderr: "",
     latestTokenUsage: session.tokenUsage || null,
+    rawTurnUsage: null,
     latestGoal: session.goal || null,
     completed: false,
     finishing: false,
@@ -2724,6 +2742,10 @@ async function resolveThreadForJob(job) {
 }
 
 async function startTurnJob(repo, session, runtime, message, attachments = [], storedMessage = message, options = {}) {
+  if (repo.kind === "personal") {
+    if (!personalPreviewEnabled) throw Object.assign(new Error("个人空间执行未启用：独立 worker 尚未完成配置与验收"), { statusCode: 503 });
+    runtime = runtimeForRepo(repo, runtime);
+  }
   const key = makeSessionKey(repo.id, session.id);
   const existing = activeTurns.get(key);
   if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
@@ -2989,6 +3011,7 @@ function handleAppServerNotification(rpcMessage) {
   }
   if (rpcMessage.method === "thread/tokenUsage/updated") {
     if (job) {
+      if (job.kind === "turn" && params.tokenUsage) job.rawTurnUsage = params.tokenUsage;
       job.latestTokenUsage = normalizeTokenUsage(params.tokenUsage) || job.latestTokenUsage;
       emitJobEvent(job, "tokenUsage", { tokenUsage: job.latestTokenUsage });
     }
@@ -3435,6 +3458,7 @@ function handleAppServerNotification(rpcMessage) {
       return;
     }
     if (turnJob) {
+      turnJob.rawTurnUsage = params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage || turnJob.rawTurnUsage;
       turnJob.latestTokenUsage =
         normalizeTokenUsage(params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage) || turnJob.latestTokenUsage;
       const status = params.turn?.status || "completed";
@@ -4447,6 +4471,10 @@ async function getRepo(repo) {
     };
   }
 
+  if (repo.kind === "personal") {
+    return { ...repo, present: true, executionAvailable: personalPreviewEnabled, branch: "", commit: "", dirty: false, statusText: "个人空间 · 仅上下文隔离", lastCommit: "非 Git 空间" };
+  }
+
   const [branch, commit, status, lastCommit] = await Promise.all([
     run("git", ["-C", repo.path, "branch", "--show-current"]),
     run("git", ["-C", repo.path, "rev-parse", "--short", "HEAD"]),
@@ -4626,7 +4654,9 @@ function normalizeAutomationRun(run = {}) {
     repoId: String(run.repoId || ""),
     name: String(run.name || run.automationId || "Automation run"),
     trigger: String(run.trigger || "manual"),
+    clientId: run.clientId ? String(run.clientId) : null,
     triggerIdempotencyHash: run.triggerIdempotencyHash ? String(run.triggerIdempotencyHash) : null,
+    triggerRequestHash: run.triggerRequestHash ? String(run.triggerRequestHash) : null,
     interruptionKind: run.interruptionKind ? String(run.interruptionKind) : null,
     interruptedAt: run.interruptedAt ? String(run.interruptedAt) : null,
     interruptedLastActiveAt: run.interruptedLastActiveAt ? String(run.interruptedLastActiveAt) : null,
@@ -4650,6 +4680,7 @@ function normalizeAutomationRun(run = {}) {
     model: run.model ? String(run.model) : null,
     reasoning: run.reasoning ? String(run.reasoning) : null,
     prompt: redactAutomationPrompt(run.prompt),
+    usage: run.usage && typeof run.usage === "object" ? run.usage : { status: "unknown", reason: "No per-turn usage snapshot" },
     summary: run.summary ? String(run.summary).slice(0, 4000) : "",
     diffStat: run.diffStat ? String(run.diffStat).slice(0, 4000) : "",
     error: run.error ? String(run.error).slice(0, 2000) : null,
@@ -6111,20 +6142,27 @@ async function auditTimelineMessagesForSession(repoId, session, existingIds = ne
   return [...records.values()].map(normalizeChatMessage).filter((item) => item.text);
 }
 
-function validateAutomationTrigger(req) {
+async function authenticateAutomationTrigger(req) {
   const expected = String(process.env.CODEX_CLOUD_WEBHOOK_TOKEN || process.env.AUTOMATION_WEBHOOK_TOKEN || "").trim();
   const provided = String(req.get("x-codex-cloud-token") || "").trim();
   if (expected) {
     const providedBytes = Buffer.from(provided);
     const expectedBytes = Buffer.from(expected);
-    return providedBytes.length === expectedBytes.length && crypto.timingSafeEqual(providedBytes, expectedBytes);
+    if (providedBytes.length === expectedBytes.length && crypto.timingSafeEqual(providedBytes, expectedBytes)) {
+      return { id: "legacy-shared" };
+    }
   }
-  if (process.env.NODE_ENV === "production") return false;
-  return true;
+  const client = await apiClientStore.authenticate(provided, req.params.id);
+  if (client) return client;
+  if (!expected && process.env.NODE_ENV !== "production" && !provided) return { id: "local-development" };
+  return null;
 }
 
 function automationTriggerClientKey(req, automationId) {
-  return `${String(req.ip || req.socket?.remoteAddress || "unknown")}:${automationId}`;
+  const identity = req.apiClient && !["legacy-shared", "local-development"].includes(req.apiClient.id)
+    ? `client:${req.apiClient.id}`
+    : `ip:${String(req.ip || req.socket?.remoteAddress || "unknown")}`;
+  return `${identity}:${automationId}`;
 }
 
 function consumeAutomationTriggerRate(req, automationId) {
@@ -6141,13 +6179,13 @@ function consumeAutomationTriggerRate(req, automationId) {
   return { ok: true, retryAfterMs: 0 };
 }
 
-function automationTriggerIdempotencyKey(req, automationId, trigger) {
+function automationTriggerIdempotencyKey(req, automationId, trigger, clientId = "legacy-shared") {
   const raw = String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim();
   if (!raw) return { key: "", error: null };
   if (!/^[A-Za-z0-9._:-]{8,160}$/.test(raw)) {
     return { key: "", error: "Idempotency-Key must be 8-160 characters using letters, numbers, dot, underscore, colon, or dash" };
   }
-  return { key: `${automationId}:${trigger}:${raw}`, error: null };
+  return { key: `${clientId === "legacy-shared" ? "" : `${clientId}:`}${automationId}:${trigger}:${raw}`, error: null };
 }
 
 function pruneAutomationTriggerIdempotency(now = Date.now()) {
@@ -6167,16 +6205,29 @@ async function refreshAutomationTriggerPayload(payload) {
   return stored ? { ...payload, run: stored } : payload;
 }
 
-function automationRunCanSatisfyIdempotentReplay(run) {
-  const status = String(run?.status || "");
-  if (["queued", "running", "completed"].includes(status)) return true;
-  return status === "failed" && Boolean(normalizeAutomationCompletionContract(run?.completionContract));
+function automationTriggerRequestHash(req, automation, trigger, completionContract) {
+  const body = req.body || {};
+  return crypto.createHash("sha256").update(JSON.stringify({
+    automationId: automation.id,
+    trigger,
+    prompt: String(body.prompt || automation.prompt || "").trim(),
+    sessionId: String(body.sessionId || ""),
+    worktree: body.worktree !== false,
+    model: String(body.model || automation.model || defaultRuntime.model),
+    reasoning: String(body.reasoning || automation.reasoning || defaultRuntime.reasoning),
+    sandbox: String(body.sandbox || defaultRuntime.sandbox),
+    approval: String(body.approval || defaultRuntime.approval),
+    search: body.search !== false,
+    completionContract,
+  })).digest("hex");
 }
 
-function automationTriggerOptions(req, trigger, triggerIdempotencyHash = null, completionContract = null) {
+function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash = null, triggerRequestHash = null, completionContract = null) {
   return {
     trigger,
+    clientId,
     triggerIdempotencyHash,
+    triggerRequestHash,
     completionContract,
     prompt: req.body?.prompt,
     sessionId: req.body?.sessionId,
@@ -6217,7 +6268,9 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     repoId: repo.id,
     name: automation.name,
     trigger: options.trigger || "manual",
+    clientId: options.clientId || null,
     triggerIdempotencyHash: options.triggerIdempotencyHash || null,
+    triggerRequestHash: options.triggerRequestHash || null,
     recoveryOfRunId: options.recoveryOfRunId || null,
     recoveryRootRunId: options.recoveryRootRunId || null,
     recoveryAttempt: options.recoveryAttempt || 0,
@@ -6279,6 +6332,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           summary: job.output || "",
+          usage: runUsageFromProtocol(job.rawTurnUsage),
           error,
           completionOutcome: completion.outcome,
           completionCheckedAt: completionContract ? new Date().toISOString() : null,
@@ -6387,7 +6441,6 @@ async function recoverInterruptedAutomationRuns() {
           run.automationId === runRecord.automationId &&
           run.trigger === runRecord.trigger &&
           run.triggerIdempotencyHash === runRecord.triggerIdempotencyHash &&
-          automationRunCanSatisfyIdempotentReplay(run) &&
           Date.parse(run.startedAt || "") >= Date.now() - automationTriggerIdempotencyTtlMs
         )
       : null;
@@ -6430,7 +6483,9 @@ async function recoverInterruptedAutomationRuns() {
       const recoveryRun = await startAppServerAutomationRun(automation, executionRepo, {
         executionPolicy: runRecord.worktreePolicy,
         trigger: runRecord.trigger,
+        clientId: runRecord.clientId,
         triggerIdempotencyHash: runRecord.triggerIdempotencyHash,
+        triggerRequestHash: runRecord.triggerRequestHash,
         sessionId: session.id,
         worktree: false,
         requireExistingThread: true,
@@ -8146,11 +8201,69 @@ app.get("/healthz", async (_req, res) => {
   res.status(responseHealth.strictOk ? 200 : 503).json(responseHealth);
 });
 
+app.get("/api/approvals", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ok: true, pending: approvalBroker.list() });
+});
+
+app.post("/api/approvals/:id/decision", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    approvalBroker.decide(req.params.id, req.body || {});
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/clients", async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ ok: true, clients: await apiClientStore.list() }); }
+  catch (error) { res.status(500).json({ ok: false, error: error.message }); }
+});
+
+app.post("/api/clients", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const automationIds = req.body?.automationIds;
+  if (!Array.isArray(automationIds) || automationIds.some((id) => !automations.some((automation) => automation.id === id))) {
+    return res.status(400).json({ ok: false, error: "Unknown automation scope" });
+  }
+  try {
+    res.status(201).json({ ok: true, ...(await apiClientStore.create({
+      name: req.body?.name, automationIds, expiresAt: req.body?.expiresAt,
+    })) });
+  } catch (error) { res.status(error.statusCode || 500).json({ ok: false, error: error.message }); }
+});
+
+app.post("/api/clients/:id/revoke", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ ok: true, client: await apiClientStore.revoke(req.params.id) }); }
+  catch (error) { res.status(error.statusCode || 500).json({ ok: false, error: error.message }); }
+});
+
+app.get("/api/clients/usage", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const from = req.query.from ? Date.parse(String(req.query.from)) : Date.now() - 7 * 24 * 60 * 60_000;
+  const to = req.query.to ? Date.parse(String(req.query.to)) : Date.now();
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || to - from > 31 * 24 * 60 * 60_000) {
+    return res.status(400).json({ ok: false, error: "Invalid usage time range" });
+  }
+  try {
+    const clientId = String(req.query.clientId || "");
+    const [requests, runStore] = await Promise.all([
+      apiClientStore.usage({ from, to, clientId }),
+      readAutomationRuns(),
+    ]);
+    res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(runStore.runs, { from, to, clientId }) });
+  } catch (error) { res.status(500).json({ ok: false, error: error.message }); }
+});
+
 app.post("/api/repos", async (req, res) => {
   const remote = String(req.body?.remote || req.body?.url || "").trim();
   const requestedName = String(req.body?.name || "").trim();
   const id = slugifyRepoId(req.body?.id || requestedName || remote);
   if (!id) return res.status(400).json({ ok: false, error: "Project name or remote is required" });
+  if (id === personalRepoId) return res.status(409).json({ ok: false, error: "Reserved personal space ID" });
   if (repos.some((repo) => repo.id === id)) return res.status(409).json({ ok: false, error: `项目 ${id} 已存在` });
 
   const repo = normalizeCustomRepo({
@@ -8865,6 +8978,7 @@ app.get("/api/audit/events", async (req, res) => {
 app.post("/api/repos/:id/pull", async (req, res) => {
   const repo = repos.find((item) => item.id === req.params.id);
   if (!repo) return res.status(404).json({ ok: false, output: "Unknown repository" });
+  if (repo.kind === "personal") return res.status(400).json({ ok: false, error: "Personal space is not a Git repository" });
   if (!(await exists(repo.path))) {
     if (!allowLocalFallback) return res.status(503).json({ ok: false, output: "Repository path is not available", source: "app-server-unavailable" });
     return res.json({ ok: true, mocked: true, output: `${repo.name}: mock pull completed` });
@@ -8879,7 +8993,8 @@ app.get("/api/chat/search", async (req, res) => {
   if (query.length < 2) return res.json({ ok: true, query, sessions: [], errors: {} });
 
   const repoId = String(req.query?.repoId || "").trim();
-  const searchRepos = repoId ? [getRepoById(repoId)] : repos;
+  const space = String(req.query?.space || "");
+  const searchRepos = repoId ? [getRepoById(repoId)] : repos.filter((repo) => space === "personal" ? repo.kind === "personal" : space === "work" ? repo.kind !== "personal" : true);
   const perRepoLimit = repoId ? limit : Math.max(6, Math.ceil(limit / Math.max(searchRepos.length, 1)) + 4);
   const results = await Promise.all(
     searchRepos.map(async (repo) => {
@@ -9020,8 +9135,8 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
   const session = store.sessions[req.params.id];
   if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
 
-  const requestedRuntime = normalizeRuntime(req.body, session);
-  const storedRuntime = normalizeRuntime({}, session);
+  const requestedRuntime = runtimeForRepo(repo, normalizeRuntime(req.body, session));
+  const storedRuntime = runtimeForRepo(repo, normalizeRuntime({}, session));
   const turnRuntimeChanged =
     requestedRuntime.model !== storedRuntime.model || requestedRuntime.reasoning !== storedRuntime.reasoning;
   const modelList = await getModelListForRoute();
@@ -9400,6 +9515,7 @@ app.post("/api/uploads", async (req, res) => {
   try {
     const payload = await uploadRequestPayload(req);
     const repo = getRepoById(payload.repoId);
+    if (repo.kind === "personal") return res.status(403).json({ ok: false, error: "个人空间暂不支持上传附件" });
     const incoming = Array.isArray(payload.files) ? payload.files.slice(0, maxUploadFiles) : [];
     if (!incoming.length) return res.status(400).json({ ok: false, error: "No files uploaded" });
     const uploadDir = await assertRepoPathAccess(
@@ -9490,6 +9606,7 @@ app.delete("/api/uploads", async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
+  if (repo.kind === "personal" && !personalPreviewEnabled) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
   const runtime = normalizeRuntime(req.body, session);
@@ -9531,6 +9648,10 @@ app.post("/api/chat", async (req, res) => {
 app.post("/api/chat/stream", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
+  if (repo.kind === "personal" && !personalPreviewEnabled) return res.status(503).json({ ok: false, error: "个人空间执行未启用：独立 worker 尚未完成配置与验收" });
+  if (repo.kind === "personal" && Array.isArray(req.body?.attachments) && req.body.attachments.length) {
+    return res.status(403).json({ ok: false, error: "个人空间暂不支持附件" });
+  }
   let attachments = [];
   try {
     attachments = Array.isArray(req.body?.attachments)
@@ -9745,6 +9866,7 @@ app.get("/api/codex/generated-image", async (req, res) => {
 app.post("/api/files/write", async (req, res) => {
   try {
     const repo = getRepoById(req.body?.repoId);
+    if (repo.kind === "personal") return res.status(403).json({ ok: false, error: "个人空间暂不支持文件写入" });
     const filePath = await assertRepoPathAccess(repo, req.body?.path || ".", { allowMissing: true });
     const content = String(req.body?.content || "");
     await serializeFileWrite(filePath, async () => {
@@ -9798,6 +9920,7 @@ app.post("/api/files/write", async (req, res) => {
 app.post("/api/terminal/run", async (req, res) => {
   try {
     const repo = getRepoById(req.body?.repoId);
+    if (repo.kind === "personal") return res.status(403).json({ ok: false, error: "个人空间暂不支持终端" });
     const result = await runShellCommand(repo, req.body?.command);
     if (!result.ok && result.source === "app-server-unavailable") {
       return res.status(502).json({ ok: false, repoId: repo.id, command: req.body?.command || "", ...result });
@@ -10043,13 +10166,26 @@ app.get("/api/automations/inbox", async (_req, res) => {
 });
 
 async function handleAutomationTriggerRequest(req, res, trigger) {
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    apiClientStore.record({
+      clientId: req.apiClient?.id || "unknown",
+      automationId: req.params.id,
+      trigger,
+      status: res.statusCode,
+      runId: res.locals.runId || null,
+      deduplicated: Boolean(res.locals.deduplicated),
+      durationMs: Date.now() - startedAt,
+    }).catch((error) => console.error(`API request metric write failed: ${error.message}`));
+  });
   const rawKey = String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim();
   if (!rawKey) return processAutomationTriggerRequest(req, res, trigger);
   return serializeAutomationTrigger(`${req.params.id}:${trigger}:${rawKey}`, () => processAutomationTriggerRequest(req, res, trigger));
 }
 
 async function processAutomationTriggerRequest(req, res, trigger) {
-  if (!validateAutomationTrigger(req)) {
+  req.apiClient = await authenticateAutomationTrigger(req);
+  if (!req.apiClient) {
     return res.status(401).json({
       ok: false,
       error: "Automation trigger token is required",
@@ -10058,24 +10194,31 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   }
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
+  if (!String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim() &&
+    !["legacy-shared", "local-development"].includes(req.apiClient.id)) {
+    return res.status(400).json({ ok: false, error: "Idempotency-Key is required for API clients" });
+  }
   let completionContract;
   try {
     completionContract = automationCompletionContractForRequest(req, automation);
   } catch (error) {
     return res.status(400).json({ ok: false, error: error.message, output: error.message });
   }
-  const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger);
+  const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger, req.apiClient.id);
   if (idempotency.error) return res.status(400).json({ ok: false, error: idempotency.error });
   if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
   const triggerIdempotencyHash = automationTriggerHash(idempotency.key);
+  const triggerRequestHash = automationTriggerRequestHash(req, automation, trigger, completionContract);
   pruneAutomationTriggerIdempotency();
   const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
   if (existing) {
     try {
       const payload = await refreshAutomationTriggerPayload(existing.payload || await existing.promise);
-      if (!automationCompletionContractsEqual(payload?.run?.completionContract, completionContract)) {
-        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能更改 completionContract" });
+      if (existing.requestHash && existing.requestHash !== triggerRequestHash) {
+        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能用于不同请求" });
       }
+      res.locals.runId = payload?.run?.id || null;
+      res.locals.deduplicated = true;
       return res.json({ ...payload, deduplicated: true });
     } catch {
       automationTriggerIdempotency.delete(idempotency.key);
@@ -10083,23 +10226,30 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   }
   if (triggerIdempotencyHash) {
     const cutoff = Date.now() - automationTriggerIdempotencyTtlMs;
-    const stored = (await readAutomationRuns()).runs.find((run) =>
+    const runs = (await readAutomationRuns()).runs;
+    const matched = runs.find((run) =>
       run.automationId === automation.id &&
       run.trigger === trigger &&
       run.triggerIdempotencyHash === triggerIdempotencyHash &&
-      automationRunCanSatisfyIdempotentReplay(run) &&
       new Date(run.startedAt).getTime() >= cutoff
     );
-    if (stored) {
-      if (!automationCompletionContractsEqual(stored.completionContract, completionContract)) {
+    if (matched) {
+      const stored = runs.find((run) => run.id === matched.recoveryRunId) || matched;
+      if (stored.triggerRequestHash && stored.triggerRequestHash !== triggerRequestHash) {
+        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能用于不同请求" });
+      }
+      if (!stored.triggerRequestHash && !automationCompletionContractsEqual(stored.completionContract, completionContract)) {
         return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能更改 completionContract" });
       }
       const payload = { ok: true, run: stored, output: `${automation.name}: ${trigger} app-server run already accepted` };
       automationTriggerIdempotency.set(idempotency.key, {
         promise: Promise.resolve(payload),
         payload,
+        requestHash: triggerRequestHash,
         expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
       });
+      res.locals.runId = stored.id;
+      res.locals.deduplicated = true;
       return res.json({ ...payload, deduplicated: true, recovered: true });
     }
   }
@@ -10112,7 +10262,7 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   const runPromise = startAppServerAutomationRun(
     automation,
     repo,
-    automationTriggerOptions(req, trigger, triggerIdempotencyHash, completionContract),
+    automationTriggerOptions(req, trigger, req.apiClient.id, triggerIdempotencyHash, triggerRequestHash, completionContract),
   ).then((runRecord) => ({
     ok: true,
     run: runRecord,
@@ -10122,16 +10272,19 @@ async function processAutomationTriggerRequest(req, res, trigger) {
     automationTriggerIdempotency.set(idempotency.key, {
       promise: runPromise,
       payload: null,
+      requestHash: triggerRequestHash,
       expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
     });
   }
   try {
     const payload = await runPromise;
     const runRecord = payload.run;
+    res.locals.runId = runRecord.id;
     if (idempotency.key) {
       automationTriggerIdempotency.set(idempotency.key, {
         promise: Promise.resolve(payload),
         payload,
+        requestHash: triggerRequestHash,
         expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
       });
     }
