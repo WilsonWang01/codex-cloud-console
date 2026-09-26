@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 
 async function canRead(path) {
-  try { await fs.access(path); return true; }
+  try { await fs.access(path, constants.R_OK); return true; }
   catch { return false; }
 }
 
