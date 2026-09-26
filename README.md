@@ -175,7 +175,7 @@ EC2 参考部署使用 systemd 常驻服务、认证 HTTPS 和独立的数据目
 
 ## 规划中的能力
 
-[Personal Agent 统一方案](docs/personal-agent-roadmap.md)整合 Muse、Today、Grok Bot 对标与项目路线图。当前完成部分安全基础、个人空间与可选专用 worker、独立调用令牌、结果/取消接口和初步用量页面；双向权限隔离、事务任务队列、完整个人助理与真实外部产品适配仍未交付。**实现与验收状态以[验收报告](docs/acceptance/2026-09-26-personal-api-mobile.md)为准**；AWS 指南与配套 Skill 已随仓库提供。
+[Personal Agent 统一方案](docs/personal-agent-roadmap.md)整合 Muse、Today、Grok Bot 对标与项目路线图。当前完成部分安全基础、共用账号的个人空间、可选专用 worker、独立调用令牌、结果/取消接口和初步用量页面；事务任务队列、完整个人助理与真实外部产品适配仍未交付。双向权限隔离是可选专用 worker 的未完成项，不阻塞默认共享账号模式。**实现与验收状态以[验收报告](docs/acceptance/2026-09-26-personal-api-mobile.md)为准**；AWS 指南与配套 Skill 已随仓库提供。
 
 ## 常见问题
 
