@@ -387,6 +387,16 @@ try {
   await page.screenshot({ path: new URL("personal-queued-390-short.png", out).pathname });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   assert.ok(await page.locator(".composer-shell").evaluate((element) => element.getBoundingClientRect().bottom <= innerHeight));
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.getByRole("heading", { name: "排队待发送" }).waitFor();
+  await page.getByRole("button", { name: /新对话.*下一个待办/ }).waitFor();
+  const queuedSession = sessions.find((item) => item.repoId === "_personal");
+  queuedSession.queuedTurn.status = "paused";
+  queuedSession.queuedTurn.reason = "上一轮未成功，排队已暂停";
+  await page.reload();
+  await page.getByRole("button", { name: /排队待核对.*上一轮未成功/ }).waitFor();
+  await page.evaluate(() => { location.hash = "/project/_personal/thread/_personal-session"; });
+  await page.getByRole("button", { name: "撤回到草稿" }).waitFor();
   await page.getByRole("button", { name: "撤回到草稿" }).click();
   await page.waitForFunction(() => !document.querySelector(".queued-turn-banner"));
   assert.equal(await composer.inputValue(), "下一个待办");
@@ -396,5 +406,5 @@ try {
   releaseJobEvents?.();
   await page.getByText("云端 Codex 任务已完成。").waitFor();
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }
