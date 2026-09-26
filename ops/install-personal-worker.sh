@@ -13,8 +13,11 @@ fi
 if ! getent group codex-personal-console >/dev/null; then
   groupadd --system codex-personal-console
 fi
+if ! getent group codex-personal >/dev/null; then
+  groupadd --system codex-personal
+fi
 if ! id codex-personal >/dev/null 2>&1; then
-  useradd --system --create-home --home-dir /var/lib/codex-personal --shell /usr/sbin/nologin codex-personal
+  useradd --system --gid codex-personal --create-home --home-dir /var/lib/codex-personal --shell /usr/sbin/nologin codex-personal
 fi
 if [[ "$(stat -c %U /var/lib/codex-personal)" != codex-personal ]]; then
   echo "Refusing to modify a personal home owned by another user" >&2
