@@ -3242,6 +3242,7 @@ export function App() {
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [chatRuntime, setChatRuntime] = useState<ChatRuntime>(defaultChatRuntime);
   const [codexModels, setCodexModels] = useState<CodexModelOption[]>([]);
+  const codexModelsLoadSeq = useRef(0);
   const [codexAppStatusRecord, setCodexAppStatus] = useState<CodexAppStatus>(fallbackAppStatus);
   const [codexAppStatusRepoId, setCodexAppStatusRepoId] = useState("");
   const codexAppStatus = codexAppStatusRepoId === selectedRepoId ? codexAppStatusRecord : fallbackAppStatus;
@@ -3744,8 +3745,10 @@ export function App() {
   }, [diagnosticsBusy, pushEvent]);
 
   const loadCodexModels = useCallback(async (forceRefresh = false) => {
+    const requestSeq = ++codexModelsLoadSeq.current;
     try {
       const result = await api<CodexModelsResponse>(`/api/codex/models${forceRefresh ? "?refresh=1" : ""}`);
+      if (requestSeq !== codexModelsLoadSeq.current) return;
       if (!result.ok || result.source !== "app-server" || result.authoritative !== true) {
         throw new Error(result.error || "模型列表不是 app-server 权威响应");
       }
@@ -3766,6 +3769,14 @@ export function App() {
 
   useEffect(() => {
     loadCodexModels(true);
+    const timer = window.setInterval(() => { if (!document.hidden) loadCodexModels(); }, 60_000);
+    const onVisible = () => { if (!document.hidden) loadCodexModels(true); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      codexModelsLoadSeq.current += 1;
+    };
   }, [loadCodexModels]);
 
   const loadCodexAppStatus = useCallback(async () => {
@@ -5968,6 +5979,7 @@ export function App() {
               uploadingAttachments={uploadingAttachments}
               runtime={chatRuntime}
               modelOptions={codexModels}
+              onRefreshModels={() => loadCodexModels(true)}
               appStatus={codexAppStatus}
               appStatusLoading={visibleCodexAppStatusLoading}
               tokenUsage={threadTokenUsage}
@@ -8302,6 +8314,7 @@ function CloudChat({
   uploadingAttachments,
   runtime,
   modelOptions,
+  onRefreshModels,
   appStatus,
   appStatusLoading,
   tokenUsage,
@@ -8367,6 +8380,7 @@ function CloudChat({
   uploadingAttachments: boolean;
   runtime: ChatRuntime;
   modelOptions: CodexModelOption[];
+  onRefreshModels: () => void;
   appStatus: CodexAppStatus;
   appStatusLoading: boolean;
   tokenUsage: ThreadTokenUsage | null;
@@ -10061,7 +10075,7 @@ function CloudChat({
                 目标
               </button>
             )}
-            <button type="button" onClick={() => setActivePanel("model")} aria-label={`模型：${activeModel?.displayName || runtime.model}`}>{activeModel?.displayName || runtime.model}</button>
+            <button type="button" onClick={() => { onRefreshModels(); setActivePanel("model"); }} aria-label={`模型：${activeModel?.displayName || runtime.model}`}>{activeModel?.displayName || runtime.model}</button>
             <button type="button" onClick={() => setActivePanel("reasoning")} aria-label={`推理深度：${reasoningLabel(runtime.reasoning)}`}>{reasoningLabel(runtime.reasoning)}</button>
             {showFooterContext && (
               <button className={cx("footer-context-chip", contextState)} type="button" onClick={() => setActivePanel("status")} title={contextDetail} aria-label={`上下文：${contextDetail}`}>

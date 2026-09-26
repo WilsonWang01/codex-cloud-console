@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const schemaRoot = join(repoRoot, "src/generated/app-server");
-const defaultCodexSchemaVersion = "0.153.0";
+const defaultCodexSchemaVersion = "0.157.1";
 
 function parseMode(argv) {
   return argv.includes("--check") ? "check" : "update";

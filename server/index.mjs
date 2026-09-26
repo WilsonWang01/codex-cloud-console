@@ -8553,7 +8553,8 @@ async function readStoredModelListCache() {
     const parsed = JSON.parse(await fs.readFile(codexModelsCachePath, "utf8"));
     if (parsed?.ok === true && parsed?.source === "app-server" && Array.isArray(parsed?.models) && parsed.models.length) {
       const data = { ...parsed, models: normalizeCodexModelsResult({ data: parsed.models }) };
-      modelListCache = { data, cachedAt: Date.parse(parsed.cachedAt || "") || 0 };
+      // A previous process may have used an older CLI or account catalog.
+      modelListCache = { data, cachedAt: 0 };
       return modelListCache;
     }
   } catch {
@@ -8563,15 +8564,22 @@ async function readStoredModelListCache() {
 }
 
 async function refreshModelList() {
-  const response = await codexAppServerRequest("model/list", { includeHidden: false }, 45_000);
-  if (!response.ok) {
-    throw new Error(response.error || "model/list failed");
-  }
+  const models = [];
+  const cursors = new Set();
+  let cursor = null;
+  do {
+    const response = await codexAppServerRequest("model/list", { includeHidden: false, limit: 100, cursor }, 45_000);
+    if (!response.ok) throw new Error(response.error || "model/list failed");
+    models.push(...normalizeCodexModelsResult(response.result || {}));
+    cursor = response.result?.nextCursor || null;
+    if (cursor && (cursors.has(cursor) || cursors.size >= 20)) throw new Error("model/list pagination did not complete");
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
   const data = {
     ok: true,
     source: "app-server",
     authoritative: true,
-    models: normalizeCodexModelsResult(response.result || {}),
+    models: [...new Map(models.map((model) => [model.id, model])).values()],
     cachedAt: new Date().toISOString(),
   };
   if (!data.models.length) throw new Error("model/list returned no models");

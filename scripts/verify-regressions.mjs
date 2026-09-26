@@ -131,9 +131,11 @@ input.on("line", (line) => {
     threads.push(thread);
     return send({ id: message.id, result: { thread } });
   }
+  if (message.method === "model/list" && message.params?.cursor === "new-models") return send({ id: message.id, result: { data: [{ id: "gpt-6-astra", model: "gpt-6-astra", displayName: "GPT-6 Astra", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "ultra" }] }], nextCursor: null } });
   if (message.method === "model/list") return send({
     id: message.id,
     result: {
+      nextCursor: "new-models",
       data: [
         {
           id: "gpt-5.6-sol",
@@ -1017,6 +1019,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(models.data.models.some((model) => model.id === "gpt-5.5"), false);
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("max"));
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("ultra"));
+    assert.equal(models.data.models.find((model) => model.id === "gpt-6-astra")?.displayName, "GPT-6 Astra");
+    assert.deepEqual(models.data.models.find((model) => model.id === "gpt-6-astra")?.supportedReasoningEfforts, ["medium", "ultra"]);
     const generatedImage = await fetch(
       new URL(`/api/codex/generated-image?path=${encodeURIComponent(generatedImagePath)}`, baseUrl),
     );

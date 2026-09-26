@@ -27,6 +27,8 @@ let pending = [{
 let decision = null;
 let createdToken = "";
 let personalLoginFlow = null;
+let includeNewModel = false;
+let selectedRuntime = null;
 const errors = [];
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -54,7 +56,11 @@ await context.route("**/api/**", async (route) => {
     return send({ ok: true, flow: personalLoginFlow, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: [personalLoginFlow] } });
   }
   if (url.pathname === "/api/codex/app-status") return send({ ok: true, source: "app-server", authoritative: true, partial: false, account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" }, auth: { ok: true }, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: personalLoginFlow ? [personalLoginFlow] : [] }, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: {}, gaps: [] });
-  if (url.pathname === "/api/codex/models") return send({ ok: true, models: [{ id: "gpt-5.6-terra", label: "GPT-5.6-Terra", supportedReasoningEfforts: ["medium"] }] });
+  if (url.pathname === "/api/codex/models") return send({ ok: true, source: "app-server", authoritative: true, models: [{ id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium"] }, ...(includeNewModel ? [{ id: "gpt-6-astra", displayName: "GPT-6 Astra", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium", "ultra"] }] : [])] });
+  if (url.pathname.endsWith("/runtime") && req.method() === "PATCH") {
+    selectedRuntime = body;
+    return send({ ok: true, runtime: body });
+  }
   const draft = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft$/);
   if (draft) {
     const session = sessions.find((item) => item.id === decodeURIComponent(draft[1]));
@@ -89,6 +95,12 @@ try {
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
   await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
   assert.equal(await composer.inputValue(), "独立个人草稿");
+  includeNewModel = true;
+  await page.getByRole("button", { name: "模型：GPT-5.6-Terra", exact: true }).click();
+  await page.getByRole("button", { name: /GPT-6 Astra gpt-6-astra/ }).click();
+  await page.getByRole("button", { name: "模型：GPT-6 Astra", exact: true }).waitFor();
+  assert.equal(selectedRuntime?.model, "gpt-6-astra");
+  assert.equal(selectedRuntime?.reasoning, "medium");
   await page.getByRole("button", { name: "同意本次" }).click();
   assert.deepEqual(decision, { decision: "accept", digest: "digest-test" });
   await page.screenshot({ path: new URL("personal-desktop.png", out).pathname, fullPage: true });
@@ -151,5 +163,5 @@ try {
   assert.equal(await authorizationLink.getAttribute("href"), "https://login.example.test/device");
   assert.equal(await authorizationLink.getAttribute("rel"), "noopener noreferrer");
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "打开模型列表发现新增模型并保留 medium", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }
