@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { assertCaddyRouteExtension, extendAutomationRoutes } from "../ops/extend-caddy-automation-routes.mjs";
 
 const source = `example.com {
@@ -46,4 +51,18 @@ test("Caddy-generated group numbers may change but unrelated route content may n
   assert.doesNotThrow(() => assertCaddyRouteExtension(before, after));
   routes[3].handle[0].auth = "changed";
   assert.throws(() => assertCaddyRouteExtension(before, after), /outside the two new API matchers changed/);
+});
+
+test("Caddy extension CLI runs through a release symlink", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-caddy-cli-"));
+  try {
+    const script = fileURLToPath(new URL("../ops/extend-caddy-automation-routes.mjs", import.meta.url));
+    const linkedScript = path.join(dir, "extend.mjs");
+    await fs.symlink(script, linkedScript);
+    const result = spawnSync(process.execPath, [linkedScript], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Usage: node extend-caddy-automation-routes\.mjs/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

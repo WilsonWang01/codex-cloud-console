@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const triggerBlock = "\t@automation_trigger path_regexp automation_trigger ^/api/automations/[^/]+/(webhook|heartbeat)$\n\thandle @automation_trigger {\n\t\treverse_proxy 127.0.0.1:8787\n\t}\n";
 const newRoutes = `\t@automation_result {
@@ -75,7 +76,7 @@ export function assertCaddyRouteExtension(before, after) {
   }
 }
 
-if (process.argv[1] && new URL(`file://${process.argv[1]}`).href === import.meta.url) {
+if (process.argv[1] && await fs.realpath(process.argv[1]).catch(() => null) === fileURLToPath(import.meta.url)) {
   const [sourcePath, candidatePath] = process.argv.slice(2);
   if (!sourcePath || !candidatePath) throw new Error("Usage: node extend-caddy-automation-routes.mjs SOURCE CANDIDATE");
   const source = await fs.readFile(sourcePath, "utf8");
