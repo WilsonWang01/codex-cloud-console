@@ -13,11 +13,12 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   await page.evaluate(() => {
     const original = window.fetch.bind(window);
     const paths = new Set(["/api/chat/stream", "/api/codex/review/stream", "/api/codex/thread-compact/stream", "/api/chat/job-events"]);
-    const harness = { records: [], interrupts: 0, activeFailures: 0 };
+    const harness = { records: [], interrupts: 0, steers: 0, activeFailures: 0 };
     window.__streamHarness = harness;
     window.fetch = async (input, options = {}) => {
       const url = new URL(String(input), location.href);
       if (url.pathname === "/api/codex/turn-interrupt") harness.interrupts += 1;
+      if (url.pathname === "/api/codex/turn-steer") harness.steers += 1;
       if (url.pathname === "/api/chat/active" && harness.activeFailures > 0) {
         harness.activeFailures -= 1;
         throw new Error("验收模拟运行状态查询失败");
@@ -58,7 +59,7 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
     await waitUntil(async () => await composer.getAttribute("placeholder") === "向云端 Codex 发送消息");
   };
   const command = async (value) => { await composer.fill(value); await composer.press("Enter"); };
-  const busy = () => page.getByRole("button", { name: "云端 Codex 正在处理", exact: true });
+  const busy = () => page.getByRole("button", { name: "补充本轮回复", exact: true });
 
   await command("/compact");
   await waitUntil(async () => (await records()).length === 1);
@@ -89,6 +90,13 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   assert.equal(await busy().count(), 1);
   assert.equal(await page.locator(".chat-bubble.streaming").filter({ hasText: "验收持续生成中" }).count(), 1);
   await page.screenshot({ path: new URL("desktop-streaming.png", out).pathname, fullPage: true });
+  const failedSteer = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/codex/turn-steer" && response.status() === 409);
+  await command("验收失败的补充指令");
+  await failedSteer;
+  await waitUntil(() => page.evaluate(() => window.__streamHarness.steers === 1));
+  assert.equal(await composer.inputValue(), "验收失败的补充指令");
+  assert.equal(await page.locator(".chat-bubble.user").filter({ hasText: "验收失败的补充指令" }).count(), 0);
+  await composer.fill("");
 
   await navigate("sample-app-2");
   assert.equal((await records())[2].aborted, true);
@@ -123,5 +131,5 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   assert.equal((await records())[5].aborted, true);
   activeJobs.clear();
   assert.equal(await page.evaluate(() => window.__streamHarness.interrupts), 0);
-  return ["压缩切换会话只取消订阅", "旧流结束不释放新任务", "Review 离开后不污染其他会话", "聊天生成状态持续保留", "回到运行中会话重新订阅", "状态查询失败后自动重试", "重连退避避免请求风暴", "事件重放不重复输出或残留错误", "跨项目离开不终止云端任务"];
+  return ["压缩切换会话只取消订阅", "旧流结束不释放新任务", "Review 离开后不污染其他会话", "聊天生成状态持续保留", "失败的补充指令不伪装已发送且保留输入", "回到运行中会话重新订阅", "状态查询失败后自动重试", "重连退避避免请求风暴", "事件重放不重复输出或残留错误", "跨项目离开不终止云端任务"];
 }

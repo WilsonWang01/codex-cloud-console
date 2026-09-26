@@ -8,6 +8,7 @@ import {
   Bot,
   Brain,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   Circle,
   Cloud,
@@ -24,6 +25,7 @@ import {
   History,
   Loader2,
   Link2,
+  ListTodo,
   Menu,
   MessageSquare,
   Paperclip,
@@ -53,6 +55,8 @@ const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = lazy(() => import("./CodexPluginManager"));
 const LazyUsageView = lazy(() => import("./UsageView"));
 const LazyConnectedServices = lazy(() => import("./ConnectedServices"));
+const LazyPersonalFiles = lazy(() => import("./PersonalFiles"));
+const LazyPersonalFacts = lazy(() => import("./PersonalFacts"));
 
 type RunEvent = {
   id: string;
@@ -62,7 +66,7 @@ type RunEvent = {
   body: string;
 };
 
-type ActiveView = "inbox" | "automations" | "cli" | "agent" | "logs" | "settings" | "usage";
+type ActiveView = "inbox" | "automations" | "cli" | "agent" | "logs" | "settings" | "usage" | "today" | "materials" | "admin";
 type CloudConnection = "checking" | "cloud" | "degraded" | "local" | "offline";
 type ActiveCodexJob = NonNullable<ConsoleStatus["activeJobs"]>[number];
 type PendingApproval = {
@@ -101,7 +105,7 @@ type AppRoute = {
 
 const defaultRepoId = "sample-app";
 const defaultAutomationId = "sample-maintenance";
-const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings", "usage"]);
+const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings", "usage", "today", "materials", "admin"]);
 
 type GlobalSearchResult = {
   id: string;
@@ -3146,6 +3150,7 @@ function parseAppHash(hash = typeof window === "undefined" ? "" : window.locatio
     .filter(Boolean);
   const [head, second, third, fourth] = parts;
   if (head === "project" && second) {
+    if (third === "today" || third === "materials" || third === "admin") return { view: third, repoId: second };
     return { view: "cli", repoId: second, sessionId: third === "thread" ? fourth : third };
   }
   if (head === "thread" && second) {
@@ -3159,6 +3164,7 @@ function parseAppHash(hash = typeof window === "undefined" ? "" : window.locatio
 }
 
 function buildAppHash(route: AppRoute) {
+  if (route.view === "today" || route.view === "materials" || route.view === "admin") return `#/project/${routePart(route.repoId || "_personal")}/${route.view}`;
   if (route.view === "cli") {
     const repo = routePart(route.repoId || defaultRepoId);
     const session = route.sessionId ? `/thread/${routePart(route.sessionId)}` : "";
@@ -3229,6 +3235,18 @@ function parseReviewText(reviewText: string): ReviewResult {
 }
 
 export function App() {
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    const update = () => document.documentElement.style.setProperty("--app-visual-height", `${Math.round(viewport?.height || window.innerHeight)}px`);
+    update();
+    viewport?.addEventListener("resize", update);
+    window.addEventListener("resize", update);
+    return () => {
+      viewport?.removeEventListener("resize", update);
+      window.removeEventListener("resize", update);
+      document.documentElement.style.removeProperty("--app-visual-height");
+    };
+  }, []);
   const initialRouteRef = useRef(parseAppHash());
   const initialRoute = initialRouteRef.current;
   const [status, setStatus] = useState<ConsoleStatus>(fallbackStatus);
@@ -3236,6 +3254,8 @@ export function App() {
   const [selectedAutomationId, setSelectedAutomationId] = useState(initialRoute.automationId || defaultAutomationId);
   const [selectedRepoId, setSelectedRepoId] = useState(initialRoute.repoId || window.localStorage.getItem("codex-cloud-last-space-repo") || defaultRepoId);
   const [activeView, setActiveView] = useState<ActiveView>(initialRoute.view);
+  const [selectedPersonalFilePath, setSelectedPersonalFilePath] = useState("");
+  const [personalApprovalCount, setPersonalApprovalCount] = useState(0);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -3354,7 +3374,8 @@ export function App() {
   }, [selectedRepo, selectedRepoId, statusReady]);
   const repoSelectionReady = statusReady && status.repos.some((item) => item.id === selectedRepoId);
   useEffect(() => {
-    if (repoSelectionReady && selectedRepo.kind === "personal" && !["cli", "settings", "usage"].includes(activeView)) setActiveView("cli");
+    if (repoSelectionReady && selectedRepo.kind === "personal" && !["today", "materials", "cli", "settings", "admin"].includes(activeView)) setActiveView("today");
+    if (repoSelectionReady && selectedRepo.kind !== "personal" && ["today", "materials", "admin"].includes(activeView)) setActiveView("cli");
   }, [activeView, repoSelectionReady, selectedRepo]);
   const selectedAutomation = useMemo(
     () =>
@@ -4235,7 +4256,7 @@ export function App() {
     const onHashChange = () => {
       const route = parseAppHash();
       const targetRepo = statusRef.current.repos.find((repo) => repo.id === (route.repoId || selectedRepoIdRef.current));
-      setActiveView(targetRepo?.kind === "personal" && !["cli", "settings", "usage"].includes(route.view) ? "cli" : route.view);
+      setActiveView(targetRepo?.kind === "personal" && !["today", "materials", "cli", "settings", "admin"].includes(route.view) ? "today" : route.view);
       if (route.automationId) setSelectedAutomationId(route.automationId);
       if (route.view === "cli" && route.sessionId && (!route.repoId || route.repoId === selectedRepoIdRef.current)) {
         void flushComposerDraft();
@@ -4954,8 +4975,10 @@ export function App() {
       { view: "logs", label: "日志", hint: `${status.logs.length} 个最近日志` },
       { view: "settings", label: "设置", hint: "云端入口、权限和实例信息" },
       { view: "usage", label: "调用与用量", hint: "外部服务请求和 token" },
+      { view: "today", label: "今日", hint: "个人待处理和近期对话" },
+      { view: "materials", label: "资料", hint: "个人上传材料与生成文件" },
     ];
-    for (const item of viewItems.filter((item) => selectedRepo?.kind !== "personal" || ["cli", "settings", "usage"].includes(item.view))) {
+    for (const item of viewItems.filter((item) => selectedRepo?.kind === "personal" ? ["cli", "settings", "today", "materials"].includes(item.view) : !["today", "materials"].includes(item.view))) {
       if (matches(item.label, item.hint, item.view)) results.push({ id: `view:${item.view}`, kind: "view", label: item.label, hint: item.hint, view: item.view });
     }
     for (const repo of status.repos.filter((item) => (item.kind === "personal") === (selectedRepo?.kind === "personal"))) {
@@ -5221,7 +5244,6 @@ export function App() {
         pushEvent({ tone: "warn", title: "附件", body: "当前回复运行中，附件请等本轮完成后再发送。" });
         return;
       }
-      setChatMessages((current) => [...current, { id: `${Date.now()}-user-steer`, role: "user", text: message, time: new Date().toISOString() }]);
       chatSubmissionInFlight.current = submissionId;
       try {
         await api("/api/codex/turn-steer", {
@@ -5229,9 +5251,12 @@ export function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ repoId: chatRepoId, sessionId: activeSessionId, message }),
         });
+        if (chatLoadSeq.current === conversationSeq && selectedRepoIdRef.current === chatRepoId && activeSessionIdRef.current === activeSessionId) {
+          setChatMessages((current) => [...current, { id: `${Date.now()}-user-steer`, role: "user", text: message, time: new Date().toISOString() }]);
+        }
         await clearSubmittedDraft();
       } catch (error) {
-        pushEvent({ tone: "warn", title: "补充指令", body: error instanceof Error ? error.message : "当前回复无法补充指令" });
+        pushEvent({ tone: "warn", title: "补充指令状态未确认", body: `${error instanceof Error ? error.message : "请求未完成"}。输入已保留，请先核对当前任务进展，避免重复发送。` });
       } finally {
         releaseSubmission();
       }
@@ -5816,14 +5841,14 @@ export function App() {
           const target = space === "personal"
             ? status.repos.find((repo) => repo.kind === "personal")
             : status.repos.find((repo) => repo.id === lastWorkRepoId.current && repo.kind !== "personal") || status.repos.find((repo) => repo.kind !== "personal");
-          if (target) { selectRepo(target.id); setActiveView("cli"); }
+          if (target) { selectRepo(target.id); setActiveView(space === "personal" ? "today" : "cli"); }
         }}
         sessions={chatSessions}
         activeSessionId={activeSessionId}
         historyLoading={isLoadingChatHistory}
         mobileOpen={mobileSidebarOpen}
         onClose={() => setMobileSidebarOpen(false)}
-        onSelectView={setActiveView}
+        onSelectView={(view) => { if (view === "materials") setSelectedPersonalFilePath(""); setActiveView(view); }}
         onNewChat={() => {
           setActiveView("cli");
           newChatSession();
@@ -5857,7 +5882,7 @@ export function App() {
           searchLoading={globalSessionSearchLoading}
           onSearchSelect={openGlobalSearchResult}
           />
-          <PendingApprovals />
+          <PendingApprovals personalSpace={selectedRepo.kind === "personal"} repoId={selectedRepo.id} onPersonalCount={setPersonalApprovalCount} />
         </div>
 
         {activeView === "inbox" && (
@@ -5886,7 +5911,29 @@ export function App() {
           </div>
         )}
 
-        {activeView === "usage" && <Suspense fallback={<div className="usage-view">加载用量中...</div>}><LazyUsageView automations={status.automations} /></Suspense>}
+        {activeView === "today" && selectedRepo.kind === "personal" && <PersonalToday
+          status={status}
+          repo={selectedRepo}
+          approvalCount={personalApprovalCount}
+          authOk={codexAppStatusRepoId === selectedRepo.id && codexAppStatus.source === "app-server" ? codexAppStatus.auth?.ok === true : null}
+          sessions={chatSessions.filter((session) => session.repoId === selectedRepo.id)}
+          onContinue={(sessionId) => { setActiveView("cli"); void selectChatSession(sessionId); }}
+          onOpenMaterial={(filePath) => { setSelectedPersonalFilePath(filePath); setActiveView("materials"); }}
+          onNew={() => { setActiveView("cli"); void newChatSession(); }}
+          onConnections={() => setActiveView("settings")}
+        />}
+
+        {activeView === "materials" && selectedRepo.kind === "personal" && <Suspense fallback={<div className="personal-page">正在读取个人文件…</div>}><LazyPersonalFiles initialPath={selectedPersonalFilePath} onContinue={(file) => {
+          const mention = file.path.includes(" ") ? `个人工作区文件：${file.path}` : `@${file.path}`;
+          setChatInput((current) => `${current}${current ? "\n\n" : ""}${file.kind === "output" ? "请继续修改这个文件" : "请分析这个文件"}：${mention}`);
+          setActiveView("cli");
+        }} /></Suspense>}
+
+        {activeView === "usage" && <Suspense fallback={<div className="usage-view">加载用量中...</div>}><LazyUsageView automations={status.automations} onOpenRun={(automationId, runId) => {
+          const run = (status.automationRuns || []).find((item) => item.id === runId && item.automationId === automationId);
+          if (run) openAutomationRun(run);
+          else { setSelectedAutomationId(automationId); setActiveView("automations"); }
+        }} /></Suspense>}
 
         {activeView === "automations" && (
           <div className="content-grid">
@@ -6077,8 +6124,20 @@ export function App() {
           </div>
         )}
 
-        {activeView === "settings" && (
+        {activeView === "settings" && selectedRepo.kind === "personal" && <PersonalSettings
+          repo={selectedRepo}
+          appStatus={codexAppStatus}
+          browserPushEndpoint={browserPushEndpoint}
+          pushReadiness={browserPushReadiness}
+          onPushSubscribe={enableBrowserPushNotifications}
+          onPushUnsubscribe={disableBrowserPushNotifications}
+          onCodexLogin={() => startCodexAccountLogin("chatgptDeviceCode")}
+          onOpenAdvanced={() => setActiveView("admin")}
+        />}
+
+        {(activeView === "settings" && selectedRepo.kind !== "personal" || activeView === "admin") && (
           <div className="content-grid">
+            {activeView === "admin" && <button className="personal-admin-back" type="button" onClick={() => setActiveView("settings")}><ChevronLeft size={16} />个人设置</button>}
             <SettingsView
               status={status}
               repo={selectedRepo}
@@ -6113,8 +6172,7 @@ export function App() {
             />
             <aside className="right-rail">
               <CloudStatus status={status} cloudConnection={cloudConnection} onOpenThread={openAttentionThread} />
-              <RepoCard repo={selectedRepo} />
-              <LogCard logs={status.logs} automation={selectedAutomation} />
+              {selectedRepo.kind !== "personal" && <><RepoCard repo={selectedRepo} /><LogCard logs={status.logs} automation={selectedAutomation} /></>}
             </aside>
           </div>
         )}
@@ -6133,6 +6191,72 @@ export function App() {
       </section>
     </main>
   );
+}
+
+function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContinue, onOpenMaterial, onNew, onConnections }: {
+  status: ConsoleStatus;
+  repo: Repo;
+  approvalCount: number;
+  authOk: boolean | null;
+  sessions: ChatSession[];
+  onContinue: (sessionId: string) => void;
+  onOpenMaterial: (filePath: string) => void;
+  onNew: () => void;
+  onConnections: () => void;
+}) {
+  const [recentFiles, setRecentFiles] = useState<Array<{ path: string; name: string; updatedAt: string }>>([]);
+  const [filesError, setFilesError] = useState("");
+  const [filesLoading, setFilesLoading] = useState(true);
+  useEffect(() => {
+    const controller = new AbortController();
+    setFilesLoading(true);
+    setFilesError("");
+    void fetch("/api/personal/files", { signal: controller.signal, cache: "no-store" })
+      .then(async (response) => {
+        const result = await response.json() as { ok: boolean; files?: Array<{ path: string; name: string; updatedAt: string; kind: string }>; error?: string };
+        if (!response.ok || !result.ok) throw new Error(result.error || "读取最近文件失败");
+        return result;
+      })
+      .then((result) => { if (!controller.signal.aborted) setRecentFiles((result.files || []).filter((file) => file.kind === "output").slice(0, 5)); })
+      .catch((error) => { if (!controller.signal.aborted) setFilesError(error instanceof Error ? error.message : "读取最近文件失败"); })
+      .finally(() => { if (!controller.signal.aborted) setFilesLoading(false); });
+    return () => controller.abort();
+  }, [repo.id]);
+  const needsAttention = getAttentionSummary(status).items.filter((item) => item.repoId === "_personal" && !["neutral", "active"].includes(item.tone) && !item.acknowledged);
+  const running = (status.activeJobs || []).filter((job) => job.repoId === "_personal" && !job.completed);
+  const recent = [...sessions].filter((session) => !isVerificationChatSession(session)).sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime()).slice(0, 6);
+  return <div className="personal-page personal-today">
+    <header className="personal-page-header"><div><p className="eyebrow">个人助理</p><h1>今日</h1></div><button type="button" className="command-button" onClick={onNew}><Plus size={17} />交办新任务</button></header>
+    {authOk === false && <p className="personal-state-warning" role="status">个人助理的 Codex 账号需要重新登录，已有对话和文件仍会保留。</p>}
+    <div className="personal-overview" aria-label="个人任务概览"><span><strong>{needsAttention.length + approvalCount}</strong>待处理</span><span><strong>{running.length}</strong>运行中</span><span><strong>{recent.length}</strong>近期对话</span></div>
+    <section className="personal-list-section"><h2>需要你决定</h2>{approvalCount > 0 && <button type="button" className="personal-task-row" onClick={() => document.querySelector(".pending-approvals")?.scrollIntoView({ behavior: "smooth", block: "start" })}><span><strong>{approvalCount} 项待确认请求</strong><small>查看上方请求及具体操作范围</small></span><ChevronRight size={17} /></button>}{needsAttention.length ? needsAttention.map((item) => <button type="button" className="personal-task-row" key={item.id} onClick={() => item.sessionId && onContinue(item.sessionId)} disabled={!item.sessionId}><span><strong>{item.title}</strong><small>{item.body || "打开对应对话继续处理"}</small></span><ChevronRight size={17} /></button>) : approvalCount === 0 && <p className="personal-empty">暂无待处理事项。</p>}</section>
+    <section className="personal-list-section"><h2>进行中</h2>{running.length ? running.map((job) => <button type="button" className="personal-task-row" key={job.id} onClick={() => job.sessionId && onContinue(job.sessionId)} disabled={!job.sessionId}><span><strong>{job.title || job.message || "正在处理"}</strong><small>{job.body || "打开对话查看进展"}</small></span><ChevronRight size={17} /></button>) : <p className="personal-empty">当前没有运行中的个人任务。</p>}</section>
+    <section className="personal-list-section"><h2>最近文件</h2>{recentFiles.length ? recentFiles.map((file) => <button type="button" className="personal-task-row" key={file.path} onClick={() => onOpenMaterial(file.path)}><span><strong>{file.name}</strong><small>{new Date(file.updatedAt).toLocaleString()} · 查看结果</small></span><ChevronRight size={17} /></button>) : <p className="personal-empty">{filesLoading ? "正在读取结果文件…" : filesError || "还没有可查看的结果文件。"}</p>}</section>
+    <section className="personal-list-section"><h2>继续上次对话</h2>{recent.length ? recent.map((session) => <button type="button" className="personal-task-row" key={session.id} onClick={() => onContinue(session.id)}><span><strong>{sessionDisplayTitle(session)}</strong><small>{session.updatedAt ? timeLabel(session.updatedAt) : "草稿"} · {session.messageCount || 0} 条消息</small></span><ChevronRight size={17} /></button>) : <p className="personal-empty">还没有个人对话。交办第一个任务即可开始。</p>}</section>
+    <button type="button" className="personal-secondary-link" onClick={onConnections}><Link2 size={16} />管理连接服务<ChevronRight size={16} /></button>
+  </div>;
+}
+
+function PersonalSettings({ repo, appStatus, browserPushEndpoint, pushReadiness, onPushSubscribe, onPushUnsubscribe, onCodexLogin, onOpenAdvanced }: {
+  repo: Repo;
+  appStatus: CodexAppStatus;
+  browserPushEndpoint: string | null;
+  pushReadiness: BrowserPushReadiness;
+  onPushSubscribe: () => void;
+  onPushUnsubscribe: () => void;
+  onCodexLogin: () => void;
+  onOpenAdvanced: () => void;
+}) {
+  const login = appStatus.accountLogin?.active;
+  const authenticated = appStatus.auth?.ok !== false && Boolean(appStatus.account);
+  return <div className="personal-page personal-settings">
+    <header className="personal-page-header"><div><p className="eyebrow">个人助理</p><h1>设置</h1></div></header>
+    <section className="personal-list-section"><h2>账号与空间</h2><p>{authenticated ? `${appStatus.account?.email || "Codex 账号"} · ${repo.runtimeMode === "shared" ? "与工作空间共用登录" : "独立执行器"}` : appStatus.auth?.issue || "Codex 账号待确认"}</p><p>个人会话与工作项目的上下文分开；共用登录不代表第三方服务授权也分开。</p><button type="button" className="mini-action" onClick={onCodexLogin}><RefreshCw size={15} />重新登录 Codex</button>{login && codexVerificationUrl(login) && <a href={codexVerificationUrl(login)} target="_blank" rel="noopener noreferrer">打开授权页 · {login.userCode || "继续登录"}</a>}</section>
+    <section className="personal-list-section"><h2>连接服务</h2><Suspense fallback={<p className="personal-empty">正在读取连接服务…</p>}><LazyConnectedServices repoId={repo.id} /></Suspense></section>
+    <section className="personal-list-section"><h2>偏好与事实</h2><Suspense fallback={<p className="personal-empty">正在读取个人事实…</p>}><LazyPersonalFacts /></Suspense></section>
+    <section className="personal-list-section"><h2>通知</h2><p>{browserPushEndpoint ? "本机浏览器已订阅待处理通知。" : pushReadiness.supported ? "可订阅本机待处理通知。" : "当前浏览器不支持后台通知或尚未满足安全入口条件。"}</p><button type="button" className="mini-action" disabled={!browserPushEndpoint && !pushReadiness.supported} onClick={browserPushEndpoint ? onPushUnsubscribe : onPushSubscribe}><Bell size={15} />{browserPushEndpoint ? "取消本机订阅" : "订阅本机通知"}</button></section>
+    <button type="button" className="personal-secondary-link" onClick={onOpenAdvanced}><Settings2 size={16} />服务器与高级诊断<ChevronRight size={16} /></button>
+  </div>;
 }
 
 function Sidebar({
@@ -6206,6 +6330,8 @@ function Sidebar({
       </div>
 
       <nav className="nav-stack">
+        {isPersonal && <button className={cx("nav-item", activeView === "today" && "active")} onClick={choose(() => onSelectView("today"))}><ListTodo size={18} /><span>今日</span></button>}
+        {isPersonal && <button className={cx("nav-item", activeView === "materials" && "active")} onClick={choose(() => onSelectView("materials"))}><FolderOpen size={18} /><span>资料</span></button>}
         {!isPersonal && <button className={cx("nav-item", activeView === "inbox" && "active")} onClick={choose(() => onSelectView("inbox"))}>
           <CheckCircle2 size={18} />
           <span>收件箱</span>
@@ -6216,10 +6342,10 @@ function Sidebar({
           <span>自动化</span>
           <small>{status.automations.length}</small>
         </button>}
-        <button className={cx("nav-item", activeView === "usage" && "active")} onClick={choose(() => onSelectView("usage"))}>
+        {!isPersonal && <button className={cx("nav-item", activeView === "usage" && "active")} onClick={choose(() => onSelectView("usage"))}>
           <Gauge size={18} />
           <span>调用与用量</span>
-        </button>
+        </button>}
         <button className={cx("nav-item", activeView === "cli" && "active")} onClick={choose(onNewChat)}>
           <MessageSquare size={18} />
           <span>新对话</span>
@@ -7154,7 +7280,7 @@ function PanelTitle({
   );
 }
 
-function PendingApprovals() {
+function PendingApprovals({ personalSpace, repoId, onPersonalCount }: { personalSpace: boolean; repoId: string; onPersonalCount: (count: number) => void }) {
   const [pending, setPending] = useState<PendingApproval[]>([]);
   const [busyId, setBusyId] = useState("");
   const [error, setError] = useState("");
@@ -7222,11 +7348,13 @@ function PendingApprovals() {
     }
   };
 
-  if (!pending.length) return null;
+  const visible = pending.filter((item) => personalSpace ? item.owner.repoId === repoId : item.owner.repoId !== "_personal");
+  useEffect(() => { onPersonalCount(personalSpace ? visible.length : 0); }, [onPersonalCount, personalSpace, visible.length]);
+  if (!visible.length) return null;
   return (
     <section className="pending-approvals" aria-label="待处理请求" aria-live="polite">
-      <div className="pending-approvals-head"><ShieldCheck size={18} /><strong>待确认 · {pending.length}</strong></div>
-      {pending.map((item) => {
+      <div className="pending-approvals-head"><ShieldCheck size={18} /><strong>待确认 · {visible.length}</strong></div>
+      {visible.map((item) => {
         const questions = item.params.questions || [];
         const inputRequest = item.method === "item/tool/requestUserInput";
         const mcpRequest = item.method === "mcpServer/elicitation/request";
@@ -8431,10 +8559,37 @@ function CloudChat({
   historyError: string;
 }) {
   const endRef = useRef<HTMLDivElement | null>(null);
+  const chatWindowRef = useRef<HTMLDivElement | null>(null);
+  const followChatRef = useRef(true);
+  const lastProgressRef = useRef("");
+  const [newProgress, setNewProgress] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [commandIndex, setCommandIndex] = useState(0);
   const [draggingAttachments, setDraggingAttachments] = useState(false);
-  const [activePanel, setActivePanel] = useState<"model" | "reasoning" | "goal" | "status" | "auto" | "sessions" | "capabilities" | "permissions" | "diff" | "review" | "guide" | "connections" | null>(null);
+  const [activePanel, setActivePanel] = useState<"model" | "reasoning" | "goal" | "status" | "auto" | "sessions" | "capabilities" | "permissions" | "diff" | "review" | "guide" | "connections" | "sessionSettings" | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const [compactViewport, setCompactViewport] = useState(() => window.matchMedia("(max-width: 820px)").matches);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 820px)");
+    const update = () => setCompactViewport(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    if (!activePanel || !compactViewport) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [activePanel, compactViewport]);
+  useEffect(() => {
+    if (!activePanel) return;
+    const trigger = document.activeElement;
+    const frame = window.requestAnimationFrame(() => panelRef.current?.querySelector<HTMLButtonElement>('button[aria-label="关闭面板"]')?.focus());
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (trigger instanceof HTMLElement && trigger.isConnected && !panelRef.current?.contains(trigger)) trigger.focus();
+    };
+  }, [activePanel]);
   const [diffResult, setDiffResult] = useState<GitDiffResponse | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState("");
@@ -9160,13 +9315,17 @@ function CloudChat({
     onFilesSelected(files);
   };
 
+  useEffect(() => { followChatRef.current = true; lastProgressRef.current = ""; setNewProgress(false); }, [activeSessionId]);
   useEffect(() => {
-    const scroller = endRef.current?.closest(".chat-window");
-    if (scroller instanceof HTMLElement) {
+    const scroller = chatWindowRef.current;
+    if (!scroller) return;
+    const last = messages.at(-1);
+    const progress = `${last?.id || ""}:${last?.text?.length || 0}:${last?.status || ""}:${busy}`;
+    if (followChatRef.current) {
       scroller.scrollTop = scroller.scrollHeight;
-      return;
-    }
-    endRef.current?.scrollIntoView({ block: "end" });
+      setNewProgress(false);
+    } else if (lastProgressRef.current && progress !== lastProgressRef.current) setNewProgress(true);
+    lastProgressRef.current = progress;
   }, [messages, busy]);
 
   useEffect(() => {
@@ -9265,19 +9424,25 @@ function CloudChat({
 
       {repo.kind === "personal" && <div className="personal-scope-notice" data-mode={repo.runtimeMode} role="status">
         <UserRound size={16} />
-        <span>{repo.executionAvailable
+        <span className="personal-scope-long">{repo.executionAvailable
           ? repo.runtimeMode === "dedicated"
             ? "个人助理 · 独立执行器 · 独立对话"
             : "个人助理 · 共用账号 · 独立对话"
           : "个人空间执行暂未启用，草稿仍会保留。"}</span>
+        <span className="personal-scope-short">{repo.executionAvailable ? repo.runtimeMode === "dedicated" ? "独立执行器" : "共用账号" : "暂不可执行"}</span>
+        <span className="personal-connection-brief">{connection.label}</span>
         <div className="personal-scope-actions">
           <button type="button" className="mini-action" onClick={() => setActivePanel("guide")}><Sparkles size={14} />任务建议</button>
           <button type="button" className="mini-action" onClick={() => setActivePanel("connections")}><Link2 size={14} />连接服务</button>
         </div>
       </div>}
 
-      <div className="chat-window" aria-busy={historyLoading}>
-        {repo.kind === "personal" && !historyLoading && !historyError && messages.length === 0 && <PersonalAssistantGuide onChoose={choosePersonalTask} />}
+      <div className="chat-window" ref={chatWindowRef} aria-busy={historyLoading} onScroll={(event) => {
+        const target = event.currentTarget;
+        followChatRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 96;
+        if (followChatRef.current) setNewProgress(false);
+      }}>
+        {repo.kind === "personal" && !historyLoading && !historyError && messages.length === 0 && <PersonalAssistantGuide onChoose={choosePersonalTask} onConnect={() => setActivePanel("connections")} />}
         {historyLoading && messages.length === 0 && (
           <article className="chat-bubble codex compact">
             <span className="chat-avatar">
@@ -9311,6 +9476,11 @@ function CloudChat({
         onDragOver={handleComposerDragOver}
         onDrop={handleComposerDrop}
       >
+        {newProgress && <button className="chat-new-progress" type="button" onClick={() => {
+          followChatRef.current = true;
+          if (chatWindowRef.current) chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
+          setNewProgress(false);
+        }}>有新进展 <ChevronRight size={15} /></button>}
         {draggingAttachments && (
           <div className="composer-drop-overlay" data-testid="composer-drop-overlay">
             <Paperclip size={18} />
@@ -9393,8 +9563,24 @@ function CloudChat({
           </div>
         )}
 
+        {activePanel && compactViewport && <button className="command-panel-backdrop" type="button" aria-label="关闭面板" onClick={() => setActivePanel(null)} />}
         {activePanel && (
-          <div className="command-panel">
+          <div
+            className="command-panel"
+            ref={panelRef}
+            role="dialog"
+            aria-modal={compactViewport}
+            aria-label={activePanel === "connections" ? "连接服务" : activePanel === "sessionSettings" ? "会话设置" : "会话选项"}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") { event.stopPropagation(); setActivePanel(null); return; }
+              if (event.key !== "Tab" || !compactViewport) return;
+              const focusable = Array.from(panelRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary') || []);
+              const first = focusable[0];
+              const last = focusable.at(-1);
+              if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+              else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+            }}
+          >
             <div className="command-panel-head">
               <strong>
                 {activePanel === "model" && "模型"}
@@ -9409,13 +9595,19 @@ function CloudChat({
                 {activePanel === "review" && "Review"}
                 {activePanel === "guide" && "个人助理"}
                 {activePanel === "connections" && "连接服务"}
+                {activePanel === "sessionSettings" && "会话设置"}
               </strong>
               <button className="icon-command" onClick={() => setActivePanel(null)} type="button" aria-label="关闭面板">
                 ×
               </button>
             </div>
 
-            {activePanel === "guide" && <PersonalAssistantGuide onChoose={choosePersonalTask} />}
+            {activePanel === "guide" && <PersonalAssistantGuide onChoose={choosePersonalTask} onConnect={() => setActivePanel("connections")} />}
+            {activePanel === "sessionSettings" && <div className="personal-session-settings">
+              <button type="button" onClick={() => setActivePanel("permissions")}><ShieldCheck size={18} /><span><strong>工作区权限</strong><small>{permissionRuntimeLabel(runtime.sandbox, runtime.approval)}</small></span><ChevronRight size={16} /></button>
+              <button type="button" onClick={() => { onRefreshModels(); setActivePanel("model"); }}><Bot size={18} /><span><strong>模型</strong><small>{activeModel?.displayName || runtime.model}</small></span><ChevronRight size={16} /></button>
+              <button type="button" onClick={() => setActivePanel("reasoning")}><SlidersHorizontal size={18} /><span><strong>推理深度</strong><small>{reasoningLabel(runtime.reasoning)}</small></span><ChevronRight size={16} /></button>
+            </div>}
             {activePanel === "connections" && <>
               <Suspense fallback={<p role="status">正在加载服务…</p>}><LazyConnectedServices key={repo.id} repoId={repo.id} /></Suspense>
               <button className="mini-action" type="button" onClick={() => setActivePanel("capabilities")}><SlidersHorizontal size={14} />MCP 与其他工具</button>
@@ -10034,7 +10226,7 @@ function CloudChat({
             }}
             placeholder={
               busy
-                ? "继续补充当前回复"
+                ? "补充本轮回复（立即生效）"
                 : busyAction === "compact"
                   ? "正在压缩上下文"
                   : repo.kind === "personal" ? repo.executionAvailable ? "向个人助理发送消息" : "个人空间暂未开放执行，可先保存草稿" : "向云端 Codex 发送消息"
@@ -10043,7 +10235,7 @@ function CloudChat({
           <button
             className="icon-command attach-button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={historyLoading || Boolean(busyAction) || uploadingAttachments || repo.kind === "personal"}
+            disabled={historyLoading || Boolean(busyAction) || uploadingAttachments || (repo.kind === "personal" && !repo.executionAvailable)}
             title="上传截图或文件"
             aria-label={uploadingAttachments ? "正在上传附件" : "上传截图或文件"}
             type="button"
@@ -10055,15 +10247,17 @@ function CloudChat({
             onClick={onSend}
             disabled={historyLoading || (repo.kind === "personal" && !repo.executionAvailable) || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
             aria-label={
-              busy || busyAction === "compact"
-                ? "云端 Codex 正在处理"
+              busy
+                ? "补充本轮回复"
+                : busyAction === "compact"
+                  ? "云端 Codex 正在处理"
                 : input.trim() || attachments.length > 0
                   ? "发送消息"
                   : "输入消息后发送"
             }
             type="button"
           >
-            {busy || busyAction === "compact" ? <Loader2 size={17} className="spin" /> : <Send size={17} />}
+            {busy ? <Send size={17} /> : busyAction === "compact" ? <Loader2 size={17} className="spin" /> : <Send size={17} />}
           </button>
           <button
             className="icon-command clear-chat"
@@ -10078,6 +10272,7 @@ function CloudChat({
         </div>
         <div className="composer-footer app-composer-footer">
           <div className="composer-footer-left">
+            {repo.kind === "personal" ? <button type="button" onClick={() => setActivePanel("sessionSettings")} aria-label={`会话设置：${activeModel?.displayName || runtime.model}，${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}`}><SlidersHorizontal size={15} />{activeModel?.displayName || runtime.model} · {permissionLabel(runtime.sandbox)}</button> : <>
             <button type="button" onClick={() => onInput("/")} disabled={Boolean(busyAction)} title="指令" aria-label="打开 Codex 指令">
               <Command size={14} />
               /
@@ -10092,8 +10287,9 @@ function CloudChat({
               <ShieldCheck size={14} />
               {permissionLabel(runtime.sandbox)}
             </button>
+            </>}
           </div>
-          <div className="composer-footer-right">
+          {repo.kind !== "personal" && <div className="composer-footer-right">
             {goal && (
               <button className="footer-goal-chip" type="button" onClick={() => setActivePanel("goal")} title={goal.objective}>
                 <Target size={12} />
@@ -10108,7 +10304,7 @@ function CloudChat({
                 {compactStatus?.running ? "压缩中" : `${percent}% ctx`}
               </button>
             )}
-          </div>
+          </div>}
         </div>
       </div>
     </section>

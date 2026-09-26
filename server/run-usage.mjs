@@ -58,3 +58,26 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
   }
   return [...buckets.values()].sort((a, b) => a.hour.localeCompare(b.hour));
 }
+
+export function runUsageDetails(runs, { from, to, clientId = "", limit = 200 }) {
+  return runs.filter((run) => {
+    const started = Date.parse(run.startedAt || "");
+    return run.clientId && (!clientId || run.clientId === clientId) && Number.isFinite(started) && started >= from && started < to;
+  }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map((run) => ({
+    id: run.id,
+    clientId: run.clientId,
+    automationId: run.automationId,
+    status: run.status,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt || null,
+    model: run.model || null,
+    reasoning: run.reasoning || null,
+    usage: run.usage?.status === "complete" ? {
+      status: "complete",
+      inputTokens: run.usage.inputTokens,
+      outputTokens: run.usage.outputTokens,
+      totalTokens: run.usage.totalTokens,
+      cachedInputTokens: run.usage.cachedInputTokens,
+    } : { status: "unknown" },
+  }));
+}

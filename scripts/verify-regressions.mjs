@@ -224,6 +224,7 @@ input.on("line", (line) => {
     const requestText = JSON.stringify(message.params || {});
     const turnId = requestText.includes("cancel regression") ? "turn-cancel-regression" : "turn-regression";
     const progressRegression = requestText.includes("progress regression");
+    const personalDeletionRegression = requestText.includes("personal deletion regression");
     const recoveryRegression = requestText.includes("继续上一轮因服务重启中断的自动化任务");
     const outcomeContractRegression = requestText.includes("outcome contract regression");
     send({ id: message.id, result: { turn: { id: turnId } } });
@@ -240,6 +241,12 @@ input.on("line", (line) => {
         threadId: "thread-regression",
         turn: { id: turnId, status: "completed" },
       } }, 650);
+    }
+    if (personalDeletionRegression) {
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId,
+        turn: { id: turnId, status: "completed" },
+      } }, 900);
     }
     if (outcomeContractRegression) {
       const missingMarker = requestText.includes("missing marker");
@@ -795,6 +802,106 @@ await check("personal and work reuse authentication without sharing threads or s
     const refreshResume = refreshRequests.filter((r) => r.method === "thread/resume").at(-1).params;
     assert.equal(refreshResume.sandbox, "workspace-write");
     assert.equal(refreshResume.approvalPolicy, "on-request");
+    const createdFact = await jsonRequest(base, "/api/personal/facts", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ label: "称呼", value: "回归测试称呼" }),
+    });
+    assert.equal(createdFact.response.status, 201);
+    const factSession = await jsonRequest(base, "/api/chat/sessions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "Fact test" }),
+    });
+    assert.equal(factSession.response.status, 200);
+    const withFact = await jsonRequest(base, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "outcome contract regression with fact" }),
+    });
+    assert.equal(withFact.data.ok, true);
+    const factStarts = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "thread/start" && request.params.cwd === path.join(cloudRoot, "personal"));
+    assert.match(factStarts.at(-1).params.developerInstructions, /回归测试称呼/);
+    const deletedFact = await jsonRequest(base, `/api/personal/facts/${createdFact.data.fact.id}`, { method: "DELETE" });
+    assert.equal(deletedFact.response.status, 200);
+    const removedFactSession = await jsonRequest(base, "/api/chat/sessions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "Removed fact test" }),
+    });
+    assert.equal(removedFactSession.response.status, 200);
+    const withoutFact = await jsonRequest(base, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "_personal", sessionId: removedFactSession.data.activeSessionId, message: "outcome contract regression after fact removal" }),
+    });
+    assert.equal(withoutFact.data.ok, true);
+    const updatedStarts = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "thread/start" && request.params.cwd === path.join(cloudRoot, "personal"));
+    assert.doesNotMatch(updatedStarts.at(-1).params.developerInstructions, /回归测试称呼/);
+    const attachmentBytes = Buffer.from("personal upload regression\n");
+    const uploaded = await jsonRequest(base, "/api/uploads", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "_personal", files: [{ name: "notes.txt", type: "text/plain", dataUrl: `data:text/plain;base64,${attachmentBytes.toString("base64")}` }] }),
+    });
+    assert.equal(uploaded.response.status, 200, JSON.stringify(uploaded.data));
+    assert.equal(uploaded.data.files.length, 1);
+    assert.equal(uploaded.data.files[0].source, "personal-upload");
+    const uploadPath = uploaded.data.files[0].path;
+    assert.match(uploadPath, /^\.codex-cloud\/uploads\//);
+    assert.deepEqual(await fs.readFile(path.join(cloudRoot, "personal", uploadPath)), attachmentBytes);
+    const preview = await fetch(`${base}/api/files/blob?repoId=_personal&path=${encodeURIComponent(uploadPath)}`);
+    assert.equal(preview.status, 200);
+    assert.deepEqual(Buffer.from(await preview.arrayBuffer()), attachmentBytes);
+    await fs.mkdir(path.join(cloudRoot, "personal", "results"), { recursive: true });
+    await fs.writeFile(path.join(cloudRoot, "personal", "results", "summary.md"), "personal result\n");
+    await fs.writeFile(path.join(cloudRoot, "workspace", "sample-app", "work-only.txt"), "must not be exposed\n");
+    await fs.symlink(path.join(cloudRoot, "workspace", "sample-app"), path.join(cloudRoot, "personal", "results", "work-link"));
+    const personalFiles = await jsonRequest(base, "/api/personal/files");
+    assert.equal(personalFiles.response.status, 200);
+    assert.ok(personalFiles.data.files.some((file) => file.path === "results/summary.md" && file.kind === "output"));
+    assert.ok(personalFiles.data.files.some((file) => file.path === uploadPath && file.kind === "input"));
+    assert.equal(personalFiles.data.files.some((file) => file.path.includes("work-link")), false);
+    const resultFile = await fetch(`${base}/api/personal/files/content?path=results%2Fsummary.md&preview=1`);
+    assert.equal(resultFile.status, 200);
+    assert.equal(resultFile.headers.get("content-security-policy"), "sandbox");
+    assert.match(resultFile.headers.get("content-disposition"), /^inline;/);
+    assert.equal(await resultFile.text(), "personal result\n");
+    const downloadedFile = await fetch(`${base}/api/personal/files/content?path=results%2Fsummary.md`);
+    assert.equal(downloadedFile.status, 200);
+    assert.equal(downloadedFile.headers.get("content-type"), "application/octet-stream");
+    assert.match(downloadedFile.headers.get("content-disposition"), /^attachment;/);
+    assert.equal(await downloadedFile.text(), "personal result\n");
+    const linkedWorkFile = await fetch(`${base}/api/personal/files/content?path=results%2Fwork-link%2Fwork-only.txt`);
+    assert.equal(linkedWorkFile.status, 403);
+    const crossSpacePreview = await fetch(`${base}/api/files/blob?repoId=sample-app&path=${encodeURIComponent(uploadPath)}`);
+    assert.notEqual(crossSpacePreview.status, 200);
+    const traversal = await jsonRequest(base, "/api/chat/stream", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "_personal", attachments: [{ path: "../../sample-app/secret.txt", name: "secret.txt", mimeType: "text/plain" }] }),
+    });
+    assert.equal(traversal.response.status, 400);
+    const materialSession = await jsonRequest(base, "/api/chat/sessions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "Material retention" }),
+    });
+    assert.equal(materialSession.response.status, 200);
+    const materialSessionId = materialSession.data.activeSessionId;
+    const attachedDraft = await jsonRequest(base, `/api/chat/sessions/${materialSessionId}/draft`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "_personal", input: "", attachments: [{ name: "notes.txt", path: uploadPath, mimeType: "text/plain", size: attachmentBytes.length, kind: "file" }] }),
+    });
+    assert.equal(attachedDraft.response.status, 200, JSON.stringify(attachedDraft.data));
+    const blockedDelete = await jsonRequest(base, `/api/personal/files?path=${encodeURIComponent(uploadPath)}`, { method: "DELETE" });
+    assert.equal(blockedDelete.response.status, 409);
+    const deletedSession = await jsonRequest(base, `/api/chat/sessions/${materialSessionId}?repoId=_personal`, { method: "DELETE" });
+    assert.equal(deletedSession.response.status, 200, JSON.stringify(deletedSession.data));
+    assert.deepEqual(deletedSession.data.uploadCleanup.retained, [uploadPath]);
+    assert.deepEqual(await fs.readFile(path.join(cloudRoot, "personal", uploadPath)), attachmentBytes);
+    const activePersonalTurn = await fetch(`${base}/api/chat/stream`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "personal deletion regression" }),
+    });
+    assert.equal(activePersonalTurn.status, 200);
+    const blockedDuringTurn = await jsonRequest(base, `/api/personal/files?path=${encodeURIComponent(uploadPath)}`, { method: "DELETE" });
+    assert.equal(blockedDuringTurn.response.status, 409);
+    assert.deepEqual(await fs.readFile(path.join(cloudRoot, "personal", uploadPath)), attachmentBytes);
+    await activePersonalTurn.text();
+    const removed = await jsonRequest(base, `/api/personal/files?path=${encodeURIComponent(uploadPath)}`, { method: "DELETE" });
+    assert.equal(removed.response.status, 200, JSON.stringify(removed.data));
+    assert.equal(await fs.stat(path.join(cloudRoot, "personal", uploadPath)).catch(() => null), null);
+    assert.equal(await fs.readFile(path.join(cloudRoot, "personal", "results", "summary.md"), "utf8"), "personal result\n");
     const { data: status } = await jsonRequest(base, "/api/status");
     assert.equal(status.codex.authenticated, true);
     assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);
@@ -1395,6 +1502,17 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.equal(scopedCompleted?.status, "completed");
+    const completedProgress = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, { headers: scopedHeaders });
+    assert.equal(completedProgress.response.status, 200);
+    assert.ok(completedProgress.data.eventCursor >= 1);
+    assert.equal(completedProgress.data.run.eventCursor, completedProgress.data.eventCursor);
+    assert.ok(completedProgress.data.events.some((event) => event.type === "queued"));
+    assert.ok(completedProgress.data.events.every((event) => !Object.hasOwn(event, "text")));
+    const noNewProgress = await jsonRequest(baseUrl, `${clientTrigger.data.run.resultPath}?after=${completedProgress.data.eventCursor}`, { headers: scopedHeaders });
+    assert.equal(noNewProgress.data.events.length, 0);
+    assert.equal(noNewProgress.data.eventGap, false);
+    const invalidCursor = await jsonRequest(baseUrl, `${clientTrigger.data.run.resultPath}?after=bad`, { headers: scopedHeaders });
+    assert.equal(invalidCursor.response.status, 400);
     const originalClientRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === clientTrigger.data.run.id);
     assert.notEqual(originalClientRun.worktreePath, repoRoot);
     const chatStateFile = path.join(stateRoot, "chat-history.json");

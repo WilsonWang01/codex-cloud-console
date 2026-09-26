@@ -153,7 +153,17 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 调用方使用 `x-codex-cloud-token` 提交令牌，并为每个业务事件提供 8–160 字符的 `Idempotency-Key`。同一服务重试同一事件时复用该键；同键不同请求会返回 409，失败终态也不会被静默重跑。独立调用方不能指定 `worktree:false`；所授权仓库需要可解析 `HEAD` 的 Git 提交。令牌仅能触发创建时选择的自动化、读取和请求取消自己的运行，不能查看管理页面或批准自己的任务。旧共享令牌仍兼容，统计中标记为 `legacy-shared`，不会被当作某个新服务。
 
-触发响应中的 `run.resultPath` 是只含任务 ID 的结果地址。调用方携带**同一令牌**向该路径发送 GET，读取状态、摘要、已知 token 用量及错误；向 `${resultPath}/cancel` 发送 POST 可请求取消。运行中的取消返回 202，只有模型确认中断后才进入 `canceled`，已发生的外部动作不能撤销。结果查询每个令牌每分钟最多 60 次，超限返回 429 和 `Retry-After`。跨调用方结果/取消返回 404，撤销令牌后返回 401；未认证查询不进入应用层请求曲线，避免公网请求撑大指标文件。
+触发响应中的 `run.resultPath` 是只含任务 ID 的结果地址。调用方携带**同一令牌**向该路径发送 GET，读取状态、摘要、已知 token 用量及错误；查询响应另有 `eventCursor`、`events` 和 `eventGap`。后续可用 `?after=<上次 eventCursor>` 只取新事件；事件只含序号、时间和类型，不包含原始工具内容。只保留最近 80 条，游标过旧时 `eventGap: true`，应以当前 Run 快照重新同步。向 `${resultPath}/cancel` 发送 POST 可请求取消。运行中的取消返回 202，只有模型确认中断后才进入 `canceled`，已发生的外部动作不能撤销。结果查询每个令牌每分钟最多 60 次，超限返回 429 和 `Retry-After`。跨调用方结果/取消返回 404，撤销令牌后返回 401；未认证查询不进入应用层请求曲线，避免公网请求撑大指标文件。
+
+仓库提供不保存令牌的[参考客户端](../scripts/external-client-example.mjs)。将 `CODEX_CLOUD_URL` 指向已开放独立令牌路由的 HTTPS 控制台，并通过服务自己的秘密管理注入 `CODEX_CLOUD_API_TOKEN`；不要把令牌写进命令参数、脚本或 Git。以下命令会**真实触发已配置自动化并消耗模型额度**，先确认任务范围和预算。`event-id` 是业务事件的稳定 ID，同一事件重试必须复用：
+
+```bash
+node scripts/external-client-example.mjs submit my-app-review business-event-20260926 --wait
+node scripts/external-client-example.mjs status my-app-review run-id --wait
+node scripts/external-client-example.mjs cancel my-app-review run-id
+```
+
+轮询中断只停止本地等待，不自动取消服务器任务；取消必须显式运行第三条命令。参考客户端默认使用该自动化已保存的 prompt，不接受外部任意命令。测试使用本地假服务端，不触发模型。
 
 独立令牌的项目范围、隔离工作树和并发限制**不是操作系统沙箱**：当前执行器仍与控制台共用系统用户、Codex 进程和环境。不要把令牌给不受信任的服务，也不要让外部输入直接驱动有高权限的任意命令；对外开放前需要独立 worker、最小权限和出站边界验收。旧共享令牌权限更宽，应迁移为独立令牌并按需撤销。
 
@@ -180,7 +190,7 @@ sudo systemctl status codex-personal-worker.service --no-pager
 sudo systemctl restart codex-cloud-console.service
 ```
 
-安装脚本为控制台添加 `CODEX_PERSONAL_WORKER=1` drop-in。个人 worker 的 `HOME/CODEX_HOME` 与工作账号分开，服务使用 `ProtectHome=yes`、只允许写自己的状态目录，阻断实例元数据地址与本机 TCP 管理端口。切到“个人”，在设置里为**个人空间**单独执行设备码登录；工作空间的登录保持不变。安装后先用无秘密夹具核对专用账号、Socket、工作目录不可读、元数据和本机管理端口不可达，再做一次可计费的最小模型任务。未登录时个人任务会明确失败，不会自动借用工作账号。
+安装脚本为控制台添加 `CODEX_PERSONAL_WORKER=1` drop-in，并重启个人 worker，因此升级时也必须先核对运行任务。个人 worker 的 `HOME/CODEX_HOME` 与工作账号分开，服务使用 `ProtectHome=yes`、只允许写自己的状态目录，阻断实例元数据地址与本机 TCP 管理端口。除 app-server 的 `worker.sock` 外，`files.sock` 仅接收个人目录内的文件列表、校验、用户主动上传、读取与上传删除；安装后应确认两个 socket 都存在。切到“个人”，在设置里为**个人空间**单独执行设备码登录；工作空间的登录保持不变。安装后先用无秘密夹具核对专用账号、两个 Socket、工作目录不可读、元数据和本机管理端口不可达，再做一次可计费的最小模型任务。未登录时个人任务会明确失败，不会自动借用工作账号。
 
 这只隔离个人执行器到工作数据的方向。现有 `ubuntu` 工作执行器有 sudo，能读取个人状态；在迁移工作执行器到低权限用户并验收前，不要把个人空间用于需要防范工作任务读取的秘密。服务重启会打断运行中任务，先检查任务再操作；回滚控制台时停用个人 drop-in 即可，**不删除** `/var/lib/codex-personal`。
 

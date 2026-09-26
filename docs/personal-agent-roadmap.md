@@ -1,6 +1,6 @@
 # Personal Agent 统一产品与技术方案
 
-状态：已整合的开发基线，阶段状态见第九节；逐项证据见[本轮验收与 review](acceptance/2026-09-26-personal-api-mobile.md)。更新日期：2026-09-26。调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`。
+状态：已整合的开发基线，阶段状态见第九节；逐项证据见[个人/API/移动验收](acceptance/2026-09-26-personal-api-mobile.md)、[个人引导与连接验收](acceptance/2026-09-26-personal-onboarding-connections.md)和[第二轮本地实现验收](acceptance/2026-09-26-personal-second-iteration.md)。更新日期：2026-09-26。原调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`；[第二轮对标与体验审查](competitor-benchmark-2026-09-26.md)基于 `5d07e80`，补充当前差距、复现问题及下一轮优先级。
 
 本文整合 `docs/research/2026-09-26-personal-agent-benchmark.md` 的对标、代码发现和后端演进建议，以及原四项需求方案，作为后续开发、review、验收的唯一计划入口。原调研保留为日期固定的证据档案，其中旧阶段顺序与接口建议以本文的整合决定为准。
 
@@ -50,7 +50,9 @@
 
 来源：[Muse Custom Connector](https://www.meta.com/help/artificial-intelligence/1687253048996149/)、[Today](https://today.ai/)、[Grok Bot 电脑与应用](https://docs.x.ai/grok-bot/computer-and-apps)、[Grok Chat MCP](https://docs.x.ai/grok/connectors)。接口能力未知不阻塞通用后端开发；实际产品适配完成前，不在 README 宣称已兼容。
 
-### 2.2 当前基础与缺口
+### 2.2 原调研基线与缺口
+
+本表及 2.3 保留原提交的发现，不代表当前线上仍存在全部问题。个人空间、真实审批、调用方令牌、幂等摘要、按通道通知和模型发现等已有后续交付；当前差距以 2.4 及最新验收为准。
 
 | 现有基础 | 缺口及设计影响 | 代码入口 |
 | --- | --- | --- |
@@ -84,6 +86,18 @@
 基线代码证据：[审批](https://github.com/WilsonWang01/codex-cloud-console/blob/7988422ed78567b2f2cbced4e233ed795fbae292/server/index.mjs#L2215)、[执行器](https://github.com/WilsonWang01/codex-cloud-console/blob/7988422ed78567b2f2cbced4e233ed795fbae292/server/index.mjs#L2316)、[幂等](https://github.com/WilsonWang01/codex-cloud-console/blob/7988422ed78567b2f2cbced4e233ed795fbae292/server/index.mjs#L6145)、[事件恢复](https://github.com/WilsonWang01/codex-cloud-console/blob/7988422ed78567b2f2cbced4e233ed795fbae292/server/index.mjs#L9351)、[完成校验](https://github.com/WilsonWang01/codex-cloud-console/blob/7988422ed78567b2f2cbced4e233ed795fbae292/server/index.mjs#L4534)、[通知](https://github.com/WilsonWang01/codex-cloud-console/blob/7988422ed78567b2f2cbced4e233ed795fbae292/server/index.mjs#L5880)。
 
 原调研用隔离 VM 做过 7 项纯逻辑探针，观察到命令/文件自动批准、空范围扩大、问题空答、MCP elicitation 拒绝、无幂等键继续执行、无合约失败记录不能持久重放。这些是待修复行为的证据，不是功能验收通过；当时未执行真实模型、云变更、竞品 E2E 或生产压测。
+
+### 2.4 第二轮对标后的优先级
+
+[第二轮报告](competitor-benchmark-2026-09-26.md)重新核对 Muse、Today、Grok Bot 和 Codex App 的官方资料，并对现有页面做只读浏览器检查。没有执行竞品真实任务，也没有授权本轮新增费用或部署。
+
+- 先处理 D3/D4 的已复现体验问题：用量筛选旧响应覆盖新筛选、加载/时区含义不明、移动端首屏控制区过高、常用按钮热区过小、连接面板与个人设置分层不清。
+- 然后完成 D2/D3/D5 的最小个人任务闭环：个人附件、可获取产物、待确认/进行中/最近结果，以及对应的持久任务和结果核验。
+- D5/D6/D7 保留可管理记忆、Routine、通知、外部客户端、业务行动预览；不因有连接入口就宣称已完成完整个人助理或竞品接入。
+- 上游实验性协议、无人值守副作用和用量未知仍是放行条件。共享账号不等于文件保密隔离；已知 token 门槛不是费用硬上限。
+- 本地第二轮补齐个人材料、可编辑事实、用量请求下钻和自动化事件游标；跨重启事务领取、真实业务回执及独立 worker 实机验收仍为后续门槛，状态见[第二轮验收](acceptance/2026-09-26-personal-second-iteration.md)。
+
+报告中的 R2-01 至 R2-13 是本路线图 D2-D7 的增量验收项，不另起阶段体系。现有功能、历史缺陷、代码风险和真实复现应分别记录，防止重复开发已解决能力。
 
 ## 三、统一架构与设计取舍
 
@@ -396,9 +410,9 @@ Skill 默认先只读盘点，引用随仓库提供的指南；创建计费资�
 | D0 | 合并方案、AWS 指南、Skill、README 导航 | 链接、结构、示例与安全边界校验 | 已整合，文档校验通过 |
 | D1 | 真实审批/输入、项目与调用方权限、并发与预算准入；专用 worker 可选 | PA-02/03/04/05；API-01/06；CORE-01/02/06 | 审批逐项决定；客户端令牌限定自动化与本人运行；单进程并发限额和已知 token 日软门槛已实现。默认调整为共用账号，不再等待专用登录；系统级双向隔离仅是可选 worker 模式的未完成项 |
 | D2 | 共用持久任务服务、幂等/恢复/取消、事件游标、结果与产物；依赖 D1 | API-02；CORE-03/04/05/07；OPS-01 | 部分功能已部署：Webhook 幂等绑定请求摘要、失败终态可重放、重启后外部任务待核对；结果查询与确认式取消经过模拟，Caddy 路由已上线且无令牌请求返回应用层 401。事务接收、租约、事件游标和结构化产物未完成 |
-| D3 | 个人空间与非 Git 对话、基础个人资料、API token 账本和曲线、移动交办；依赖 D1/D2 | PA-01/06；API-03/04/05/07；MOB-01/02/04 | 空间、独立会话/草稿、触发与轮询曲线、已知单轮 token、响应式页面已部署；已核对旧生产会话与自动化运行数量不变。默认共用登录；个人资料、完整用量和真机验收未完成 |
-| D4 | 通知按通道重试、连接状态、移动审批与结果、性能、协议矩阵和整批 review | MOB-03/05/06；CORE-08；DAILY-03/04；完整回归 | 部分功能已部署并在本机模拟验收：每通道持久重试、网页审批和多宽度检查；独立 Outbox、真实设备、协议矩阵与性能门槛未完成 |
-| D5 | 可治理记忆、跨会话目标、Routine、今日摘要与研究简报 | DAILY-01/02/05；经授权的连续日常试用 | 后续阶段 |
+| D3 | 个人空间与非 Git 对话、基础个人资料、API token 账本和曲线、移动交办；依赖 D1/D2 | PA-01/06；API-03/04/05/07；MOB-01/02/04 | 已部署基础能力；第二轮在本地补个人上传/资料、显式事实、今日状态、用量下钻和筛选竞态修复。尚未部署第二轮，也未做真机或真实模型验收 |
+| D4 | 通知按通道重试、连接状态、移动审批与结果、性能、协议矩阵和整批 review | MOB-03/05/06；CORE-08；DAILY-03/04；完整回归 | 已部署部分通知与审批基础；第二轮本地浏览器回归通过移动面板和触控检查，独立 Outbox、真实设备、协议矩阵与性能门槛未完成 |
+| D5 | 可治理记忆、跨会话目标、Routine、今日摘要与研究简报 | DAILY-01/02/05；经授权的连续日常试用 | 显式个人事实和今日聚合本地实现；跨天任务、Routine 与主动简报仍属后续阶段 |
 | D6 | `/v1`、MCP、可靠回调、一个实际外部客户端适配 | EXT-01/02/03；客户端能力现场验证 | 后续阶段 |
 | D7 | 邮件/日程草稿、持久浏览器、语音输入与有界委派 | 独立方案、容量验证、授权与跨渠道验收 | 后续阶段 |
 

@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: {
-      "/api": "http://127.0.0.1:8787",
+      "/api": process.env.CODEX_CLOUD_DEV_API_ORIGIN || "http://127.0.0.1:8787",
     },
   },
 });

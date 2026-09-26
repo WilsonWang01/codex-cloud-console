@@ -15,6 +15,7 @@ export function externalRunView(run, automationId) {
     summary: run.summary,
     error: run.error,
     usage: run.usage,
+    eventCursor: run.eventSeq || 0,
     resultPath: `/api/automations/${encodeURIComponent(automationId)}/runs/${encodeURIComponent(run.id)}`,
   };
 }

@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
+import { personalFileBridgeJson, personalFileSocketPath } from "../server/personal-file-bridge.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "../server/personal-runtime.mjs";
 import { appAuthorizationUrl, readConnectedApps } from "../server/connected-apps.mjs";
 
@@ -73,6 +74,10 @@ test("personal runtime requires a dedicated Linux home and socket", () => {
   assert.equal(enabled.enabled, true);
   assert.equal(enabled.root, "/var/lib/codex-personal/workspace");
   assert.equal(appServerRequestScope({ cwd: [enabled.root] }, enabled.root), "personal");
+  assert.equal(appServerRequestScope({ cwds: [enabled.root] }, enabled.root), "personal");
+  assert.equal(appServerRequestScope({ roots: [path.join(enabled.root, "notes")] }, enabled.root), "personal");
+  assert.equal(appServerRequestScope({ path: path.join(enabled.root, "notes.txt") }, enabled.root), "personal");
+  assert.equal(appServerRequestScope({ path: `${enabled.root}-other/notes.txt` }, enabled.root), "work");
   assert.equal(appServerRequestScope({ cwd: ["/home/ubuntu/workspace"] }, enabled.root), "work");
   assert.throws(() => personalRuntimeConfig({ NODE_ENV: "production", CODEX_PERSONAL_WORKER: "1" }, "darwin"), /Linux/);
   assert.throws(() => personalRuntimeConfig({ NODE_ENV: "production", CODEX_PERSONAL_WORKER: "1", CODEX_PERSONAL_ROOT: "/home/ubuntu/workspace" }, "linux"), /dedicated personal home/);
@@ -81,7 +86,9 @@ test("personal runtime requires a dedicated Linux home and socket", () => {
 test("personal worker bridges app-server over a socket without inherited secrets", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-worker-"));
   const socketPath = path.join(root, "worker.sock");
+  const fileSocketPath = personalFileSocketPath(socketPath);
   const fakeCodex = path.join(root, "fake-codex.mjs");
+  await fs.mkdir(path.join(root, "workspace"));
   await fs.writeFile(fakeCodex, `#!${process.execPath}
 import fs from "node:fs";
 let buffer = "";
@@ -108,10 +115,13 @@ process.stdin.on("data", (chunk) => {
   let client;
   try {
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (await fs.stat(socketPath).catch(() => null)) break;
+      if (await fs.stat(socketPath).catch(() => null) && await fs.stat(fileSocketPath).catch(() => null)) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.ok(await fs.stat(socketPath).catch(() => null), stderr);
+    assert.ok(await fs.stat(fileSocketPath).catch(() => null), stderr);
+    const fileList = await personalFileBridgeJson(fileSocketPath, "GET", "/files");
+    assert.deepEqual(fileList.files, []);
     client = new CodexAppServerClient({ socketPath, initializeTimeoutMs: 2_000 });
     const result = await client.request("ping", {}, 2_000).catch((error) => {
       throw new Error(`${error.message}; worker stderr: ${stderr}`);

@@ -32,6 +32,15 @@ let selectedRuntime = null;
 let appsFailure = false;
 let appsDirectoryDenied = false;
 let submittedMessages = 0;
+let uploadedCount = 0;
+let personalFilesDeleted = 0;
+let personalFiles = [
+  { path: "results/demo.md", name: "demo.md", kind: "output", size: 13, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
+  { path: ".codex-cloud/uploads/2026-09-26/notes.txt", name: "notes.txt", kind: "input", size: 12, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
+];
+let personalFacts = [];
+let usageRace = false;
+let usageFailure = false;
 const errors = [];
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -43,6 +52,23 @@ await context.route("**/api/**", async (route) => {
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
+  if (url.pathname === "/api/personal/files") {
+    if (req.method() === "DELETE") { personalFilesDeleted += 1; personalFiles = personalFiles.filter((file) => file.path !== url.searchParams.get("path")); return send({ ok: true }); }
+    return send({ ok: true, files: personalFiles });
+  }
+  if (url.pathname === "/api/personal/files/content") return route.fulfill({ status: 200, contentType: "text/plain", body: "sample result\n" });
+  if (url.pathname === "/api/personal/facts") {
+    if (req.method() === "POST") { const fact = { id: `fact-${personalFacts.length + 1}`, label: body.label, value: body.value, source: "user", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; personalFacts.push(fact); return send({ ok: true, fact }, 201); }
+    return send({ ok: true, facts: personalFacts });
+  }
+  if (url.pathname.startsWith("/api/personal/facts/")) {
+    const id = url.pathname.split("/").at(-1);
+    const fact = personalFacts.find((item) => item.id === id);
+    if (!fact) return send({ ok: false, error: "not found" }, 404);
+    if (req.method() === "PATCH") { fact.label = body.label; fact.value = body.value; fact.updatedAt = new Date().toISOString(); return send({ ok: true, fact }); }
+    if (req.method() === "DELETE") { personalFacts = personalFacts.filter((item) => item.id !== id); return send({ ok: true, fact }); }
+  }
+  if (url.pathname === "/api/uploads" && req.method() === "POST") { uploadedCount += 1; return send({ ok: true, files: body.files.map((file, index) => ({ name: file.name, path: `.codex-cloud/uploads/2026-09-26/${uploadedCount}-${index}-${file.name}`, mimeType: file.type, size: 12, kind: file.type.startsWith("image/") ? "image" : "file", source: "personal-upload" })) }); }
   if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", directoryError: appsDirectoryDenied ? "上游拒绝了云端服务目录请求（403）。" : "", apps: [
     { id: "mail", name: "Gmail", description: "整理邮件", installUrl: "https://chatgpt.com/apps/gmail/mail", accessible: false, enabled: true, callable: false },
     { id: "calendar", name: "Calendar", description: "查看日程", installUrl: "https://chatgpt.com/apps/calendar/cal", accessible: true, enabled: true, callable: true },
@@ -54,11 +80,18 @@ await context.route("**/api/**", async (route) => {
     if (req.method() === "POST") { createdToken = "ccc_test-token-only-once"; return send({ ok: true, token: createdToken, client: { id: "new", name: body.name } }, 201); }
     return send({ ok: true, clients: [{ id: "client-a", name: "研究服务", tokenPrefix: "ccc_test", automationIds: [status.automations[0].id], createdAt: new Date().toISOString(), expiresAt: null, revokedAt: null, lastUsedAt: new Date().toISOString() }] });
   }
-  if (url.pathname === "/api/clients/usage") return send({ ok: true, droppedRequests: 0,
-    buckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", requests: 2, accepted: 1, errors: 0, replayed: 1, polls: 3, controls: 1 }],
+  if (url.pathname === "/api/clients/usage") {
+    if (usageFailure) return send({ ok: false, error: "模拟统计不可用" }, 502);
+    const requestedDays = (Date.now() - Date.parse(url.searchParams.get("from"))) / 86_400_000;
+    if (usageRace && requestedDays > 4 && requestedDays < 10) await new Promise((resolve) => setTimeout(resolve, 300));
+    const requests = usageRace && requestedDays > 20 ? 30 : usageRace && requestedDays > 4 ? 7 : 2;
+    return send({ ok: true, droppedRequests: 0,
+    buckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", requests, accepted: 1, errors: 0, replayed: 1, polls: 3, controls: 1 }],
     runBuckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", runs: 2, completed: 1, failed: 0, knownRuns: 1, unknownRuns: 1, inputTokens: 100, outputTokens: 20, totalTokens: 120 }],
     requests: [{ id: "request-1", clientId: "client-a", automationId: status.automations[0].id, trigger: "webhook", status: 200, runId: "run-1", deduplicated: false, durationMs: 5, time: new Date().toISOString() }],
-  });
+    runs: [{ id: "run-1", clientId: "client-a", automationId: status.automations[0].id, status: "completed", startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), model: "gpt-5.6-terra", reasoning: "medium", usage: { status: "complete", inputTokens: 100, outputTokens: 20, totalTokens: 120 } }],
+  }).catch(() => null);
+  }
   if (url.pathname === "/api/codex/account/login") {
     personalLoginFlow = { loginId: "personal-login", type: "chatgptDeviceCode", status: "pending", userCode: "TEST-CODE", verificationUrl: "https://login.example.test/device" };
     return send({ ok: true, flow: personalLoginFlow, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: [personalLoginFlow] } });
@@ -85,17 +118,30 @@ await context.route("**/api/**", async (route) => {
 
 const page = await context.newPage();
 page.on("pageerror", (error) => errors.push(error.message));
+const openRecentPersonalChat = () => page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "继续上次对话" }) }).locator(".personal-task-row").first().click();
 const out = new URL("../docs/research/acceptance/personal-usage-2026-09-26/", import.meta.url);
 await fs.mkdir(out, { recursive: true });
 try {
   const baseUrl = process.env.CODEX_CLOUD_SAFETY_UI_URL || "http://127.0.0.1:5174/";
   await page.goto(`${baseUrl}#/project/sample-app/thread/sample-app-session`);
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
+  await page.getByRole("heading", { name: "今日" }).waitFor();
+  assert.equal(await page.getByText("echo approval-check", { exact: true }).count(), 0);
+  await page.screenshot({ path: new URL("today-desktop.png", out).pathname, fullPage: true });
+  assert.equal(await page.getByText("其他项目的历史诊断", { exact: true }).count(), 0);
+  await openRecentPersonalChat();
   await page.locator(".personal-scope-notice").waitFor();
   await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
   assert.match(page.url(), /_personal/);
   assert.equal(await page.locator(".send-button").isDisabled(), true);
   const composer = page.locator(".composer-shell textarea");
+  await page.locator(".hidden-file-input").setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("my notes\n") });
+  await page.getByText("notes.txt", { exact: true }).waitFor();
+  assert.equal(uploadedCount, 1);
+  await page.getByRole("button", { name: "移除附件 notes.txt" }).click();
+  await page.getByRole("button", { name: "连接邮箱" }).click();
+  await page.getByRole("link", { name: "连接Gmail" }).waitFor();
+  await page.locator(".command-panel").getByRole("button", { name: "关闭面板" }).click();
   await page.getByRole("button", { name: /整理邮件待办/ }).click();
   assert.match(await composer.inputValue(), /不要代我发送邮件/);
   assert.equal(submittedMessages, 0);
@@ -103,15 +149,16 @@ try {
   page.once("dialog", (dialog) => dialog.dismiss());
   await page.locator(".command-panel").getByRole("button", { name: /调研一个问题/ }).click();
   assert.match(await composer.inputValue(), /不要代我发送邮件/);
-  await page.getByRole("button", { name: "关闭面板" }).click();
-  await page.getByRole("button", { name: /^权限：/ }).click();
+  await page.locator(".command-panel").getByRole("button", { name: "关闭面板" }).click();
+  await page.getByRole("button", { name: /^会话设置：/ }).click();
+  await page.locator(".personal-session-settings").getByRole("button", { name: /工作区权限/ }).click();
   assert.equal(await page.locator(".choice-list").getByRole("button", { name: /全权限/ }).count(), 0);
   page.once("dialog", (dialog) => dialog.dismiss());
   await page.getByRole("button", { name: /^允许写入个人工作区/ }).click();
   assert.equal(selectedRuntime, null);
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: /^允许写入个人工作区/ }).click();
-  await page.getByRole("button", { name: /^权限：工作区写入/ }).waitFor();
+  await page.getByRole("button", { name: /^会话设置：.*工作区写入/ }).waitFor();
   assert.equal(selectedRuntime.sandbox, "workspace-write");
   assert.equal(selectedRuntime.approval, "on-request");
   await page.getByRole("button", { name: "连接服务", exact: true }).click();
@@ -127,7 +174,10 @@ try {
   await page.screenshot({ path: new URL("connections-desktop.png", out).pathname, fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
-  await page.screenshot({ path: new URL("connections-390.png", out).pathname, fullPage: true });
+  const panelBounds = await page.locator(".command-panel").evaluate((element) => ({ top: element.getBoundingClientRect().top, height: element.getBoundingClientRect().height, viewport: innerHeight }));
+  assert.equal(Math.round(panelBounds.top), 0);
+  assert.ok(panelBounds.height >= panelBounds.viewport);
+  await page.screenshot({ path: new URL("connections-390.png", out).pathname });
   appsFailure = true;
   await page.getByRole("button", { name: "刷新连接" }).click();
   await page.getByText("服务暂不可用", { exact: true }).waitFor();
@@ -136,10 +186,11 @@ try {
   appsDirectoryDenied = true;
   await page.getByRole("button", { name: "刷新连接" }).click();
   await mailAuthorization.waitFor();
+  await page.locator(".connected-directory-warning summary").click();
   await page.getByText("上游拒绝了云端服务目录请求（403）。", { exact: true }).waitFor();
-  assert.equal(await page.getByRole("link", { name: "打开官方服务目录" }).getAttribute("href"), "https://chatgpt.com/apps");
+  assert.equal(await page.getByRole("link", { name: "管理全部服务" }).getAttribute("href"), "https://chatgpt.com/apps");
   appsDirectoryDenied = false;
-  await page.getByRole("button", { name: "关闭面板" }).click();
+  await page.locator(".command-panel").getByRole("button", { name: "关闭面板" }).click();
   await page.setViewportSize({ width: 1280, height: 900 });
   await composer.fill("独立个人草稿");
   assert.equal(await page.locator(".send-button").isEnabled(), true);
@@ -147,34 +198,58 @@ try {
   await page.locator(".session-current[data-session-id='sample-app-session']").waitFor();
   assert.equal(await composer.inputValue(), "");
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
+  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await openRecentPersonalChat();
   await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
   assert.equal(await composer.inputValue(), "独立个人草稿");
   includeNewModel = true;
-  await page.getByRole("button", { name: "模型：GPT-5.6-Terra", exact: true }).click();
+  await page.getByRole("button", { name: /^会话设置：/ }).click();
+  await page.locator(".personal-session-settings").getByRole("button", { name: /模型/ }).click();
   await page.getByRole("button", { name: /GPT-6 Astra gpt-6-astra/ }).click();
-  await page.getByRole("button", { name: "模型：GPT-6 Astra", exact: true }).waitFor();
+  await page.getByRole("button", { name: /^会话设置：GPT-6 Astra/ }).waitFor();
   assert.equal(selectedRuntime?.model, "gpt-6-astra");
   assert.equal(selectedRuntime?.reasoning, "medium");
-  await page.getByRole("button", { name: "同意本次" }).click();
-  assert.deepEqual(decision, { decision: "accept", digest: "digest-test" });
   await page.screenshot({ path: new URL("personal-desktop.png", out).pathname, fullPage: true });
 
   await page.locator(".space-switch").getByRole("button", { name: "工作" }).click();
+  await page.getByRole("button", { name: "同意本次" }).click();
+  assert.deepEqual(decision, { decision: "accept", digest: "digest-test" });
   await page.getByRole("button", { name: /调用与用量/ }).click();
   await page.getByRole("heading", { name: "调用与用量" }).waitFor();
   assert.match(await page.locator(".usage-summary").innerText(), /120/);
   assert.match(await page.locator(".usage-view").innerText(), /1 次运行用量未知/);
   assert.match(await page.locator(".usage-summary").innerText(), /结果查询\s*3/);
+  await page.locator(".usage-request summary").first().click();
+  assert.match(await page.locator(".usage-request-expanded").innerText(), /Token 120/);
   await page.getByRole("group", { name: "曲线指标" }).getByRole("button", { name: "查询" }).click();
   await page.getByRole("img", { name: "查询 趋势" }).waitFor();
   assert.ok(await page.locator('.usage-chart-column[title$=": 3"]').count());
+  await page.locator(".usage-chart-data summary").click();
+  assert.match(await page.locator(".usage-chart-data table").innerText(), /查询[\s\S]*3/);
   await page.getByRole("textbox", { name: "调用方名称" }).fill("第二个服务");
   await page.locator(".usage-scopes input[type='checkbox']").first().check();
   await page.getByRole("button", { name: "创建令牌" }).click();
   await page.getByText(createdToken).waitFor();
+  await page.getByRole("group", { name: "时间范围" }).getByRole("button", { name: "24 小时" }).click();
+  await page.waitForFunction(() => document.querySelector(".usage-summary > div:first-child strong")?.textContent === "2");
+  usageRace = true;
+  await page.getByRole("group", { name: "时间范围" }).getByRole("button", { name: "7 天" }).click();
+  await page.getByRole("group", { name: "时间范围" }).getByRole("button", { name: "30 天" }).click();
+  await page.waitForFunction(() => document.querySelector(".usage-summary > div:first-child strong")?.textContent === "30");
+  await page.waitForTimeout(350);
+  assert.equal(await page.locator(".usage-summary > div:first-child strong").innerText(), "30");
+  usageRace = false;
+  usageFailure = true;
+  await page.getByRole("button", { name: "刷新用量" }).click();
+  await page.getByText("模拟统计不可用", { exact: true }).waitFor();
+  assert.equal(await page.locator(".usage-summary > div:first-child strong").innerText(), "30");
+  await page.getByText(/当前显示上次成功数据/).waitFor();
+  usageFailure = false;
+  await page.getByRole("button", { name: "刷新用量" }).click();
+  await page.waitForFunction(() => !document.querySelector(".usage-error"));
   await page.screenshot({ path: new URL("usage-desktop.png", out).pathname, fullPage: true });
   for (const width of [320, 360, 390, 430, 768, 820, 1280]) {
-    await page.setViewportSize({ width, height: width <= 430 ? 800 : 900 });
+    await page.setViewportSize({ width, height: width === 390 ? 844 : width <= 430 ? 800 : 900 });
     if (width <= 820) await page.getByRole("button", { name: "打开侧边栏" }).click();
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
     assert.equal(overflow, false, `horizontal overflow at ${width}px`);
@@ -189,8 +264,24 @@ try {
       if (width === 390) {
         await page.getByRole("button", { name: "打开侧边栏" }).click();
         await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
+        await page.getByRole("heading", { name: "今日" }).waitFor();
+        await page.screenshot({ path: new URL("today-390.png", out).pathname });
+        await openRecentPersonalChat();
         await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
-        await page.getByText("个人助理 · 共用账号 · 独立对话", { exact: true }).waitFor();
+        await page.getByText("共用账号", { exact: true }).waitFor();
+        const chatHeight = await page.locator(".chat-window").evaluate((element) => element.getBoundingClientRect().height);
+        const chatLayout = await page.evaluate(() => Object.fromEntries([".topbar", ".app-session-strip", ".personal-scope-notice", ".composer-shell", ".composer", ".composer-footer", ".chat-window"].map((selector) => [selector, Math.round(document.querySelector(selector)?.getBoundingClientRect().height || 0)])));
+        assert.ok(chatHeight >= 844 * 0.5, `390px personal chat window too short: ${chatHeight}px; ${JSON.stringify(chatLayout)}`);
+        const smallControls = await page.locator(".composer-shell .attach-button, .composer-shell .send-button, .composer-shell .clear-chat, .personal-scope-actions button, .session-actions button").evaluateAll((buttons) => buttons.filter((button) => {
+          const rect = button.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && (rect.width < 44 || rect.height < 44);
+        }).map((button) => button.outerHTML.slice(0, 140)));
+        assert.deepEqual(smallControls, [], "undersized personal controls at 390px");
+        await page.getByRole("button", { name: "连接服务", exact: true }).click();
+        assert.equal(await page.locator(".command-panel").getAttribute("aria-modal"), "true");
+        await page.waitForFunction(() => document.activeElement?.closest(".command-panel") !== null);
+        await page.keyboard.press("Escape");
+        assert.equal(await page.locator(".command-panel").count(), 0);
         await page.screenshot({ path: new URL("personal-390.png", out).pathname, fullPage: true });
         await page.getByRole("button", { name: "打开侧边栏" }).click();
         await page.locator(".space-switch").getByRole("button", { name: "工作" }).click();
@@ -203,19 +294,66 @@ try {
   await page.goto(`${baseUrl}#/inbox`);
   await page.evaluate(() => localStorage.setItem("codex-cloud-last-space-repo", "_personal"));
   await page.reload();
-  await page.locator(".personal-scope-notice").waitFor();
-  await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
+  await page.getByRole("heading", { name: "今日" }).waitFor();
   assert.match(page.url(), /#\/project\/_personal/);
   assert.equal(await page.getByText("仅草稿", { exact: true }).count(), 0);
   await page.evaluate(() => { window.open = () => null; });
   await page.getByRole("button", { name: "设置", exact: true }).click();
-  await page.getByText("登录有效 · 与工作空间共用账号", { exact: true }).waitFor();
+  await page.getByText(/与工作空间共用登录/).waitFor();
   assert.equal(await page.getByText("其他项目的历史诊断", { exact: true }).count(), 0);
   await page.getByRole("button", { name: "重新登录" }).first().click();
-  const authorizationLink = page.getByRole("link", { name: "打开授权页" }).first();
+  const authorizationLink = page.getByRole("link", { name: /打开授权页/ }).first();
   await authorizationLink.waitFor();
   assert.equal(await authorizationLink.getAttribute("href"), "https://login.example.test/device");
   assert.equal(await authorizationLink.getAttribute("rel"), "noopener noreferrer");
+  await page.getByRole("textbox", { name: "事实名称" }).fill("称呼");
+  await page.getByRole("textbox", { name: "事实内容" }).fill("小王");
+  await page.getByRole("button", { name: "添加事实" }).click();
+  await page.getByText("小王", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "编辑 称呼" }).click();
+  await page.getByRole("textbox", { name: "事实内容" }).fill("小李");
+  await page.getByRole("button", { name: "保存修改" }).click();
+  await page.getByText("小李", { exact: true }).waitFor();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "删除 称呼" }).click();
+  assert.equal(personalFacts.length, 0);
+  pending.push({ id: "personal-approval-test", method: "item/commandExecution/requestApproval", digest: "personal-digest", owner: { repoId: "_personal", sessionId: "_personal-session" }, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), params: { command: "echo personal approval check", cwd: "/tmp/personal" } });
+  await page.getByRole("button", { name: "今日", exact: true }).click();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.getByText("echo personal approval check", { exact: true }).waitFor();
+  assert.equal(await page.locator(".personal-overview span:first-child strong").innerText(), "1");
+  assert.equal(await page.getByText("echo approval-check", { exact: true }).count(), 0);
+  await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "最近文件" }) }).getByRole("button", { name: /demo.md/ }).click();
+  await page.getByRole("heading", { name: "助理生成的文件" }).waitFor();
+  await page.getByRole("heading", { name: "demo.md" }).waitFor();
+  await page.screenshot({ path: new URL("material-desktop.png", out).pathname, fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("material-390.png", out).pathname });
+  await page.locator(".personal-files .personal-task-row").filter({ hasText: "notes.txt" }).click();
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "删除上传副本" }).click();
+  assert.equal(personalFilesDeleted, 0);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "删除上传副本" }).click();
+  await page.waitForFunction(() => !document.querySelector(".personal-files")?.textContent?.includes("notes.txt"));
+  assert.equal(personalFilesDeleted, 1);
+  await page.locator(".personal-files .personal-task-row").filter({ hasText: "demo.md" }).click();
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  assert.ok(await page.getByRole("button", { name: "继续修改" }).evaluate((element) => element.getBoundingClientRect().height >= 44));
+  await page.screenshot({ path: new URL("material-320.png", out).pathname });
+  await page.getByRole("button", { name: "继续修改" }).click();
+  await page.locator(".personal-scope-notice").waitFor();
+  await page.setViewportSize({ width: 390, height: 480 });
+  await page.waitForFunction(() => {
+    const composer = document.querySelector(".composer-shell");
+    const input = composer?.querySelector("textarea");
+    return composer && input && composer.getBoundingClientRect().bottom <= innerHeight && input.getBoundingClientRect().height >= 44;
+  }, undefined, { timeout: 3000 });
+  await page.screenshot({ path: new URL("personal-390-short.png", out).pathname });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  assert.match(await composer.inputValue(), /独立个人草稿[\s\S]*@results\/demo.md/);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "打开模型列表发现新增模型并保留 medium", "一次性审批决定", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日结果直达预览与继续修改草稿"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

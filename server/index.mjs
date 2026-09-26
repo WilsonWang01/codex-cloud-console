@@ -1,5 +1,6 @@
 import express from "express";
 import { EventEmitter } from "node:events";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -16,12 +17,16 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource } from "./external-automation.mjs";
+import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
-import { aggregateRunUsage, runUsageFromProtocol } from "./run-usage.mjs";
+import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
 import { readConnectedApps } from "./connected-apps.mjs";
+import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
+import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
+import { createPersonalFactsStore } from "./personal-facts.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
@@ -42,6 +47,7 @@ const generatedImagesRoot = process.env.CODEX_GENERATED_IMAGES_ROOT || path.join
 const workspaceRoot = process.env.CODEX_WORKSPACE_ROOT || path.join(cloudRoot, "workspace");
 const personalRuntime = personalRuntimeConfig(process.env);
 const personalRoot = personalRuntime.enabled ? personalRuntime.root : process.env.CODEX_PERSONAL_ROOT || path.join(cloudRoot, "personal");
+const personalFileSocket = personalFileSocketPath(personalRuntime.socketPath);
 const personalRepoId = "_personal";
 const personalExecutionAvailable = personalRuntime.mode !== "disabled";
 const logsRoot = process.env.CODEX_LOGS_ROOT || path.join(cloudRoot, "logs");
@@ -49,6 +55,7 @@ const stateRoot =
   process.env.CODEX_STATE_ROOT ||
   (process.env.NODE_ENV === "production" ? path.join(cloudRoot, "state") : path.join(projectRoot, ".codex-cloud-state"));
 const chatHistoryPath = path.join(stateRoot, "chat-history.json");
+const personalFactsStore = createPersonalFactsStore(path.join(stateRoot, "personal-facts.json"));
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
 const auditEventsPath = path.join(stateRoot, "audit-events.json");
@@ -1765,7 +1772,7 @@ function cloudRuntimeDeveloperInstructions(runtime) {
   ].join("\n");
 }
 
-function appServerThreadParams(repo, runtime) {
+async function appServerThreadParams(repo, runtime) {
   return {
     cwd: repo.path,
     model: runtime.model,
@@ -1775,7 +1782,7 @@ function appServerThreadParams(repo, runtime) {
     personality: "pragmatic",
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
-      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime)] : []),
+      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, await personalFactsStore.list())] : []),
     ].join("\n"),
     config: {
       model_reasoning_effort: runtime.reasoning,
@@ -2816,7 +2823,7 @@ async function resolveThreadForJob(job) {
   const client = appServerClientForJob(job);
   if (job.threadId) {
     try {
-      await client.request("thread/resume", { threadId: job.threadId, ...appServerThreadParams(job.repo, job.runtime) }, 30_000);
+      await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime) }, 30_000);
       emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}` });
       rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
       return job.threadId;
@@ -2824,7 +2831,7 @@ async function resolveThreadForJob(job) {
       throw new Error(`原 app-server thread 无法恢复，已保留原会话，请重试：${error.message || error}`);
     }
   }
-  const started = await client.request("thread/start", appServerThreadParams(job.repo, job.runtime), 30_000);
+  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime), 30_000);
   job.threadId = started?.thread?.id;
   if (!job.threadId) throw new Error("Codex app-server did not return a thread id");
   rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
@@ -4771,6 +4778,7 @@ function normalizeAutomationRun(run = {}) {
         ? rawCompletionOutcome
         : "pending"
     : null;
+  const { events, eventSeq } = normalizeAutomationEvents(run.events, run.eventSeq);
   return {
     id: String(run.id || automationRunId(String(run.automationId || "automation"))),
     automationId: String(run.automationId || ""),
@@ -4808,13 +4816,8 @@ function normalizeAutomationRun(run = {}) {
     summary: run.summary ? String(run.summary).slice(0, 4000) : "",
     diffStat: run.diffStat ? String(run.diffStat).slice(0, 4000) : "",
     error: run.error ? String(run.error).slice(0, 2000) : null,
-    events: Array.isArray(run.events)
-      ? run.events.slice(-80).map((event) => ({
-          time: String(event.time || new Date().toISOString()),
-          type: String(event.type || "status"),
-          text: String(event.text || "").slice(0, 1200),
-        }))
-      : [],
+    eventSeq,
+    events,
   };
 }
 
@@ -4822,16 +4825,6 @@ async function readAutomationRuns() {
   const parsed = await readJsonState(automationRunsPath, { version: 1, runs: [] });
   const runs = Array.isArray(parsed?.runs) ? parsed.runs.map(normalizeAutomationRun) : [];
   return { version: 1, runs };
-}
-
-function mergeAutomationRunEvents(...groups) {
-  const seen = new Set();
-  return groups.flat().filter(Boolean).filter((event) => {
-    const key = `${event.time || ""}|${event.type || ""}|${event.text || ""}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).slice(-80);
 }
 
 async function writeAutomationRunsWithinQueue(store) {
@@ -4850,11 +4843,13 @@ async function upsertAutomationRun(run, event = null, { budgetLimit = null } = {
     }
     const index = store.runs.findIndex((item) => item.id === run.id);
     const current = index >= 0 ? store.runs[index] : null;
+    const { events, eventSeq } = mergeAutomationEvents(current, run.events || [], event ? [event] : []);
     const normalized = normalizeAutomationRun({
       ...(current || {}),
       ...run,
       updatedAt: new Date().toISOString(),
-      events: mergeAutomationRunEvents(current?.events || [], run.events || [], event ? [event] : []),
+      events,
+      eventSeq,
     });
     if (index >= 0) store.runs[index] = normalized;
     else store.runs.unshift(normalized);
@@ -4869,11 +4864,13 @@ async function appendAutomationRunEvent(runId, patch = {}, event = null) {
     const index = store.runs.findIndex((item) => item.id === runId);
     if (index < 0) return null;
     const current = store.runs[index];
+    const { events, eventSeq } = mergeAutomationEvents(current, event ? [event] : []);
     const next = normalizeAutomationRun({
       ...current,
       ...patch,
       updatedAt: new Date().toISOString(),
-      events: mergeAutomationRunEvents(current.events || [], event ? [event] : []),
+      events,
+      eventSeq,
     });
     store.runs[index] = next;
     await writeAutomationRunsWithinQueue(store);
@@ -4896,12 +4893,14 @@ async function requestAutomationRunCancellation(runId, automationId, clientId) {
     if (!["queued", "running"].includes(current.status)) {
       throw Object.assign(new Error("Run cannot be canceled in its current state"), { statusCode: 409 });
     }
+    const { events, eventSeq } = mergeAutomationEvents(current, [{ time: new Date().toISOString(), type: "cancel-requested", text: "Cancellation requested; already completed actions remain" }]);
     const next = normalizeAutomationRun({
       ...current,
       status: "canceling",
       cancelRequestedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      events: mergeAutomationRunEvents(current.events || [], [{ time: new Date().toISOString(), type: "cancel-requested", text: "Cancellation requested; already completed actions remain" }]),
+      events,
+      eventSeq,
     });
     store.runs[index] = next;
     await writeAutomationRunsWithinQueue(store);
@@ -7453,6 +7452,15 @@ async function realPathOrNearestExisting(target, seenLinks = new Set()) {
 
 async function assertRepoPathAccess(repo, target, options = {}) {
   const lexicalTarget = resolveRepoPath(repo, target);
+  if (repo.kind === "personal" && personalRuntime.enabled) {
+    const relativePath = path.relative(repo.path, lexicalTarget).replaceAll("\\", "/") || ".";
+    try {
+      await personalFileBridgeJson(personalFileSocket, "POST", "/validate", { path: relativePath, allowMissing: options.allowMissing === true });
+    } catch (error) {
+      throw repoPathError(error.message, error.statusCode || 503);
+    }
+    return lexicalTarget;
+  }
   let realRoot;
   try {
     realRoot = await fs.realpath(repo.path);
@@ -7734,11 +7742,15 @@ async function cleanupSessionUploadFiles(repo, session, store) {
     if (referencedElsewhere.has(filePath)) continue;
     try {
       await assertRepoPathAccess(repo, filePath, { allowMissing: true });
-      await fs.unlink(filePath);
+      if (repo.kind === "personal" && personalRuntime.enabled) {
+        await personalFileBridgeJson(personalFileSocket, "DELETE", `/uploads?path=${encodeURIComponent(path.relative(repo.path, filePath).replaceAll("\\", "/"))}`);
+      } else {
+        await fs.unlink(filePath);
+      }
       deleted.push(path.relative(repo.path, filePath));
-      await fs.rmdir(path.dirname(filePath)).catch(() => null);
+      if (!(repo.kind === "personal" && personalRuntime.enabled)) await fs.rmdir(path.dirname(filePath)).catch(() => null);
     } catch (error) {
-      if (error?.code !== "ENOENT") errors.push(`${path.relative(repo.path, filePath)}: ${error.message}`);
+      if (error?.code !== "ENOENT" && error?.statusCode !== 404) errors.push(`${path.relative(repo.path, filePath)}: ${error.message}`);
     }
   }
   return { deleted, errors };
@@ -7887,7 +7899,7 @@ function extractInlineTokens(message, prefix) {
 async function resolveSkillMentions(repo, message) {
   const tokens = extractInlineTokens(message, "$");
   if (!tokens.length) return [];
-  const response = await codexAppServerRequest("skills/list", { cwds: [repo.path] }, 12_000).catch((error) => ({ ok: false, error: error.message }));
+  const response = await codexAppServerRequest("skills/list", { cwds: [repo.path] }, 12_000, repo).catch((error) => ({ ok: false, error: error.message }));
   if (!response.ok) return [];
   const skills = groupedSkillsFromEntries(response.result?.data || []).filter((skill) => skill.enabled !== false && skill.path);
   const index = new Map();
@@ -7923,7 +7935,7 @@ async function resolveFileMentions(repo, message) {
     } catch {
       continue;
     }
-    const metadata = await codexAppServerRequest("fs/getMetadata", { path: absolutePath }, 8_000);
+    const metadata = await codexAppServerRequest("fs/getMetadata", { path: absolutePath }, 8_000, repo);
     if (!metadata.ok || seen.has(absolutePath)) continue;
     seen.add(absolutePath);
     resolved.push({
@@ -7964,7 +7976,7 @@ async function buildUserInputs(repo, message, attachments = []) {
 
 async function listRepoFiles(repo, relativePath = ".") {
   const target = await assertRepoPathAccess(repo, relativePath);
-  const response = await codexAppServerRequest("fs/readDirectory", { path: target }, 20_000);
+  const response = await codexAppServerRequest("fs/readDirectory", { path: target }, 20_000, repo);
   if (response.ok) {
     const rows = Array.isArray(response.result?.entries) ? response.result.entries : [];
     const visible = rows
@@ -7980,7 +7992,7 @@ async function listRepoFiles(repo, relativePath = ".") {
       } catch {
         return null;
       }
-      const metadata = await codexAppServerRequest("fs/getMetadata", { path: entryPath }, 8_000);
+      const metadata = await codexAppServerRequest("fs/getMetadata", { path: entryPath }, 8_000, repo);
       const modifiedAtMs = Number(metadata.result?.modifiedAtMs || 0);
       return {
         name: entry.fileName,
@@ -7999,7 +8011,7 @@ async function listRepoFiles(repo, relativePath = ".") {
     };
   }
 
-  if (!allowLocalFallback) throw appServerUnavailableError("fs/readDirectory", response.error);
+  if (!allowLocalFallback || (repo.kind === "personal" && personalRuntime.enabled)) throw appServerUnavailableError("fs/readDirectory", response.error);
 
   if (!(await exists(target))) return { path: relativePath, entries: [], source: "local-fallback", error: response.error };
   const entries = await fs.readdir(target, { withFileTypes: true });
@@ -8073,6 +8085,7 @@ async function searchRepoFiles(repo, query = "", options = {}) {
     "fuzzyFileSearch",
     { query: trimmed, roots: [repo.path], cancellationToken: options.cancellationToken || null },
     20_000,
+    repo,
   );
   if (response.ok) {
     const seen = new Set();
@@ -8100,7 +8113,7 @@ async function searchRepoFiles(repo, query = "", options = {}) {
     return { query: trimmed, entries, source: "app-server-fuzzy", fallback: false };
   }
 
-  if (!allowLocalFallback) throw appServerUnavailableError("fuzzyFileSearch", response.error);
+  if (!allowLocalFallback || (repo.kind === "personal" && personalRuntime.enabled)) throw appServerUnavailableError("fuzzyFileSearch", response.error);
 
   const directoryQuery = trimmed.includes("/") ? trimmed.slice(0, trimmed.lastIndexOf("/")) || "." : ".";
   const leafQuery = trimmed.includes("/") ? trimmed.slice(trimmed.lastIndexOf("/") + 1).toLowerCase() : trimmed.toLowerCase();
@@ -8469,7 +8482,7 @@ app.get("/api/clients/usage", async (req, res) => {
       apiClientStore.usage({ from, to, clientId }),
       readAutomationRuns(),
     ]);
-    res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(runStore.runs, { from, to, clientId }) });
+    res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(runStore.runs, { from, to, clientId }), runs: runUsageDetails(runStore.runs, { from, to, clientId }) });
   } catch (error) { res.status(500).json({ ok: false, error: error.message }); }
 });
 
@@ -9411,7 +9424,7 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
   if (session.codexSessionId) {
     const response = await codexAppServerRequest(
       "thread/resume",
-      { threadId: session.codexSessionId, ...appServerThreadParams(repo, requestedRuntime) },
+      { threadId: session.codexSessionId, ...await appServerThreadParams(repo, requestedRuntime) },
       20_000,
     );
     if (!response.ok) {
@@ -9563,7 +9576,9 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
     if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
     archived = true;
   }
-  const uploadCleanup = await cleanupSessionUploadFiles(repo, session, store);
+  const uploadCleanup = repo.kind === "personal"
+    ? { deleted: [], errors: [], retained: [...sessionUploadedAttachmentPaths(repo, session)].map((filePath) => path.relative(repo.path, filePath)) }
+    : await cleanupSessionUploadFiles(repo, session, store);
   await mutateChatStore((current) => {
     const currentSession = current.sessions[req.params.id];
     if (!currentSession || currentSession.repoId !== repo.id) return;
@@ -9763,15 +9778,31 @@ app.post("/api/uploads", async (req, res) => {
   try {
     const payload = await uploadRequestPayload(req);
     const repo = getRepoById(payload.repoId);
-    if (repo.kind === "personal") return res.status(403).json({ ok: false, error: "个人空间暂不支持上传附件" });
     const incoming = Array.isArray(payload.files) ? payload.files.slice(0, maxUploadFiles) : [];
     if (!incoming.length) return res.status(400).json({ ok: false, error: "No files uploaded" });
+    if (repo.kind === "personal" && personalRuntime.enabled) {
+      const files = [];
+      for (const file of incoming) {
+        const { mimeType, buffer } = uploadFileBytes(file);
+        const result = await personalFileBridgeJson(personalFileSocket, "POST", "/uploads", {
+          name: safeUploadName(file?.name || "upload"), mimeType, dataBase64: buffer.toString("base64"),
+        });
+        const uploaded = result.file;
+        files.push({
+          ...uploaded,
+          absolutePath: path.join(repo.path, uploaded.path),
+          kind: mimeType.startsWith("image/") ? "image" : "file",
+          source: "personal-worker-upload",
+        });
+      }
+      return res.json({ ok: true, repoId: repo.id, files });
+    }
     const uploadDir = await assertRepoPathAccess(
       repo,
       path.join(".codex-cloud", "uploads", new Date().toISOString().slice(0, 10)),
       { allowMissing: true },
     );
-    const mkdirResponse = await codexAppServerRequest(
+    const mkdirResponse = repo.kind === "personal" ? { ok: false } : await codexAppServerRequest(
       "command/exec",
       {
         command: ["/bin/bash", "-lc", `mkdir -p ${shellQuote(uploadDir)}`],
@@ -9783,14 +9814,14 @@ app.post("/api/uploads", async (req, res) => {
       30_000,
     );
     if (!mkdirResponse.ok || Number(mkdirResponse.result?.exitCode ?? 1) !== 0) {
-      if (!allowLocalFallback) {
+      if (!allowLocalFallback && repo.kind !== "personal") {
         return res.status(502).json({
           ok: false,
           error: mkdirResponse.error || mkdirResponse.result?.stderr || "Codex app-server upload directory creation failed",
           source: "app-server-unavailable",
         });
       }
-      await fs.mkdir(uploadDir, { recursive: true });
+      await fs.mkdir(uploadDir, { recursive: true, mode: 0o700 });
     }
     const files = [];
     for (const file of incoming) {
@@ -9798,17 +9829,18 @@ app.post("/api/uploads", async (req, res) => {
       const fileName = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${safeUploadName(file?.name || "upload")}`;
       const target = path.join(uploadDir, fileName);
       await assertRepoPathAccess(repo, target, { allowMissing: true });
-      const writeResponse = await codexAppServerRequest("fs/writeFile", { path: target, dataBase64: buffer.toString("base64") }, 30_000);
+      const writeResponse = repo.kind === "personal"
+        ? { ok: false }
+        : await codexAppServerRequest("fs/writeFile", { path: target, dataBase64: buffer.toString("base64") }, 30_000);
       if (!writeResponse.ok) {
-        if (!allowLocalFallback) {
+        if (!allowLocalFallback && repo.kind !== "personal") {
           return res.status(502).json({
             ok: false,
             error: writeResponse.error || "Codex app-server upload write failed",
             source: "app-server-unavailable",
           });
         }
-        await fs.mkdir(uploadDir, { recursive: true });
-        await fs.writeFile(target, buffer, { mode: 0o600 });
+        await fs.writeFile(target, buffer, { flag: "wx", mode: 0o600 });
       }
       files.push({
         name: safeUploadName(file?.name || fileName),
@@ -9817,7 +9849,7 @@ app.post("/api/uploads", async (req, res) => {
         mimeType,
         size: buffer.length,
         kind: mimeType.startsWith("image/") ? "image" : "file",
-        source: writeResponse.ok ? "app-server" : "local-fallback",
+        source: writeResponse.ok ? "app-server" : repo.kind === "personal" ? "personal-upload" : "local-fallback",
       });
     }
     res.json({ ok: true, repoId: repo.id, files });
@@ -9839,16 +9871,122 @@ app.delete("/api/uploads", async (req, res) => {
       target = resolveRepoPath(repo, relativePath);
       if (!isUploadedAttachmentPath(repo, target)) throw repoPathError("Path is outside the upload directory");
       await assertRepoPathAccess(repo, target, { allowMissing: true });
-      await fs.unlink(target);
+      if (repo.kind === "personal" && personalRuntime.enabled) {
+        await personalFileBridgeJson(personalFileSocket, "DELETE", `/uploads?path=${encodeURIComponent(path.relative(repo.path, target).replaceAll("\\", "/"))}`);
+      } else {
+        await fs.unlink(target);
+      }
       deleted.push(path.relative(repo.path, target));
-      await fs.rmdir(path.dirname(target)).catch(() => null);
+      if (!(repo.kind === "personal" && personalRuntime.enabled)) await fs.rmdir(path.dirname(target)).catch(() => null);
     } catch (error) {
-      if (error?.code === "ENOENT") continue;
+      if (error?.code === "ENOENT" || error?.statusCode === 404) continue;
       if (!error?.statusCode) errorStatus = 500;
       errors.push(`${String(relativePath)}: ${error.message}`);
     }
   }
   res.status(errors.length ? errorStatus : 200).json({ ok: errors.length === 0, repoId: repo.id, deleted, errors });
+});
+
+app.get("/api/personal/files", async (_req, res) => {
+  try {
+    if (!repos.some((repo) => repo.id === personalRepoId)) return res.status(404).json({ ok: false, error: "个人空间不可用" });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(personalRuntime.enabled
+      ? await personalFileBridgeJson(personalFileSocket, "GET", "/files")
+      : { ok: true, files: await listPersonalFiles(personalRoot) });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.get("/api/personal/facts", async (_req, res) => {
+  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, facts: await personalFactsStore.list() }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/facts", async (req, res) => {
+  try { res.status(201).json({ ok: true, fact: await personalFactsStore.create(req.body) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.patch("/api/personal/facts/:id", async (req, res) => {
+  try { res.json({ ok: true, fact: await personalFactsStore.update(req.params.id, req.body) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.delete("/api/personal/facts/:id", async (req, res) => {
+  try { res.json({ ok: true, fact: await personalFactsStore.remove(req.params.id) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+async function pipePersonalFileFromWorker(res, relativePath, preview) {
+  const query = new URLSearchParams({ path: relativePath, preview: preview ? "1" : "0" });
+  const upstream = await personalFileBridgeStream(personalFileSocket, "GET", `/files/content?${query}`);
+  if (upstream.statusCode !== 200) {
+    const chunks = [];
+    for await (const chunk of upstream) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return res.status(upstream.statusCode || 502).json({ ok: false, error: payload?.error || "个人文件读取失败" });
+  }
+  for (const header of ["content-type", "content-length", "content-disposition", "cache-control", "x-content-type-options", "content-security-policy"]) {
+    if (upstream.headers[header]) res.setHeader(header, upstream.headers[header]);
+  }
+  upstream.on("error", (error) => res.destroy(error));
+  res.on("close", () => upstream.destroy());
+  return upstream.pipe(res);
+}
+
+app.get("/api/personal/files/content", async (req, res) => {
+  try {
+    if (!repos.some((repo) => repo.id === personalRepoId)) return res.status(404).json({ ok: false, error: "个人空间不可用" });
+    if (personalRuntime.enabled) {
+      return pipePersonalFileFromWorker(res, String(req.query?.path || ""), req.query?.preview === "1");
+    }
+    const file = await resolvePersonalFile(personalRoot, req.query?.path, maxUploadBytes);
+    const handle = await fs.open(file.target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat().catch(async (error) => { await handle.close(); throw error; });
+    if (!opened.isFile() || opened.dev !== file.stat.dev || opened.ino !== file.stat.ino || opened.size !== file.stat.size) {
+      await handle.close();
+      return res.status(409).json({ ok: false, error: "个人文件在读取前已改变，请刷新列表后重试" });
+    }
+    const inline = req.query?.preview === "1" && file.mimeType !== "application/octet-stream";
+    const name = path.basename(file.target);
+    res.setHeader("Content-Type", inline ? file.mimeType : "application/octet-stream");
+    res.setHeader("Content-Length", String(file.stat.size));
+    res.setHeader("Content-Disposition", `${inline ? "inline" : "attachment"}; filename="file"; filename*=UTF-8''${encodeURIComponent(name)}`);
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "sandbox");
+    const stream = handle.createReadStream();
+    stream.on("error", (error) => { console.error(`Personal file stream failed: ${error.message}`); res.destroy(error); });
+    res.on("close", () => stream.destroy());
+    stream.pipe(res);
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.delete("/api/personal/files", async (req, res) => {
+  try {
+    const repo = getRepoById(personalRepoId);
+    if ([...activeTurns.values(), ...activeAutomationRuns.values()].some((job) => job.repoId === repo.id && !job.completed)) {
+      return res.status(409).json({ ok: false, error: "个人任务仍在运行，结束后再删除资料副本" });
+    }
+    const relativePath = String(req.query?.path || "").replaceAll("\\", "/");
+    if (!/^\.codex-cloud\/uploads\/\d{4}-\d{2}-\d{2}\/[^/]+$/.test(relativePath)) {
+      return res.status(400).json({ ok: false, error: "只能删除个人上传的资料副本" });
+    }
+    const target = resolveRepoPath(repo, relativePath);
+    const store = await readChatStore();
+    if (Object.values(store.sessions || {}).some((session) => session.repoId === repo.id && sessionUploadedAttachmentPaths(repo, session).has(target))) {
+      return res.status(409).json({ ok: false, error: "此资料仍被个人对话引用，先从对话中移除附件" });
+    }
+    if (personalRuntime.enabled) {
+      await personalFileBridgeJson(personalFileSocket, "DELETE", `/uploads?path=${encodeURIComponent(relativePath)}`);
+    } else {
+      const file = await resolvePersonalFile(personalRoot, relativePath, Number.MAX_SAFE_INTEGER);
+      if (!file.input) return res.status(400).json({ ok: false, error: "不是个人上传的资料" });
+      await fs.unlink(file.target);
+      await fs.rmdir(path.dirname(file.target)).catch(() => null);
+    }
+    res.json({ ok: true, deleted: relativePath });
+  } catch (error) { sendRouteError(res, error); }
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -9894,9 +10032,6 @@ app.post("/api/chat/stream", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   const repo = getRepoById(req.body?.repoId);
   if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行已被管理员停用" });
-  if (repo.kind === "personal" && Array.isArray(req.body?.attachments) && req.body.attachments.length) {
-    return res.status(403).json({ ok: false, error: "个人空间暂不支持附件" });
-  }
   let attachments = [];
   try {
     attachments = Array.isArray(req.body?.attachments)
@@ -9978,9 +10113,9 @@ app.get("/api/files/read", async (req, res) => {
   try {
     const repo = getRepoById(req.query?.repoId);
     const filePath = await assertRepoPathAccess(repo, req.query?.path || ".");
-    const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000);
+    const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000, repo);
     if (metadata.ok && !metadata.result?.isFile) return res.status(400).json({ ok: false, error: "Path is not a file" });
-    const readResponse = await codexAppServerRequest("fs/readFile", { path: filePath }, 20_000);
+    const readResponse = await codexAppServerRequest("fs/readFile", { path: filePath }, 20_000, repo);
     if (readResponse.ok) {
       const buffer = Buffer.from(String(readResponse.result?.dataBase64 || ""), "base64");
       if (buffer.length > 512_000) return res.status(400).json({ ok: false, error: "File is larger than 512 KB" });
@@ -9996,7 +10131,7 @@ app.get("/api/files/read", async (req, res) => {
       });
     }
 
-    if (!allowLocalFallback) {
+    if (!allowLocalFallback || (repo.kind === "personal" && personalRuntime.enabled)) {
       return res.status(502).json({
         ok: false,
         error: readResponse.error || "Codex app-server file read failed",
@@ -10034,6 +10169,9 @@ app.get("/api/files/blob", async (req, res) => {
     if (!imageMimeType && !isUpload) {
       return res.status(415).json({ ok: false, error: "Only raster image previews or uploaded attachments are supported" });
     }
+    if (repo.kind === "personal" && personalRuntime.enabled) {
+      return pipePersonalFileFromWorker(res, path.relative(repo.path, filePath).replaceAll("\\", "/"), Boolean(imageMimeType));
+    }
     const mimeType = imageMimeType || attachmentMimeForPath(filePath);
     const disposition = imageMimeType ? "inline" : "attachment";
     const metadata = await codexAppServerRequest("fs/getMetadata", { path: filePath }, 12_000);
@@ -10049,7 +10187,7 @@ app.get("/api/files/blob", async (req, res) => {
       res.setHeader("X-Codex-Source", "app-server");
       return res.end(buffer);
     }
-    if (!allowLocalFallback) {
+    if (!allowLocalFallback && repo.kind !== "personal") {
       return res.status(502).json({
         ok: false,
         error: readResponse.error || "Codex app-server file read failed",
@@ -10435,8 +10573,11 @@ app.get("/api/automations/:id/runs/:runId", async (req, res) => {
   if (!clientCanReadRun(req.apiClient, req.params.id, run)) {
     return res.status(404).json({ ok: false, error: "Run not found" });
   }
+  const afterRaw = req.query.after;
+  const after = afterRaw === undefined ? 0 : Number(afterRaw);
+  if (!Number.isSafeInteger(after) || after < 0) return res.status(400).json({ ok: false, error: "after must be a non-negative integer cursor" });
   res.locals.runId = run.id;
-  return res.json({ ok: true, run: externalRunView(run, req.params.id) });
+  return res.json({ ok: true, run: externalRunView(run, req.params.id), ...automationEventsSince(run, after) });
 });
 
 app.post("/api/automations/:id/runs/:runId/cancel", async (req, res) => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { aggregateRunUsage, runUsageFromProtocol } from "../server/run-usage.mjs";
+import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "../server/run-usage.mjs";
 
 test("last-turn usage does not add cache or reasoning subfields twice", () => {
   const usage = runUsageFromProtocol({
@@ -36,4 +36,15 @@ test("queued and running work is not mislabeled as missing final usage", () => {
   assert.equal(buckets[0].runs, 3);
   assert.equal(buckets[0].failed, 1);
   assert.equal(buckets[0].unknownRuns, 1);
+});
+
+test("request drilldown returns scoped per-run usage without prompt content", () => {
+  const range = { from: Date.parse("2026-09-26T00:00:00Z"), to: Date.parse("2026-09-27T00:00:00Z"), clientId: "client-a" };
+  const rows = runUsageDetails([
+    { id: "run-a", clientId: "client-a", automationId: "research", status: "completed", startedAt: "2026-09-26T06:00:00Z", prompt: "private", model: "gpt-5.6-terra", usage: { status: "complete", inputTokens: 100, outputTokens: 20, totalTokens: 120 } },
+    { id: "run-b", clientId: "client-b", automationId: "research", status: "failed", startedAt: "2026-09-26T07:00:00Z" },
+  ], range);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].usage.totalTokens, 120);
+  assert.equal("prompt" in rows[0], false);
 });
