@@ -248,6 +248,22 @@ node scripts/local-cloud-console-proxy.mjs
 
 Review 本地操作开关、主机 GitHub 授权和当前 PR 状态都满足时，才可以使用对应 PR 功能。浏览器检查还需要主机可用的浏览器程序；MCP、Skills、插件和图片生成取决于 Codex 配置及账号能力。
 
+### GitHub 账号与 Issue 工作流
+
+GitHub 页面使用服务器上的 [GitHub CLI](https://cli.github.com/manual/gh_auth_login)，不在控制台数据库或浏览器中保存 PAT。必须在**运行 `codex-cloud-console.service` 的系统用户**下安装并登录 `gh`；示例 systemd 单元使用 `ubuntu`，实际以 `systemctl cat codex-cloud-console.service` 的 `User=` 为准。登录只需一次，之后由 `gh` 管理凭据；凭据失效时需重新授权。Codex 内的 GitHub App 连接是另一套授权，不会自动提供主机 Git 推送权限。
+
+```bash
+# 以下命令在 EC2 上以控制台服务用户执行；不要把 token 输入网页或日志。
+gh --version
+gh auth login --web --hostname github.com
+gh auth status --active --hostname github.com
+gh auth setup-git --hostname github.com
+```
+
+无图形浏览器时，`gh auth login --web` 会提示设备授权流程；在自己信任的浏览器打开官方地址并完成授权。`gh auth setup-git` 为 HTTPS Git 操作配置凭据助手；如果使用 SSH remote，需另行配置该系统用户的 SSH key。服务器的 `HOME`、`GH_CONFIG_DIR` 或 `GH_TOKEN` 等环境可能使交互终端与 systemd 看到不同凭据，排障时应核对服务环境，**不要打印 token**。GitHub 官方也提醒：无安全凭据存储时，`gh` 可能回退到明文配置文件，需检查该文件权限并保护服务器备份。参见 [GitHub CLI 登录文档](https://cli.github.com/manual/gh_auth_login)与[Git 凭据设置](https://cli.github.com/manual/gh_auth_setup-git)。
+
+只有工作项目的真实 Git `origin` 指向 `github.com` 且项目配置相符时，Issue 页面才会启用。读取 Issue 需要该账号有仓库访问权；发布 PR 还要求仓库写权限、干净工作树、与 Issue 编号匹配的 `codex/issue-编号` 分支以及相对本地默认分支的新提交。本地跟踪的默认分支必须与远端一致，且当前分支包含该基线；否则先同步、重测、重审。控制台在发布前预览提交与文件清单，并二次核对 SHA；只用非强制 push，不覆盖同名远端分支。创建 PR 前不会主动评论或关闭 Issue；PR 描述会关联 Issue，合并时可能自动关闭它。推送可能启动 GitHub Actions 并产生额度或费用，请先检查仓库工作流和预算。GitHub 官方的 [`gh issue` 列表](https://cli.github.com/manual/gh_issue_list)、[详情](https://cli.github.com/manual/gh_issue_view)和 [`gh pr create`](https://cli.github.com/manual/gh_pr_create) 是此流程的命令基础。
+
 ## 验证
 
 常规本地检查，不提交真实模型任务：

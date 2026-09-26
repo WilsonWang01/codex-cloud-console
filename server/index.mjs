@@ -27,6 +27,7 @@ import { readConnectedApps } from "./connected-apps.mjs";
 import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore } from "./personal-facts.mjs";
+import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
@@ -204,6 +205,7 @@ const apiClientStore = createApiClientStore({
   write: (state) => atomicWriteJson(apiClientsPath, state),
   metricsRoot: apiRequestMetricsRoot,
 });
+const githubWorkflow = createGitHubWorkflow();
 const configuredOwnerEntries = Number(process.env.CODEX_OWNER_INDEX_MAX || 5_000);
 const maxOwnerEntries = Number.isFinite(configuredOwnerEntries) ? Math.max(500, configuredOwnerEntries) : 5_000;
 
@@ -8734,6 +8736,81 @@ app.post("/api/repos", async (req, res) => {
   await writeCustomRepos(customRepos);
   const session = await ensureChatSession(repo.id, "", "新会话");
   res.json({ ok: true, repo: await getRepo(repo), activeSessionId: session.id });
+});
+
+function githubRouteError(res, error) {
+  res.status(error.statusCode || 500).json({ ok: false, error: error.message || "GitHub 操作失败" });
+}
+
+app.get("/api/github/connection", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    res.json({ ok: true, repoId: repo.id, connection: await githubWorkflow.connection(repo) });
+  } catch (error) { githubRouteError(res, error); }
+});
+
+app.get("/api/github/issues", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    const result = await githubWorkflow.issues(repo, String(req.query?.state || "open"), Number(req.query?.limit || 30));
+    res.json({ ok: true, repoId: repo.id, ...result });
+  } catch (error) { githubRouteError(res, error); }
+});
+
+app.get("/api/github/issues/:number", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const repo = getRepoById(req.query?.repoId);
+    res.json({ ok: true, repoId: repo.id, ...await githubWorkflow.issue(repo, req.params.number) });
+  } catch (error) { githubRouteError(res, error); }
+});
+
+app.post("/api/github/issues/:number/prepare", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const { connection, issue } = await githubWorkflow.issue(repo, req.params.number);
+    const session = normalizeSession({
+      id: sessionId(),
+      repoId: repo.id,
+      title: `Issue #${issue.number}: ${issue.title}`,
+      messages: [],
+      sandbox: "workspace-write",
+      approval: "on-request",
+      draft: { input: githubIssuePrompt(connection.repo, issue) },
+    }, repo.id);
+    await mutateChatStore((store) => {
+      store.sessions[session.id] = session;
+      store.activeByRepo[repo.id] = session.id;
+      compactEmptyDraftSessions(store, repo.id, session.id);
+    });
+    await appendAuditEvent({ source: "github-cli", type: "github-issue-draft", repoId: repo.id, sessionId: session.id, summary: `已为 Issue #${issue.number} 建立待发送草稿` });
+    const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true });
+    res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages: [] });
+  } catch (error) { githubRouteError(res, error); }
+});
+
+app.post("/api/github/issues/:number/publish-preview", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    res.json({ ok: true, repoId: repo.id, preview: await githubWorkflow.previewPublish(repo, req.params.number) });
+  } catch (error) { githubRouteError(res, error); }
+});
+
+app.post("/api/github/publish", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const repo = getRepoById(req.body?.repoId);
+    const previewId = String(req.body?.previewId || "");
+    if (!/^[0-9a-f]{48}$/u.test(previewId)) return res.status(400).json({ ok: false, error: "请先生成有效发布预览" });
+    await appendAuditEvent({ source: "github-cli", type: "github-publish-attempt", repoId: repo.id, summary: "已确认 GitHub PR 发布预览，开始核对提交与远端状态" });
+    const published = await githubWorkflow.publish(repo, previewId);
+    await appendAuditEvent({ source: "github-cli", type: "github-publish", repoId: repo.id, summary: published.existingPr ? "已找到现有 GitHub PR" : `已创建 GitHub PR #${published.issueNumber}`, detail: JSON.stringify(published) });
+    res.json({ ok: true, repoId: repo.id, published });
+  } catch (error) { githubRouteError(res, error); }
 });
 
 app.get("/api/codex/capabilities", async (_req, res) => {

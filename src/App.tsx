@@ -58,6 +58,7 @@ const LazyUsageView = lazy(() => import("./UsageView"));
 const LazyConnectedServices = lazy(() => import("./ConnectedServices"));
 const LazyPersonalFiles = lazy(() => import("./PersonalFiles"));
 const LazyPersonalFacts = lazy(() => import("./PersonalFacts"));
+const LazyGitHubIssues = lazy(() => import("./GitHubIssues"));
 
 type RunEvent = {
   id: string;
@@ -67,7 +68,7 @@ type RunEvent = {
   body: string;
 };
 
-type ActiveView = "inbox" | "automations" | "cli" | "agent" | "logs" | "settings" | "usage" | "today" | "materials" | "admin";
+type ActiveView = "inbox" | "automations" | "cli" | "agent" | "logs" | "settings" | "usage" | "today" | "materials" | "admin" | "issues";
 type CloudConnection = "checking" | "cloud" | "degraded" | "local" | "offline";
 type ActiveCodexJob = NonNullable<ConsoleStatus["activeJobs"]>[number];
 type PendingApproval = {
@@ -106,7 +107,7 @@ type AppRoute = {
 
 const defaultRepoId = "sample-app";
 const defaultAutomationId = "sample-maintenance";
-const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings", "usage", "today", "materials", "admin"]);
+const routeViews = new Set<ActiveView>(["inbox", "automations", "cli", "agent", "logs", "settings", "usage", "today", "materials", "admin", "issues"]);
 
 type GlobalSearchResult = {
   id: string;
@@ -3161,7 +3162,7 @@ function parseAppHash(hash = typeof window === "undefined" ? "" : window.locatio
     .filter(Boolean);
   const [head, second, third, fourth] = parts;
   if (head === "project" && second) {
-    if (third === "today" || third === "materials" || third === "admin") return { view: third, repoId: second };
+    if (third === "today" || third === "materials" || third === "admin" || third === "issues") return { view: third, repoId: second };
     return { view: "cli", repoId: second, sessionId: third === "thread" ? fourth : third };
   }
   if (head === "thread" && second) {
@@ -3175,7 +3176,7 @@ function parseAppHash(hash = typeof window === "undefined" ? "" : window.locatio
 }
 
 function buildAppHash(route: AppRoute) {
-  if (route.view === "today" || route.view === "materials" || route.view === "admin") return `#/project/${routePart(route.repoId || "_personal")}/${route.view}`;
+  if (route.view === "today" || route.view === "materials" || route.view === "admin" || route.view === "issues") return `#/project/${routePart(route.repoId || (route.view === "issues" ? defaultRepoId : "_personal"))}/${route.view}`;
   if (route.view === "cli") {
     const repo = routePart(route.repoId || defaultRepoId);
     const session = route.sessionId ? `/thread/${routePart(route.sessionId)}` : "";
@@ -4525,6 +4526,24 @@ export function App() {
     } finally {
       setBusyAction(null);
     }
+  };
+
+  const prepareGitHubIssue = async (number: number) => {
+    if (busyAction || isLoadingChatHistory || selectedRepo.kind === "personal") return;
+    const repoId = selectedRepo.id;
+    const requestSeq = ++chatLoadSeq.current;
+    setBusyAction("github-issue-draft");
+    try {
+      await saveComposerDraft(repoId, activeSessionId, chatInput, chatAttachments);
+      const result = await api<ChatHistoryResponse>(`/api/github/issues/${number}/prepare`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId }),
+      });
+      if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
+      setChatRuntime({ ...defaultChatRuntime, sandbox: "workspace-write", approval: "on-request" });
+      setActiveView("cli");
+    } finally { setBusyAction(null); }
   };
 
   const selectChatSession = async (sessionId: string) => {
@@ -5981,6 +6000,8 @@ export function App() {
           else { setSelectedAutomationId(automationId); setActiveView("automations"); }
         }} /></Suspense>}
 
+        {activeView === "issues" && selectedRepo.kind !== "personal" && <Suspense fallback={<div className="github-page">正在加载 GitHub…</div>}><LazyGitHubIssues repoId={selectedRepo.id} onPrepare={prepareGitHubIssue} /></Suspense>}
+
         {activeView === "automations" && (
           <div className="content-grid">
             <section className="panel automation-panel" aria-label="自动化任务">
@@ -6397,6 +6418,10 @@ function Sidebar({
         {!isPersonal && <button className={cx("nav-item", activeView === "usage" && "active")} onClick={choose(() => onSelectView("usage"))}>
           <Gauge size={18} />
           <span>调用与用量</span>
+        </button>}
+        {!isPersonal && <button className={cx("nav-item", activeView === "issues" && "active")} onClick={choose(() => onSelectView("issues"))}>
+          <GitPullRequestArrow size={18} />
+          <span>GitHub</span>
         </button>}
         <button className={cx("nav-item", activeView === "cli" && "active")} onClick={choose(onNewChat)}>
           <MessageSquare size={18} />
