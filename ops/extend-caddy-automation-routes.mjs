@@ -51,8 +51,24 @@ function withoutAddedRoutes(config) {
   return copy;
 }
 
+function canonicalGroupIds(value) {
+  const groups = new Map();
+  const visit = (item) => {
+    if (Array.isArray(item)) return item.map(visit);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item).map(([key, entry]) => {
+      if (key !== "group" || typeof entry !== "string") return [key, visit(entry)];
+      if (!groups.has(entry)) groups.set(entry, `group-${groups.size + 1}`);
+      return [key, groups.get(entry)];
+    }));
+  };
+  return visit(value);
+}
+
 export function assertCaddyRouteExtension(before, after) {
-  assert.deepEqual(withoutAddedRoutes(after), before, "Caddy routes outside the two new API matchers changed");
+  if (JSON.stringify(canonicalGroupIds(withoutAddedRoutes(after))) !== JSON.stringify(canonicalGroupIds(before))) {
+    throw new Error("Caddy routes outside the two new API matchers changed");
+  }
   const serialized = JSON.stringify(after);
   for (const name of ["automation_result", "automation_cancel"]) {
     assert.equal(serialized.split(`"name":"${name}"`).length - 1, 1, `Missing or duplicated ${name} matcher`);
