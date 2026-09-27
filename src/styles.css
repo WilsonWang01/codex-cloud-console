@@ -2569,6 +2569,13 @@ h3 {
   white-space: nowrap;
 }
 
+.composer-footer .footer-save-routine {
+  justify-content: center;
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+}
+
 .composer-footer .footer-permission-chip.full-access {
   color: var(--warn);
   background: var(--warn-soft);
@@ -7229,6 +7236,7 @@ pre {
   .external-review-banner .mini-action { min-height: 44px; margin-left: 28px; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer button { min-height: 44px; height: auto; }
+  .session-content-grid:has(.personal-scope-notice) .composer-footer .footer-save-routine { width: 44px; min-width: 44px; }
   .command-panel-backdrop { display: block; position: fixed; inset: 0; z-index: 59; width: 100vw; height: var(--app-visual-height, 100dvh); padding: 0; border: 0; border-radius: 0; background: rgba(15, 23, 42, .22); }
   .command-panel { position: fixed; inset: 0; z-index: 60; width: 100vw; max-width: none; height: var(--app-visual-height, 100dvh); max-height: none; padding: 16px max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); border: 0; border-radius: 0; background: var(--surface); overscroll-behavior: contain; }
   .command-panel-head { position: sticky; top: -16px; z-index: 1; min-height: 44px; background: var(--surface); }

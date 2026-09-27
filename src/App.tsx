@@ -6,6 +6,7 @@ import {
   Activity,
   BriefcaseBusiness,
   Bell,
+  BookmarkPlus,
   Bot,
   Brain,
   CheckCircle2,
@@ -3281,6 +3282,13 @@ export function App() {
   }, []);
   const initialRouteRef = useRef(parseAppHash());
   const initialRoute = initialRouteRef.current;
+  const lastWrittenHashRef = useRef(window.location.hash);
+  const pendingHashNavigationRef = useRef<AppRoute | null>(null);
+  const writeAppHash = useCallback((route: AppRoute) => {
+    replaceAppHash(route);
+    lastWrittenHashRef.current = window.location.hash;
+    pendingHashNavigationRef.current = null;
+  }, []);
   const [status, setStatus] = useState<ConsoleStatus>(fallbackStatus);
   const [cloudConnection, setCloudConnection] = useState<CloudConnection>("checking");
   const [selectedAutomationId, setSelectedAutomationId] = useState(initialRoute.automationId || defaultAutomationId);
@@ -3294,6 +3302,7 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState("");
   const [chatInput, setChatInput] = useState("");
   const [routineEditorId, setRoutineEditorId] = useState<string | null>(null);
+  const [routineEditorSeed, setRoutineEditorSeed] = useState("");
   const [routineArchiveRevision, setRoutineArchiveRevision] = useState(0);
   const [chatAttachments, setChatAttachments] = useState<UploadedAttachment[]>([]);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
@@ -4272,6 +4281,14 @@ export function App() {
   }, [activeSessionId, chatAttachments, chatInput, isLoadingChatHistory, saveComposerDraft, selectedRepoId]);
 
   useEffect(() => {
+    if (window.location.hash !== lastWrittenHashRef.current && !pendingHashNavigationRef.current) return;
+    const externalRoute = pendingHashNavigationRef.current;
+    if (externalRoute) {
+      if (activeView !== externalRoute.view || (externalRoute.repoId && selectedRepoId !== externalRoute.repoId)) return;
+      if (externalRoute.view === "automations" && selectedAutomationId !== (externalRoute.automationId || "")) return;
+      if (externalRoute.view === "cli" && externalRoute.sessionId && activeRouteSessionId !== externalRoute.sessionId) return;
+      pendingHashNavigationRef.current = null;
+    }
     const pendingTarget = pendingRouteSession || pendingRouteSessionRef.current;
     if (
       activeView === "cli" &&
@@ -4281,20 +4298,22 @@ export function App() {
     ) {
       return;
     }
-    replaceAppHash({
+    writeAppHash({
       view: activeView,
       repoId: selectedRepoId,
       sessionId: activeView === "cli" ? activeRouteSessionId || undefined : undefined,
       automationId: activeView === "automations" ? selectedAutomationId : undefined,
     });
-  }, [activeRouteSessionId, activeView, pendingRouteSession, selectedAutomationId, selectedRepoId]);
+  }, [activeRouteSessionId, activeView, pendingRouteSession, selectedAutomationId, selectedRepoId, writeAppHash]);
 
   useEffect(() => {
     const onHashChange = () => {
       const route = parseAppHash();
       const targetRepo = statusRef.current.repos.find((repo) => repo.id === (route.repoId || selectedRepoIdRef.current));
-      setActiveView(targetRepo?.kind === "personal" && !["today", "materials", "automations", "cli", "settings", "admin"].includes(route.view) ? "today" : route.view);
-      if (route.automationId) setSelectedAutomationId(route.automationId);
+      const view = targetRepo?.kind === "personal" && !["today", "materials", "automations", "cli", "settings", "admin"].includes(route.view) ? "today" : route.view;
+      pendingHashNavigationRef.current = { ...route, view };
+      setActiveView(view);
+      if (route.view === "automations") setSelectedAutomationId(route.automationId || "");
       if (route.view === "cli" && route.sessionId && (!route.repoId || route.repoId === selectedRepoIdRef.current)) {
         void flushComposerDraft();
       }
@@ -5898,8 +5917,8 @@ export function App() {
     switchRepoConversation(repoId);
     setPendingRouteSession(pending);
     setActiveView("cli");
-    replaceAppHash({ view: "cli", repoId, sessionId });
-  }, [flushComposerDraft, switchRepoConversation]);
+    writeAppHash({ view: "cli", repoId, sessionId });
+  }, [flushComposerDraft, switchRepoConversation, writeAppHash]);
 
   useEffect(() => {
     if (!notificationsEnabled || typeof window.Notification === "undefined" || window.Notification.permission !== "granted") return;
@@ -5931,12 +5950,12 @@ export function App() {
       }
       if (latestItem?.action === "automation") {
         setActiveView("automations");
-        replaceAppHash({ view: "automations", repoId: latestItem.repoId || selectedRepoId, automationId: latestItem.automationId || undefined });
+        writeAppHash({ view: "automations", repoId: latestItem.repoId || selectedRepoId, automationId: latestItem.automationId || undefined });
         return;
       }
       if (latestItem?.action === "logs") {
         setActiveView("logs");
-        replaceAppHash({ view: "logs" });
+        writeAppHash({ view: "logs" });
         return;
       }
       const externalActionUrl = safeExternalActionUrl(latestItem?.actionUrl);
@@ -5946,13 +5965,13 @@ export function App() {
       }
       if (["settings", "codex-login", "mcp-login"].includes(String(latestItem?.action || ""))) {
         setActiveView("settings");
-        replaceAppHash({ view: "settings" });
+        writeAppHash({ view: "settings" });
         return;
       }
       setActiveView("inbox");
-      replaceAppHash({ view: "inbox" });
+      writeAppHash({ view: "inbox" });
     };
-  }, [notificationsEnabled, openAttentionThread, selectRepo, selectedRepoId, status]);
+  }, [notificationsEnabled, openAttentionThread, selectRepo, selectedRepoId, status, writeAppHash]);
 
   return (
     <main className="app-shell">
@@ -6070,14 +6089,15 @@ export function App() {
           <div className={cx("content-grid", selectedRepo.kind === "personal" && "personal-automations")}>
             <section className="panel automation-panel" aria-label="自动化任务">
               <PanelTitle title={selectedRepo.kind === "personal" ? "计划任务" : "自动化"} eyebrow={selectedRepo.kind === "personal" ? "个人助理" : "云端任务"} onRefresh={refresh} spinning={isRefreshing} />
-              {selectedRepo.kind === "personal" && <button className="command-button personal-routine-new" type="button" onClick={() => setRoutineEditorId("")}>
+              {selectedRepo.kind === "personal" && <button className="command-button personal-routine-new" type="button" onClick={() => { setRoutineEditorSeed(""); setRoutineEditorId(""); }}>
                 <Plus size={17} />新建流程
               </button>}
               {selectedRepo.kind === "personal" && routineEditorId !== null && <PersonalRoutineEditor
                 key={routineEditorId}
                 automation={status.automations.find((item) => item.id === routineEditorId && item.personalRoutine)}
+                initialPrompt={routineEditorId === "" ? routineEditorSeed : ""}
                 onCancel={() => setRoutineEditorId(null)}
-                onSaved={(id) => { setRoutineEditorId(null); setSelectedAutomationId(id); void refresh(); }}
+                onSaved={(id) => { setRoutineEditorSeed(""); setRoutineEditorId(null); setSelectedAutomationId(id); void refresh(); }}
               />}
 
               <div className="automation-list">
@@ -6226,6 +6246,7 @@ export function App() {
               onMcpLogin={startMcpLogin}
               onMcpReload={reloadMcpServers}
               onSend={() => sendChat()}
+              onSaveRoutine={(prompt) => { setRoutineEditorSeed(prompt); setRoutineEditorId(""); setActiveView("automations"); }}
               onSteer={() => sendChat(undefined, undefined, "steer")}
               onRestoreQueued={restoreQueuedTurn}
               queueRestoreBusy={queueRestoreBusy}
@@ -7765,13 +7786,14 @@ function searchResultIcon(kind: GlobalSearchResult["kind"]) {
   return <Command size={15} />;
 }
 
-function PersonalRoutineEditor({ automation, onCancel, onSaved }: {
+function PersonalRoutineEditor({ automation, initialPrompt = "", onCancel, onSaved }: {
   automation?: Automation;
+  initialPrompt?: string;
   onCancel: () => void;
   onSaved: (id: string) => void;
 }) {
   const [name, setName] = useState(automation?.name || "");
-  const [prompt, setPrompt] = useState(automation?.prompt || "");
+  const [prompt, setPrompt] = useState(automation?.prompt || initialPrompt);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const save = async (event: FormEvent) => {
@@ -8826,6 +8848,7 @@ function CloudChat({
   onMcpLogin,
   onMcpReload,
   onSend,
+  onSaveRoutine,
   onSteer,
   onRestoreQueued,
   queueRestoreBusy,
@@ -8897,6 +8920,7 @@ function CloudChat({
   onMcpLogin: (serverName: string) => void;
   onMcpReload: () => void;
   onSend: () => void;
+  onSaveRoutine: (prompt: string) => void;
   onSteer: () => void;
   onRestoreQueued: () => void;
   queueRestoreBusy: boolean;
@@ -10665,7 +10689,8 @@ function CloudChat({
         </div>}
         <div className="composer-footer app-composer-footer">
           <div className="composer-footer-left">
-            {repo.kind === "personal" ? <button type="button" onClick={() => setActivePanel("sessionSettings")} aria-label={`会话设置：${activeModel?.displayName || runtime.model}，${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}`}><SlidersHorizontal size={15} />{activeModel?.displayName || runtime.model} · {permissionLabel(runtime.sandbox)}</button> : <>
+            {repo.kind === "personal" ? <><button type="button" onClick={() => setActivePanel("sessionSettings")} aria-label={`会话设置：${activeModel?.displayName || runtime.model}，${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}`}><SlidersHorizontal size={15} />{activeModel?.displayName || runtime.model} · {permissionLabel(runtime.sandbox)}</button>
+            <button className="footer-save-routine" type="button" onClick={() => onSaveRoutine(input.trim())} disabled={historyLoading || queueRestoreBusy || uploadingAttachments || !input.trim() || input.trim().length > 8000 || attachments.length > 0} title={attachments.length ? "带附件的草稿不能直接保存为流程" : input.trim().length > 8000 ? "流程任务最多 8000 字" : "保存草稿为流程，不会发送消息"} aria-label="保存草稿为流程"><BookmarkPlus size={16} /></button></> : <>
             <button type="button" onClick={() => onInput("/")} disabled={Boolean(busyAction)} title="指令" aria-label="打开 Codex 指令">
               <Command size={14} />
               /
