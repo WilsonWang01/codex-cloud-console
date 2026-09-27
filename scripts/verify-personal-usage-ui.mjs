@@ -41,6 +41,8 @@ let steeredMessages = [];
 let uploadedCount = 0;
 let personalFilesDeleted = 0;
 let manualAutomationRuns = 0;
+let personalRoutineSequence = 0;
+let archivedPersonalRoutines = [];
 let personalFiles = [
   { path: "results/demo.md", name: "demo.md", kind: "output", size: 13, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
   { path: ".codex-cloud/uploads/2026-09-26/notes.txt", name: "notes.txt", kind: "input", size: 12, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
@@ -67,6 +69,45 @@ await context.route("**/api/**", async (route) => {
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
   if (url.pathname === "/api/automations/personal-plan/run" && req.method() === "POST") { manualAutomationRuns += 1; return send({ ok: true }); }
+  if (url.pathname === "/api/personal/routines" && req.method() === "GET") return send({ ok: true, routines: [...status.automations.filter((item) => item.personalRoutine), ...archivedPersonalRoutines] });
+  if (url.pathname === "/api/personal/routines" && req.method() === "POST") {
+    const id = `personal-routine-test-${++personalRoutineSequence}`;
+    status.automations.push({ id, name: body.name, prompt: body.prompt, repoId: "_personal", personalRoutine: true, revision: 1,
+      mode: "on-demand", enabled: true, nextRun: "按需触发", lastRun: "", timer: null, service: null, schedule: "手动运行", model: "gpt-6-sol", reasoning: "medium",
+      run: { activeState: "inactive", failedState: "inactive", exitCode: "ready", logName: null, logUpdatedAt: null, logTail: [] } });
+    return send({ ok: true, routine: { id, ...body, revision: 1 } }, 201);
+  }
+  if (url.pathname.startsWith("/api/personal/routines/") && req.method() === "PATCH") {
+    const routine = status.automations.find((item) => item.id === url.pathname.split("/").at(-1));
+    if (!routine || routine.revision !== body.revision) return send({ error: "流程已修改" }, 409);
+    Object.assign(routine, { name: body.name, prompt: body.prompt, revision: routine.revision + 1 });
+    return send({ ok: true, routine });
+  }
+  if (url.pathname.startsWith("/api/personal/routines/") && req.method() === "DELETE") {
+    const id = url.pathname.split("/").at(-1);
+    const index = status.automations.findIndex((item) => item.id === id && item.revision === body.revision);
+    if (index < 0) return send({ error: "流程已修改" }, 409);
+    const routine = status.automations.splice(index, 1)[0];
+    routine.archivedAt = new Date().toISOString();
+    routine.revision += 1;
+    archivedPersonalRoutines.push(routine);
+    return send({ ok: true, routine });
+  }
+  if (url.pathname.startsWith("/api/personal/routines/") && url.pathname.endsWith("/restore") && req.method() === "POST") {
+    const id = url.pathname.split("/").at(-2);
+    const index = archivedPersonalRoutines.findIndex((item) => item.id === id && item.revision === body.revision);
+    if (index < 0) return send({ error: "流程已修改" }, 409);
+    const routine = archivedPersonalRoutines.splice(index, 1)[0];
+    routine.archivedAt = null;
+    routine.revision += 1;
+    status.automations.push(routine);
+    return send({ ok: true, routine });
+  }
+  if (url.pathname.startsWith("/api/automations/personal-routine-test-") && url.pathname.endsWith("/run") && req.method() === "POST") {
+    if (body.confirmModelCost !== true) return send({ error: "未确认额度" }, 428);
+    manualAutomationRuns += 1;
+    return send({ ok: true, output: "已开始" });
+  }
   if (url.pathname === "/api/attention/acknowledgements" && req.method() === "POST") {
     const acknowledged = status.attention.items.filter((item) => body.itemIds?.includes(item.id));
     for (const item of acknowledged) item.acknowledged = true;
@@ -664,7 +705,8 @@ try {
   assert.equal(await page.locator(".automation-list .automation-row").count(), 1);
   assert.equal(await page.getByRole("button", { name: "同步" }).count(), 0);
   assert.match(await page.locator(".automation-runs-panel").innerText(), /会话待建立/);
-  assert.doesNotMatch(await page.locator(".automation-task-grid").innerText(), /T\d\d:\d\d:\d\d/);
+  assert.equal(await page.locator(".automation-task-grid").count(), 0);
+  assert.match(await page.locator(".personal-routine-prompt").innerText(), /任务内容/);
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   await page.screenshot({ path: new URL("personal-routines-390.png", out).pathname, fullPage: true });
@@ -675,7 +717,7 @@ try {
   await page.screenshot({ path: new URL("personal-routines-320.png", out).pathname });
   let runConfirmation = "";
   page.once("dialog", (dialog) => { runConfirmation = dialog.message(); void dialog.dismiss(); });
-  await page.getByRole("button", { name: "Codex 运行" }).click();
+  await page.getByRole("button", { name: "立即运行" }).click();
   assert.match(runConfirmation, /模型额度/);
   assert.equal(manualAutomationRuns, 0);
   await page.goto(`${baseUrl}#/project/_personal/today`);
@@ -686,11 +728,45 @@ try {
   status.automations.find((item) => item.id === "personal-plan").mode = "on-demand";
   status.automations.find((item) => item.id === "personal-plan").nextRun = "按需触发";
   await page.reload();
-  await page.getByText("按需任务", { exact: true }).waitFor();
+  await page.locator(".automation-brief .run-badge").getByText("按需", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "暂停", exact: true }).count(), 0);
+  await page.getByRole("button", { name: "新建流程" }).click();
+  const routineEditor = page.locator(".personal-routine-editor");
+  await routineEditor.getByRole("textbox", { name: "名称" }).fill("每天整理资料");
+  await routineEditor.getByRole("textbox", { name: "每次执行的任务" }).fill("只读总结资料，不修改外部数据");
+  await page.screenshot({ path: new URL("personal-routine-create-320.png", out).pathname });
+  assert.equal(manualAutomationRuns, 0);
+  await routineEditor.getByRole("button", { name: "保存" }).click();
+  await page.locator(".automation-row").filter({ hasText: "每天整理资料" }).waitFor();
+  assert.equal(manualAutomationRuns, 0);
+  await page.getByRole("button", { name: "编辑" }).click();
+  await routineEditor.getByRole("textbox", { name: "名称" }).fill("每次整理资料");
+  await routineEditor.getByRole("button", { name: "保存" }).click();
+  await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).waitFor();
+  await page.reload();
+  await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).waitFor();
+  await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).click();
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  page.once("dialog", (dialog) => { void dialog.dismiss(); });
+  await page.getByRole("button", { name: "立即运行" }).click();
+  assert.equal(manualAutomationRuns, 0);
+  page.once("dialog", (dialog) => { void dialog.accept(); });
+  await page.getByRole("button", { name: "立即运行" }).click();
+  await page.waitForFunction(() => document.body.textContent?.includes("已开始"));
+  assert.equal(manualAutomationRuns, 1);
+  page.once("dialog", (dialog) => { void dialog.accept(); });
+  await page.getByRole("button", { name: "归档" }).click();
+  await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).waitFor({ state: "detached" });
+  await page.getByText("已归档流程 (1)").click();
+  await page.locator(".personal-routine-archive-row").getByRole("button", { name: "恢复" }).click();
+  await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).waitFor();
+  assert.equal(manualAutomationRuns, 1);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("personal-routine-edit-320.png", out).pathname });
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.locator(".sidebar .nav-item").filter({ hasText: "今日" }).click();
   await page.getByRole("heading", { name: "今日" }).waitFor();
+  assert.match(await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "可复用流程" }) }).innerText(), /每次整理资料/);
   await page.reload();
   await page.getByRole("heading", { name: "今日" }).waitFor();
   const reviewButton = page.locator(".personal-priority-section").getByRole("button", { name: "已核对" });
@@ -705,5 +781,5 @@ try {
   assert.equal(await page.locator(".personal-priority-section").count(), 0);
   assert.match(await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "最近结果" }) }).innerText(), /外部操作待核对/);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，取消额度确认不触发运行", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，取消额度确认不触发运行", "个人流程可创建编辑且仅确认后运行", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

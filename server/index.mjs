@@ -29,6 +29,7 @@ import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore } from "./personal-facts.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
+import { createPersonalRoutinesStore, personalRoutineAutomation } from "./personal-routines.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 
@@ -61,6 +62,7 @@ const stateRoot =
 const chatHistoryPath = path.join(stateRoot, "chat-history.json");
 const personalFactsStore = createPersonalFactsStore(path.join(stateRoot, "personal-facts.json"));
 const personalCommitmentsStore = createPersonalCommitmentsStore(path.join(stateRoot, "personal-commitments.json"));
+const personalRoutinesStore = createPersonalRoutinesStore(path.join(stateRoot, "personal-routines.json"));
 const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
@@ -274,8 +276,8 @@ const defaultAutomations = [
     service: null,
     schedule: "On demand",
     mode: "on-demand",
-    model: "gpt-5.6-terra",
-    reasoning: "high",
+    model: "gpt-6-sol",
+    reasoning: "medium",
     prompt: "Run the requested repository workflow. Read the repository instructions first, keep changes scoped, and report verification results.",
   },
   {
@@ -285,8 +287,8 @@ const defaultAutomations = [
     timer: "codex-auto-sample-maintenance.timer",
     service: "codex-auto-sample-maintenance.service",
     schedule: "Weekdays 09:30",
-    model: "gpt-5.6-terra",
-    reasoning: "high",
+    model: "gpt-6-sol",
+    reasoning: "medium",
     prompt: "Run the repository maintenance workflow in an isolated worktree. Summarize changes, verification, and anything requiring maintainer attention.",
   },
   {
@@ -296,8 +298,8 @@ const defaultAutomations = [
     timer: "codex-auto-sample-research.timer",
     service: "codex-auto-sample-research.service",
     schedule: "Every 30 minutes",
-    model: "gpt-5.6-terra",
-    reasoning: "high",
+    model: "gpt-6-sol",
+    reasoning: "medium",
     prompt: "Process one queued research task using the repository's evidence and verification rules.",
   },
   {
@@ -307,8 +309,8 @@ const defaultAutomations = [
     timer: "codex-auto-sample-hourly.timer",
     service: "codex-auto-sample-hourly.service",
     schedule: "Hourly",
-    model: "gpt-5.6-terra",
-    reasoning: "high",
+    model: "gpt-6-sol",
+    reasoning: "medium",
     prompt: "Run the configured hourly analysis in an isolated worktree and report verification results.",
   },
   {
@@ -318,7 +320,7 @@ const defaultAutomations = [
     timer: "codex-auto-sample-verification.timer",
     service: "codex-auto-sample-verification.service",
     schedule: "Weekdays 09:50",
-    model: "gpt-5.6-terra",
+    model: "gpt-6-sol",
     reasoning: "medium",
     prompt: "Verify the latest maintenance run and report a pass or fail with evidence and follow-up actions.",
   },
@@ -329,7 +331,7 @@ const defaultAutomations = [
     timer: "codex-auto-sample-service-refresh.timer",
     service: "codex-auto-sample-service-refresh.service",
     schedule: "Daily 18:30",
-    model: "gpt-5.6-terra",
+    model: "gpt-6-sol",
     reasoning: "medium",
     prompt: "Refresh the service using its documented workflow and report outputs, sources, and failures.",
   },
@@ -340,8 +342,8 @@ const defaultAutomations = [
     timer: "codex-auto-sample-data-refresh.timer",
     service: "codex-auto-sample-data-refresh.service",
     schedule: "Every 24 hours",
-    model: "gpt-5.6-terra",
-    reasoning: "high",
+    model: "gpt-6-sol",
+    reasoning: "medium",
     prompt: "Refresh the repository data using the documented process and report changes, verification, and next steps.",
   },
 ];
@@ -366,6 +368,10 @@ if (repos.some((repo) => repo.id === personalRepoId) || personalRootOverlapsWork
   } else {
     repos.push({ id: personalRepoId, name: "个人助理", kind: "personal", path: personalRoot, remote: "", accent: "teal" });
   }
+}
+
+if (repos.some((repo) => repo.id === personalRepoId)) {
+  automations.push(...(await personalRoutinesStore.list()).filter((item) => !item.archivedAt).map(personalRoutineAutomation));
 }
 
 function run(command, args = [], options = {}) {
@@ -7162,14 +7168,17 @@ async function getTimers() {
     timeout: 8_000,
   });
   if (!result.ok) {
+    const fallbackStatus = parseTimerLines("");
     return Promise.all(
-      automations.map(async (automation, index) => ({
-        ...automation,
-        enabled: true,
-        nextRun: ["今天 09:30", "今天 09:50", "今天 18:30", "明天 00:38"][index],
-        lastRun: index === 3 ? "今天 00:38" : "尚未运行",
-        run: await getLogForAutomation(automation),
-      })),
+      fallbackStatus.map(async (automation) => automation.mode === "on-demand"
+        ? automation
+        : {
+          ...automation,
+          enabled: true,
+          nextRun: automation.schedule,
+          lastRun: "尚未运行",
+          run: await getLogForAutomation(automation),
+        }),
     );
   }
   return attachRunDetails(parseTimerLines(result.stdout));
@@ -10431,6 +10440,60 @@ app.get("/api/personal/commitments", async (_req, res) => {
   catch (error) { sendRouteError(res, error); }
 });
 
+app.get("/api/personal/routines", async (_req, res) => {
+  try {
+    if (!repos.some((repo) => repo.id === personalRepoId)) return res.status(404).json({ ok: false, error: "个人空间不可用" });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, routines: await personalRoutinesStore.list() });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/routines", async (req, res) => {
+  try {
+    if (!personalExecutionAvailable || !repos.some((repo) => repo.id === personalRepoId)) return res.status(503).json({ ok: false, error: "个人空间执行不可用" });
+    const routine = await personalRoutinesStore.create(req.body);
+    automations.push(personalRoutineAutomation(routine));
+    statusCache = null;
+    res.status(201).json({ ok: true, routine });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.patch("/api/personal/routines/:id", async (req, res) => {
+  try {
+    const index = automations.findIndex((item) => item.id === req.params.id && item.personalRoutine);
+    if (index < 0) return res.status(404).json({ ok: false, error: "个人流程不存在" });
+    const routine = await personalRoutinesStore.update(req.params.id, req.body);
+    automations[index] = personalRoutineAutomation(routine);
+    statusCache = null;
+    res.json({ ok: true, routine });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.delete("/api/personal/routines/:id", async (req, res) => {
+  try {
+    const index = automations.findIndex((item) => item.id === req.params.id && item.personalRoutine);
+    if (index < 0) return res.status(404).json({ ok: false, error: "个人流程不存在" });
+    if ((await readAutomationRuns()).runs.some((run) => run.automationId === req.params.id && ["queued", "running", "canceling", "needs_reconciliation"].includes(run.status))) {
+      return res.status(409).json({ ok: false, error: "流程仍在运行或待核对，请先处理后再归档" });
+    }
+    const routine = await personalRoutinesStore.archive(req.params.id, req.body?.revision);
+    automations.splice(index, 1);
+    statusCache = null;
+    res.json({ ok: true, routine });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/routines/:id/restore", async (req, res) => {
+  try {
+    if (!personalExecutionAvailable || !repos.some((repo) => repo.id === personalRepoId)) return res.status(503).json({ ok: false, error: "个人空间执行不可用" });
+    if (automations.some((item) => item.id === req.params.id)) return res.status(409).json({ ok: false, error: "流程已启用" });
+    const routine = await personalRoutinesStore.restore(req.params.id, req.body?.revision);
+    automations.push(personalRoutineAutomation(routine));
+    statusCache = null;
+    res.json({ ok: true, routine });
+  } catch (error) { sendRouteError(res, error); }
+});
+
 app.post("/api/personal/commitments", async (req, res) => {
   try { res.status(201).json({ ok: true, commitment: await personalCommitmentsStore.create(req.body) }); }
   catch (error) { sendRouteError(res, error); }
@@ -11230,6 +11293,7 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
 async function processAutomationTriggerRequest(req, res, trigger) {
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
+  if (automation.personalRoutine) return res.status(403).json({ ok: false, error: "个人流程只能从已登录的控制台手动运行" });
   if (!String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim() &&
     !["legacy-shared", "local-development"].includes(req.apiClient.id)) {
     return res.status(400).json({ ok: false, error: "Idempotency-Key is required for API clients" });
@@ -11384,6 +11448,9 @@ app.post("/api/automations/:id/heartbeat", (req, res) => {
 app.post("/api/automations/:id/run", async (req, res) => {
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
+  if (automation.repoId === personalRepoId && req.body?.confirmModelCost !== true) {
+    return res.status(428).json({ ok: false, error: "运行个人任务前需确认模型额度消耗" });
+  }
   const repo = getRepoById(automation.repoId);
   if (req.body?.runner === "app-server" || req.query?.runner === "app-server") {
     let completionContract;

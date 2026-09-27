@@ -542,6 +542,91 @@ h3 {
   overflow: auto;
 }
 
+.personal-routine-new {
+  align-self: flex-start;
+  margin-top: 14px;
+}
+
+.personal-routine-editor {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(55, 79, 97, 0.12);
+}
+
+.personal-routine-editor label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.personal-routine-editor input,
+.personal-routine-editor textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(55, 79, 97, 0.25);
+  border-radius: 6px;
+  color: #17212b;
+  background: #fff;
+  font: inherit;
+  font-weight: 400;
+}
+
+.personal-routine-editor textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+.personal-routine-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.personal-routine-prompt {
+  display: grid;
+  gap: 7px;
+  padding: 15px 0;
+  border-bottom: 1px solid rgba(55, 79, 97, 0.12);
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.personal-routine-prompt strong {
+  color: #52656f;
+  font-size: 12px;
+}
+
+.personal-routine-archive {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(55, 79, 97, 0.12);
+  font-size: 13px;
+}
+
+.personal-routine-archive summary {
+  cursor: pointer;
+  color: #52656f;
+}
+
+.personal-routine-archive-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 0;
+}
+
+.personal-routine-archive-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .automation-row {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) auto;

@@ -51,7 +51,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
+import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 
 const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
@@ -3293,6 +3293,8 @@ export function App() {
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [chatInput, setChatInput] = useState("");
+  const [routineEditorId, setRoutineEditorId] = useState<string | null>(null);
+  const [routineArchiveRevision, setRoutineArchiveRevision] = useState(0);
   const [chatAttachments, setChatAttachments] = useState<UploadedAttachment[]>([]);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [chatRuntime, setChatRuntime] = useState<ChatRuntime>(defaultChatRuntime);
@@ -6068,6 +6070,15 @@ export function App() {
           <div className={cx("content-grid", selectedRepo.kind === "personal" && "personal-automations")}>
             <section className="panel automation-panel" aria-label="自动化任务">
               <PanelTitle title={selectedRepo.kind === "personal" ? "计划任务" : "自动化"} eyebrow={selectedRepo.kind === "personal" ? "个人助理" : "云端任务"} onRefresh={refresh} spinning={isRefreshing} />
+              {selectedRepo.kind === "personal" && <button className="command-button personal-routine-new" type="button" onClick={() => setRoutineEditorId("")}>
+                <Plus size={17} />新建流程
+              </button>}
+              {selectedRepo.kind === "personal" && routineEditorId !== null && <PersonalRoutineEditor
+                key={routineEditorId}
+                automation={status.automations.find((item) => item.id === routineEditorId && item.personalRoutine)}
+                onCancel={() => setRoutineEditorId(null)}
+                onSaved={(id) => { setRoutineEditorId(null); setSelectedAutomationId(id); void refresh(); }}
+              />}
 
               <div className="automation-list">
                 {filteredAutomations.map((automation) => (
@@ -6083,6 +6094,10 @@ export function App() {
                   />
                 ))}
               </div>
+              {selectedRepo.kind === "personal" && <PersonalRoutineArchive
+                refreshKey={routineArchiveRevision}
+                onRestored={(id) => { setSelectedAutomationId(id); void refresh(); }}
+              />}
             </section>
 
             {selectedAutomation && selectedAutomationRepo ? <section className="thread-panel">
@@ -6099,10 +6114,24 @@ export function App() {
                     api(`/api/automations/${selectedAutomation.id}/run`, {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ runner: "app-server", worktree: selectedAutomationRepo.kind !== "personal" }),
+                      body: JSON.stringify({ runner: "app-server", worktree: selectedAutomationRepo.kind !== "personal", confirmModelCost: true }),
                     }),
                   );
                 }}
+                onEdit={selectedAutomation.personalRoutine ? () => setRoutineEditorId(selectedAutomation.id) : undefined}
+                onArchive={selectedAutomation.personalRoutine ? () => {
+                  if (!window.confirm(`归档“${selectedAutomation.name}”？它会从计划列表隐藏，但运行记录和流程内容仍保留，可随时恢复。`)) return;
+                  void runAction(`archive-${selectedAutomation.id}`, "归档流程", async () => {
+                    await api(`/api/personal/routines/${encodeURIComponent(selectedAutomation.id)}`, {
+                      method: "DELETE", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ revision: selectedAutomation.revision }),
+                    });
+                    setRoutineEditorId(null);
+                    setSelectedAutomationId("");
+                    setRoutineArchiveRevision((current) => current + 1);
+                    return { output: "已归档，运行记录保留" };
+                  });
+                } : undefined}
                 onOpenRun={(run) => {
                   openAutomationRun(run);
                 }}
@@ -6384,9 +6413,10 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   const recent = [...sessions].filter((session) => !isVerificationChatSession(session)).sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
   const goals = recent.filter((session) => session.goal?.objective && !["complete", "completed"].includes(session.goal.status)).slice(0, 4);
   const upcoming = status.automations.filter((item) => item.repoId === repo.id && item.enabled && Number.isFinite(Date.parse(item.nextRun))).sort((a, b) => Date.parse(a.nextRun) - Date.parse(b.nextRun)).slice(0, 3);
+  const repeatable = status.automations.filter((item) => item.repoId === repo.id && item.personalRoutine).slice(0, 3);
   const recentRuns = (status.automationRuns || []).filter((run) => run.repoId === repo.id && run.finishedAt).sort((a, b) => Date.parse(b.finishedAt || "") - Date.parse(a.finishedAt || "")).slice(0, 3);
   const decisionCount = approvalCount + queuedNeedsAttention.length + externalNeedsAttention.length + needsAttention.length;
-  const guideFirst = !decisionCount && dueCount === 0 && !running.length && !queuedInFlight.length && !goals.length && !upcoming.length && !recentFiles.length && !recentRuns.length && !filesLoading && !filesError;
+  const guideFirst = !decisionCount && dueCount === 0 && !running.length && !queuedInFlight.length && !goals.length && !upcoming.length && !repeatable.length && !recentFiles.length && !recentRuns.length && !filesLoading && !filesError;
   const summary = decisionCount ? `${decisionCount} 项需要你处理` : dueCount ? `${dueCount} 项关注事项今天或此前到期` : running.length || queuedInFlight.length ? "任务正在继续处理" : dueCount === null || filesLoading ? "正在整理今日事项…" : "目前没有需要你决定的事项";
   const guide = <PersonalAssistantGuide onChoose={onChooseTask} onConnect={onConnections} heading="可以交办" />;
   const runDetail = (run: AutomationRun) => `${run.status === "completed" ? "运行完成" : run.status === "failed" ? "运行失败" : run.status === "needs_reconciliation" ? "外部操作待核对" : run.status === "cancelled" ? "已取消" : "运行已结束"} · ${new Date(run.finishedAt || "").toLocaleString()}`;
@@ -6429,6 +6459,10 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
       <h2>持续跟进</h2>
       {goals.map((session) => <PersonalActivityRow key={`goal:${session.id}`} title={session.goal!.objective} detail={`目标 · ${sessionDisplayTitle(session)} · ${timeLabel(session.updatedAt)}`} onClick={() => onContinue(session.id)} />)}
       {upcoming.map((item) => <PersonalActivityRow key={`routine:${item.id}`} title={item.name} detail={Date.parse(item.nextRun) < Date.now() ? `定时任务 · 计划时间 ${new Date(item.nextRun).toLocaleString()} 已过，待核对` : `定时任务 · 下次 ${new Date(item.nextRun).toLocaleString()}`} onClick={() => onOpenAutomation(item.id)} />)}
+    </section>}
+    {repeatable.length > 0 && <section className="personal-list-section">
+      <h2>可复用流程</h2>
+      {repeatable.map((item) => <PersonalActivityRow key={item.id} title={item.name} detail="手动运行 · 打开后确认额度" onClick={() => onOpenAutomation(item.id)} />)}
     </section>}
     {(recentFiles.length > 0 || recentRuns.length > 0 || filesLoading || filesError) && <section className="personal-list-section">
       <h2>最近结果</h2>
@@ -7731,6 +7765,88 @@ function searchResultIcon(kind: GlobalSearchResult["kind"]) {
   return <Command size={15} />;
 }
 
+function PersonalRoutineEditor({ automation, onCancel, onSaved }: {
+  automation?: Automation;
+  onCancel: () => void;
+  onSaved: (id: string) => void;
+}) {
+  const [name, setName] = useState(automation?.name || "");
+  const [prompt, setPrompt] = useState(automation?.prompt || "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const result = await api<{ routine: { id: string } }>(automation ? `/api/personal/routines/${encodeURIComponent(automation.id)}` : "/api/personal/routines", {
+        method: automation ? "PATCH" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, prompt, ...(automation ? { revision: automation.revision } : {}) }),
+      });
+      onSaved(result.routine.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <form className="personal-routine-editor" onSubmit={(event) => void save(event)}>
+    <h3>{automation ? "修改流程" : "新建流程"}</h3>
+    <label>名称<input autoFocus maxLength={80} required value={name} onChange={(event) => setName(event.target.value)} /></label>
+    <label>每次执行的任务<textarea maxLength={8000} required rows={6} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+    <p className="muted-line">仅手动运行；保存不会调用模型。运行前会再次确认额度。</p>
+    {error && <p className="warn-text" role="alert">{error}</p>}
+    <div className="personal-routine-editor-actions">
+      <button className="text-button" type="button" onClick={onCancel} disabled={saving}>取消</button>
+      <button className="primary-command" type="submit" disabled={saving || !name.trim() || !prompt.trim()}>{saving ? <Loader2 size={16} className="spin" /> : <CheckCircle2 size={16} />}保存</button>
+    </div>
+  </form>;
+}
+
+type PersonalRoutineRecord = { id: string; name: string; prompt: string; revision: number; archivedAt: string | null };
+
+function PersonalRoutineArchive({ refreshKey, onRestored }: { refreshKey: number; onRestored: (id: string) => void }) {
+  const [items, setItems] = useState<PersonalRoutineRecord[]>([]);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let live = true;
+    void api<{ routines: PersonalRoutineRecord[] }>("/api/personal/routines")
+      .then((result) => { if (live) setItems(result.routines.filter((item) => item.archivedAt)); })
+      .catch((cause) => { if (live) setError(cause instanceof Error ? cause.message : "读取归档失败"); });
+    return () => { live = false; };
+  }, [refreshKey]);
+  const restore = async (item: PersonalRoutineRecord) => {
+    if (busy) return;
+    setBusy(item.id);
+    setError("");
+    try {
+      await api(`/api/personal/routines/${encodeURIComponent(item.id)}/restore`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: item.revision }),
+      });
+      setItems((current) => current.filter((entry) => entry.id !== item.id));
+      onRestored(item.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "恢复失败");
+    } finally {
+      setBusy("");
+    }
+  };
+  if (!items.length && !error) return null;
+  return <details className="personal-routine-archive">
+    <summary>已归档流程{items.length ? ` (${items.length})` : ""}</summary>
+    {error && <p className="warn-text" role="alert">{error}</p>}
+    {items.map((item) => <div className="personal-routine-archive-row" key={item.id}>
+      <span>{item.name}</span>
+      <button className="text-button" type="button" onClick={() => void restore(item)} disabled={Boolean(busy)}>
+        <RefreshCw size={15} />恢复
+      </button>
+    </div>)}
+  </details>;
+}
+
 function AutomationRow({
   automation,
   repo,
@@ -7769,6 +7885,8 @@ function RunThread({
   events,
   busyAction,
   onRun,
+  onEdit,
+  onArchive,
   onOpenRun,
   onPause,
   onPull,
@@ -7781,6 +7899,8 @@ function RunThread({
   events: RunEvent[];
   busyAction: string | null;
   onRun: () => void;
+  onEdit?: () => void;
+  onArchive?: () => void;
   onOpenRun: (run: AutomationRun) => void;
   onPause: () => void;
   onPull: () => void;
@@ -7796,11 +7916,13 @@ function RunThread({
             <Sparkles size={19} />
           </div>
           <div>
-            <p className="eyebrow">自动化会话</p>
+            <p className="eyebrow">{repo.kind === "personal" ? "个人计划" : "自动化会话"}</p>
             <h2>{automation.name}</h2>
           </div>
         </div>
         <div className="thread-actions">
+          {onEdit && <button className="command-button" onClick={onEdit} disabled={Boolean(busyAction)}><Pencil size={17} />编辑</button>}
+          {onArchive && <button className="command-button" onClick={onArchive} disabled={Boolean(busyAction)}><History size={17} />归档</button>}
           {repo.kind !== "personal" && <button className="command-button" onClick={onPull} disabled={Boolean(busyAction)}>
             {actionBusy("pull") ? <Loader2 size={17} className="spin" /> : <GitPullRequestArrow size={17} />}
             同步
@@ -7811,7 +7933,7 @@ function RunThread({
           </button>}
           <button className="primary-command" onClick={onRun} disabled={Boolean(busyAction)}>
             {actionBusy("run") ? <Loader2 size={17} className="spin" /> : <Play size={17} />}
-            Codex 运行
+            {repo.kind === "personal" ? "立即运行" : "Codex 运行"}
           </button>
         </div>
       </div>
@@ -7821,31 +7943,38 @@ function RunThread({
           {automation.mode === "on-demand" ? "按需" : automation.enabled ? "启用" : "暂停"}
         </span>
         <span>{automation.model} · {reasoningLabel(automation.reasoning)}</span>
-        <span>{automation.schedule}</span>
+        {automation.mode !== "on-demand" && <span>{automation.schedule}</span>}
       </div>
 
-      <div className="task-grid automation-task-grid">
+      {repo.kind === "personal" && <div className="personal-routine-prompt">
+        <strong>任务内容</strong>
+        <ExpandableText text={automation.prompt || "未设置任务内容"} limit={500} />
+      </div>}
+
+      {repo.kind !== "personal" && <div className="task-grid automation-task-grid">
         <Metric label="后台任务" value={automation.mode === "on-demand" ? "按需触发" : automation.enabled ? "计划已启用" : "计划已暂停"} icon={<Timer size={16} />} />
-        <Metric label={repo.kind === "personal" ? "空间" : "仓库"} value={repo.name} icon={repo.kind === "personal" ? <UserRound size={16} /> : <GitBranch size={16} />} />
-        <Metric label="运行方式" value={repo.kind === "personal" ? "云端 Codex · 个人空间" : "云端 Codex · 隔离工作区"} icon={<Bot size={16} />} />
+        <Metric label="仓库" value={repo.name} icon={<GitBranch size={16} />} />
+        <Metric label="运行方式" value="云端 Codex · 隔离工作区" icon={<Bot size={16} />} />
         <Metric label="下次运行" value={displayHumanDateTime(automation.nextRun)} icon={<Timer size={16} />} />
-      </div>
+      </div>}
 
       <AutomationRunsPanel runs={runs} personal={repo.kind === "personal"} onOpenRun={onOpenRun} />
       {repo.kind !== "personal" && <AutomationWebhookPanel automation={automation} status={status} />}
       {repo.kind !== "personal" && <RunLogPanel automation={automation} onOpenLog={onOpenLog} />}
 
-      <div className="conversation">
-        <Message tone="info" title="云端 Codex" body={repo.kind === "personal" ? "个人空间" : `工作区 ${displayWorktreePath(repo.path) || repo.name}`} />
+      {(repo.kind !== "personal" || events.length > 0) && <div className="conversation">
+        {repo.kind !== "personal" && <>
+        <Message tone="info" title="云端 Codex" body={`工作区 ${displayWorktreePath(repo.path) || repo.name}`} />
         <Message
           tone={automation.enabled ? "ok" : "warn"}
           title={automation.mode === "on-demand" ? "按需任务" : automation.enabled ? "定时器已启用" : "定时器已暂停"}
-          body={`${automation.mode === "on-demand" ? "按需触发" : repo.kind === "personal" ? "计划" : "系统定时器"} · ${automation.schedule}`}
+          body={`${automation.mode === "on-demand" ? "按需触发" : "系统定时器"} · ${automation.schedule}`}
         />
+        </>}
         {events.map((event) => (
           <Message key={event.id} title={`${displayLiveEventTitle(event)} · ${timeLabel(event.time)}`} tone={event.tone} body={displayLiveEventBody(event)} />
         ))}
-      </div>
+      </div>}
     </div>
   );
 }

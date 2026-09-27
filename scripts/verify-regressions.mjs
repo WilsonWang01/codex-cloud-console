@@ -960,6 +960,44 @@ await check("personal and work reuse authentication without sharing threads or s
       body: JSON.stringify({ title: "回归测试个人事项", nextStep: "整理资料", dueAt: "2026-10-02T09:00:00.000Z" }),
     });
     assert.equal(createdCommitment.response.status, 201);
+    const createdRoutine = await jsonRequest(base, "/api/personal/routines", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "回归测试流程", prompt: "只读整理资料" }),
+    });
+    assert.equal(createdRoutine.response.status, 201);
+    const routineId = createdRoutine.data.routine.id;
+    const listedRoutines = await jsonRequest(base, "/api/personal/routines");
+    assert.equal(listedRoutines.data.routines[0].id, routineId);
+    const routineStatus = await jsonRequest(base, "/api/status");
+    assert.equal(routineStatus.data.automations.find((item) => item.id === routineId)?.mode, "on-demand");
+    const unconfirmedRun = await jsonRequest(base, `/api/automations/${routineId}/run`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ runner: "app-server" }),
+    });
+    assert.equal(unconfirmedRun.response.status, 428);
+    const externalRoutine = await jsonRequest(base, `/api/automations/${routineId}/webhook`, {
+      method: "POST", headers: { "content-type": "application/json", "x-codex-cloud-token": "shared-test-token-only" }, body: JSON.stringify({ prompt: "run" }),
+    });
+    assert.equal(externalRoutine.response.status, 403);
+    const staleRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 0, name: "旧名称", prompt: "旧任务" }),
+    });
+    assert.equal(staleRoutine.response.status, 409);
+    const updatedRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, name: "新名称", prompt: "只读整理明天资料" }),
+    });
+    assert.equal(updatedRoutine.response.status, 200);
+    assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.name, "新名称");
+    const archivedRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
+      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 2 }),
+    });
+    assert.equal(archivedRoutine.response.status, 200);
+    assert.ok(archivedRoutine.data.routine.archivedAt);
+    assert.equal((await jsonRequest(base, "/api/status")).data.automations.some((item) => item.id === routineId), false);
+    const restoredRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}/restore`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 3 }),
+    });
+    assert.equal(restoredRoutine.response.status, 200);
+    assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.name, "新名称");
     const firstBrief = await jsonRequest(base, "/api/personal/brief");
     assert.equal(firstBrief.response.status, 200);
     assert.ok(firstBrief.data.brief.items.some((item) => item.title === "回归测试个人事项" && item.detail === "新增关注事项"));
