@@ -20,6 +20,7 @@ export type Automation = {
   name: string;
   repoId: string;
   personalRoutine?: boolean;
+  personalTestApproval?: { runId: string; approvedAt: string; current: boolean } | null;
   personalSchedule?: {
     cadence: "daily" | "weekdays";
     time: string;

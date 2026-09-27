@@ -3,11 +3,15 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createPersonalRoutinesStore, personalRoutineAutomation } from "../server/personal-routines.mjs";
+import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash } from "../server/personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "../server/personal-scheduler.mjs";
 import { nextPersonalOccurrence, personalScheduleLocalDate, validatePersonalSchedule } from "../server/personal-schedule.mjs";
 
 const shanghai = { cadence: "daily", time: "09:00", timeZone: "Asia/Shanghai" };
+
+async function approveFixture(store, routine) {
+  return store.approveTest(routine.id, { revision: routine.revision, runId: "fixture-run", promptHash: personalRoutinePromptHash(routine.prompt) });
+}
 
 test("personal schedule validates timezones and handles DST without a duplicate local day", () => {
   assert.throws(() => validatePersonalSchedule({ ...shanghai, timeZone: "Mars/Olympus" }), { statusCode: 400 });
@@ -29,7 +33,9 @@ test("schedule is opt-in, claims at most once, survives restart and pauses on fa
     const store = createPersonalRoutinesStore(file);
     const routine = await store.create({ name: "简报", prompt: "只读整理今日资料" });
     assert.equal(personalRoutineAutomation(routine).personalSchedule, null);
-    const enabled = await store.configureSchedule(routine.id, { revision: 1, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z"));
+    await assert.rejects(store.configureSchedule(routine.id, { revision: 1, enabled: true, ...shanghai }), /试运行/);
+    const approved = await approveFixture(store, routine);
+    const enabled = await store.configureSchedule(routine.id, { revision: approved.revision, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z"));
     assert.equal(enabled.personalSchedule.nextRunAt, "2026-09-28T01:00:00.000Z");
     assert.equal(await store.claimDue(Date.parse("2026-09-28T00:59:59Z")), null);
     const now = Date.parse("2026-09-28T01:00:15Z");
@@ -55,12 +61,34 @@ test("missed windows are skipped and old version-one state remains readable", as
     const store = createPersonalRoutinesStore(file);
     assert.deepEqual(await store.claims(), []);
     const routine = await store.create({ name: "晨报", prompt: "读取资料" });
-    await store.configureSchedule(routine.id, { revision: 1, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z"));
+    const approved = await approveFixture(store, routine);
+    await store.configureSchedule(routine.id, { revision: approved.revision, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z"));
     const due = await store.claimDue(Date.parse("2026-09-28T02:00:00Z"));
     assert.equal(due.skipped, true);
     assert.equal(due.routine.personalSchedule.lastResult.status, "skipped");
     assert.equal(due.routine.personalSchedule.nextRunAt, "2026-09-29T01:00:00.000Z");
     assert.deepEqual(await store.claims(), []);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("approved trial is tied to prompt content and editing pauses an active schedule", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-trial-"));
+  try {
+    const store = createPersonalRoutinesStore(path.join(root, "routines.json"));
+    const routine = await store.create({ name: "晨报", prompt: "只读整理资料" });
+    const testing = await store.beginTest(routine.id, routine.revision);
+    assert.equal(testing.personalTestApproval, null);
+    const approved = await approveFixture(store, testing);
+    assert.equal(personalRoutineAutomation(approved).personalTestApproval.current, true);
+    const enabled = await store.configureSchedule(routine.id, { revision: approved.revision, enabled: true, ...shanghai });
+    await assert.rejects(store.beginTest(routine.id, enabled.revision), /暂停/);
+    const renamed = await store.update(routine.id, { revision: enabled.revision, name: "新晨报", prompt: routine.prompt });
+    assert.equal(renamed.personalSchedule.enabled, true);
+    const edited = await store.update(routine.id, { revision: renamed.revision, name: "新晨报", prompt: "只读整理新资料" });
+    assert.equal(edited.personalSchedule.enabled, false);
+    assert.equal(edited.personalSchedule.nextRunAt, null);
+    assert.equal(personalRoutineAutomation(edited).personalTestApproval.current, false);
+    await assert.rejects(store.configureSchedule(routine.id, { revision: edited.revision, enabled: true, ...shanghai }), /试运行/);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -71,18 +99,20 @@ test("only three enabled schedules and three daily claims are allowed", async ()
     const routines = [];
     for (let index = 0; index < 4; index += 1) routines.push(await store.create({ name: `任务 ${index}`, prompt: "只读整理" }));
     for (const routine of routines.slice(0, 3)) {
-      await store.configureSchedule(routine.id, { revision: 1, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z"));
+      const approved = await approveFixture(store, routine);
+      await store.configureSchedule(routine.id, { revision: approved.revision, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z"));
     }
-    await assert.rejects(store.configureSchedule(routines[3].id, { revision: 1, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z")), { statusCode: 409 });
+    const fourthApproved = await approveFixture(store, routines[3]);
+    await assert.rejects(store.configureSchedule(routines[3].id, { revision: fourthApproved.revision, enabled: true, ...shanghai }, Date.parse("2026-09-27T23:00:00Z")), { statusCode: 409 });
     for (let index = 0; index < 3; index += 1) {
       const due = await store.claimDue(Date.parse("2026-09-28T01:00:05Z"));
       assert.ok(due.claim);
       await store.settleClaim(due.claim.runId, "completed");
     }
     assert.equal(await store.claimDue(Date.parse("2026-09-28T01:00:05Z")), null);
-    const disabled = await store.configureSchedule(routines[0].id, { revision: 2, enabled: false });
+    const disabled = await store.configureSchedule(routines[0].id, { revision: 3, enabled: false });
     assert.equal(disabled.personalSchedule.enabled, false);
-    const fourth = await store.configureSchedule(routines[3].id, { revision: 1, enabled: true, ...shanghai, time: "10:30" }, Date.parse("2026-09-28T01:00:05Z"));
+    const fourth = await store.configureSchedule(routines[3].id, { revision: fourthApproved.revision, enabled: true, ...shanghai, time: "10:30" }, Date.parse("2026-09-28T01:00:05Z"));
     assert.equal(fourth.personalSchedule.nextRunAt, "2026-09-28T02:30:00.000Z");
     const capped = await store.claimDue(Date.parse("2026-09-28T02:30:05Z"));
     assert.equal(capped.skipped, true);

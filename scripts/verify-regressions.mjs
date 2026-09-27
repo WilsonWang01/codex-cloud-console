@@ -239,6 +239,8 @@ input.on("line", (line) => {
     const personalDeletionRegression = requestText.includes("personal deletion regression");
     const recoveryRegression = requestText.includes("继续上一轮因服务重启中断的自动化任务");
     const outcomeContractRegression = requestText.includes("outcome contract regression");
+    const personalTestRegression = requestText.includes("personal schedule test regression");
+    const personalEmptyTestRegression = requestText.includes("personal schedule empty regression");
     const externalWriteRegression = requestText.includes("external write regression");
     send({ id: message.id, result: { turn: { id: turnId } } });
     if (externalWriteRegression) {
@@ -311,6 +313,23 @@ input.on("line", (line) => {
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
         turn: { id: turnId, status: "completed" },
+      } }, 80);
+    } else if (personalTestRegression) {
+      send({ method: "item/agentMessage/delta", params: {
+        threadId: message.params?.threadId, turnId, delta: "模拟试运行结果：已核对资料，无外部写入",
+      } }, 40);
+      send({ method: "thread/tokenUsage/updated", params: {
+        threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+      } }, 60);
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
+      } }, 80);
+    } else if (personalEmptyTestRegression) {
+      send({ method: "thread/tokenUsage/updated", params: {
+        threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 1 } },
+      } }, 60);
+      send({ method: "turn/completed", params: {
+        threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
       } }, 80);
     } else if (recoveryRegression) {
       const output = requestText.includes("RECOVERY_REGRESSION_COMPLETE")
@@ -993,13 +1012,43 @@ await check("personal and work reuse authentication without sharing threads or s
     });
     assert.equal(invalidSchedule.response.status, 400);
     const updatedRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
-      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, name: "新名称", prompt: "只读整理明天资料" }),
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, name: "新名称", prompt: "只读整理明天资料 personal schedule test regression" }),
     });
     assert.equal(updatedRoutine.response.status, 200);
     assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.name, "新名称");
     const scheduleTime = new Date(Date.now() + 2 * 60 * 60_000);
-    const schedulePayload = { revision: 2, enabled: true, confirmModelCost: true, cadence: "daily",
+    const schedulePayload = { revision: 4, enabled: true, confirmModelCost: true, cadence: "daily",
       time: `${String(scheduleTime.getUTCHours()).padStart(2, "0")}:${String(scheduleTime.getUTCMinutes()).padStart(2, "0")}`, timeZone: "UTC" };
+    const untestedSchedule = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...schedulePayload, revision: 2 }),
+    });
+    assert.equal(untestedSchedule.response.status, 409);
+    const trialWithoutConsent = await jsonRequest(base, `/api/personal/routines/${routineId}/test`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 2 }),
+    });
+    assert.equal(trialWithoutConsent.response.status, 428);
+    const startedTrial = await jsonRequest(base, `/api/personal/routines/${routineId}/test`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 2, confirmModelCost: true }),
+    });
+    assert.equal(startedTrial.response.status, 200);
+    assert.equal(startedTrial.data.revision, 3);
+    let latestTrial;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      latestTrial = await jsonRequest(base, `/api/personal/routines/${routineId}/test`);
+      if (latestTrial.data.test?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(latestTrial.data.test?.status, "completed");
+    assert.equal(latestTrial.data.test.promptMatches, true);
+    const approvalWithoutReview = await jsonRequest(base, `/api/personal/routines/${routineId}/test/approve`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 3, runId: latestTrial.data.test.id }),
+    });
+    assert.equal(approvalWithoutReview.response.status, 428);
+    const approvedTrial = await jsonRequest(base, `/api/personal/routines/${routineId}/test/approve`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 3, runId: latestTrial.data.test.id, confirmResult: true }),
+    });
+    assert.equal(approvedTrial.response.status, 200, JSON.stringify({ test: latestTrial.data.test, response: approvedTrial.data }));
+    assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.personalTestApproval?.current, true);
     const enabledSchedule = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
       method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(schedulePayload),
     });
@@ -1008,18 +1057,42 @@ await check("personal and work reuse authentication without sharing threads or s
     const scheduledStatus = await jsonRequest(base, "/api/status");
     assert.ok(Number.isFinite(Date.parse(scheduledStatus.data.automations.find((item) => item.id === routineId)?.nextRun)));
     const pausedSchedule = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
-      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 3, enabled: false }),
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 5, enabled: false }),
     });
     assert.equal(pausedSchedule.response.status, 200);
     assert.equal(pausedSchedule.data.routine.personalSchedule.enabled, false);
+    const editedAfterTrial = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 6, name: "新名称", prompt: "只读整理空结果 personal schedule empty regression" }),
+    });
+    assert.equal(editedAfterTrial.response.status, 200);
+    assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.personalTestApproval?.current, false);
+    assert.equal((await jsonRequest(base, `/api/personal/routines/${routineId}/test`)).data.test.promptMatches, false);
+    const emptyTrial = await jsonRequest(base, `/api/personal/routines/${routineId}/test`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 7, confirmModelCost: true }),
+    });
+    assert.equal(emptyTrial.response.status, 200, JSON.stringify(emptyTrial.data));
+    let emptyTrialStatus;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      emptyTrialStatus = await jsonRequest(base, `/api/personal/routines/${routineId}/test`);
+      if (emptyTrialStatus.data.test?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(emptyTrialStatus.data.test?.status, "completed");
+    assert.match(emptyTrialStatus.data.test.reviewIssue, /没有可审核/);
+    const emptyApproval = await jsonRequest(base, `/api/personal/routines/${routineId}/test/approve`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 8, runId: emptyTrialStatus.data.test.id, confirmResult: true }),
+    });
+    assert.equal(emptyApproval.response.status, 409);
     const archivedRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
-      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 4 }),
+      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 8 }),
     });
     assert.equal(archivedRoutine.response.status, 200);
     assert.ok(archivedRoutine.data.routine.archivedAt);
     assert.equal((await jsonRequest(base, "/api/status")).data.automations.some((item) => item.id === routineId), false);
     const restoredRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}/restore`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 5 }),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 9 }),
     });
     assert.equal(restoredRoutine.response.status, 200);
     assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.name, "新名称");
@@ -1186,6 +1259,30 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(removed.response.status, 200, JSON.stringify(removed.data));
     assert.equal(await fs.stat(path.join(cloudRoot, "personal", uploadPath)).catch(() => null), null);
     assert.equal(await fs.readFile(path.join(cloudRoot, "personal", "results", "summary.md"), "utf8"), "personal result\n");
+    const writeRoutine = await jsonRequest(base, "/api/personal/routines", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "外部写入拦截", prompt: "external write regression" }),
+    });
+    assert.equal(writeRoutine.response.status, 201);
+    const writeRoutineId = writeRoutine.data.routine.id;
+    const writeTrial = await jsonRequest(base, `/api/personal/routines/${writeRoutineId}/test`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, confirmModelCost: true }),
+    });
+    assert.equal(writeTrial.response.status, 200, JSON.stringify(writeTrial.data));
+    let writeTrialStatus;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      writeTrialStatus = await jsonRequest(base, `/api/personal/routines/${writeRoutineId}/test`);
+      if (writeTrialStatus.data.test?.status === "needs_reconciliation") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(writeTrialStatus.data.test?.status, "needs_reconciliation");
+    assert.match(writeTrialStatus.data.test.error, /连接服务写入/);
+    const blockedWriteApproval = await jsonRequest(base, `/api/personal/routines/${writeRoutineId}/test/approve`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 2, runId: writeTrialStatus.data.test.id, confirmResult: true }),
+    });
+    assert.equal(blockedWriteApproval.response.status, 409);
     const { data: status } = await jsonRequest(base, "/api/status");
     assert.equal(status.codex.authenticated, true);
     assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);

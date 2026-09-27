@@ -615,6 +615,29 @@ h3 {
   font-size: 13px;
 }
 
+.personal-routine-test {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.personal-routine-test > .warn-text,
+.personal-routine-test > .expandable-text,
+.personal-routine-test-actions {
+  flex-basis: 100%;
+  min-width: 0;
+  margin: 0;
+}
+
+.personal-routine-test-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .personal-routine-schedule-fields {
   display: grid;
   grid-template-columns: minmax(110px, 1fr) minmax(110px, 1fr) minmax(155px, 1.5fr);

@@ -1763,6 +1763,7 @@ function automationRunnerLabel(value = "") {
 function automationTriggerLabel(value = "") {
   const lower = value.toLowerCase();
   if (!value) return "未知触发";
+  if (lower === "personal-test") return "计划试运行";
   if (lower.includes("heartbeat")) return "继续会话";
   if (lower.includes("webhook")) return "外部触发";
   if (lower.includes("manual") || lower.includes("run")) return "手动运行";
@@ -6137,17 +6138,24 @@ export function App() {
                 events={events}
                 busyAction={busyAction}
                 onRun={() => {
-                  if (!window.confirm(`现在运行“${selectedAutomation.name}”会消耗 Codex 模型额度，确认运行吗？`)) return;
-                  void runAction(`run-${selectedAutomation.id}`, "立即运行", () =>
-                    api(`/api/automations/${selectedAutomation.id}/run`, {
+                  if (!window.confirm(selectedAutomation.personalRoutine
+                    ? `试运行“${selectedAutomation.name}”会消耗 Codex 模型额度。试运行最长 10 分钟，任务要求只读，但已连接服务的写权限不能由此技术性隔离；请核对任务内容。确认开始吗？`
+                    : `现在运行“${selectedAutomation.name}”会消耗 Codex 模型额度，确认运行吗？`)) return;
+                  void runAction(`run-${selectedAutomation.id}`, selectedAutomation.personalRoutine ? "试运行" : "立即运行", () =>
+                    api(selectedAutomation.personalRoutine
+                      ? `/api/personal/routines/${encodeURIComponent(selectedAutomation.id)}/test`
+                      : `/api/automations/${selectedAutomation.id}/run`, {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ runner: "app-server", worktree: selectedAutomationRepo.kind !== "personal", confirmModelCost: true }),
+                      body: JSON.stringify(selectedAutomation.personalRoutine
+                        ? { revision: selectedAutomation.revision, confirmModelCost: true }
+                        : { runner: "app-server", worktree: true, confirmModelCost: true }),
                     }),
                   );
                 }}
                 onEdit={selectedAutomation.personalRoutine ? () => setRoutineEditorId(selectedAutomation.id) : undefined}
                 onScheduleSaved={selectedAutomation.personalRoutine ? () => { void refresh(); } : undefined}
+                onOpenTestSession={selectedAutomation.personalRoutine ? (sessionId) => { setActiveView("cli"); void selectChatSession(sessionId); } : undefined}
                 onArchive={selectedAutomation.personalRoutine ? () => {
                   if (!window.confirm(`归档“${selectedAutomation.name}”？它会从计划列表隐藏，但运行记录和流程内容仍保留，可随时恢复。`)) return;
                   void runAction(`archive-${selectedAutomation.id}`, "归档流程", async () => {
@@ -7908,7 +7916,23 @@ function AutomationRow({
   );
 }
 
-function PersonalRoutineSchedule({ automation, onSaved }: { automation: Automation; onSaved: () => void }) {
+type PersonalRoutineTest = {
+  id: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  summary: string;
+  error: string | null;
+  reviewIssue: string | null;
+  promptMatches: boolean;
+  sessionId: string | null;
+};
+
+function PersonalRoutineSchedule({ automation, onSaved, onOpenTestSession }: {
+  automation: Automation;
+  onSaved: () => void;
+  onOpenTestSession?: (sessionId: string) => void;
+}) {
   const schedule = automation.personalSchedule;
   const [cadence, setCadence] = useState<"daily" | "weekdays">(schedule?.cadence || "daily");
   const [time, setTime] = useState(schedule?.time || "09:00");
@@ -7916,6 +7940,17 @@ function PersonalRoutineSchedule({ automation, onSaved }: { automation: Automati
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [test, setTest] = useState<PersonalRoutineTest | null>(null);
+  useEffect(() => {
+    let live = true;
+    const load = () => api<{ test: PersonalRoutineTest | null }>(`/api/personal/routines/${encodeURIComponent(automation.id)}/test`)
+      .then((result) => { if (live) setTest(result.test); })
+      .catch((cause) => { if (live) setError(cause instanceof Error ? cause.message : "读取试运行状态失败"); });
+    void load();
+    const pending = ["queued", "running", "canceling"].includes(test?.status || "");
+    const timer = pending ? window.setInterval(() => { if (document.visibilityState === "visible") void load(); }, 4000) : null;
+    return () => { live = false; if (timer !== null) window.clearInterval(timer); };
+  }, [automation.id, automation.revision, test?.status]);
   useEffect(() => {
     if (!schedule) return;
     setCadence(schedule.cadence);
@@ -7941,12 +7976,49 @@ function PersonalRoutineSchedule({ automation, onSaved }: { automation: Automati
       setBusy(false);
     }
   };
+  const approveTest = async () => {
+    if (busy || !test || test.status !== "completed" || !test.promptMatches || test.reviewIssue) return;
+    if (!window.confirm(`已查看“${automation.name}”的试运行结果，并确认当前任务内容适合按计划自动执行？已连接服务的写入权限仍需由你自行核对。`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/personal/routines/${encodeURIComponent(automation.id)}/test/approve`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: automation.revision, runId: test.id, confirmResult: true }),
+      });
+      setNotice("已确认试运行结果，可以启用计划");
+      onSaved();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "确认试运行失败");
+    } finally { setBusy(false); }
+  };
   const configured = Boolean(schedule?.enabled);
+  const approved = automation.personalTestApproval?.current === true;
+  let testLabel = "尚未试运行";
+  if (approved) testLabel = "试运行已确认";
+  else if (automation.personalTestApproval) testLabel = "任务已修改，需重试";
+  else if (test && !test.promptMatches) testLabel = "任务已修改，需重试";
+  else if (test?.status === "completed" && test.promptMatches) testLabel = test.reviewIssue ? "试运行不可确认" : "试运行待确认";
+  else if (test) testLabel = `试运行${runStatusLabel(test.status)}`;
   const changed = cadence !== schedule?.cadence || time !== schedule?.time || timeZone !== schedule?.timeZone;
   const last = schedule?.lastResult;
   const resultText = last ? ({ completed: "已完成", running: "运行中", claimed: "正在启动", skipped: "已跳过", failed: "失败，计划已暂停", needs_reconciliation: "待核对，计划已暂停", interrupted: "中断，计划已暂停", canceled: "已取消，计划已暂停" } as Record<string, string>)[last.status] || last.status : "";
   return <form className="personal-routine-schedule" onSubmit={(event) => { event.preventDefault(); void save(true); }}>
     <div className="personal-routine-schedule-head"><strong>计划运行</strong><span className={cx("run-badge", configured ? "ok" : "warn")}>{configured ? "已启用" : "未启用"}</span></div>
+    <div className="personal-routine-test">
+      <span className={cx("run-badge", approved ? "ok" : "warn")}>{testLabel}</span>
+      {approved && !test && automation.personalTestApproval && <span className="muted-line">{new Date(automation.personalTestApproval.approvedAt).toLocaleString("zh-CN")} 确认 · 运行详情已归档</span>}
+      {test && <>
+        <span className="muted-line">{test.promptMatches ? new Date(test.startedAt).toLocaleString("zh-CN") : "当前任务内容与试运行不一致"}</span>
+        {test.error && <p className="warn-text">{test.error}</p>}
+        {test.reviewIssue && <p className="warn-text">{test.reviewIssue}</p>}
+        {test.summary && <ExpandableText text={test.summary} limit={280} />}
+        <div className="personal-routine-test-actions">
+          {test.sessionId && onOpenTestSession && <button className="text-button compact" type="button" onClick={() => onOpenTestSession(test.sessionId!)}><MessageSquare size={15} />查看会话</button>}
+          {!approved && test.status === "completed" && test.promptMatches && !test.reviewIssue && <button className="command-button" type="button" disabled={busy} onClick={() => void approveTest()}><CheckCircle2 size={15} />确认结果</button>}
+        </div>
+      </>}
+    </div>
     <div className="personal-routine-schedule-fields">
       <label>频率<select value={cadence} onChange={(event) => setCadence(event.target.value as "daily" | "weekdays")}><option value="daily">每天</option><option value="weekdays">工作日</option></select></label>
       <label>时间<input type="time" required value={time} onChange={(event) => setTime(event.target.value)} /></label>
@@ -7958,7 +8030,7 @@ function PersonalRoutineSchedule({ automation, onSaved }: { automation: Automati
     {notice && <p className="muted-line" role="status">{notice}</p>}
     <div className="personal-routine-editor-actions">
       {configured && <button type="button" className="command-button" disabled={busy} onClick={() => void save(false)}><Pause size={16} />暂停</button>}
-      {(!configured || changed) && <button type="submit" className="primary-command" disabled={busy}>{busy ? <Loader2 size={16} className="spin" /> : <Timer size={16} />}{configured ? "更新计划" : "启用计划"}</button>}
+      {(!configured || changed) && <button type="submit" className="primary-command" disabled={busy || !approved} title={!approved ? "需先完成试运行并确认结果" : undefined}>{busy ? <Loader2 size={16} className="spin" /> : <Timer size={16} />}{configured ? "更新计划" : "启用计划"}</button>}
     </div>
   </form>;
 }
@@ -7973,6 +8045,7 @@ function RunThread({
   onRun,
   onEdit,
   onScheduleSaved,
+  onOpenTestSession,
   onArchive,
   onOpenRun,
   onPause,
@@ -7988,6 +8061,7 @@ function RunThread({
   onRun: () => void;
   onEdit?: () => void;
   onScheduleSaved?: () => void;
+  onOpenTestSession?: (sessionId: string) => void;
   onArchive?: () => void;
   onOpenRun: (run: AutomationRun) => void;
   onPause: () => void;
@@ -8019,9 +8093,9 @@ function RunThread({
             {actionBusy("pause") ? <Loader2 size={17} className="spin" /> : <Pause size={17} />}
             {automation.enabled ? "暂停" : "恢复"}
           </button>}
-          <button className="primary-command" onClick={onRun} disabled={Boolean(busyAction)}>
+          <button className="primary-command" onClick={onRun} disabled={Boolean(busyAction) || Boolean(automation.personalRoutine && automation.personalSchedule?.enabled)} title={automation.personalRoutine && automation.personalSchedule?.enabled ? "请先暂停计划" : undefined}>
             {actionBusy("run") ? <Loader2 size={17} className="spin" /> : <Play size={17} />}
-            {repo.kind === "personal" ? "立即运行" : "Codex 运行"}
+            {automation.personalRoutine ? "试运行" : repo.kind === "personal" ? "立即运行" : "Codex 运行"}
           </button>
         </div>
       </div>
@@ -8039,7 +8113,7 @@ function RunThread({
         <ExpandableText text={automation.prompt || "未设置任务内容"} limit={500} />
       </div>}
 
-      {automation.personalRoutine && onScheduleSaved && <PersonalRoutineSchedule key={automation.id} automation={automation} onSaved={onScheduleSaved} />}
+      {automation.personalRoutine && onScheduleSaved && <PersonalRoutineSchedule key={automation.id} automation={automation} onSaved={onScheduleSaved} onOpenTestSession={onOpenTestSession} />}
 
       {repo.kind !== "personal" && <div className="task-grid automation-task-grid">
         <Metric label="后台任务" value={automation.mode === "on-demand" ? "按需触发" : automation.enabled ? "计划已启用" : "计划已暂停"} icon={<Timer size={16} />} />

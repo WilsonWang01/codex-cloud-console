@@ -6,6 +6,10 @@ import { nextDistinctPersonalOccurrence, nextPersonalOccurrence, personalSchedul
 export const personalScheduleDailyRunLimit = 3;
 export const personalScheduleKnownTokenLimit = 100_000;
 
+export function personalRoutinePromptHash(prompt) {
+  return crypto.createHash("sha256").update(String(prompt).trim()).digest("hex");
+}
+
 function inputError(message, statusCode = 400) {
   return Object.assign(new Error(message), { statusCode });
 }
@@ -33,6 +37,11 @@ export function personalRoutineAutomation(routine) {
     prompt: routine.prompt,
     personalRoutine: true,
     personalSchedule: routine.personalSchedule || null,
+    personalTestApproval: routine.personalTestApproval ? {
+      runId: routine.personalTestApproval.runId,
+      approvedAt: routine.personalTestApproval.approvedAt,
+      current: routine.personalTestApproval.promptHash === personalRoutinePromptHash(routine.prompt),
+    } : null,
     revision: routine.revision,
   };
 }
@@ -46,6 +55,9 @@ export function createPersonalRoutinesStore(filePath) {
       if (parsed.routines.some((item) => !/^personal-routine-[0-9a-f-]{36}$/.test(item?.id || "") ||
         typeof item.name !== "string" || typeof item.prompt !== "string" ||
         !Number.isInteger(item.revision) || item.revision < 1 ||
+        (item.personalTestApproval && (typeof item.personalTestApproval.runId !== "string" ||
+          !/^[0-9a-f]{64}$/.test(item.personalTestApproval.promptHash || "") ||
+          !Number.isFinite(Date.parse(item.personalTestApproval.approvedAt || "")))) ||
         (item.archivedAt != null && (typeof item.archivedAt !== "string" || !Number.isFinite(Date.parse(item.archivedAt)))) ||
         (item.personalSchedule && (!validateStoredSchedule(item.personalSchedule) || (item.archivedAt && item.personalSchedule.enabled))))) throw inputError("个人流程数据格式无效", 500);
       if (parsed.claims != null && (!Array.isArray(parsed.claims) || parsed.claims.some((claim) =>
@@ -94,7 +106,34 @@ export function createPersonalRoutinesStore(filePath) {
     update: (id, payload) => mutate(({ routines }) => {
       const routine = find(routines, id, payload?.revision);
       if (routine.archivedAt) throw inputError("请先恢复已归档流程", 409);
-      Object.assign(routine, fields(payload), { revision: routine.revision + 1, updatedAt: new Date().toISOString() });
+      const next = fields(payload);
+      if (routine.prompt !== next.prompt && routine.personalSchedule?.enabled) {
+        routine.personalSchedule.enabled = false;
+        routine.personalSchedule.nextRunAt = null;
+      }
+      Object.assign(routine, next, { revision: routine.revision + 1, updatedAt: new Date().toISOString() });
+      return routine;
+    }),
+    beginTest: (id, revision) => mutate(({ routines }) => {
+      const routine = find(routines, id, revision);
+      if (routine.archivedAt) throw inputError("请先恢复已归档流程", 409);
+      if (routine.personalSchedule?.enabled) throw inputError("请先暂停计划，再试运行", 409);
+      routine.personalTestApproval = null;
+      routine.revision += 1;
+      routine.updatedAt = new Date().toISOString();
+      return routine;
+    }),
+    approveTest: (id, payload) => mutate(({ routines }) => {
+      const routine = find(routines, id, payload?.revision);
+      if (routine.archivedAt) throw inputError("请先恢复已归档流程", 409);
+      if (payload?.promptHash !== personalRoutinePromptHash(routine.prompt)) throw inputError("任务内容已变化，请重新试运行", 409);
+      routine.personalTestApproval = {
+        runId: payload.runId,
+        promptHash: payload.promptHash,
+        approvedAt: new Date().toISOString(),
+      };
+      routine.revision += 1;
+      routine.updatedAt = routine.personalTestApproval.approvedAt;
       return routine;
     }),
     archive: (id, revision) => mutate(({ routines, claims }) => {
@@ -126,6 +165,9 @@ export function createPersonalRoutinesStore(filePath) {
       const fields = enabled ? validatePersonalSchedule(payload) : routine.personalSchedule
         ? { cadence: routine.personalSchedule.cadence, time: routine.personalSchedule.time, timeZone: routine.personalSchedule.timeZone }
         : validatePersonalSchedule(payload);
+      if (enabled && routine.personalTestApproval?.promptHash !== personalRoutinePromptHash(routine.prompt)) {
+        throw inputError("请先完成当前任务内容的试运行，并确认结果", 409);
+      }
       routine.personalSchedule = {
         ...routine.personalSchedule, ...fields, enabled,
         nextRunAt: enabled ? nextPersonalOccurrence(fields, now) : null,

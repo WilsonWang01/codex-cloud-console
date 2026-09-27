@@ -43,6 +43,7 @@ let uploadedCount = 0;
 let personalFilesDeleted = 0;
 let manualAutomationRuns = 0;
 let personalRoutineSequence = 0;
+const personalTrials = new Map();
 let archivedPersonalRoutines = [];
 let personalFiles = [
   { path: "results/demo.md", name: "demo.md", kind: "output", size: 13, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
@@ -78,11 +79,39 @@ await context.route("**/api/**", async (route) => {
       run: { activeState: "inactive", failedState: "inactive", exitCode: "ready", logName: null, logUpdatedAt: null, logTail: [] } });
     return send({ ok: true, routine: { id, ...body, revision: 1 } }, 201);
   }
+  if (url.pathname.startsWith("/api/personal/routines/") && url.pathname.endsWith("/test") && req.method() === "GET") {
+    return send({ ok: true, test: personalTrials.get(url.pathname.split("/").at(-2)) || null });
+  }
+  if (url.pathname.startsWith("/api/personal/routines/") && url.pathname.endsWith("/test") && req.method() === "POST") {
+    const id = url.pathname.split("/").at(-2);
+    const routine = status.automations.find((item) => item.id === id);
+    if (!routine || routine.revision !== body.revision) return send({ error: "流程已修改" }, 409);
+    if (!body.confirmModelCost) return send({ error: "未确认额度" }, 428);
+    if (routine.personalSchedule?.enabled) return send({ error: "请先暂停计划" }, 409);
+    routine.personalTestApproval = null;
+    routine.revision += 1;
+    manualAutomationRuns += 1;
+    const test = { id: `trial-${manualAutomationRuns}`, status: "completed", startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(), summary: "模拟试运行完成", error: null, reviewIssue: null, promptMatches: true, sessionId: "_personal-session" };
+    personalTrials.set(id, test);
+    return send({ ok: true, run: test, revision: routine.revision, output: "试运行已启动" });
+  }
+  if (url.pathname.startsWith("/api/personal/routines/") && url.pathname.endsWith("/test/approve") && req.method() === "POST") {
+    const id = url.pathname.split("/").at(-3);
+    const routine = status.automations.find((item) => item.id === id);
+    const test = personalTrials.get(id);
+    if (!body.confirmResult) return send({ error: "请先确认结果" }, 428);
+    if (!routine || routine.revision !== body.revision || test?.id !== body.runId || !test.promptMatches) return send({ error: "试运行已过期" }, 409);
+    routine.personalTestApproval = { runId: test.id, approvedAt: new Date().toISOString(), current: true };
+    routine.revision += 1;
+    return send({ ok: true, routine });
+  }
   if (url.pathname.startsWith("/api/personal/routines/") && url.pathname.endsWith("/schedule") && req.method() === "PATCH") {
     const id = url.pathname.split("/").at(-2);
     const routine = status.automations.find((item) => item.id === id);
     if (!routine || routine.revision !== body.revision) return send({ error: "流程已修改" }, 409);
     if (body.enabled && body.confirmModelCost !== true) return send({ error: "未确认额度" }, 428);
+    if (body.enabled && !routine.personalTestApproval?.current) return send({ error: "请先试运行" }, 409);
     routine.personalSchedule = { cadence: body.cadence, time: body.time, timeZone: body.timeZone, enabled: body.enabled,
       nextRunAt: body.enabled ? nextPersonalOccurrence(body, Date.now()) : null };
     routine.nextRun = body.enabled ? routine.personalSchedule.nextRunAt : "按需触发";
@@ -92,6 +121,11 @@ await context.route("**/api/**", async (route) => {
   if (url.pathname.startsWith("/api/personal/routines/") && req.method() === "PATCH") {
     const routine = status.automations.find((item) => item.id === url.pathname.split("/").at(-1));
     if (!routine || routine.revision !== body.revision) return send({ error: "流程已修改" }, 409);
+    if (routine.prompt !== body.prompt) {
+      if (routine.personalTestApproval) routine.personalTestApproval.current = false;
+      if (routine.personalSchedule?.enabled) { routine.personalSchedule.enabled = false; routine.personalSchedule.nextRunAt = null; }
+      if (personalTrials.has(routine.id)) personalTrials.get(routine.id).promptMatches = false;
+    }
     Object.assign(routine, { name: body.name, prompt: body.prompt, revision: routine.revision + 1 });
     return send({ ok: true, routine });
   }
@@ -114,11 +148,6 @@ await context.route("**/api/**", async (route) => {
     routine.revision += 1;
     status.automations.push(routine);
     return send({ ok: true, routine });
-  }
-  if (url.pathname.startsWith("/api/automations/personal-routine-test-") && url.pathname.endsWith("/run") && req.method() === "POST") {
-    if (body.confirmModelCost !== true) return send({ error: "未确认额度" }, 428);
-    manualAutomationRuns += 1;
-    return send({ ok: true, output: "已开始" });
   }
   if (url.pathname === "/api/attention/acknowledgements" && req.method() === "POST") {
     const acknowledged = status.attention.items.filter((item) => body.itemIds?.includes(item.id));
@@ -754,6 +783,19 @@ try {
   const scheduleForm = page.locator(".personal-routine-schedule");
   await scheduleForm.waitFor();
   assert.match(await scheduleForm.innerText(), /未启用/);
+  assert.match(await scheduleForm.innerText(), /尚未试运行/);
+  assert.equal(await scheduleForm.getByRole("button", { name: "启用计划" }).isDisabled(), true);
+  page.once("dialog", (dialog) => { void dialog.dismiss(); });
+  await page.getByRole("button", { name: "试运行" }).click();
+  assert.equal(manualAutomationRuns, 0);
+  page.once("dialog", (dialog) => { void dialog.accept(); });
+  await page.getByRole("button", { name: "试运行" }).click();
+  await scheduleForm.getByText("试运行待确认").waitFor();
+  assert.equal(manualAutomationRuns, 1);
+  assert.equal(await scheduleForm.getByRole("button", { name: "启用计划" }).isDisabled(), true);
+  page.once("dialog", (dialog) => { void dialog.accept(); });
+  await scheduleForm.getByRole("button", { name: "确认结果" }).click();
+  await scheduleForm.getByText("试运行已确认").waitFor();
   await scheduleForm.getByRole("combobox", { name: "频率" }).selectOption("weekdays");
   await scheduleForm.getByRole("textbox", { name: "时区" }).fill("Asia/Shanghai");
   page.once("dialog", (dialog) => { void dialog.dismiss(); });
@@ -762,7 +804,7 @@ try {
   page.once("dialog", (dialog) => { void dialog.accept(); });
   await scheduleForm.getByRole("button", { name: "启用计划" }).click();
   await scheduleForm.getByText("已启用", { exact: true }).waitFor();
-  assert.equal(manualAutomationRuns, 0);
+  assert.equal(manualAutomationRuns, 1);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   await page.screenshot({ path: new URL("personal-routine-schedule-320.png", out).pathname });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -785,19 +827,19 @@ try {
   await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).click();
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   page.once("dialog", (dialog) => { void dialog.dismiss(); });
-  await page.getByRole("button", { name: "立即运行" }).click();
-  assert.equal(manualAutomationRuns, 0);
-  page.once("dialog", (dialog) => { void dialog.accept(); });
-  await page.getByRole("button", { name: "立即运行" }).click();
-  await page.waitForFunction(() => document.body.textContent?.includes("已开始"));
+  await page.getByRole("button", { name: "试运行" }).click();
   assert.equal(manualAutomationRuns, 1);
+  page.once("dialog", (dialog) => { void dialog.accept(); });
+  await page.getByRole("button", { name: "试运行" }).click();
+  await page.waitForFunction(() => document.body.textContent?.includes("试运行已启动"));
+  assert.equal(manualAutomationRuns, 2);
   page.once("dialog", (dialog) => { void dialog.accept(); });
   await page.getByRole("button", { name: "归档" }).click();
   await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).waitFor({ state: "detached" });
   await page.getByText("已归档流程 (1)").click();
   await page.locator(".personal-routine-archive-row").getByRole("button", { name: "恢复" }).click();
   await page.locator(".automation-row").filter({ hasText: "每次整理资料" }).waitFor();
-  assert.equal(manualAutomationRuns, 1);
+  assert.equal(manualAutomationRuns, 2);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   await page.screenshot({ path: new URL("personal-routine-edit-320.png", out).pathname });
   await page.setViewportSize({ width: 1280, height: 900 });
@@ -827,7 +869,7 @@ try {
   await saveRoutineButton.click();
   const draftRoutineEditor = page.locator(".personal-routine-editor");
   assert.equal(await draftRoutineEditor.getByRole("textbox", { name: "每次执行的任务" }).inputValue(), "请每次检查我的待办进度，并给出下一步");
-  assert.equal(manualAutomationRuns, 1);
+  assert.equal(manualAutomationRuns, 2);
   assert.equal(submittedMessages, submittedBeforeRoutine);
   await draftRoutineEditor.getByRole("textbox", { name: "名称" }).fill("跟进待办");
   await draftRoutineEditor.getByRole("button", { name: "保存" }).click();
@@ -847,5 +889,5 @@ try {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   status.automations.push(...savedAutomations);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，取消额度确认不触发运行", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态紧凑且无溢出", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态紧凑且无溢出", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

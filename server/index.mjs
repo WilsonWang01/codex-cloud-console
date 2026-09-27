@@ -29,7 +29,7 @@ import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore } from "./personal-facts.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
-import { createPersonalRoutinesStore, personalRoutineAutomation, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
+import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
@@ -5084,6 +5084,7 @@ function normalizeAutomationRun(run = {}) {
     clientId: run.clientId ? String(run.clientId) : null,
     triggerIdempotencyHash: run.triggerIdempotencyHash ? String(run.triggerIdempotencyHash) : null,
     triggerRequestHash: run.triggerRequestHash ? String(run.triggerRequestHash) : null,
+    personalTestPromptHash: /^[0-9a-f]{64}$/.test(run.personalTestPromptHash || "") ? run.personalTestPromptHash : null,
     interruptionKind: run.interruptionKind ? String(run.interruptionKind) : null,
     interruptedAt: run.interruptedAt ? String(run.interruptedAt) : null,
     interruptedLastActiveAt: run.interruptedLastActiveAt ? String(run.interruptedLastActiveAt) : null,
@@ -5269,7 +5270,7 @@ async function createAutomationWorktree(repo, runId) {
 async function diffStatForPath(cwd) {
   if (!cwd) return "";
   const result = await run("git", ["-C", cwd, "diff", "--stat"], { timeout: 30_000 });
-  return result.stdout || result.stderr || "";
+  return result.ok ? result.stdout || "" : "";
 }
 
 function usageLimitStillActionable(usageLimit = null) {
@@ -6782,6 +6783,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       clientId: options.clientId || null,
       triggerIdempotencyHash: options.triggerIdempotencyHash || null,
       triggerRequestHash: options.triggerRequestHash || null,
+      personalTestPromptHash: options.personalTestPromptHash || null,
       recoveryOfRunId: options.recoveryOfRunId || null,
       recoveryRootRunId: options.recoveryRootRunId || null,
       recoveryAttempt: options.recoveryAttempt || 0,
@@ -6856,13 +6858,16 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       const completion = artifact && !artifact.satisfied ? artifact : markerCompletion;
       const completed = result.ok && completion.satisfied;
       const needsExternalReview = Boolean(result.externalActionReview);
+      const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
-      const error = completed ? null : needsExternalReview ? result.externalActionReview.reason : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
+      const error = needsExternalReview ? result.externalActionReview.reason
+        : personalWriteObserved ? "检测到连接服务写入；请在对应服务核对结果，个人计划已暂停。"
+          : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await appendAutomationRunEventWithRetry(
         runId,
         {
-          status: needsExternalReview || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
+          status: needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           summary: job.output || "",
@@ -6872,7 +6877,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           completionCheckedAt: completionContract ? new Date().toISOString() : null,
           ...(diffStat ? { diffStat } : {}),
         },
-        { type: needsExternalReview ? "needs-reconciliation" : canceled ? "canceled" : completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: completed ? "自动化任务已完成" : error },
+        { type: needsExternalReview || personalWriteObserved ? "needs-reconciliation" : canceled ? "canceled" : completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: error || "自动化任务已完成" },
       );
     }).catch((persistenceError) => {
       const message = `自动化任务 ${runId} 的终态写入失败，已保留为可重启恢复状态：${persistenceError.message || persistenceError}`;
@@ -7092,6 +7097,17 @@ function syncPersonalRoutineAutomation(routine) {
   statusCache = null;
 }
 
+function personalRoutineReadOnlyPrompt(prompt) {
+  return `按个人计划执行以下只读任务。不要发送消息、修改日历或其他第三方数据；需要写入时停下并报告给用户。\n\n${prompt}`;
+}
+
+function personalTestReviewIssue(run) {
+  if (!run || run.status !== "completed") return "试运行尚未成功完成";
+  if (!automationRunDisplayText(run.summary, 700).trim()) return "试运行没有可审核的结果";
+  if (String(run.diffStat || "").trim()) return "试运行修改了本地文件，请核对后重新测试";
+  return null;
+}
+
 function startPersonalRoutineScheduler() {
   if (!personalExecutionAvailable || !repos.some((repo) => repo.id === personalRepoId)) return;
   const tick = createPersonalRoutineScheduler({
@@ -7108,7 +7124,7 @@ function startPersonalRoutineScheduler() {
       approval: "on-request",
       maxRuntimeMs: 10 * 60_000,
       budgetLimit: personalScheduleKnownTokenLimit,
-      prompt: `按已启用的个人计划执行以下只读任务。不要发送消息、修改日历或其他第三方数据；需要写入时停下并报告给用户。\n\n${automation.prompt}`,
+      prompt: personalRoutineReadOnlyPrompt(automation.prompt),
     }),
   });
   const start = () => { void tick(); setInterval(() => void tick(), 30_000).unref?.(); };
@@ -10500,6 +10516,62 @@ app.patch("/api/personal/routines/:id", async (req, res) => {
     const routine = await personalRoutinesStore.update(req.params.id, req.body);
     automations[index] = personalRoutineAutomation(routine);
     statusCache = null;
+    res.json({ ok: true, routine });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.get("/api/personal/routines/:id/test", async (req, res) => {
+  try {
+    const routine = (await personalRoutinesStore.list()).find((item) => item.id === req.params.id && !item.archivedAt);
+    if (!routine) return res.status(404).json({ ok: false, error: "个人流程不存在" });
+    const latest = (await readAutomationRuns()).runs.find((run) => run.automationId === routine.id && run.trigger === "personal-test");
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, test: latest ? {
+      id: latest.id, status: latest.status, startedAt: latest.startedAt, finishedAt: latest.finishedAt,
+      summary: automationRunDisplayText(latest.summary, 700), error: automationRunDisplayText(latest.error, 520),
+      reviewIssue: latest.status === "completed" ? personalTestReviewIssue(latest) : null,
+      promptMatches: latest.personalTestPromptHash === personalRoutinePromptHash(routine.prompt),
+      sessionId: latest.sessionId, threadId: latest.threadId,
+    } : null });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/routines/:id/test", async (req, res) => {
+  try {
+    const index = automations.findIndex((item) => item.id === req.params.id && item.personalRoutine);
+    if (index < 0) return res.status(404).json({ ok: false, error: "个人流程不存在" });
+    if (req.body?.confirmModelCost !== true) return res.status(428).json({ ok: false, error: "试运行前需确认模型额度消耗" });
+    if (!personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行不可用" });
+    const active = (await readAutomationRuns()).runs.some((run) => run.automationId === req.params.id && ["queued", "running", "canceling", "needs_reconciliation"].includes(run.status));
+    if (active) return res.status(409).json({ ok: false, error: "流程仍在运行或待核对，请先处理" });
+    const routine = await personalRoutinesStore.beginTest(req.params.id, req.body?.revision);
+    automations[index] = personalRoutineAutomation(routine);
+    statusCache = null;
+    if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
+    const run = await startAppServerAutomationRun(automations[index], getRepoById(personalRepoId), {
+      trigger: "personal-test", clientId: "personal-console", worktree: false,
+      sandbox: "read-only", approval: "on-request", maxRuntimeMs: 10 * 60_000,
+      budgetLimit: personalScheduleKnownTokenLimit,
+      prompt: personalRoutineReadOnlyPrompt(routine.prompt),
+      personalTestPromptHash: personalRoutinePromptHash(routine.prompt),
+    });
+    res.json({ ok: true, run: summarizeAutomationRun(run), revision: routine.revision, output: "试运行已启动，请查看结果并确认后再启用计划" });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/routines/:id/test/approve", async (req, res) => {
+  try {
+    if (req.body?.confirmResult !== true) return res.status(428).json({ ok: false, error: "请先查看并确认试运行结果" });
+    const latest = (await readAutomationRuns()).runs.find((run) => run.automationId === req.params.id && run.trigger === "personal-test");
+    if (!latest || latest.id !== req.body?.runId || latest.status !== "completed") {
+      return res.status(409).json({ ok: false, error: "最近一次试运行尚未成功完成" });
+    }
+    const issue = personalTestReviewIssue(latest);
+    if (issue) return res.status(409).json({ ok: false, error: issue });
+    const routine = await personalRoutinesStore.approveTest(req.params.id, {
+      revision: req.body?.revision, runId: latest.id, promptHash: latest.personalTestPromptHash,
+    });
+    syncPersonalRoutineAutomation(routine);
     res.json({ ok: true, routine });
   } catch (error) { sendRouteError(res, error); }
 });
