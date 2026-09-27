@@ -239,8 +239,19 @@ input.on("line", (line) => {
     const personalDeletionRegression = requestText.includes("personal deletion regression");
     const recoveryRegression = requestText.includes("继续上一轮因服务重启中断的自动化任务");
     const outcomeContractRegression = requestText.includes("outcome contract regression");
+    const externalWriteRegression = requestText.includes("external write regression");
     send({ id: message.id, result: { turn: { id: turnId } } });
-    if (queueRegressionNext) {
+    if (externalWriteRegression) {
+      const isReadOnly = requestText.includes("read only");
+      const isTimeout = requestText.includes("timeout");
+      const isFailure = requestText.includes("tool failure");
+      const item = { type: "mcpToolCall", id: "external-write-regression", server: "connected-calendar", tool: "create_event", status: "inProgress", readOnlyHint: isReadOnly, appContext: requestText.includes("no app context") ? null : { connectorId: "fixture-calendar", actionName: "create_event" } };
+      send({ method: "item/started", params: { threadId: message.params?.threadId, turnId, item } }, 20);
+      if (!isTimeout) {
+        send({ method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed" } } }, 65);
+        send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: "completed" } } }, 90);
+      }
+    } else if (queueRegressionNext) {
       send({ method: "item/agentMessage/delta", params: {
         threadId: message.params?.threadId,
         turnId,
@@ -1267,6 +1278,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
       CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS: "250",
       CODEX_TURN_TIMEOUT_MS: "300",
+      CODEX_EXTERNAL_WRITE_TIMEOUT_MS: "120",
       CODEX_ALLOW_LOCAL_FALLBACK: "0",
       BENXING_SITE_ORIGIN: `http://127.0.0.1:${benxingPort}`,
       BENXING_SITES_BYPASS_BEARER_TOKEN: "regression-sites-bypass-token",
@@ -1666,6 +1678,52 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const inactiveAfterTimeout = await jsonRequest(baseUrl, `/api/chat/active?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
     assert.equal(inactiveAfterTimeout.response.status, 200);
     assert.equal(inactiveAfterTimeout.data.turn, null);
+
+    const externalRead = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", sessionId, message: "external write regression read only" }),
+    });
+    assert.equal(externalRead.data.ok, true);
+    const externalSuccess = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", sessionId, message: "external write regression success no app context" }),
+    });
+    assert.equal(externalSuccess.data.ok, true);
+    let externalStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    assert.equal(externalStore.sessions[sessionId].externalActionReview, null);
+
+    const externalTimeout = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", sessionId, message: "external write regression timeout" }),
+    });
+    assert.equal(externalTimeout.data.ok, false);
+    externalStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    const review = externalStore.sessions[sessionId].externalActionReview;
+    assert.equal(review.server, "connected-calendar");
+    assert.deepEqual(review.actions.map((action) => action.status), ["inProgress"]);
+    assert.match(review.reason, /勿直接重试/);
+    const blockedExternalRetry = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", sessionId, message: "external write regression success" }),
+    });
+    assert.equal(blockedExternalRetry.response.status, 409);
+    const staleReviewAck = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/external-action-review/acknowledge`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", reviewId: "wrong-review" }),
+    });
+    assert.equal(staleReviewAck.response.status, 409);
+    const reviewAck = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/external-action-review/acknowledge`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", reviewId: review.id }),
+    });
+    assert.equal(reviewAck.response.status, 200);
+    externalStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    assert.equal(externalStore.sessions[sessionId].externalActionReview, null);
+
+    const externalToolFailure = await jsonRequest(baseUrl, "/api/chat", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", sessionId, message: "external write regression tool failure" }),
+    });
+    assert.equal(externalToolFailure.data.ok, false);
+    externalStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    assert.ok(externalStore.sessions[sessionId].externalActionReview);
+    const failureAck = await jsonRequest(baseUrl, `/api/chat/sessions/${sessionId}/external-action-review/acknowledge`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "sample-app", reviewId: externalStore.sessions[sessionId].externalActionReview.id }),
+    });
+    assert.equal(failureAck.response.status, 200);
 
     const matchedRuntimeStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
     matchedRuntimeStore.sessions[sessionId].codexSessionId = "thread-runtime-matched";

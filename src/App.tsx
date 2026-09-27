@@ -46,6 +46,7 @@ import {
   Terminal,
   Timer,
   Trash2,
+  TriangleAlert,
   UserRound,
   Wifi,
   X,
@@ -180,6 +181,16 @@ type CreateProjectResponse = {
 
 type HealthCheckResponse = NonNullable<ConsoleStatus["health"]>;
 
+type ExternalActionReview = {
+  id: string;
+  server: string;
+  tool: string;
+  count: number;
+  at: string;
+  reason: string;
+  actions: Array<{ server: string; tool: string; status: "completed" | "failed" | "inProgress" }>;
+};
+
 type ChatSession = {
   id: string;
   repoId: string;
@@ -202,6 +213,7 @@ type ChatSession = {
   runtimePending?: boolean;
   draft?: ChatDraft | null;
   queuedTurn?: QueuedTurn | null;
+  externalActionReview?: ExternalActionReview | null;
 };
 
 type QueuedTurn = {
@@ -3316,6 +3328,7 @@ export function App() {
   const [pendingAction, setBusyAction] = useState<string | null>(null);
   const [streamAction, setStreamAction] = useState<"chat" | "compact" | null>(null);
   const [queueRestoreBusy, setQueueRestoreBusy] = useState(false);
+  const [externalReviewBusy, setExternalReviewBusy] = useState(false);
   const busyAction = pendingAction || streamAction;
   const [mcpLoginBusy, setMcpLoginBusy] = useState<string | null>(null);
   const [codexAccountBusy, setCodexAccountBusy] = useState<"login" | "cancel" | "logout" | null>(null);
@@ -5273,6 +5286,10 @@ export function App() {
     const attachments = overrideAttachments ?? chatAttachments;
     if (!message && attachments.length === 0) return;
     const chatRepoId = selectedRepo.id;
+    if (chatSessions.some((session) => session.id === activeSessionId && session.externalActionReview)) {
+      pushEvent({ tone: "warn", title: "先核对连接服务操作", body: "请在对应服务检查上一轮结果，确认已核对后再发送。当前输入已保留。" });
+      return;
+    }
     const conversationSeq = chatLoadSeq.current;
     const submissionId = Symbol();
     const releaseSubmission = () => {
@@ -5453,12 +5470,16 @@ export function App() {
         }
         if (event === "done") {
           const ok = Boolean(payload.ok);
+          const externalActionReview = payload.externalActionReview as ChatSession["externalActionReview"];
           if (payload.sessionId) {
             streamSessionId = String(payload.sessionId);
             setActiveSessionId(streamSessionId);
           }
+          if (externalActionReview) {
+            setChatSessions((current) => current.map((session) => session.id === streamSessionId ? { ...session, externalActionReview } : session));
+          }
           patchResponse({
-            text: collected || stderr || (ok ? "Codex 已完成但没有返回内容。" : "云端 Codex 没有返回内容。"),
+            text: `${collected || stderr || (ok ? "Codex 已完成但没有返回内容。" : "云端 Codex 没有返回内容。")}${externalActionReview ? `\n\n${externalActionReview.reason}` : ""}`,
             mocked,
             streaming: false,
             status: ok ? "完成" : `退出码 ${payload.code ?? "未知"}`,
@@ -5526,6 +5547,25 @@ export function App() {
       pushEvent({ tone: "warn", title: "撤回排队失败", body: error instanceof Error ? error.message : "请核对任务状态后重试" });
     } finally {
       setQueueRestoreBusy(false);
+    }
+  };
+
+  const acknowledgeExternalReview = async (reviewId: string) => {
+    const repoId = selectedRepo.id;
+    const sessionId = activeSessionId;
+    if (!sessionId || externalReviewBusy) return;
+    setExternalReviewBusy(true);
+    try {
+      await api(`/api/chat/sessions/${encodeURIComponent(sessionId)}/external-action-review/acknowledge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId, reviewId }),
+      });
+      setChatSessions((current) => current.map((session) => session.id === sessionId && session.externalActionReview?.id === reviewId ? { ...session, externalActionReview: null } : session));
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "核对状态未更新", body: error instanceof Error ? error.message : "请刷新后重试" });
+    } finally {
+      setExternalReviewBusy(false);
     }
   };
 
@@ -6150,6 +6190,8 @@ export function App() {
               onSteer={() => sendChat(undefined, undefined, "steer")}
               onRestoreQueued={restoreQueuedTurn}
               queueRestoreBusy={queueRestoreBusy}
+              onAcknowledgeExternalReview={acknowledgeExternalReview}
+              externalReviewBusy={externalReviewBusy}
               onSubmitReviewComment={(message) => sendChat(message, [])}
               onInterrupt={interruptChat}
               onClear={clearChatHistory}
@@ -6322,12 +6364,13 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   const needsAttention = getAttentionSummary(status).items.filter((item) => item.repoId === repo.id && !["neutral", "active"].includes(item.tone) && !item.acknowledged);
   const running = (status.activeJobs || []).filter((job) => job.repoId === repo.id && !job.completed);
   const queuedNeedsAttention = sessions.filter((session) => ["paused", "needs_reconciliation"].includes(session.queuedTurn?.status || ""));
+  const externalNeedsAttention = sessions.filter((session) => Boolean(session.externalActionReview));
   const queuedInFlight = sessions.filter((session) => ["queued", "dispatching"].includes(session.queuedTurn?.status || ""));
   const recent = [...sessions].filter((session) => !isVerificationChatSession(session)).sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
   const goals = recent.filter((session) => session.goal?.objective && !["complete", "completed"].includes(session.goal.status)).slice(0, 4);
   const upcoming = status.automations.filter((item) => item.repoId === repo.id && item.enabled && Number.isFinite(Date.parse(item.nextRun))).sort((a, b) => Date.parse(a.nextRun) - Date.parse(b.nextRun)).slice(0, 3);
   const recentRuns = (status.automationRuns || []).filter((run) => run.repoId === repo.id && run.finishedAt).sort((a, b) => Date.parse(b.finishedAt || "") - Date.parse(a.finishedAt || "")).slice(0, 3);
-  const decisionCount = approvalCount + queuedNeedsAttention.length + needsAttention.length;
+  const decisionCount = approvalCount + queuedNeedsAttention.length + externalNeedsAttention.length + needsAttention.length;
   const guideFirst = !decisionCount && dueCount === 0 && !running.length && !queuedInFlight.length && !goals.length && !upcoming.length && !recentFiles.length && !recentRuns.length && !filesLoading && !filesError;
   const summary = decisionCount ? `${decisionCount} 项需要你处理` : dueCount ? `${dueCount} 项关注事项今天或此前到期` : running.length || queuedInFlight.length ? "任务正在继续处理" : dueCount === null || filesLoading ? "正在整理今日事项…" : "目前没有需要你决定的事项";
   const guide = <PersonalAssistantGuide onChoose={onChooseTask} onConnect={onConnections} heading="可以交办" />;
@@ -6341,6 +6384,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
     {decisionCount > 0 && <section className="personal-list-section personal-priority-section">
       <h2>需要你决定 <small>{decisionCount}</small></h2>
       {approvalCount > 0 && <PersonalActivityRow title={`${approvalCount} 项待确认请求`} detail="查看具体操作后再决定，离开页面不会自动批准" onClick={() => document.querySelector(".pending-approvals")?.scrollIntoView({ behavior: "smooth", block: "start" })} />}
+      {externalNeedsAttention.map((session) => <PersonalActivityRow key={`external:${session.id}`} title={`${sessionDisplayTitle(session)} · 外部操作待核对`} detail={`${session.externalActionReview!.server} / ${session.externalActionReview!.tool} · ${session.externalActionReview!.reason}`} onClick={() => onContinue(session.id)} />)}
       {queuedNeedsAttention.map((session) => <PersonalActivityRow key={`queue:${session.id}`} title={`${sessionDisplayTitle(session)} · 待核对`} detail={session.queuedTurn?.reason || "核对上一轮结果后，撤回消息或决定是否重发"} onClick={() => onContinue(session.id)} />)}
       {needsAttention.map((item) => <PersonalActivityRow key={item.id} title={item.title} detail={item.body || (item.sessionId ? "打开对话继续处理" : "请在对应服务中查看详情")} onClick={item.sessionId ? () => onContinue(item.sessionId!) : undefined} />)}
     </section>}
@@ -8631,6 +8675,8 @@ function CloudChat({
   onSteer,
   onRestoreQueued,
   queueRestoreBusy,
+  onAcknowledgeExternalReview,
+  externalReviewBusy,
   onSubmitReviewComment,
   onInterrupt,
   onClear,
@@ -8700,6 +8746,8 @@ function CloudChat({
   onSteer: () => void;
   onRestoreQueued: () => void;
   queueRestoreBusy: boolean;
+  onAcknowledgeExternalReview: (reviewId: string) => void;
+  externalReviewBusy: boolean;
   onSubmitReviewComment: (message: string) => void;
   onInterrupt: () => void;
   onClear: () => void;
@@ -9585,8 +9633,8 @@ function CloudChat({
         <span className="personal-scope-short">{repo.executionAvailable ? repo.runtimeMode === "dedicated" ? "独立执行器" : "共用账号" : "暂不可执行"}</span>
         <span className="personal-connection-brief">{connection.label}</span>
         <div className="personal-scope-actions">
-          <button type="button" className="mini-action" onClick={() => setActivePanel("guide")}><Sparkles size={14} />任务建议</button>
-          <button type="button" className="mini-action" onClick={() => setActivePanel("connections")}><Link2 size={14} />连接服务</button>
+          <button type="button" className="mini-action" aria-label="任务建议" title="任务建议" onClick={() => setActivePanel("guide")}><Sparkles size={14} /><span>任务建议</span></button>
+          <button type="button" className="mini-action" aria-label="连接服务" title="连接服务" onClick={() => setActivePanel("connections")}><Link2 size={14} /><span>连接服务</span></button>
         </div>
       </div>}
 
@@ -9629,6 +9677,24 @@ function CloudChat({
         onDragOver={handleComposerDragOver}
         onDrop={handleComposerDrop}
       >
+        {activeSession?.externalActionReview && <div className="external-review-banner" role="alert" data-testid="external-action-review">
+          <TriangleAlert size={18} aria-hidden="true" />
+          <span>
+            <strong>连接服务操作待核对</strong>
+            <small>{activeSession.externalActionReview.reason} {activeSession.externalActionReview.count > 1 ? `本轮涉及 ${activeSession.externalActionReview.count} 次写入。` : ""}</small>
+            {activeSession.externalActionReview.actions.length > 0 && <details className="external-review-details">
+              <summary>查看操作清单 · {activeSession.externalActionReview.count} 次写入</summary>
+              <ul className="external-review-actions">
+                {activeSession.externalActionReview.actions.map((action, index) => <li key={`${action.server}:${action.tool}:${index}`}>
+                  {action.server} / {action.tool} · {action.status === "completed" ? "连接器报告完成" : action.status === "failed" ? "连接器报告失败" : "没有完成回执"}
+                </li>)}
+              </ul>
+            </details>}
+          </span>
+          <button type="button" className="mini-action" onClick={() => onAcknowledgeExternalReview(activeSession.externalActionReview!.id)} disabled={externalReviewBusy || busy}>
+            {externalReviewBusy ? "处理中…" : "已在服务中核对"}
+          </button>
+        </div>}
         {queuedTurn && <div className="queued-turn-banner" role="status">
           <ListTodo size={17} />
           <span>
@@ -10382,7 +10448,7 @@ function CloudChat({
               }
               if (event.key === "Enter" && !event.shiftKey && !composing) {
                 event.preventDefault();
-                if (repo.kind !== "personal" || repo.executionAvailable) onSend();
+                if (!activeSession?.externalActionReview && (repo.kind !== "personal" || repo.executionAvailable)) onSend();
               }
             }}
             placeholder={
@@ -10414,7 +10480,7 @@ function CloudChat({
           <button
             className="primary-command send-button"
             onClick={onSend}
-            disabled={historyLoading || queueRestoreBusy || Boolean(queuedTurn) || (repo.kind === "personal" && !repo.executionAvailable) || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
+            disabled={historyLoading || queueRestoreBusy || Boolean(queuedTurn) || Boolean(activeSession?.externalActionReview) || (repo.kind === "personal" && !repo.executionAvailable) || (!input.trim() && attachments.length === 0) || slashMode || uploadingAttachments || (Boolean(busyAction) && !busy)}
             aria-label={
               busy
                 ? "排队下一条消息"

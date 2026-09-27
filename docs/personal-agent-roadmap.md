@@ -1,6 +1,6 @@
 # Personal Agent 统一产品与技术方案
 
-状态：已整合的开发基线，阶段状态见第九节；逐项证据见[个人/API/移动验收](acceptance/2026-09-26-personal-api-mobile.md)、[个人引导与连接验收](acceptance/2026-09-26-personal-onboarding-connections.md)和[第二轮本地实现验收](acceptance/2026-09-26-personal-second-iteration.md)。更新日期：2026-09-26。原调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`；[第二轮对标与体验审查](competitor-benchmark-2026-09-26.md)基于 `5d07e80`，补充当前差距、复现问题及下一轮优先级。
+状态：已整合的开发基线，阶段状态见第九节；逐项证据见[个人/API/移动验收](acceptance/2026-09-26-personal-api-mobile.md)、[个人引导与连接验收](acceptance/2026-09-26-personal-onboarding-connections.md)、[第二轮本地实现验收](acceptance/2026-09-26-personal-second-iteration.md)和[外部操作可靠性迭代](acceptance/2026-09-27-personal-agent-reliability-iteration.md)。更新日期：2026-09-27。原调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`；[第二轮对标与体验审查](competitor-benchmark-2026-09-26.md)基于 `5d07e80`，补充当前差距、复现问题及下一轮优先级。
 
 本文整合 `docs/research/2026-09-26-personal-agent-benchmark.md` 的对标、代码发现和后端演进建议，以及原四项需求方案，作为后续开发、review、验收的唯一计划入口。原调研保留为日期固定的证据档案，其中旧阶段顺序与接口建议以本文的整合决定为准。
 
@@ -159,7 +159,7 @@ Runtime Adapter -> 有限且受限的 Codex worker
 
 继续使用 app-server，通过单一 Runtime Adapter 接入线程、turn、审批与事件；简单任务以后可评估 SDK，但不能让它形成第二份会话状态。接口资料见 [App Server](https://learn.chatgpt.com/docs/app-server) 与 [Codex SDK](https://learn.chatgpt.com/docs/codex-sdk)。
 
-记录实际 CLI 版本、协议能力、模型/推理支持和有效执行参数。测试矩阵包含已验证版本与升级候选版本，不只检查仓库内固定 schema。缺少必要能力时给出具体失败或降级说明；保留 `gpt-5.6-terra / medium` 默认，不静默提升模型。
+记录实际 CLI 版本、协议能力、模型/推理支持和有效执行参数。测试矩阵包含已验证版本与升级候选版本，不只检查仓库内固定 schema。缺少必要能力时给出具体失败或降级说明；当前新会话默认 `gpt-6-sol / medium`，已有显式模型不静默迁移。
 
 ## 四、个人助理空间
 
@@ -172,7 +172,7 @@ Runtime Adapter -> 有限且受限的 Codex worker
 - 日常调研、备忘、旅行规划等按主题新建个人对话；不同对话默认不互相注入全文。
 - 对话标题、输入区与审批窗口持续显示当前空间。切换不会停止已运行的任务，也不会把正在发送的消息改投到新空间。
 - 跨空间协作使用“将选定内容交给工作项目”，先预览将复制的文字和附件，再创建新任务；默认不复制完整历史、私有记忆或工具凭据。
-- 保持现有模型默认 `gpt-5.6-terra / medium`。仅在用户明确指定时提升，实际能力以对应运行环境返回的模型列表为准；不可用时说明原因，不偷偷改用更贵的模型。
+- 新会话默认 `gpt-6-sol / medium`。仅在用户明确指定时提升，实际能力以对应运行环境返回的模型列表为准；不可用时说明原因，不偷偷改用其他模型。
 
 第一版不做独立的复杂“今日仪表盘”。先让用户顺畅完成“打开个人空间 → 交办 → 等待或补充 → 审批 → 查看结果”；日程、长期记忆、主动提醒可在此基础上迭代。复用自动化时，个人任务仍要绑定个人空间，不能回落到第一个工作项目。
 

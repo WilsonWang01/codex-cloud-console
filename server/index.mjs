@@ -17,6 +17,7 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource } from "./external-automation.mjs";
+import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
 import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
 import { createRunAdmission } from "./run-admission.mjs";
@@ -117,6 +118,7 @@ const maxUploadBytes = Number(process.env.CODEX_MAX_UPLOAD_BYTES || 20 * 1024 * 
 const maxUploadFiles = Number(process.env.CODEX_MAX_UPLOAD_FILES || 8);
 const codexTurnIdleTimeoutMs = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS || process.env.CODEX_TURN_TIMEOUT_MS || 900_000);
 const codexTurnMaxRuntimeMs = Number(process.env.CODEX_TURN_MAX_RUNTIME_MS || 60 * 60_000);
+const externalWriteTimeoutMs = Math.min(Math.max(Number(process.env.CODEX_EXTERNAL_WRITE_TIMEOUT_MS || 90_000) || 90_000, 100), 300_000);
 const codexCompactTimeoutMs = Number(process.env.CODEX_COMPACT_TIMEOUT_MS || 900_000);
 const automationAttentionMaxAgeHours = Number(process.env.CODEX_AUTOMATION_ATTENTION_MAX_AGE_HOURS || 72);
 const automationRecoveryEnabled = process.env.CODEX_AUTOMATION_RECOVERY_ENABLED !== "0";
@@ -580,6 +582,23 @@ function normalizeQueuedTurn(value) {
   };
 }
 
+function normalizeExternalActionReview(value) {
+  if (!value || typeof value !== "object" || !value.id) return null;
+  return {
+    id: String(value.id).slice(0, 240),
+    server: String(value.server || "connected service").slice(0, 100),
+    tool: String(value.tool || "action").slice(0, 120),
+    count: Math.max(1, Math.min(Number(value.count) || 1, 100)),
+    actions: Array.isArray(value.actions) ? value.actions.slice(-10).map((action) => ({
+      server: String(action?.server || "connected service").slice(0, 100),
+      tool: String(action?.tool || "action").slice(0, 120),
+      status: action?.status === "completed" ? "completed" : action?.status === "failed" ? "failed" : "inProgress",
+    })) : [],
+    at: String(value.at || "").slice(0, 40),
+    reason: String(value.reason || "请先核对第三方结果，勿直接重试。").slice(0, 240),
+  };
+}
+
 function queuedTurnSummary(value) {
   const queued = normalizeQueuedTurn(value);
   if (!queued) return null;
@@ -611,6 +630,7 @@ function normalizeSession(item, repoId) {
     compactedAt: item?.compactedAt ? String(item.compactedAt) : null,
     draft: normalizeChatDraft(item?.draft),
     queuedTurn: normalizeQueuedTurn(item?.queuedTurn),
+    externalActionReview: normalizeExternalActionReview(item?.externalActionReview),
   };
 }
 
@@ -1450,6 +1470,7 @@ function sessionSummary(item) {
     compactedAt: item.compactedAt || null,
     draft: normalizeChatDraft(item.draft || {}),
     queuedTurn: queuedTurnSummary(item.queuedTurn),
+    externalActionReview: normalizeExternalActionReview(item.externalActionReview),
   };
 }
 
@@ -1460,7 +1481,7 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
     for (const session of Object.values(store.sessions)) {
       if (session.repoId !== repo.id || !session.codexSessionId) continue;
       const draft = normalizeChatDraft(session.draft);
-      if (listedThreadIds.has(session.codexSessionId) || session.queuedTurn || draft.input.trim() || draft.attachments.length) continue;
+      if (listedThreadIds.has(session.codexSessionId) || session.queuedTurn || session.externalActionReview || draft.input.trim() || draft.attachments.length) continue;
       delete store.sessions[session.id];
     }
   }
@@ -2889,6 +2910,9 @@ function createServerJob(kind, repo, session, runtime) {
     turnId: null,
     itemIds: new Set(),
     toolItems: new Map(),
+    externalWriteItems: new Map(),
+    externalWriteTimer: null,
+    externalReviewPersistPromise: Promise.resolve(),
     output: "",
     stderr: "",
     latestTokenUsage: session.tokenUsage || null,
@@ -2925,6 +2949,29 @@ function interruptTimedOutTurn(job, message) {
       emitJobEvent(job, "error", { message: error.message || "Codex turn timeout cleanup failed" });
     });
   });
+}
+
+function persistExternalWriteReview(job) {
+  const review = unresolvedExternalAction(job.externalWriteItems, { ok: false, turnId: job.id });
+  if (!review) return;
+  job.externalReviewPersistPromise = job.externalReviewPersistPromise
+    .catch(() => null)
+    .then(() => updateSessionRuntime(job.repoId, job.sessionId, { externalActionReview: review }, { makeActive: false }));
+  job.externalReviewPersistPromise.catch((error) => {
+    emitJobEvent(job, "error", { message: `连接服务待核对状态保存失败: ${error.message}` });
+  });
+}
+
+function armExternalWriteTimeout(job) {
+  if (job.externalWriteTimer) clearTimeout(job.externalWriteTimer);
+  const oldestPending = [...job.externalWriteItems.values()]
+    .filter((item) => item.status === "inProgress")
+    .sort((a, b) => a.startedAt - b.startedAt)[0];
+  if (!oldestPending) return;
+  job.externalWriteTimer = setTimeout(() => {
+    interruptTimedOutTurn(job, "连接服务写入等待回执超时。请先在对应服务核对结果，勿直接重试。");
+  }, Math.max(1, externalWriteTimeoutMs - (Date.now() - oldestPending.startedAt)));
+  job.externalWriteTimer.unref?.();
 }
 
 function scheduleTurnIdleTimeout(job) {
@@ -2976,7 +3023,11 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
     runtime = runtimeForRepo(repo, runtime);
   }
   const key = makeSessionKey(repo.id, session.id);
-  const storedQueuedTurn = (await readStoredSessionForJob(repo.id, session.id)).queuedTurn;
+  const storedSession = await readStoredSessionForJob(repo.id, session.id);
+  const storedQueuedTurn = storedSession.queuedTurn;
+  if (storedSession.externalActionReview) {
+    throw Object.assign(new Error("连接服务操作尚待核对。请先在对应服务检查结果，再确认已核对。"), { statusCode: 409 });
+  }
   if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
   if (options.queuedTurnId ? storedQueuedTurn?.id !== options.queuedTurnId || storedQueuedTurn.status !== "dispatching" : Boolean(storedQueuedTurn)) {
     throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
@@ -3089,9 +3140,16 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   job.finishing = true;
   if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
   if (job.maxRuntimeTimer) clearTimeout(job.maxRuntimeTimer);
-  job.ok = ok;
-  job.code = code;
-  job.error = error;
+  if (job.externalWriteTimer) clearTimeout(job.externalWriteTimer);
+  await job.externalReviewPersistPromise.catch(() => null);
+  const externalActionReview = unresolvedExternalAction(job.externalWriteItems, { ok, turnId: job.id });
+  const effectiveOk = ok && !externalActionReview;
+  const effectiveError = externalActionReview
+    ? `${error ? `${String(error).slice(0, 300)}；` : ""}${externalActionReview.reason}`
+    : error;
+  job.ok = effectiveOk;
+  job.code = effectiveOk ? code : code || 1;
+  job.error = effectiveError;
   await persistJobToolAudits(job).catch((auditError) => {
     emitJobEvent(job, "error", { message: `命令审计保存失败: ${auditError.message}` });
   });
@@ -3102,13 +3160,14 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
         ...job.runtime,
         tokenUsage: normalizeTokenUsage(job.latestTokenUsage),
         goal: job.latestGoal,
+        ...(job.externalWriteItems.size ? { externalActionReview } : {}),
         title:
           job.session.title === "新会话" && job.storedMessage
             ? sessionTitle(job.storedMessage)
             : job.session.title,
       }, { makeActive: job.makeSessionActive !== false });
     } else {
-      await appendChatTurn(job.repoId, job.sessionId, job.storedMessage, job.output || job.stderr || error || "Codex completed without output.", false);
+      await appendChatTurn(job.repoId, job.sessionId, job.storedMessage, job.output || job.stderr || effectiveError || "Codex completed without output.", false);
     }
   } catch (saveError) {
     emitJobEvent(job, "error", { message: `会话保存失败: ${saveError.message}` });
@@ -3116,22 +3175,22 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   job.completed = true;
   job.finishing = false;
   if (job.queuedTurnId) {
-    await updateQueuedTurn(job.repoId, job.sessionId, job.queuedTurnId, ok ? null : {
+    await updateQueuedTurn(job.repoId, job.sessionId, job.queuedTurnId, effectiveOk ? null : {
       status: "needs_reconciliation",
       reason: "排队消息执行未成功。请核对会话记录，系统不会自动重发。",
     }).catch((queueError) => {
       emitJobEvent(job, "error", { message: `排队状态保存失败: ${queueError.message}` });
     });
-  } else if (!ok) {
+  } else if (!effectiveOk) {
     await pauseQueuedTurn(job.repoId, job.sessionId, "上一轮未成功，排队已暂停。请核对结果后再发送。").catch((queueError) => {
       emitJobEvent(job, "error", { message: `排队状态保存失败: ${queueError.message}` });
     });
   }
   if (activeTurns.get(job.key) === job) activeTurns.delete(job.key);
   clearJobOwners(job);
-  emitJobEvent(job, "done", { ok, code, sessionId: job.sessionId, codexSessionId: job.threadId, turnId: job.turnId, error });
-  job.resolve?.({ ok, code, error });
-  if (ok && !job.queuedTurnId) {
+  emitJobEvent(job, "done", { ok: effectiveOk, code: job.code, sessionId: job.sessionId, codexSessionId: job.threadId, turnId: job.turnId, error: effectiveError, externalActionReview });
+  job.resolve?.({ ok: effectiveOk, code: job.code, error: effectiveError, externalActionReview });
+  if (effectiveOk && !job.queuedTurnId) {
     setImmediate(() => dispatchQueuedTurn(job.repoId, job.sessionId).catch((queueError) => {
       console.warn(`Queued turn dispatch failed: ${queueError.message}`);
     }));
@@ -3343,6 +3402,14 @@ function handleAppServerNotification(rpcMessage) {
       rememberOwner({ threadId: owner.threadId || job.threadId, turnId: owner.turnId || job.turnId, itemId: params.item.id }, { repoId: job.repoId, sessionId: job.sessionId });
     }
     auditAppServerItem(params.item || {}, job, owner);
+    if (turnJob) {
+      const attempt = externalWriteAttempt(params.item);
+      if (attempt && !turnJob.externalWriteItems.has(attempt.id)) {
+        turnJob.externalWriteItems.set(attempt.id, { ...attempt, startedAt: Date.now() });
+        persistExternalWriteReview(turnJob);
+        armExternalWriteTimeout(turnJob);
+      }
+    }
     const statusText = formatAppServerItemStatus(params.item);
     if (statusText && job) emitJobEvent(job, "status", { text: statusText });
     if (params.item?.type === "contextCompaction") {
@@ -3367,6 +3434,12 @@ function handleAppServerNotification(rpcMessage) {
   }
   if (rpcMessage.method === "item/completed") {
     const item = params.item || {};
+    if (turnJob && turnJob.externalWriteItems.has(item.id)) {
+      const attempt = turnJob.externalWriteItems.get(item.id);
+      attempt.status = item.status === "completed" && !item.error ? "completed" : "failed";
+      persistExternalWriteReview(turnJob);
+      armExternalWriteTimeout(turnJob);
+    }
     if (item.type === "agentMessage" && turnJob && !turnJob.output && item.text) {
       turnJob.output = String(item.text);
       emitJobEvent(turnJob, "delta", { text: turnJob.output });
@@ -9786,6 +9859,25 @@ app.post("/api/chat/sessions/:id/select", async (req, res) => {
   const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: !session.codexSessionId });
   res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages });
+});
+
+app.post("/api/chat/sessions/:id/external-action-review/acknowledge", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId);
+  const reviewId = String(req.body?.reviewId || "");
+  if (!reviewId) return res.status(400).json({ ok: false, error: "缺少待核对操作 ID" });
+  if (activeTurns.has(makeSessionKey(repo.id, req.params.id))) {
+    return res.status(409).json({ ok: false, error: "会话仍在运行，请等待结束后再核对" });
+  }
+  const result = await mutateChatStore((store) => {
+    const session = store.sessions[req.params.id];
+    if (!session || session.repoId !== repo.id) return "missing";
+    if (session.externalActionReview?.id !== reviewId) return "stale";
+    session.externalActionReview = null;
+    return "cleared";
+  });
+  if (result === "missing") return res.status(404).json({ ok: false, error: "会话不存在" });
+  if (result === "stale") return res.status(409).json({ ok: false, error: "待核对操作已变化，请刷新后重试" });
+  res.json({ ok: true });
 });
 
 app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {

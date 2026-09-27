@@ -122,6 +122,13 @@ await context.route("**/api/**", async (route) => {
     session.queuedTurn = null;
     return send({ ok: true, queuedTurn, draft: session.draft });
   }
+  if (url.pathname.endsWith("/external-action-review/acknowledge") && req.method() === "POST") {
+    const sessionId = decodeURIComponent(url.pathname.split("/")[4]);
+    const session = sessions.find((item) => item.id === sessionId && item.repoId === repoId);
+    if (!session || session.externalActionReview?.id !== body.reviewId) return send({ ok: false, error: "stale review" }, 409);
+    session.externalActionReview = null;
+    return send({ ok: true });
+  }
   if (url.pathname === "/api/codex/turn-steer" && queueFlow) { steeredMessages.push(body.message); return send({ ok: true }); }
   if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", directoryError: appsDirectoryDenied ? "上游拒绝了云端服务目录请求（403）。" : "", apps: [
     { id: "mail", name: "Gmail", description: "整理邮件", installUrl: "https://chatgpt.com/apps/gmail/mail", accessible: false, enabled: true, callable: false },
@@ -568,6 +575,44 @@ try {
   assert.equal(await reminderPage.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   await reminderPage.screenshot({ path: new URL("personal-reminders-390.png", out).pathname, fullPage: true });
   await reminderPage.close();
+  oldCommitmentApi = false;
+  sessions.find((item) => item.id === "_personal-session").externalActionReview = {
+    id: "external-review-ui", server: "Calendar", tool: "create_event", count: 2,
+    at: new Date().toISOString(), reason: "连接服务写入尚无可信的成功回执，是否已执行尚不明确。请先在对应服务核对，勿直接重试。",
+    actions: [
+      { server: "Calendar", tool: "create_event", status: "completed" },
+      { server: "Calendar", tool: "update_event", status: "inProgress" },
+    ],
+  };
+  await page.goto(`${baseUrl}#/project/_personal/today`);
+  await page.reload();
+  await page.getByRole("heading", { name: /需要你决定/ }).waitFor().catch(async (error) => {
+    throw new Error(`Missing external review on ${page.url()}: ${(await page.locator("body").innerText()).slice(0, 1800)}`, { cause: error });
+  });
+  await page.getByRole("button", { name: /外部操作待核对/ }).click();
+  await page.getByTestId("external-action-review").waitFor();
+  await page.reload();
+  await page.getByTestId("external-action-review").waitFor();
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("external-review-390.png", out).pathname, fullPage: true });
+  await page.locator(".external-review-details summary").click();
+  assert.match(await page.getByTestId("external-action-review").innerText(), /create_event[\s\S]*update_event/);
+  assert.ok(await page.getByRole("button", { name: "已在服务中核对" }).evaluate((element) => element.getBoundingClientRect().height >= 44));
+  assert.equal(await page.locator(".send-button").isDisabled(), true);
+  const beforeBlockedSend = submittedMessages;
+  await composer.fill("保留这条输入");
+  await composer.press("Enter");
+  assert.equal(submittedMessages, beforeBlockedSend);
+  assert.equal(await composer.inputValue(), "保留这条输入");
+  await page.screenshot({ path: new URL("external-review-expanded-390.png", out).pathname, fullPage: true });
+  await page.locator(".external-review-details summary").click();
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("external-review-320.png", out).pathname, fullPage: true });
+  await page.getByRole("button", { name: "已在服务中核对" }).click();
+  await page.getByTestId("external-action-review").waitFor({ state: "detached" });
+  assert.equal(sessions.find((item) => item.id === "_personal-session").externalActionReview, null);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }
