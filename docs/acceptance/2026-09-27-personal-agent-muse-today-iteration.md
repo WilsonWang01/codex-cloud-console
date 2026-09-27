@@ -39,7 +39,7 @@
 - 日历 OAuth 的读写授权不是对具体业务写入的授权。此前尚未收到创建并删除测试日程的单独确认；后续用户已明确授权，执行结果见本文末尾的补充验收。不能将此前的日历读取通过记作业务动作闭环通过。
 - 用户另行授权一次限时、无外部写入的 EC2 后台模型任务。验收使用独立的 `/tmp/codex-personal-acceptance-QFb3l4` 状态目录与仅本机可访问的 `127.0.0.1:18788` 端口，不更改生产自动化配置：个人自动化运行 `run-personal-acceptance-mujhrqbo-67a448` 返回 `completed`、结果合约 `passed`，会话 `sess-mujhrqbv-ccb98297` 只有用户消息和模型回复，未调用工具；运行记录统计 16,253 tokens，其中 11,776 为缓存输入。停止并重启隔离服务后，API 仍只列出同一条完成的运行记录，原会话仍可读取；验收服务已停止，生产服务保持健康且没有活动任务。该测试不能证明跨天定时触发，也不能证明中断中的外部动作可恰好一次恢复。
 - `npm run verify:local` 再次通过，其中“外部自动化被重启中断后等待核对、不重复动作”和通知按通道失败重试、成功通道不重复发送的回归通过；这些是受控回归，不是生产第三方动作的回执证据。
-- 部署前备份在 `/home/ubuntu/codex-cloud/backups/pre-personal-parity-20260927T061431Z`，目录仅 root 可访问、大小约 3.4 GB；个人事项文件权限为 `0600`。EC2 当前保留两版可回滚发布，磁盘剩余约 7.4 GB。
+- 前一阶段部署备份在 `/home/ubuntu/codex-cloud/backups/pre-personal-parity-20260927T061431Z`，目录仅 root 可访问、大小约 3.4 GB；个人事项文件权限为 `0600`。当时保留两版发布供回滚；本轮最终保留情况见末尾补充验收。
 - 截图位于 `docs/research/acceptance/personal-usage-2026-09-26/`，包括 `today-commitment-active-390.png` 和 `today-commitment-active-320.png`。
 
 ## 未验收与后续优先级
@@ -63,7 +63,7 @@
 ### 2026-09-27 18:16 CST 部署与日历实测
 
 - 用户授权先查运行任务、备份后部署。切换前 `/healthz` 为 `strictOk: true, partial: false`，活动会话任务与排队/运行自动化均为 0。备份 `/home/ubuntu/codex-cloud/backups/pre-personal-parity-20260927T101040Z/state-personal-config.tar.gz` 包含状态、个人目录和服务配置；归档校验通过，SHA-256 为 `77d76fd6f04ea9888c615a2f346a05c6769429e0bb8957c90a01cc7f0b3212f0`。未复制、删除或改写工作区。
-- 本地 `npm run verify:local` 再次通过。部署使用原子脚本切换至 `/home/ubuntu/codex-cloud/releases/console/20260927T101601Z-1793350`，暂留上一版供回退；线上严格健康检查通过。`GET /api/personal/brief` 返回 `ok: true`，当前真实来源无新变化，`total: 0`。历史会话和自动化状态文件大小与部署前一致（分别为 73,544 和 2,867,657 字节）；部署后无活动任务。当前 Push 订阅数 0，个人提醒启用数 0；未发送真实 Push，不能据此验收设备通知送达。
+- 本地 `npm run verify:local` 再次通过。部署使用原子脚本切换至 `/home/ubuntu/codex-cloud/releases/console/20260927T101601Z-1793350`，验收期间暂留上一版供回退；严格健康检查通过后，按用户要求只删除上一版约 33 MB 的发布目录，当前保留新版本及状态备份。`GET /api/personal/brief` 返回 `ok: true`，当前真实来源无新变化，`total: 0`。历史会话和自动化状态文件大小与部署前一致（分别为 73,544 和 2,867,657 字节）；清理后严格健康检查仍通过且无活动任务，磁盘剩余约 7.4 GB。当前 Push 订阅数 0，个人提醒启用数 0；未发送真实 Push，不能据此验收设备通知送达。
 - `GET /api/codex/apps?repoId=_personal` 显示 Google Calendar 运行时 `callable: true`，但服务目录本身仍有上游 403 提示。用户授权最多两次限时模型回合。第一回合 `sess-mujo231t-6926e21f` 使用 `gpt-6-sol / low`，请求创建并立即删除无参与者、无提醒的临时日程；150 秒无响应后主动中断。实际工具记录为 `google_calendar.create_event` 失败，错误 `user cancelled MCP tool call`，结果为空、无事件 ID，**没有 EC2 写入成功证据**。中断前线程累计用量显示 37,552 tokens（含 23,552 缓存输入），不是账单金额。
 - 第二回合改用 `gpt-6-luna / low` 只读查找同一时间窗口，`google_calendar.search_events` 工具回执 `completed`、450 毫秒、`events: []`；这证明 EC2 的日历只读调用可用，不证明写入可用。两次模型额度已用完，没有继续付费重试。
 - 为隔离账号权限问题，在本任务已连接的 Google Calendar 上直接创建同一测试日程，返回事件 ID `o23khrf5nvicdu1k0hbhm3imhk`；随即按该 ID 删除，删除工具成功，事后同时间窗口搜索为零。该闭环只证明当前连接账号的直接日历写权限及清理结果，**不能代替 EC2 Codex App 写入链路的成功验收**；云端与本任务连接是否指向完全相同的授权主体也未独立核实。
