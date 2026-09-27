@@ -3298,9 +3298,18 @@ export function App() {
     lastWrittenHashRef.current = window.location.hash;
     pendingHashNavigationRef.current = null;
   }, []);
-  const [status, setStatus] = useState<ConsoleStatus>(fallbackStatus);
+  const [status, setStatus] = useState<ConsoleStatus>(() => initialRoute.repoId === "_personal" ? {
+    ...fallbackStatus,
+    repos: [{
+      id: "_personal", kind: "personal", name: "个人助理", path: "", remote: "", accent: "teal",
+      present: false, branch: "", commit: "", dirty: false, statusText: "", lastCommit: "",
+    }],
+    automations: [], logs: [], events: [],
+    instance: { ...fallbackStatus.instance, publicIp: "", privateIp: "", type: "" },
+    codex: { ...fallbackStatus.codex, authenticated: false, detail: "等待云端状态同步" },
+  } : fallbackStatus);
   const [cloudConnection, setCloudConnection] = useState<CloudConnection>("checking");
-  const [selectedAutomationId, setSelectedAutomationId] = useState(initialRoute.automationId || defaultAutomationId);
+  const [selectedAutomationId, setSelectedAutomationId] = useState(initialRoute.automationId || (initialRoute.view === "automations" ? "" : defaultAutomationId));
   const [selectedRepoId, setSelectedRepoId] = useState(initialRoute.repoId || window.localStorage.getItem("codex-cloud-last-space-repo") || defaultRepoId);
   const [activeView, setActiveView] = useState<ActiveView>(initialRoute.view);
   const [selectedPersonalFilePath, setSelectedPersonalFilePath] = useState("");
@@ -6063,7 +6072,8 @@ export function App() {
           </div>
         )}
 
-        {activeView === "today" && selectedRepo.kind === "personal" && <PersonalToday
+        {activeView === "today" && selectedRepo.kind === "personal" && !repoSelectionReady && <div className="personal-page" role="status">正在读取个人空间…</div>}
+        {activeView === "today" && selectedRepo.kind === "personal" && repoSelectionReady && <PersonalToday
           status={status}
           repo={selectedRepo}
           approvalCount={personalApprovalCount}
@@ -6094,7 +6104,8 @@ export function App() {
 
         {activeView === "issues" && selectedRepo.kind !== "personal" && <Suspense fallback={<div className="github-page">正在加载 GitHub…</div>}><LazyGitHubIssues repoId={selectedRepo.id} onPrepare={prepareGitHubIssue} /></Suspense>}
 
-        {activeView === "automations" && (
+        {activeView === "automations" && !repoSelectionReady && <div className="personal-page" role="status">正在读取计划任务…</div>}
+        {activeView === "automations" && repoSelectionReady && (
           <div className={cx("content-grid", selectedRepo.kind === "personal" && "personal-automations")}>
             <section className="panel automation-panel" aria-label="自动化任务">
               <PanelTitle title={selectedRepo.kind === "personal" ? "计划任务" : "自动化"} eyebrow={selectedRepo.kind === "personal" ? "个人助理" : "云端任务"} onRefresh={refresh} spinning={isRefreshing} />

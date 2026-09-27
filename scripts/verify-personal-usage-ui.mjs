@@ -289,6 +289,16 @@ const out = new URL("../docs/research/acceptance/personal-usage-2026-09-26/", im
 await fs.mkdir(out, { recursive: true });
 try {
   const baseUrl = process.env.CODEX_CLOUD_SAFETY_UI_URL || "http://127.0.0.1:5174/";
+  const pendingStatusPage = await context.newPage();
+  await pendingStatusPage.route("**/api/status", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await route.fallback().catch(() => null);
+  });
+  await pendingStatusPage.goto(`${baseUrl}#/automations/_personal`);
+  await pendingStatusPage.locator(".app-shell").waitFor();
+  assert.equal(new URL(pendingStatusPage.url()).hash, "#/automations/_personal");
+  assert.doesNotMatch(await pendingStatusPage.locator("body").innerText(), /sample-app|Sample repository maintenance/);
+  await pendingStatusPage.close();
   await page.goto(`${baseUrl}#/project/sample-app/thread/sample-app-session`);
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
   await page.getByRole("heading", { name: "今日" }).waitFor();
