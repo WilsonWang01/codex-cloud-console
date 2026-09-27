@@ -16,7 +16,8 @@
 - 个人流程版本 `112bf51` 已在第二次备份（`/home/ubuntu/codex-cloud/backups/pre-personal-routine-20260927T151218Z/state-personal-config.tar.gz`，SHA-256 `5ade2a8eefdfaaac66cf7f3e31980f1a81d84d2ec6edc6d0a78c16fb239653f9`）后发布到 `/home/ubuntu/codex-cloud/releases/console/20260927T151402Z-1836806`，严格健康通过。会话与自动化状态文件分别为 75,666 和 2,867,657 字节，自动化记录仍为 200，活动任务 0。
 - 真实 EC2 的个人流程列表 API 返回空列表。非法创建请求返回 400，列表仍为空，未运行模型。经 SSH 本地转发的线上页面在 320px/1280px 均无横向溢出或页面异常；线上空列表截图暴露通用网格最小高度造成的大块空白，已补充移动端高度修正及模拟空态回归。
 - 移动端修复 `da6dd91` 在第三次备份（`/home/ubuntu/codex-cloud/backups/pre-routine-mobile-20260927T152247Z/state-personal-config.tar.gz`，SHA-256 `57a6b6eb34565c765be97c5ed5d1096ba71dc0156c2ee4dab829b49751d563da`）后发布到 `/home/ubuntu/codex-cloud/releases/console/20260927T152440Z-1839346`。严格健康为 `strictOk: true, partial: false`；真实线上 320px 空列表面板高度从约 397px 降到约 120px，页面宽度 320px、无脚本异常。自动化状态文件仍为 2,867,657 字节，会话文件为 75,699 字节（服务运行期间有少量元数据写入），个人流程仍为 0，未触发模型运行。
-- 追加体验迭代：个人对话中可将纯文本草稿预填到“新建流程”，原草稿保留；带附件、超长及尚在加载的草稿不允许转换。浏览器模拟验证 320px 下新入口、保存前不调用模型，以及从个人对话直接跳转计划页不会被旧路由写回。`npm run verify:local`、`npm run verify:safety:ui`、`npm run verify:personal:ui` 与 `git diff --check` 通过；追加迭代尚待线上验收。
+- 追加体验迭代：个人对话中可将纯文本草稿预填到“新建流程”，原草稿保留；带附件、超长及尚在加载的草稿不允许转换。浏览器模拟验证 320px 下新入口、保存前不调用模型，以及从个人对话直接跳转计划页不会被旧路由写回。`npm run verify:local`、`npm run verify:safety:ui`、`npm run verify:personal:ui` 与 `git diff --check` 通过。
+- 追加版本 `7c3f181` 在第四次备份（`/home/ubuntu/codex-cloud/backups/pre-routine-capture-20260927T154037Z/state-personal-config.tar.gz`，SHA-256 `dbf65c3f9919f4c52d7a9490fc6557c31a441a9789b531f015fe513aced0f03a`）后发布到 `/home/ubuntu/codex-cloud/releases/console/20260927T154218Z-1842994`。严格健康为 `strictOk: true, partial: false`，上线前后自动化记录为 200、活动任务为 0，状态文件大小不变。经本机转发的真实线上页面在 320px 下验证新按钮 44×44、直接跳转计划页地址不回退、空态面板约 120px、无横向溢出和脚本异常；没有修改真实个人草稿或运行模型。
 - 浏览器/本地模拟测试没有创建真实业务计划或调用模型；线上尚未执行新流程的真实模型回合。
 
 ## 对标复评
