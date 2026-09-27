@@ -430,6 +430,7 @@ await check("automation completion contracts fail closed without changing legacy
     CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
     CODEX_ALLOW_LOCAL_FALLBACK: "0",
     CODEX_TURN_TIMEOUT_MS: "2500",
+    CODEX_EXTERNAL_WRITE_TIMEOUT_MS: "120",
     CODEX_AUTOMATION_RECOVERY_ENABLED: "0",
     PATH: `${binDir}:${process.env.PATH}`,
   };
@@ -533,6 +534,12 @@ await check("automation completion contracts fail closed without changing legacy
     });
     assert.equal(invalidContract.response.status, 400);
 
+    const externalWriteStart = await trigger("external-write-timeout-0001", "external write regression timeout");
+    assert.equal(externalWriteStart.response.status, 200);
+    const externalWriteRun = await waitForRun(externalWriteStart.data.run.id, "needs_reconciliation");
+    assert.match(externalWriteRun.error, /勿直接重试/);
+    assert.ok((await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/inbox")).data.needsAttention.some((run) => run.id === externalWriteRun.id));
+
     await stopProcess(firstServer);
     firstServer = null;
     secondServer = startServer();
@@ -543,6 +550,10 @@ await check("automation completion contracts fail closed without changing legacy
     assert.equal(afterRestartReplay.data.deduplicated, true);
     assert.equal(afterRestartReplay.data.run?.id, missingRun.id);
     assert.equal(afterRestartReplay.data.run?.status, "failed");
+    const externalWriteReplay = await trigger("external-write-timeout-0001", "external write regression timeout");
+    assert.equal(externalWriteReplay.data.deduplicated, true);
+    assert.equal(externalWriteReplay.data.run?.id, externalWriteRun.id);
+    assert.equal(externalWriteReplay.data.run?.status, "needs_reconciliation");
 
     const legacyStart = await trigger("contract-legacy-0001", "outcome contract regression legacy no contract", undefined);
     assert.equal(legacyStart.response.status, 200);

@@ -6842,13 +6842,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         : null;
       const completion = artifact && !artifact.satisfied ? artifact : markerCompletion;
       const completed = result.ok && completion.satisfied;
-      const canceled = job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
-      const error = completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
+      const needsExternalReview = Boolean(result.externalActionReview);
+      const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
+      const error = completed ? null : needsExternalReview ? result.externalActionReview.reason : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await appendAutomationRunEventWithRetry(
         runId,
         {
-          status: canceled ? "canceled" : completed ? "completed" : completion.outcome === "artifact-unknown" ? "needs_reconciliation" : "failed",
+          status: needsExternalReview || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           summary: job.output || "",
@@ -6858,7 +6859,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           completionCheckedAt: completionContract ? new Date().toISOString() : null,
           ...(diffStat ? { diffStat } : {}),
         },
-        { type: canceled ? "canceled" : completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: completed ? "自动化任务已完成" : error },
+        { type: needsExternalReview ? "needs-reconciliation" : canceled ? "canceled" : completed ? "done" : completion.outcome === "missing" ? "completion-contract-missing" : "error", text: completed ? "自动化任务已完成" : error },
       );
     }).catch((persistenceError) => {
       const message = `自动化任务 ${runId} 的终态写入失败，已保留为可重启恢复状态：${persistenceError.message || persistenceError}`;
