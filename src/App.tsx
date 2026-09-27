@@ -183,6 +183,7 @@ type HealthCheckResponse = NonNullable<ConsoleStatus["health"]>;
 
 type ExternalActionReview = {
   id: string;
+  automationRunId?: string;
   server: string;
   tool: string;
   count: number;
@@ -6376,10 +6377,9 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   const running = (status.activeJobs || []).filter((job) => job.repoId === repo.id && !job.completed);
   const externalNeedsAttention = sessions.filter((session) => Boolean(session.externalActionReview));
   const queuedNeedsAttention = sessions.filter((session) => !session.externalActionReview && ["paused", "needs_reconciliation"].includes(session.queuedTurn?.status || ""));
-  const reviewSessions = [...externalNeedsAttention, ...queuedNeedsAttention];
   const needsAttention = getAttentionSummary(status).items.filter((item) =>
     item.repoId === repo.id && !["neutral", "active"].includes(item.tone) && !item.acknowledged &&
-    !(item.type === "automation" && reviewSessions.some((session) => attentionMatchesSession(item, session))));
+    !(item.type === "automation" && item.runId && externalNeedsAttention.some((session) => session.externalActionReview?.automationRunId === item.runId)));
   const queuedInFlight = sessions.filter((session) => ["queued", "dispatching"].includes(session.queuedTurn?.status || ""));
   const recent = [...sessions].filter((session) => !isVerificationChatSession(session)).sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
   const goals = recent.filter((session) => session.goal?.objective && !["complete", "completed"].includes(session.goal.status)).slice(0, 4);

@@ -538,6 +538,8 @@ await check("automation completion contracts fail closed without changing legacy
     assert.equal(externalWriteStart.response.status, 200);
     const externalWriteRun = await waitForRun(externalWriteStart.data.run.id, "needs_reconciliation");
     assert.match(externalWriteRun.error, /勿直接重试/);
+    const externalWriteSessions = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
+    assert.equal(externalWriteSessions[externalWriteRun.sessionId]?.externalActionReview?.automationRunId, externalWriteRun.id);
     assert.ok((await jsonRequest(`http://127.0.0.1:${port}/`, "/api/automations/inbox")).data.needsAttention.some((run) => run.id === externalWriteRun.id));
 
     await stopProcess(firstServer);

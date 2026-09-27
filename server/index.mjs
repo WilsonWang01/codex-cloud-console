@@ -586,6 +586,7 @@ function normalizeExternalActionReview(value) {
   if (!value || typeof value !== "object" || !value.id) return null;
   return {
     id: String(value.id).slice(0, 240),
+    ...(value.automationRunId ? { automationRunId: String(value.automationRunId).slice(0, 120) } : {}),
     server: String(value.server || "connected service").slice(0, 100),
     tool: String(value.tool || "action").slice(0, 120),
     count: Math.max(1, Math.min(Number(value.count) || 1, 100)),
@@ -2952,7 +2953,7 @@ function interruptTimedOutTurn(job, message) {
 }
 
 function persistExternalWriteReview(job) {
-  const review = unresolvedExternalAction(job.externalWriteItems, { ok: false, turnId: job.id });
+  const review = unresolvedExternalAction(job.externalWriteItems, { ok: false, turnId: job.id, automationRunId: job.automationRunId });
   if (!review) return;
   job.externalReviewPersistPromise = job.externalReviewPersistPromise
     .catch(() => null)
@@ -3038,6 +3039,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
 
   const job = createServerJob("turn", repo, session, runtime);
+  job.automationRunId = options.automationRunId || null;
   job.makeSessionActive = options.makeSessionActive !== false;
   job.requireExistingThread = options.requireExistingThread === true;
   job.queuedTurnId = options.queuedTurnId || null;
@@ -3142,7 +3144,7 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   if (job.maxRuntimeTimer) clearTimeout(job.maxRuntimeTimer);
   if (job.externalWriteTimer) clearTimeout(job.externalWriteTimer);
   await job.externalReviewPersistPromise.catch(() => null);
-  const externalActionReview = unresolvedExternalAction(job.externalWriteItems, { ok, turnId: job.id });
+  const externalActionReview = unresolvedExternalAction(job.externalWriteItems, { ok, turnId: job.id, automationRunId: job.automationRunId });
   const effectiveOk = ok && !externalActionReview;
   const effectiveError = externalActionReview
     ? `${error ? `${String(error).slice(0, 300)}；` : ""}${externalActionReview.reason}`
@@ -6810,6 +6812,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
+      automationRunId: runId,
     });
     activeAutomationRuns.set(runId, job);
     if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {

@@ -8,7 +8,7 @@ export function externalWriteAttempt(item = {}) {
   };
 }
 
-export function unresolvedExternalAction(attempts, { ok, turnId, at = new Date().toISOString() } = {}) {
+export function unresolvedExternalAction(attempts, { ok, turnId, automationRunId, at = new Date().toISOString() } = {}) {
   const writes = [...attempts.values()];
   if (ok && writes.every((item) => item.status === "completed")) return null;
   const last = writes.at(-1);
@@ -16,6 +16,7 @@ export function unresolvedExternalAction(attempts, { ok, turnId, at = new Date()
   const unfinished = writes.some((item) => item.status !== "completed");
   return {
     id: String(turnId || "turn").slice(0, 120),
+    ...(automationRunId ? { automationRunId: String(automationRunId).slice(0, 120) } : {}),
     server: last.server,
     tool: last.tool,
     count: writes.length,

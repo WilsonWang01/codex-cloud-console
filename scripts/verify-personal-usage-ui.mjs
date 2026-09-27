@@ -598,7 +598,7 @@ try {
     items: [{ id: "automation:review-run-ui", type: "automation", tone: "danger", title: "每周资料整理", body: "日历事件可能已创建", time: new Date().toISOString(), repoId: "_personal", automationId: "personal-plan", runId: reviewRun.id, sessionId: "_personal-session", action: "thread", acknowledged: false }],
   };
   sessions.find((item) => item.id === "_personal-session").externalActionReview = {
-    id: "external-review-ui", server: "Calendar", tool: "create_event", count: 2,
+    id: "external-review-ui", automationRunId: reviewRun.id, server: "Calendar", tool: "create_event", count: 2,
     at: new Date().toISOString(), reason: "连接服务写入尚无可信的成功回执，是否已执行尚不明确。请先在对应服务核对，勿直接重试。",
     actions: [
       { server: "Calendar", tool: "create_event", status: "completed" },
@@ -613,6 +613,16 @@ try {
   });
   assert.equal(await page.locator(".personal-priority-section .personal-task-row").count(), 1);
   assert.match(await page.locator(".personal-daily-summary").innerText(), /1 项需要你处理/);
+  const unrelatedRun = { ...reviewRun, id: "unrelated-run-ui" };
+  status.automationRuns.push(unrelatedRun);
+  status.attention.items.push({ ...status.attention.items[0], id: "automation:unrelated-run-ui", runId: unrelatedRun.id, title: "另一项待核对运行" });
+  await page.reload();
+  await page.getByRole("heading", { name: "今日" }).waitFor();
+  assert.equal(await page.locator(".personal-priority-section .personal-task-row").count(), 2);
+  status.automationRuns.pop();
+  status.attention.items.pop();
+  await page.reload();
+  await page.getByRole("heading", { name: "今日" }).waitFor();
   assert.match(await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "最近结果" }) }).innerText(), /外部操作待核对/);
   await page.locator(".sidebar .nav-item").filter({ hasText: "计划任务" }).click();
   await page.locator(".automation-runs-panel").waitFor();

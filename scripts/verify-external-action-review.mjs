@@ -36,4 +36,6 @@ test("incomplete or failed writes stay reviewable even if the model turn complet
   assert.deepEqual(review.actions.map((action) => action.status), ["completed", "failed"]);
   assert.equal(review.actions[1].tool, "delete_event");
   assert.match(review.reason, /勿直接重试/);
+  assert.equal(unresolvedExternalAction(attempts, { ok: false, turnId: "turn-2", automationRunId: "run-1" }).automationRunId, "run-1");
+  assert.equal("automationRunId" in review, false);
 });
