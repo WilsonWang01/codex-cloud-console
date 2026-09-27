@@ -13,7 +13,9 @@
 
 - `npm run verify:local`、`npm run verify:personal:ui` 和 `git diff --check`：通过。存储测试覆盖 0600 权限、重启读取、并发编辑冲突、归档/恢复和无定时器；API 回归覆盖创建、修改、无额度确认拒绝、外部入口拒绝、归档与恢复。
 - 浏览器模拟覆盖 320px 创建/编辑/运行确认/归档/恢复与“今日”入口，整页无横向溢出。截图位于 `docs/research/acceptance/personal-usage-2026-09-26/`，包括 `personal-routine-create-320.png` 和 `personal-routine-edit-320.png`。
-- 这些模拟测试没有创建真实计划或调用模型；个人流程本身的 EC2 增量发布与真实 API 验收结果见后续记录。
+- 个人流程版本 `112bf51` 已在第二次备份（`/home/ubuntu/codex-cloud/backups/pre-personal-routine-20260927T151218Z/state-personal-config.tar.gz`，SHA-256 `5ade2a8eefdfaaac66cf7f3e31980f1a81d84d2ec6edc6d0a78c16fb239653f9`）后发布到 `/home/ubuntu/codex-cloud/releases/console/20260927T151402Z-1836806`，严格健康通过。会话与自动化状态文件分别为 75,666 和 2,867,657 字节，自动化记录仍为 200，活动任务 0。
+- 真实 EC2 的个人流程列表 API 返回空列表。非法创建请求返回 400，列表仍为空，未运行模型。经 SSH 本地转发的线上页面在 320px/1280px 均无横向溢出或页面异常；线上空列表截图暴露通用网格最小高度造成的大块空白，已补充移动端高度修正及模拟空态回归，待小版本复验。
+- 浏览器/本地模拟测试没有创建真实业务计划或调用模型；线上尚未执行新流程的真实模型回合。
 
 ## 对标复评
 

@@ -7396,6 +7396,8 @@ pre {
   .content-grid.personal-automations {
     grid-template-columns: minmax(0, 1fr);
     height: auto;
+    min-height: 0;
+    align-content: start;
   }
 
   .personal-automations .automation-panel {
