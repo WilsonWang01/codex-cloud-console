@@ -890,14 +890,37 @@ try {
   await page.goto(`${baseUrl}#/automations/_personal`);
   await page.locator(".automation-panel").waitFor();
   assert.match(page.url(), /#\/automations\/_personal/);
+  const taskSearch = page.getByPlaceholder("搜索任务、项目、服务");
+  await taskSearch.fill("没有匹配的流程");
+  assert.equal(await page.locator(".automation-list .automation-row").count(), 0);
+  assert.equal(await page.locator(".personal-routine-starters").count(), 0);
+  await taskSearch.fill("");
   const savedAutomations = status.automations.splice(0);
   await page.reload();
   await page.getByRole("button", { name: "新建流程" }).waitFor({ timeout: 5_000 }).catch(async () => {
     throw new Error(`个人流程空态未载入：${page.url()} ${(await page.locator("body").innerText()).slice(0, 800)}`);
   });
-  assert.ok(await page.locator(".automation-panel").evaluate((element) => element.getBoundingClientRect().height < 180));
+  const starters = page.locator(".personal-routine-starters");
+  assert.equal(await starters.getByRole("button").count(), 3);
+  await starters.getByRole("button", { name: "查看近期日程" }).click();
+  const starterEditor = page.locator(".personal-routine-editor");
+  assert.equal(await starterEditor.getByRole("textbox", { name: "名称" }).inputValue(), "查看近期日程");
+  assert.match(await starterEditor.getByRole("textbox", { name: "每次执行的任务" }).inputValue(), /只读查看[\s\S]*不要创建、修改/);
+  assert.equal(manualAutomationRuns, 2);
+  await starterEditor.getByRole("button", { name: "取消" }).click();
+  await starters.getByRole("button", { name: "整理待处理邮件" }).click();
+  assert.equal(await starterEditor.getByRole("textbox", { name: "名称" }).inputValue(), "整理待处理邮件");
+  assert.match(await starterEditor.getByRole("textbox", { name: "每次执行的任务" }).inputValue(), /不要发送、归档/);
+  await starterEditor.getByRole("button", { name: "取消" }).click();
+  assert.ok(await page.locator(".automation-panel").evaluate((element) => element.getBoundingClientRect().height < 380));
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("personal-routine-starters-320.png", out).pathname });
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    await page.screenshot({ path: new URL(`personal-routine-starters-${width}.png`, out).pathname });
+  }
   status.automations.push(...savedAutomations);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态紧凑且无溢出", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态预填只读范例且不运行模型", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

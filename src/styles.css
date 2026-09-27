@@ -547,6 +547,38 @@ h3 {
   margin-top: 14px;
 }
 
+.personal-routine-starters {
+  display: grid;
+  gap: 2px;
+  padding: 4px 0;
+}
+
+.personal-routine-starters h3 {
+  margin: 0 0 8px;
+  color: #56636b;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.personal-routine-starters button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 9px 2px;
+  border: 0;
+  border-bottom: 1px solid rgba(55, 79, 97, 0.12);
+  color: #17212b;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.personal-routine-starters button:hover {
+  color: #006d75;
+}
+
 .personal-routine-editor {
   display: grid;
   gap: 12px;
@@ -7442,6 +7474,10 @@ pre {
   margin: 0 auto;
 }
 
+.content-grid.personal-automations-empty {
+  grid-template-columns: minmax(0, 560px);
+}
+
 .personal-automations .automation-panel,
 .personal-automations .thread-surface {
   border: 0;
@@ -7452,6 +7488,11 @@ pre {
 .personal-automations .automation-panel {
   padding: 8px 18px 8px 0;
   border-right: 1px solid var(--border);
+}
+
+.personal-automations-empty .automation-panel {
+  padding-right: 0;
+  border-right: 0;
 }
 
 .personal-automations .thread-surface {

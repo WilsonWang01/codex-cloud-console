@@ -3321,6 +3321,7 @@ export function App() {
   const [chatInput, setChatInput] = useState("");
   const [routineEditorId, setRoutineEditorId] = useState<string | null>(null);
   const [routineEditorSeed, setRoutineEditorSeed] = useState("");
+  const [routineEditorSeedName, setRoutineEditorSeedName] = useState("");
   const [routineArchiveRevision, setRoutineArchiveRevision] = useState(0);
   const [chatAttachments, setChatAttachments] = useState<UploadedAttachment[]>([]);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
@@ -5009,6 +5010,7 @@ export function App() {
     }
   };
 
+  const hasPersonalAutomations = status.automations.some((automation) => automation.repoId === selectedRepo.id);
   const filteredAutomations = status.automations.filter((automation) => {
     if (selectedRepo.kind === "personal" && automation.repoId !== selectedRepo.id) return false;
     const repo = status.repos.find((item) => item.id === automation.repoId);
@@ -6106,21 +6108,30 @@ export function App() {
 
         {activeView === "automations" && !repoSelectionReady && <div className="personal-page" role="status">正在读取计划任务…</div>}
         {activeView === "automations" && repoSelectionReady && (
-          <div className={cx("content-grid", selectedRepo.kind === "personal" && "personal-automations")}>
+          <div className={cx("content-grid", selectedRepo.kind === "personal" && "personal-automations", selectedRepo.kind === "personal" && !hasPersonalAutomations && "personal-automations-empty")}>
             <section className="panel automation-panel" aria-label="自动化任务">
               <PanelTitle title={selectedRepo.kind === "personal" ? "计划任务" : "自动化"} eyebrow={selectedRepo.kind === "personal" ? "个人助理" : "云端任务"} onRefresh={refresh} spinning={isRefreshing} />
-              {selectedRepo.kind === "personal" && <button className="command-button personal-routine-new" type="button" onClick={() => { setRoutineEditorSeed(""); setRoutineEditorId(""); }}>
+              {selectedRepo.kind === "personal" && <button className="command-button personal-routine-new" type="button" onClick={() => { setRoutineEditorSeed(""); setRoutineEditorSeedName(""); setRoutineEditorId(""); }}>
                 <Plus size={17} />新建流程
               </button>}
               {selectedRepo.kind === "personal" && routineEditorId !== null && <PersonalRoutineEditor
-                key={routineEditorId}
+                key={`${routineEditorId}:${routineEditorSeedName}:${routineEditorSeed}`}
                 automation={status.automations.find((item) => item.id === routineEditorId && item.personalRoutine)}
                 initialPrompt={routineEditorId === "" ? routineEditorSeed : ""}
+                initialName={routineEditorId === "" ? routineEditorSeedName : ""}
                 onCancel={() => setRoutineEditorId(null)}
-                onSaved={(id) => { setRoutineEditorSeed(""); setRoutineEditorId(null); setSelectedAutomationId(id); void refresh(); }}
+                onSaved={(id) => { setRoutineEditorSeed(""); setRoutineEditorSeedName(""); setRoutineEditorId(null); setSelectedAutomationId(id); void refresh(); }}
               />}
 
               <div className="automation-list">
+                {selectedRepo.kind === "personal" && !hasPersonalAutomations && routineEditorId === null && <div className="personal-routine-starters">
+                  <h3>从常见事项开始</h3>
+                  {personalRoutineStarters.map((starter) => <button type="button" key={starter.name} onClick={() => {
+                    setRoutineEditorSeedName(starter.name);
+                    setRoutineEditorSeed(starter.prompt);
+                    setRoutineEditorId("");
+                  }}>{starter.name}<ChevronRight size={17} /></button>)}
+                </div>}
                 {filteredAutomations.map((automation) => (
                   <AutomationRow
                     key={automation.id}
@@ -6198,7 +6209,7 @@ export function App() {
                 }
                 onOpenLog={openFullLog}
               />
-            </section> : <section className="thread-panel usage-empty">{selectedAutomation ? "自动化引用的项目不可用" : "暂无自动化任务"}</section>}
+            </section> : selectedRepo.kind !== "personal" || hasPersonalAutomations ? <section className="thread-panel usage-empty">{selectedAutomation ? "自动化引用的项目不可用" : "暂无自动化任务"}</section> : null}
 
             {selectedRepo.kind !== "personal" && <aside className="right-rail">
               <CloudStatus status={status} cloudConnection={cloudConnection} onOpenThread={openAttentionThread} />
@@ -6274,7 +6285,7 @@ export function App() {
               onMcpLogin={startMcpLogin}
               onMcpReload={reloadMcpServers}
               onSend={() => sendChat()}
-              onSaveRoutine={(prompt) => { setRoutineEditorSeed(prompt); setRoutineEditorId(""); setActiveView("automations"); }}
+              onSaveRoutine={(prompt) => { setRoutineEditorSeed(prompt); setRoutineEditorSeedName(""); setRoutineEditorId(""); setActiveView("automations"); }}
               onSteer={() => sendChat(undefined, undefined, "steer")}
               onRestoreQueued={restoreQueuedTurn}
               queueRestoreBusy={queueRestoreBusy}
@@ -7814,13 +7825,29 @@ function searchResultIcon(kind: GlobalSearchResult["kind"]) {
   return <Command size={15} />;
 }
 
-function PersonalRoutineEditor({ automation, initialPrompt = "", onCancel, onSaved }: {
+const personalRoutineStarters = [
+  {
+    name: "整理待处理邮件",
+    prompt: "只读查看我已连接邮箱中最近的待处理邮件，按紧急程度总结发件人、主题、时间和需要我决定的事项，并附上可核对的邮件引用。若邮箱未连接或无权限，说明阻碍并停止。不要发送、归档、标记或删除邮件，也不要修改任何外部服务。",
+  },
+  {
+    name: "查看近期日程",
+    prompt: "只读查看我已连接日历中接下来 7 天的日程，按时间列出冲突、准备事项和需要我确认的问题，并注明时区和日程引用。若日历未连接或无权限，说明阻碍并停止。不要创建、修改、邀请或删除日程，也不要修改任何外部服务。",
+  },
+  {
+    name: "复盘个人资料",
+    prompt: "只读查看个人工作区里最近更新的资料与成果，指出值得继续跟进的变化、未完成事项和下一步，并列出引用的文件路径。若没有可读资料，明确说明。不要修改文件、发送内容或更改任何外部服务。",
+  },
+] as const;
+
+function PersonalRoutineEditor({ automation, initialPrompt = "", initialName = "", onCancel, onSaved }: {
   automation?: Automation;
   initialPrompt?: string;
+  initialName?: string;
   onCancel: () => void;
   onSaved: (id: string) => void;
 }) {
-  const [name, setName] = useState(automation?.name || "");
+  const [name, setName] = useState(automation?.name || initialName);
   const [prompt, setPrompt] = useState(automation?.prompt || initialPrompt);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
