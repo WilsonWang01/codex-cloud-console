@@ -258,7 +258,7 @@ type ActiveJobsResponse = {
 
 const runtimeReasoning = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const defaultChatRuntime: ChatRuntime = {
-  model: "gpt-5.6-terra",
+  model: "gpt-6-sol",
   reasoning: "medium",
   sandbox: "danger-full-access",
   approval: "never",
@@ -3528,7 +3528,8 @@ export function App() {
   const refresh = useCallback(async () => {
     setIsRefreshing(true);
     try {
-      const quick = await api<HealthCheckResponse>("/healthz");
+      const healthResponse = await fetch("/healthz");
+      const quick = (await parseJsonResponse(healthResponse)) as HealthCheckResponse;
       const quickStatus = statusWithHealth(statusRef.current, quick);
       statusRef.current = quickStatus;
       setStatus(quickStatus);

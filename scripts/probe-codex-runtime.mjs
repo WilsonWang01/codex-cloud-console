@@ -8,7 +8,7 @@ import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
 const execFileAsync = promisify(execFile);
 
 function optionsFromArgs(argv) {
-  const options = { command: "codex", cwd: process.cwd(), model: "gpt-5.6-terra", requireAuth: false };
+  const options = { command: "codex", cwd: process.cwd(), model: "gpt-6-sol", requireAuth: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--require-auth") options.requireAuth = true;

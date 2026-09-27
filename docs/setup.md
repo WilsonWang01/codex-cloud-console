@@ -104,7 +104,7 @@ node --input-type=module -e '
 const tasks = [{
   id: "my-app-review", name: "项目检查", repoId: "my-app",
   mode: "on-demand", timer: null, service: null, schedule: "手动运行",
-  model: "gpt-5.6-terra", reasoning: "medium",
+  model: "gpt-6-sol", reasoning: "medium",
   prompt: "只分析项目和测试结果，列出需要关注的问题，不修改代码。"
 }];
 console.log("CODEX_CLOUD_AUTOMATIONS_CONFIG_B64=" + Buffer.from(JSON.stringify(tasks)).toString("base64"));

@@ -133,13 +133,13 @@ const enableCliDebug = process.env.CODEX_ENABLE_CLI_DEBUG === "1";
 const enableLocalReviewRead = process.env.CODEX_ENABLE_LOCAL_REVIEW_READ === "1";
 const enableLocalReviewMutation = process.env.CODEX_ENABLE_LOCAL_REVIEW_MUTATION === "1";
 const defaultRuntime = {
-  model: "gpt-5.6-terra",
+  model: "gpt-6-sol",
   reasoning: "medium",
   sandbox: "danger-full-access",
   approval: "never",
   search: true,
 };
-const deprecatedRuntimeModels = new Map([["gpt-5.5", defaultRuntime.model]]);
+const deprecatedRuntimeModels = new Map([["gpt-5.5", "gpt-5.6-terra"]]);
 const allowedReasoning = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const allowedSandbox = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const allowedApproval = new Set(["untrusted", "on-failure", "on-request", "never"]);

@@ -23,7 +23,7 @@ input.on("line", (line) => {
   fs.appendFileSync(process.env.PROBE_CAPTURE, request.method + "\\n");
   let result = {};
   if (request.method === "account/read") result = { account: process.env.PROBE_NO_AUTH ? null : { type: "chatgpt" } };
-  if (request.method === "model/list") result = { data: process.env.PROBE_NO_MODEL ? [] : [{ id: "gpt-5.6-terra", supportedReasoningEfforts: [{ reasoningEffort: "medium" }] }], nextCursor: null };
+  if (request.method === "model/list") result = { data: process.env.PROBE_NO_MODEL ? [] : [{ id: "gpt-6-sol", supportedReasoningEfforts: [{ reasoningEffort: "medium" }] }], nextCursor: null };
   if (request.method === "thread/list") result = { data: [], nextCursor: null };
   process.stdout.write(JSON.stringify({ id: request.id, result }) + "\\n");
 });

@@ -133,7 +133,10 @@ input.on("line", (line) => {
     threads.push(thread);
     return send({ id: message.id, result: { thread } });
   }
-  if (message.method === "model/list" && message.params?.cursor === "new-models") return send({ id: message.id, result: { data: [{ id: "gpt-6-astra", model: "gpt-6-astra", displayName: "GPT-6 Astra", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "ultra" }] }], nextCursor: null } });
+  if (message.method === "model/list" && message.params?.cursor === "new-models") return send({ id: message.id, result: { data: [
+    { id: "gpt-6-astra", model: "gpt-6-astra", displayName: "GPT-6 Astra", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "ultra" }] },
+    { id: "gpt-6-sol", model: "gpt-6-sol", displayName: "GPT-6 Sol", defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "ultra" }] },
+  ], nextCursor: null } });
   if (message.method === "model/list") return send({
     id: message.id,
     result: {
@@ -1364,7 +1367,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(models.response.status, 200);
     assert.equal(models.response.headers.get("x-codex-model-list-cache"), "refreshed");
     assert.equal(models.data.models[0].id, "gpt-5.6-sol");
-    assert.equal(models.data.models.find((model) => model.isDefault)?.id, "gpt-5.6-terra");
+    assert.equal(models.data.models.find((model) => model.isDefault)?.id, "gpt-6-sol");
     assert.equal(models.data.models.some((model) => model.id === "gpt-5.5"), false);
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("max"));
     assert.ok(models.data.models[0].supportedReasoningEfforts.includes("ultra"));
@@ -1446,7 +1449,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(created.response.status, 200);
     const sessionId = created.data.activeSessionId;
-    assert.equal(created.data.sessions.find((session) => session.id === sessionId)?.model, "gpt-5.6-terra");
+    assert.equal(created.data.sessions.find((session) => session.id === sessionId)?.model, "gpt-6-sol");
     const personalSession = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal" }),
     });
