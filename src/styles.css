@@ -7057,6 +7057,10 @@ pre {
 .personal-task-row strong { font-size: 14px; }
 .personal-task-row small, .personal-empty { color: var(--muted); font-size: 12px; }
 .personal-task-row strong, .personal-task-row small { overflow-wrap: anywhere; }
+.personal-attention-entry { border-bottom: 1px solid var(--border); }
+.personal-attention-entry .personal-task-row { border-bottom: 0; }
+.personal-attention-actions { display: flex; justify-content: flex-end; padding: 0 4px 10px; }
+.personal-attention-actions .mini-action { min-height: 44px; }
 .personal-secondary-link { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 52px; padding: 8px 4px; border: 0; background: transparent; text-align: left; cursor: pointer; }
 .personal-secondary-link svg:last-child { margin-left: auto; }
 .personal-state-warning { padding: 10px 12px; border-left: 3px solid var(--warn); background: #fff8e9; }
@@ -7267,4 +7271,55 @@ pre {
   .github-issue-detail { padding: 18px; }
   .github-issue-detail h2 { font-size: 19px; }
   .github-issue-body { max-height: 380px; }
+}
+
+.content-grid.personal-automations {
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.personal-automations .automation-panel,
+.personal-automations .thread-surface {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.personal-automations .automation-panel {
+  padding: 8px 18px 8px 0;
+  border-right: 1px solid var(--border);
+}
+
+.personal-automations .thread-surface {
+  padding: 8px 0 20px 12px;
+}
+
+.personal-automations .automation-runs-panel {
+  padding: 16px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+}
+
+.personal-automations .automation-run-item {
+  background: var(--surface);
+}
+
+@media (max-width: 820px) {
+  .content-grid.personal-automations {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+  }
+
+  .personal-automations .automation-panel {
+    padding: 0 0 14px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .personal-automations .thread-surface {
+    padding: 4px 0 20px;
+  }
 }

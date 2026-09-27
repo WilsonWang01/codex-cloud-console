@@ -19,6 +19,7 @@ export type Automation = {
   id: string;
   name: string;
   repoId: string;
+  mode?: string;
   timer: string;
   service: string;
   schedule: string;
