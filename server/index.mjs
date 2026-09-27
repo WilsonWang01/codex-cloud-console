@@ -29,7 +29,8 @@ import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore } from "./personal-facts.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
-import { createPersonalRoutinesStore, personalRoutineAutomation } from "./personal-routines.mjs";
+import { createPersonalRoutinesStore, personalRoutineAutomation, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
+import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 
@@ -2996,9 +2997,10 @@ function touchTurnJobTimeout(job) {
 
 function armTurnJobTimeout(job) {
   scheduleTurnIdleTimeout(job);
+  const maxRuntimeMs = Number.isFinite(job.maxRuntimeMs) ? Math.min(codexTurnMaxRuntimeMs, job.maxRuntimeMs) : codexTurnMaxRuntimeMs;
   job.maxRuntimeTimer = setTimeout(() => {
-    interruptTimedOutTurn(job, `Codex turn exceeded the ${Math.round(codexTurnMaxRuntimeMs / 1000)} second maximum runtime`);
-  }, codexTurnMaxRuntimeMs);
+    interruptTimedOutTurn(job, `Codex turn exceeded the ${Math.round(maxRuntimeMs / 1000)} second maximum runtime`);
+  }, maxRuntimeMs);
   job.maxRuntimeTimer.unref?.();
 }
 
@@ -3045,6 +3047,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
 
   const job = createServerJob("turn", repo, session, runtime);
+  job.maxRuntimeMs = options.maxRuntimeMs;
   job.automationRunId = options.automationRunId || null;
   job.makeSessionActive = options.makeSessionActive !== false;
   job.requireExistingThread = options.requireExistingThread === true;
@@ -4878,7 +4881,7 @@ function parseTimerLines(stdout) {
       return {
         ...automation,
         enabled: true,
-        nextRun: "按需触发",
+        nextRun: automation.personalSchedule?.enabled ? automation.personalSchedule.nextRunAt : "按需触发",
         lastRun: "查看任务运行记录",
         run: defaultRunDetail(automation),
       };
@@ -6739,7 +6742,7 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
 }
 
 async function startAppServerAutomationRun(automation, repo, options = {}) {
-  const runId = automationRunId(automation.id);
+  const runId = options.runId || automationRunId(automation.id);
   const runtime = normalizeRuntime(
     {
       model: options.model || automation.model,
@@ -6791,7 +6794,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       reasoning: runtime.reasoning,
       prompt,
     }, { type: "queued", text: heartbeatSession ? "Heartbeat turn queued" : "Automation run queued" }, {
-      budgetLimit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
+      budgetLimit: options.budgetLimit ?? process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
     });
     if (heartbeatSession) {
       runRecord = await appendAutomationRunEvent(
@@ -6819,6 +6822,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
       automationRunId: runId,
+      maxRuntimeMs: options.maxRuntimeMs,
     });
     activeAutomationRuns.set(runId, job);
     if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {
@@ -6954,7 +6958,7 @@ async function recoverInterruptedAutomationRuns() {
     .filter((run) =>
       run.runner === "app-server" &&
       run.status === "interrupted" &&
-      !["webhook", "heartbeat"].includes(run.trigger) &&
+      !["webhook", "heartbeat", "personal-schedule"].includes(run.trigger) &&
       run.interruptionKind === "console-restart" &&
       !run.recoverySkippedReason &&
       Number(run.recoveryAttempt || 0) < automationRecoveryMaxAttempts &&
@@ -7079,6 +7083,37 @@ function scheduleStartupAutomationRecovery() {
       return { recovered: 0, skipped: 0, error: error.message };
     });
   return startupAutomationRecoveryPromise;
+}
+
+function syncPersonalRoutineAutomation(routine) {
+  if (!routine) return;
+  const index = automations.findIndex((item) => item.id === routine.id && item.personalRoutine);
+  if (index >= 0) automations[index] = personalRoutineAutomation(routine);
+  statusCache = null;
+}
+
+function startPersonalRoutineScheduler() {
+  if (!personalExecutionAvailable || !repos.some((repo) => repo.id === personalRepoId)) return;
+  const tick = createPersonalRoutineScheduler({
+    store: personalRoutinesStore,
+    automations: () => automations,
+    readRuns: async () => (await readAutomationRuns()).runs,
+    sync: syncPersonalRoutineAutomation,
+    startRun: (claim, automation) => startAppServerAutomationRun(automation, getRepoById(personalRepoId), {
+      runId: claim.runId,
+      trigger: "personal-schedule",
+      clientId: "personal-scheduler",
+      worktree: false,
+      sandbox: "read-only",
+      approval: "on-request",
+      maxRuntimeMs: 10 * 60_000,
+      budgetLimit: personalScheduleKnownTokenLimit,
+      prompt: `按已启用的个人计划执行以下只读任务。不要发送消息、修改日历或其他第三方数据；需要写入时停下并报告给用户。\n\n${automation.prompt}`,
+    }),
+  });
+  const start = () => { void tick(); setInterval(() => void tick(), 30_000).unref?.(); };
+  if (startupAutomationRecoveryPromise) void startupAutomationRecoveryPromise.finally(start);
+  else start();
 }
 
 async function getLogForAutomation(automation) {
@@ -10469,6 +10504,21 @@ app.patch("/api/personal/routines/:id", async (req, res) => {
   } catch (error) { sendRouteError(res, error); }
 });
 
+app.patch("/api/personal/routines/:id/schedule", async (req, res) => {
+  try {
+    const index = automations.findIndex((item) => item.id === req.params.id && item.personalRoutine);
+    if (index < 0) return res.status(404).json({ ok: false, error: "个人流程不存在" });
+    if (req.body?.enabled === true && req.body?.confirmModelCost !== true) {
+      return res.status(428).json({ ok: false, error: "启用后台运行前需确认模型额度消耗" });
+    }
+    if (req.body?.enabled === true && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行不可用" });
+    const routine = await personalRoutinesStore.configureSchedule(req.params.id, req.body);
+    automations[index] = personalRoutineAutomation(routine);
+    statusCache = null;
+    res.json({ ok: true, routine });
+  } catch (error) { sendRouteError(res, error); }
+});
+
 app.delete("/api/personal/routines/:id", async (req, res) => {
   try {
     const index = automations.findIndex((item) => item.id === req.params.id && item.personalRoutine);
@@ -11691,6 +11741,7 @@ function startExternalNotificationWatcher() {
 startExternalNotificationWatcher();
 
 scheduleStartupAutomationRecovery();
+startPersonalRoutineScheduler();
 server.listen(port, host, () => {
   console.log(`Codex Cloud Console listening on http://${host}:${port}`);
 });

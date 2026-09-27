@@ -1404,6 +1404,14 @@ function displayHumanDateTime(value?: string | null) {
   return text;
 }
 
+function personalAutomationNextRunLabel(automation: Automation) {
+  const schedule = automation.personalSchedule;
+  if (!schedule?.enabled || !automation.nextRun || !Number.isFinite(Date.parse(automation.nextRun))) return displayHumanDateTime(automation.nextRun);
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: schedule.timeZone, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date(automation.nextRun));
+}
+
 function sessionSubtitle(session: ChatSession) {
   const draftInput = persistedDraftInput(session.draft?.input || "").trim();
   const draftAttachmentCount = session.draft?.attachments?.length || 0;
@@ -6139,6 +6147,7 @@ export function App() {
                   );
                 }}
                 onEdit={selectedAutomation.personalRoutine ? () => setRoutineEditorId(selectedAutomation.id) : undefined}
+                onScheduleSaved={selectedAutomation.personalRoutine ? () => { void refresh(); } : undefined}
                 onArchive={selectedAutomation.personalRoutine ? () => {
                   if (!window.confirm(`归档“${selectedAutomation.name}”？它会从计划列表隐藏，但运行记录和流程内容仍保留，可随时恢复。`)) return;
                   void runAction(`archive-${selectedAutomation.id}`, "归档流程", async () => {
@@ -6479,7 +6488,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
     {(goals.length > 0 || upcoming.length > 0) && <section className="personal-list-section">
       <h2>持续跟进</h2>
       {goals.map((session) => <PersonalActivityRow key={`goal:${session.id}`} title={session.goal!.objective} detail={`目标 · ${sessionDisplayTitle(session)} · ${timeLabel(session.updatedAt)}`} onClick={() => onContinue(session.id)} />)}
-      {upcoming.map((item) => <PersonalActivityRow key={`routine:${item.id}`} title={item.name} detail={Date.parse(item.nextRun) < Date.now() ? `定时任务 · 计划时间 ${new Date(item.nextRun).toLocaleString()} 已过，待核对` : `定时任务 · 下次 ${new Date(item.nextRun).toLocaleString()}`} onClick={() => onOpenAutomation(item.id)} />)}
+      {upcoming.map((item) => <PersonalActivityRow key={`routine:${item.id}`} title={item.name} detail={Date.parse(item.nextRun) < Date.now() ? `定时任务 · 计划时间 ${personalAutomationNextRunLabel(item)}（${item.personalSchedule?.timeZone || "Asia/Shanghai"}）已过，待核对` : `定时任务 · 下次 ${personalAutomationNextRunLabel(item)}（${item.personalSchedule?.timeZone || "Asia/Shanghai"}）`} onClick={() => onOpenAutomation(item.id)} />)}
     </section>}
     {repeatable.length > 0 && <section className="personal-list-section">
       <h2>可复用流程</h2>
@@ -7818,7 +7827,7 @@ function PersonalRoutineEditor({ automation, initialPrompt = "", onCancel, onSav
     <h3>{automation ? "修改流程" : "新建流程"}</h3>
     <label>名称<input autoFocus maxLength={80} required value={name} onChange={(event) => setName(event.target.value)} /></label>
     <label>每次执行的任务<textarea maxLength={8000} required rows={6} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
-    <p className="muted-line">仅手动运行；保存不会调用模型。运行前会再次确认额度。</p>
+    <p className="muted-line">保存不会调用模型。可以在流程详情里单独启用计划运行。</p>
     {error && <p className="warn-text" role="alert">{error}</p>}
     <div className="personal-routine-editor-actions">
       <button className="text-button" type="button" onClick={onCancel} disabled={saving}>取消</button>
@@ -7893,10 +7902,65 @@ function AutomationRow({
       </span>
       <span className="next-run">
         <Timer size={15} />
-        {displayHumanDateTime(automation.nextRun)}
+        <span title={automation.personalSchedule?.enabled ? automation.personalSchedule.timeZone : undefined}>{personalAutomationNextRunLabel(automation)}</span>
       </span>
     </button>
   );
+}
+
+function PersonalRoutineSchedule({ automation, onSaved }: { automation: Automation; onSaved: () => void }) {
+  const schedule = automation.personalSchedule;
+  const [cadence, setCadence] = useState<"daily" | "weekdays">(schedule?.cadence || "daily");
+  const [time, setTime] = useState(schedule?.time || "09:00");
+  const [timeZone, setTimeZone] = useState(schedule?.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  useEffect(() => {
+    if (!schedule) return;
+    setCadence(schedule.cadence);
+    setTime(schedule.time);
+    setTimeZone(schedule.timeZone);
+  }, [automation.revision]);
+  const save = async (enabled: boolean) => {
+    if (busy) return;
+    if (enabled && !window.confirm(`启用“${automation.name}”的自动运行？${cadence === "weekdays" ? "工作日" : "每天"} ${time}（${timeZone}）会调用 Codex 并消耗模型额度。每次最长 10 分钟；每日已知 token 门槛是软限制，不能保证单次费用上限。自动计划仅适合只读任务：本地文件只读不等于已连接服务完全没有写权限。`)) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api(`/api/personal/routines/${encodeURIComponent(automation.id)}/schedule`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: automation.revision, cadence, time, timeZone, enabled, confirmModelCost: enabled }),
+      });
+      setNotice(enabled ? "计划已启用" : "计划已暂停");
+      onSaved();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "保存计划失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const configured = Boolean(schedule?.enabled);
+  const changed = cadence !== schedule?.cadence || time !== schedule?.time || timeZone !== schedule?.timeZone;
+  const last = schedule?.lastResult;
+  const resultText = last ? ({ completed: "已完成", running: "运行中", claimed: "正在启动", skipped: "已跳过", failed: "失败，计划已暂停", needs_reconciliation: "待核对，计划已暂停", interrupted: "中断，计划已暂停", canceled: "已取消，计划已暂停" } as Record<string, string>)[last.status] || last.status : "";
+  return <form className="personal-routine-schedule" onSubmit={(event) => { event.preventDefault(); void save(true); }}>
+    <div className="personal-routine-schedule-head"><strong>计划运行</strong><span className={cx("run-badge", configured ? "ok" : "warn")}>{configured ? "已启用" : "未启用"}</span></div>
+    <div className="personal-routine-schedule-fields">
+      <label>频率<select value={cadence} onChange={(event) => setCadence(event.target.value as "daily" | "weekdays")}><option value="daily">每天</option><option value="weekdays">工作日</option></select></label>
+      <label>时间<input type="time" required value={time} onChange={(event) => setTime(event.target.value)} /></label>
+      <label>时区<input type="text" required maxLength={80} value={timeZone} onChange={(event) => setTimeZone(event.target.value)} placeholder="Asia/Shanghai" /></label>
+    </div>
+    {configured && schedule?.nextRunAt && <p className="muted-line">下次运行：{new Date(schedule.nextRunAt).toLocaleString("zh-CN", { timeZone: schedule.timeZone })}（{schedule.timeZone}）</p>}
+    {last && <p className="muted-line">上次计划：{resultText}{last.detail ? ` · ${last.detail}` : ""}</p>}
+    {error && <p className="warn-text" role="alert">{error}</p>}
+    {notice && <p className="muted-line" role="status">{notice}</p>}
+    <div className="personal-routine-editor-actions">
+      {configured && <button type="button" className="command-button" disabled={busy} onClick={() => void save(false)}><Pause size={16} />暂停</button>}
+      {(!configured || changed) && <button type="submit" className="primary-command" disabled={busy}>{busy ? <Loader2 size={16} className="spin" /> : <Timer size={16} />}{configured ? "更新计划" : "启用计划"}</button>}
+    </div>
+  </form>;
 }
 
 function RunThread({
@@ -7908,6 +7972,7 @@ function RunThread({
   busyAction,
   onRun,
   onEdit,
+  onScheduleSaved,
   onArchive,
   onOpenRun,
   onPause,
@@ -7922,6 +7987,7 @@ function RunThread({
   busyAction: string | null;
   onRun: () => void;
   onEdit?: () => void;
+  onScheduleSaved?: () => void;
   onArchive?: () => void;
   onOpenRun: (run: AutomationRun) => void;
   onPause: () => void;
@@ -7962,7 +8028,7 @@ function RunThread({
 
       <div className="automation-brief">
         <span className={cx("run-badge", automation.enabled ? "ok" : "warn")}>
-          {automation.mode === "on-demand" ? "按需" : automation.enabled ? "启用" : "暂停"}
+          {automation.personalSchedule?.enabled ? "计划" : automation.mode === "on-demand" ? "按需" : automation.enabled ? "启用" : "暂停"}
         </span>
         <span>{automation.model} · {reasoningLabel(automation.reasoning)}</span>
         {automation.mode !== "on-demand" && <span>{automation.schedule}</span>}
@@ -7972,6 +8038,8 @@ function RunThread({
         <strong>任务内容</strong>
         <ExpandableText text={automation.prompt || "未设置任务内容"} limit={500} />
       </div>}
+
+      {automation.personalRoutine && onScheduleSaved && <PersonalRoutineSchedule key={automation.id} automation={automation} onSaved={onScheduleSaved} />}
 
       {repo.kind !== "personal" && <div className="task-grid automation-task-grid">
         <Metric label="后台任务" value={automation.mode === "on-demand" ? "按需触发" : automation.enabled ? "计划已启用" : "计划已暂停"} icon={<Timer size={16} />} />

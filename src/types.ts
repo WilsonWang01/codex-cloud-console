@@ -20,6 +20,14 @@ export type Automation = {
   name: string;
   repoId: string;
   personalRoutine?: boolean;
+  personalSchedule?: {
+    cadence: "daily" | "weekdays";
+    time: string;
+    timeZone: string;
+    enabled: boolean;
+    nextRunAt: string | null;
+    lastResult?: { status: string; scheduledAt: string; runId?: string; detail?: string };
+  } | null;
   revision?: number;
   mode?: string;
   timer: string;

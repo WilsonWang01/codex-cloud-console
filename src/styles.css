@@ -601,6 +601,52 @@ h3 {
   font-size: 12px;
 }
 
+.personal-routine-schedule {
+  display: grid;
+  gap: 12px;
+  padding: 15px 0;
+  border-bottom: 1px solid rgba(55, 79, 97, 0.12);
+}
+
+.personal-routine-schedule-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.personal-routine-schedule-fields {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) minmax(110px, 1fr) minmax(155px, 1.5fr);
+  gap: 10px;
+}
+
+.personal-routine-schedule-fields label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.personal-routine-schedule-fields input,
+.personal-routine-schedule-fields select {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px;
+  border: 1px solid rgba(55, 79, 97, 0.25);
+  border-radius: 6px;
+  background: #fff;
+  color: #17212b;
+  font: inherit;
+}
+
+@media (max-width: 520px) {
+  .personal-routine-schedule-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .personal-routine-schedule-fields label:last-child { grid-column: 1 / -1; }
+}
+
 .personal-routine-archive {
   margin-top: 14px;
   padding-top: 12px;

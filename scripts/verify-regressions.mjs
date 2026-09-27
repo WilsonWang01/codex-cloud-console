@@ -982,19 +982,44 @@ await check("personal and work reuse authentication without sharing threads or s
       method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 0, name: "旧名称", prompt: "旧任务" }),
     });
     assert.equal(staleRoutine.response.status, 409);
+    const scheduleWithoutConsent = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, enabled: true, cadence: "daily", time: "09:00", timeZone: "Asia/Shanghai" }),
+    });
+    assert.equal(scheduleWithoutConsent.response.status, 428);
+    const invalidSchedule = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, enabled: true, confirmModelCost: true, cadence: "daily", time: "09:00", timeZone: "Mars/Olympus" }),
+    });
+    assert.equal(invalidSchedule.response.status, 400);
     const updatedRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
       method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, name: "新名称", prompt: "只读整理明天资料" }),
     });
     assert.equal(updatedRoutine.response.status, 200);
     assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.name, "新名称");
+    const scheduleTime = new Date(Date.now() + 2 * 60 * 60_000);
+    const schedulePayload = { revision: 2, enabled: true, confirmModelCost: true, cadence: "daily",
+      time: `${String(scheduleTime.getUTCHours()).padStart(2, "0")}:${String(scheduleTime.getUTCMinutes()).padStart(2, "0")}`, timeZone: "UTC" };
+    const enabledSchedule = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(schedulePayload),
+    });
+    assert.equal(enabledSchedule.response.status, 200);
+    assert.equal(enabledSchedule.data.routine.personalSchedule.enabled, true);
+    const scheduledStatus = await jsonRequest(base, "/api/status");
+    assert.ok(Number.isFinite(Date.parse(scheduledStatus.data.automations.find((item) => item.id === routineId)?.nextRun)));
+    const pausedSchedule = await jsonRequest(base, `/api/personal/routines/${routineId}/schedule`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 3, enabled: false }),
+    });
+    assert.equal(pausedSchedule.response.status, 200);
+    assert.equal(pausedSchedule.data.routine.personalSchedule.enabled, false);
     const archivedRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}`, {
-      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 2 }),
+      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 4 }),
     });
     assert.equal(archivedRoutine.response.status, 200);
     assert.ok(archivedRoutine.data.routine.archivedAt);
     assert.equal((await jsonRequest(base, "/api/status")).data.automations.some((item) => item.id === routineId), false);
     const restoredRoutine = await jsonRequest(base, `/api/personal/routines/${routineId}/restore`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 3 }),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 5 }),
     });
     assert.equal(restoredRoutine.response.status, 200);
     assert.equal((await jsonRequest(base, "/api/status")).data.automations.find((item) => item.id === routineId)?.name, "新名称");

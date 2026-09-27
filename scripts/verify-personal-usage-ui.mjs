@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import vm from "node:vm";
 import ts from "typescript";
 import { chromium } from "playwright";
+import { nextPersonalOccurrence } from "../server/personal-schedule.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -76,6 +77,17 @@ await context.route("**/api/**", async (route) => {
       mode: "on-demand", enabled: true, nextRun: "按需触发", lastRun: "", timer: null, service: null, schedule: "手动运行", model: "gpt-6-sol", reasoning: "medium",
       run: { activeState: "inactive", failedState: "inactive", exitCode: "ready", logName: null, logUpdatedAt: null, logTail: [] } });
     return send({ ok: true, routine: { id, ...body, revision: 1 } }, 201);
+  }
+  if (url.pathname.startsWith("/api/personal/routines/") && url.pathname.endsWith("/schedule") && req.method() === "PATCH") {
+    const id = url.pathname.split("/").at(-2);
+    const routine = status.automations.find((item) => item.id === id);
+    if (!routine || routine.revision !== body.revision) return send({ error: "流程已修改" }, 409);
+    if (body.enabled && body.confirmModelCost !== true) return send({ error: "未确认额度" }, 428);
+    routine.personalSchedule = { cadence: body.cadence, time: body.time, timeZone: body.timeZone, enabled: body.enabled,
+      nextRunAt: body.enabled ? nextPersonalOccurrence(body, Date.now()) : null };
+    routine.nextRun = body.enabled ? routine.personalSchedule.nextRunAt : "按需触发";
+    routine.revision += 1;
+    return send({ ok: true, routine });
   }
   if (url.pathname.startsWith("/api/personal/routines/") && req.method() === "PATCH") {
     const routine = status.automations.find((item) => item.id === url.pathname.split("/").at(-1));
@@ -739,6 +751,31 @@ try {
   await routineEditor.getByRole("button", { name: "保存" }).click();
   await page.locator(".automation-row").filter({ hasText: "每天整理资料" }).waitFor();
   assert.equal(manualAutomationRuns, 0);
+  const scheduleForm = page.locator(".personal-routine-schedule");
+  await scheduleForm.waitFor();
+  assert.match(await scheduleForm.innerText(), /未启用/);
+  await scheduleForm.getByRole("combobox", { name: "频率" }).selectOption("weekdays");
+  await scheduleForm.getByRole("textbox", { name: "时区" }).fill("Asia/Shanghai");
+  page.once("dialog", (dialog) => { void dialog.dismiss(); });
+  await scheduleForm.getByRole("button", { name: "启用计划" }).click();
+  assert.equal(status.automations.find((item) => item.name === "每天整理资料").personalSchedule, undefined);
+  page.once("dialog", (dialog) => { void dialog.accept(); });
+  await scheduleForm.getByRole("button", { name: "启用计划" }).click();
+  await scheduleForm.getByText("已启用", { exact: true }).waitFor();
+  assert.equal(manualAutomationRuns, 0);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("personal-routine-schedule-320.png", out).pathname });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("personal-routine-schedule-390.png", out).pathname });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("personal-routine-schedule-desktop.png", out).pathname });
+  await page.setViewportSize({ width: 320, height: 800 });
+  await scheduleForm.getByRole("button", { name: "暂停" }).click();
+  await scheduleForm.getByText("未启用").waitFor();
+  await page.reload();
+  await scheduleForm.getByText("未启用").waitFor();
   await page.getByRole("button", { name: "编辑" }).click();
   await routineEditor.getByRole("textbox", { name: "名称" }).fill("每次整理资料");
   await routineEditor.getByRole("button", { name: "保存" }).click();
