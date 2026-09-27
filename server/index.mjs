@@ -27,6 +27,8 @@ import { readConnectedApps } from "./connected-apps.mjs";
 import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore } from "./personal-facts.mjs";
+import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
+import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
@@ -57,6 +59,8 @@ const stateRoot =
   (process.env.NODE_ENV === "production" ? path.join(cloudRoot, "state") : path.join(projectRoot, ".codex-cloud-state"));
 const chatHistoryPath = path.join(stateRoot, "chat-history.json");
 const personalFactsStore = createPersonalFactsStore(path.join(stateRoot, "personal-facts.json"));
+const personalCommitmentsStore = createPersonalCommitmentsStore(path.join(stateRoot, "personal-commitments.json"));
+const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
 const auditEventsPath = path.join(stateRoot, "audit-events.json");
@@ -790,6 +794,7 @@ async function cleanupStaleStateTempFiles() {
     auditEventsPath,
     attentionStatePath,
     notificationStatePath,
+    personalBriefStatePath,
     diagnosticsStatePath,
     codexAppStatusCachePath,
     codexModelsCachePath,
@@ -1906,7 +1911,7 @@ async function appServerThreadParams(repo, runtime) {
     personality: "pragmatic",
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
-      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, await personalFactsStore.list())] : []),
+      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, await personalFactsStore.list(), await personalCommitmentsStore.list())] : []),
     ].join("\n"),
     config: {
       model_reasoning_effort: runtime.reasoning,
@@ -5981,6 +5986,7 @@ function normalizePushSubscription(value = {}) {
     lastSeenAt: value.lastSeenAt ? String(value.lastSeenAt) : new Date().toISOString(),
     lastDeliveredAt: value.lastDeliveredAt ? String(value.lastDeliveredAt) : null,
     lastError: value.lastError ? compactSingleLine(value.lastError, 360) : null,
+    personalReminders: normalizePersonalReminderSettings(value.personalReminders || {}),
   };
 }
 
@@ -6045,7 +6051,9 @@ function pushNotificationStatusFromState(state = {}) {
 async function pushNotificationStatus(state = null) {
   const currentState = state || (await readNotificationState());
   const push = normalizePushState(currentState.push || {});
-  const current = await ensurePushState(currentState, { persist: !push.vapidPublicKey || !push.vapidPrivateKey });
+  const current = push.vapidPublicKey && push.vapidPrivateKey
+    ? currentState
+    : await serializeNotificationDelivery("attention", async () => ensurePushState(await readNotificationState(), { persist: true }));
   return pushNotificationStatusFromState(current);
 }
 
@@ -6276,14 +6284,16 @@ async function externalNotificationStatus(state = null) {
   };
 }
 
-async function notifyAttentionItems(items, reason = "attention") {
-  return serializeNotificationDelivery("attention", () => notifyAttentionItemsWithinQueue(items, reason));
+async function notifyAttentionItems(items, reason = "attention", options = {}) {
+  return serializeNotificationDelivery("attention", () => notifyAttentionItemsWithinQueue(items, reason, options));
 }
 
-async function notifyAttentionItemsWithinQueue(items, reason = "attention") {
+async function notifyAttentionItemsWithinQueue(items, reason = "attention", { personalOnly = false } = {}) {
   const state = await ensurePushState(await readNotificationState());
-  const channels = notificationChannels().filter((channel) => channel.enabled);
+  const channels = personalOnly ? [] : notificationChannels().filter((channel) => channel.enabled);
   for (const subscription of Object.values(state.push?.subscriptions || {})) {
+    if (personalOnly && (!subscription.personalReminders.enabled || inPersonalQuietHours(subscription.personalReminders))) continue;
+    if (!personalOnly && reason === "personal-reminder") continue;
     channels.push({
       id: `push:${subscription.id}`,
       label: "Browser push",
@@ -6352,8 +6362,17 @@ async function runExternalNotificationCheck(reason = "poll") {
   if (notificationCheckRunning) return { ok: false, skipped: true, reason: "already-running", sent: [], failed: [] };
   notificationCheckRunning = true;
   try {
+    let personal = { skipped: true, reason: "no-due-items" };
+    try {
+      const reminders = personalReminderItems(await personalCommitmentsStore.list());
+      if (reminders.length) personal = await notifyAttentionItems(reminders, "personal-reminder", { personalOnly: true });
+    } catch (error) {
+      personal = { ok: false, error: error.message || "personal reminder failed" };
+      console.warn(`Personal reminder check failed: ${personal.error}`);
+    }
     const status = await getStatus();
-    return await notifyAttentionItems(status.attention?.items || [], reason);
+    const attention = await notifyAttentionItems(status.attention?.items || [], reason);
+    return { ...attention, personal };
   } finally {
     notificationCheckRunning = false;
   }
@@ -8571,14 +8590,18 @@ app.post("/api/notifications/push/subscribe", async (req, res) => {
       lastSeenAt: new Date().toISOString(),
     });
     if (!subscription) return res.status(400).json({ ok: false, error: "Invalid push subscription" });
-    const state = await ensurePushState(await readNotificationState());
-    state.push.subscriptions[subscription.id] = {
-      ...(state.push.subscriptions[subscription.id] || {}),
-      ...subscription,
-      createdAt: state.push.subscriptions[subscription.id]?.createdAt || subscription.createdAt,
-      lastSeenAt: new Date().toISOString(),
-    };
-    await writeNotificationState(state);
+    await serializeNotificationDelivery("attention", async () => {
+      const state = await ensurePushState(await readNotificationState());
+      const existingSubscription = state.push.subscriptions[subscription.id];
+      state.push.subscriptions[subscription.id] = {
+        ...(existingSubscription || {}),
+        ...subscription,
+        createdAt: existingSubscription?.createdAt || subscription.createdAt,
+        lastSeenAt: new Date().toISOString(),
+        personalReminders: existingSubscription?.personalReminders || normalizePersonalReminderSettings({ timeZone: req.body?.personalTimeZone || "UTC" }),
+      };
+      await writeNotificationState(state);
+    });
     res.json({ ok: true, subscriptionId: subscription.id, pushNotifications: await pushNotificationStatus() });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || "Push subscribe failed" });
@@ -8590,10 +8613,13 @@ app.delete("/api/notifications/push/subscribe", async (req, res) => {
     const endpoint = String(req.body?.endpoint || "").trim();
     const id = String(req.body?.id || (endpoint ? pushSubscriptionId(endpoint) : "")).trim();
     if (!id) return res.status(400).json({ ok: false, error: "Missing push subscription id" });
-    const state = await ensurePushState(await readNotificationState());
-    const existed = Boolean(state.push.subscriptions[id]);
-    delete state.push.subscriptions[id];
-    await writeNotificationState(state);
+    const existed = await serializeNotificationDelivery("attention", async () => {
+      const state = await ensurePushState(await readNotificationState());
+      const found = Boolean(state.push.subscriptions[id]);
+      delete state.push.subscriptions[id];
+      await writeNotificationState(state);
+      return found;
+    });
     res.json({ ok: true, removed: existed, pushNotifications: await pushNotificationStatus() });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || "Push unsubscribe failed" });
@@ -8602,19 +8628,22 @@ app.delete("/api/notifications/push/subscribe", async (req, res) => {
 
 app.post("/api/notifications/push/test", async (_req, res) => {
   try {
-    const state = await ensurePushState(await readNotificationState());
-    const item = {
-      id: `push-test:${Date.now().toString(36)}`,
-      type: "notification-test",
-      tone: "active",
-      title: "Codex Cloud Push 测试",
-      body: "这是一条由云端 console 发送的浏览器 push 测试通知。",
-      time: new Date().toISOString(),
-      action: "settings",
-    };
-    state.push.lastTestAt = new Date().toISOString();
-    const result = await sendPushNotifications(state, item, "manual-push-test");
-    await writeNotificationState(state);
+    const result = await serializeNotificationDelivery("attention", async () => {
+      const state = await ensurePushState(await readNotificationState());
+      const item = {
+        id: `push-test:${Date.now().toString(36)}`,
+        type: "notification-test",
+        tone: "active",
+        title: "Codex Cloud Push 测试",
+        body: "这是一条由云端 console 发送的浏览器 push 测试通知。",
+        time: new Date().toISOString(),
+        action: "settings",
+      };
+      state.push.lastTestAt = new Date().toISOString();
+      const delivery = await sendPushNotifications(state, item, "manual-push-test");
+      await writeNotificationState(state);
+      return delivery;
+    });
     const status = await pushNotificationStatus();
     res.status(result.ok ? 200 : 400).json({ ok: result.ok, result, pushNotifications: status });
   } catch (error) {
@@ -10301,6 +10330,88 @@ app.delete("/api/personal/facts/:id", async (req, res) => {
   catch (error) { sendRouteError(res, error); }
 });
 
+app.get("/api/personal/commitments", async (_req, res) => {
+  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, commitments: await personalCommitmentsStore.list() }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/commitments", async (req, res) => {
+  try { res.status(201).json({ ok: true, commitment: await personalCommitmentsStore.create(req.body) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.patch("/api/personal/commitments/:id", async (req, res) => {
+  try {
+    if (req.body?.sessionId !== undefined && req.body.sessionId !== null) {
+      const session = (await readChatStore()).sessions[req.body.sessionId];
+      if (!session || session.repoId !== personalRepoId) return res.status(404).json({ ok: false, error: "个人对话不存在" });
+    }
+    res.json({ ok: true, commitment: await personalCommitmentsStore.update(req.params.id, req.body) });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.delete("/api/personal/commitments/:id", async (req, res) => {
+  try { res.json({ ok: true, commitment: await personalCommitmentsStore.remove(req.params.id, req.body?.revision) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.get("/api/personal/brief", async (_req, res) => {
+  try {
+    const [commitments, runs, state] = await Promise.all([
+      personalCommitmentsStore.list(), readAutomationRuns(),
+      readJsonState(personalBriefStatePath, { version: 1, reviewedAt: null }),
+    ]);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, brief: buildPersonalBrief(commitments, runs.runs, state.reviewedAt) });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/brief/review", async (req, res) => {
+  try {
+    const through = String(req.body?.through || "");
+    const time = Date.parse(through);
+    if (!Number.isFinite(time) || new Date(time).toISOString() !== through || time > Date.now()) {
+      return res.status(400).json({ ok: false, error: "简报时间无效，请刷新后重试" });
+    }
+    const reviewedAt = await enqueueWrite("personal-brief", async () => {
+      const previous = await readJsonState(personalBriefStatePath, { version: 1, reviewedAt: null });
+      const next = Math.max(Date.parse(previous.reviewedAt || "") || 0, time);
+      const value = new Date(next).toISOString();
+      await atomicWriteJson(personalBriefStatePath, { version: 1, reviewedAt: value });
+      return value;
+    });
+    res.json({ ok: true, reviewedAt });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/reminders/status", async (req, res) => {
+  try {
+    const endpoint = String(req.body?.endpoint || "");
+    const state = await readNotificationState();
+    const subscription = state.push.subscriptions[pushSubscriptionId(endpoint)];
+    if (!endpoint || subscription?.endpoint !== endpoint) return res.status(404).json({ ok: false, error: "本机尚未订阅浏览器通知" });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, settings: subscription.personalReminders });
+  } catch (error) { sendRouteError(res, error); }
+});
+
+app.patch("/api/personal/reminders", async (req, res) => {
+  try {
+    const endpoint = String(req.body?.endpoint || "");
+    const settings = normalizePersonalReminderSettings(req.body?.settings || {});
+    const result = await serializeNotificationDelivery("attention", async () => {
+      const state = await readNotificationState();
+      const subscription = state.push.subscriptions[pushSubscriptionId(endpoint)];
+      if (!endpoint || subscription?.endpoint !== endpoint) return null;
+      subscription.personalReminders = settings;
+      await writeNotificationState(state);
+      return settings;
+    });
+    if (!result) return res.status(404).json({ ok: false, error: "本机尚未订阅浏览器通知" });
+    res.json({ ok: true, settings: result });
+  } catch (error) { sendRouteError(res, error); }
+});
+
 async function pipePersonalFileFromWorker(res, relativePath, preview) {
   const query = new URLSearchParams({ path: relativePath, preview: preview ? "1" : "0" });
   const upstream = await personalFileBridgeStream(personalFileSocket, "GET", `/files/content?${query}`);
@@ -11400,9 +11511,13 @@ await reconcileQueuedTurnsOnStartup().catch((error) => {
 
 function startExternalNotificationWatcher() {
   const pollMs = Math.max(30_000, Number(process.env.CODEX_CLOUD_NOTIFY_POLL_MS || 60_000));
-  if (!notificationChannels().some((channel) => channel.enabled)) return;
   const tick = () => {
-    runExternalNotificationCheck("poll").catch((error) => {
+    (async () => {
+      const hasExternal = notificationChannels().some((channel) => channel.enabled);
+      const state = await readNotificationState();
+      const hasPush = Object.keys(state.push.subscriptions).length > 0;
+      if (hasExternal || hasPush) await runExternalNotificationCheck("poll");
+    })().catch((error) => {
       console.warn(`External notification check failed: ${error.message}`);
     });
   };

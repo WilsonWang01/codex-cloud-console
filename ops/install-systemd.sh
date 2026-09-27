@@ -165,7 +165,7 @@ while IFS= read -r release_path; do
     retained=$((retained + 1))
     continue
   fi
-  rm -rf -- "$release_path"
+  sudo rm -rf -- "$release_path"
 done < <(find "$RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d -print | LC_ALL=C sort -r)
 
 echo "Deployed release: $RELEASE_DIR"

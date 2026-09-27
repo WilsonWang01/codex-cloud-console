@@ -17,15 +17,17 @@ test("approval is bound to exact request and can only be decided once", async ()
 });
 
 test("decline, timeout, and disconnect fail closed", async () => {
-  const broker = createApprovalBroker({ timeoutMs: 15 });
+  const broker = createApprovalBroker();
   const file = broker.request("item/fileChange/requestApproval", { threadId: "t", itemId: "i" });
   const [item] = broker.list();
   broker.decide(item.id, { decision: "decline", digest: item.digest });
   assert.deepEqual(await file, { decision: "decline" });
 
-  const timedOut = broker.request("execCommandApproval", { command: ["echo", "test"] });
+  const timeoutBroker = createApprovalBroker({ timeoutMs: 40 });
+  const timedOut = timeoutBroker.request("execCommandApproval", { command: ["echo", "test"] });
+  await new Promise((resolve) => setTimeout(resolve, 80));
   assert.deepEqual(await timedOut, { decision: { denied: { rejection: "Approval timed out" } } });
-  assert.equal(broker.list().length, 0);
+  assert.equal(timeoutBroker.list().length, 0);
 
   const permission = broker.request("item/permissions/requestApproval", { permissions: { network: { enabled: true } } });
   broker.closeAll();

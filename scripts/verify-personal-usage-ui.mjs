@@ -14,12 +14,15 @@ const status = JSON.parse(JSON.stringify(fixture.statusFixture));
 status.health.ok = true;
 status.health.layers.appServer = { ok: true, running: true };
 status.repos.push({ id: "_personal", name: "个人助理", kind: "personal", runtimeMode: "shared", executionAvailable: true, path: "/tmp/personal", remote: "", accent: "teal", present: true, branch: "", commit: "", dirty: false, statusText: "个人空间 · 共用账号", lastCommit: "非 Git 空间" });
+status.automations.push({ id: "personal-plan", name: "每周资料整理", repoId: "_personal", enabled: true, nextRun: new Date(Date.now() + 86_400_000).toISOString(), lastRun: "", timer: "", service: "", schedule: "", model: "gpt-6-sol", reasoning: "medium", run: { activeState: "", failedState: "", exitCode: "", logName: null, logUpdatedAt: null, logTail: [] } });
 status.diagnostics = { repoId: "sample-app", generatedAt: new Date().toISOString(), ok: false, summary: { total: 1, ok: 0, warn: 0, danger: 1 }, checks: [{ id: "old-work-auth", label: "其他项目的历史诊断", tone: "danger", ok: false, summary: "旧登录错误", detail: "", durationMs: 0 }] };
 const sessions = ["sample-app", "_personal"].map((repoId) => ({
   id: `${repoId}-session`, repoId, title: `${repoId} 对话`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   messageCount: 0, isDraft: true, draft: { input: "", attachments: [], revision: 0 }, model: "gpt-5.6-terra", reasoning: "medium",
   sandbox: repoId === "_personal" ? "read-only" : "danger-full-access", approval: repoId === "_personal" ? "on-request" : "never", search: true,
 }));
+sessions.find((item) => item.repoId === "_personal").goal = { threadId: "personal-thread", objective: "整理家庭旅行计划", status: "active", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: Date.now() / 1000, updatedAt: Date.now() / 1000 };
+let newSessionCount = 0;
 let pending = [{
   id: "approval-test", method: "item/commandExecution/requestApproval", digest: "digest-test", owner: { repoId: "sample-app", sessionId: "sample-app-session" },
   createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), params: { command: "echo approval-check", cwd: "/tmp" },
@@ -42,6 +45,13 @@ let personalFiles = [
   { path: ".codex-cloud/uploads/2026-09-26/notes.txt", name: "notes.txt", kind: "input", size: 12, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
 ];
 let personalFacts = [];
+let personalCommitments = [];
+let briefReviewedAt = null;
+const briefEvent = { id: "run:recent-personal:completed", kind: "completed", title: "资料整理完成", detail: "定时任务已完成", time: new Date().toISOString(), sessionId: "_personal-session" };
+const personalPushEndpoint = "https://push.example.test/personal-browser";
+let personalReminderSettings = { enabled: false, timeZone: "Asia/Shanghai", quietStart: "22:00", quietEnd: "08:00" };
+let failNextCommitmentLink = false;
+let oldCommitmentApi = false;
 let usageRace = false;
 let usageFailure = false;
 const errors = [];
@@ -60,9 +70,37 @@ await context.route("**/api/**", async (route) => {
     return send({ ok: true, files: personalFiles });
   }
   if (url.pathname === "/api/personal/files/content") return route.fulfill({ status: 200, contentType: "text/plain", body: "sample result\n" });
+  if (url.pathname === "/api/personal/brief") return send({ ok: true, brief: { until: new Date().toISOString(), reviewedAt: briefReviewedAt, items: briefReviewedAt ? [] : [briefEvent], total: briefReviewedAt ? 0 : 1 } });
+  if (url.pathname === "/api/personal/brief/review") { briefReviewedAt = body.through; return send({ ok: true, reviewedAt: briefReviewedAt }); }
+  if (url.pathname === "/api/personal/reminders/status") return body.endpoint === personalPushEndpoint ? send({ ok: true, settings: personalReminderSettings }) : send({ ok: false, error: "未订阅" }, 404);
+  if (url.pathname === "/api/personal/reminders" && req.method() === "PATCH") { personalReminderSettings = body.settings; return send({ ok: true, settings: personalReminderSettings }); }
   if (url.pathname === "/api/personal/facts") {
     if (req.method() === "POST") { const fact = { id: `fact-${personalFacts.length + 1}`, label: body.label, value: body.value, source: "user", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; personalFacts.push(fact); return send({ ok: true, fact }, 201); }
     return send({ ok: true, facts: personalFacts });
+  }
+  if (url.pathname === "/api/personal/commitments") {
+    if (oldCommitmentApi) return send({ ok: false, error: "Unknown API route: GET /personal/commitments" }, 404);
+    if (req.method() === "POST") {
+      const now = new Date().toISOString();
+      const commitment = { id: `commitment-${personalCommitments.length + 1}`, title: body.title, nextStep: body.nextStep || "", dueAt: body.dueAt || null, status: "active", sessionId: null, source: "user", revision: 1, createdAt: now, updatedAt: now, completedAt: null };
+      personalCommitments.push(commitment);
+      return send({ ok: true, commitment }, 201);
+    }
+    return send({ ok: true, commitments: personalCommitments });
+  }
+  if (url.pathname.startsWith("/api/personal/commitments/")) {
+    const id = url.pathname.split("/").at(-1);
+    const item = personalCommitments.find((entry) => entry.id === id);
+    if (!item) return send({ ok: false, error: "not found" }, 404);
+    if (item.revision !== body.revision) return send({ ok: false, error: "stale" }, 409);
+    if (req.method() === "DELETE") { personalCommitments = personalCommitments.filter((entry) => entry.id !== id); return send({ ok: true, commitment: item }); }
+    if (body.sessionId && failNextCommitmentLink) { failNextCommitmentLink = false; return send({ ok: false, error: "temporary link failure" }, 503); }
+    if (body.sessionId && !sessions.some((session) => session.id === body.sessionId && session.repoId === "_personal")) return send({ ok: false, error: "wrong space" }, 404);
+    Object.assign(item, Object.fromEntries(Object.entries(body).filter(([key]) => ["title", "nextStep", "dueAt", "status", "sessionId"].includes(key))));
+    item.revision += 1;
+    item.updatedAt = new Date().toISOString();
+    item.completedAt = item.status === "done" ? item.updatedAt : null;
+    return send({ ok: true, commitment: item });
   }
   if (url.pathname.startsWith("/api/personal/facts/")) {
     const id = url.pathname.split("/").at(-1);
@@ -126,7 +164,14 @@ await context.route("**/api/**", async (route) => {
     if (req.method() === "PATCH") session.draft = { input: body.input, attachments: body.attachments, revision: session.draft.revision + 1 };
     return send({ ok: true, repoId, sessionId: session.id, draft: session.draft });
   }
-  if (url.pathname === "/api/chat/sessions" || url.pathname === "/api/chat/history") return send({ ok: true, authoritative: true, repoId, activeSessionId: `${repoId}-session`, sessions: sessions.filter((item) => item.repoId === repoId), messages: [] });
+  if (url.pathname === "/api/chat/sessions" || url.pathname === "/api/chat/history") {
+    if (req.method() === "POST") {
+      const id = `${repoId}-new-${++newSessionCount}`;
+      sessions.push({ id, repoId, title: body.title || "新会话", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messageCount: 0, isDraft: true, draft: { input: "", attachments: [], revision: 0 }, model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only", approval: "on-request", search: true });
+      return send({ ok: true, authoritative: true, repoId, activeSessionId: id, sessions: sessions.filter((item) => item.repoId === repoId), messages: [] });
+    }
+    return send({ ok: true, authoritative: true, repoId, activeSessionId: `${repoId}-session`, sessions: sessions.filter((item) => item.repoId === repoId), messages: [] });
+  }
   if (url.pathname === "/api/chat/active") return send({ ok: true, turn: queueFlow ? { id: "active-queue-ui", kind: "turn", repoId: "_personal", sessionId: "_personal-session", threadId: "thread-ui", turnId: "turn-ui", startedAt: new Date().toISOString(), completed: false, events: [] } : null, compact: null, queuedTurn: sessions.find((item) => item.id === url.searchParams.get("sessionId"))?.queuedTurn || null });
   if (url.pathname === "/api/chat/job-events" && queueFlow) {
     await new Promise((resolve) => { releaseJobEvents = resolve; });
@@ -141,7 +186,7 @@ await context.route("**/api/**", async (route) => {
 
 const page = await context.newPage();
 page.on("pageerror", (error) => errors.push(error.message));
-const openRecentPersonalChat = () => page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "继续上次对话" }) }).locator(".personal-task-row").first().click();
+const openRecentPersonalChat = () => page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "继续对话" }) }).locator(".personal-task-row").first().click();
 const out = new URL("../docs/research/acceptance/personal-usage-2026-09-26/", import.meta.url);
 await fs.mkdir(out, { recursive: true });
 try {
@@ -149,8 +194,24 @@ try {
   await page.goto(`${baseUrl}#/project/sample-app/thread/sample-app-session`);
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
   await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "可以交办" }).waitFor();
+  await page.getByRole("heading", { name: "关注事项" }).waitFor();
+  await page.getByRole("heading", { name: "新变化" }).waitFor();
+  await page.getByText("资料整理完成", { exact: true }).waitFor();
+  await page.getByRole("button", { name: /整理家庭旅行计划/ }).waitFor();
+  await page.getByText("每周资料整理", { exact: true }).waitFor();
   assert.equal(await page.getByText("echo approval-check", { exact: true }).count(), 0);
   await page.screenshot({ path: new URL("today-desktop.png", out).pathname, fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  assert.ok(await page.locator(".personal-today .command-button").evaluate((element) => element.getBoundingClientRect().height >= 44));
+  await page.screenshot({ path: new URL("today-390.png", out).pathname, fullPage: true });
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("today-320.png", out).pathname, fullPage: true });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.locator(".personal-brief").getByRole("button", { name: "全部标记已查看" }).click();
+  await page.locator(".personal-brief").getByText("上次查看后暂无新变化。").waitFor();
   assert.equal(await page.getByText("其他项目的历史诊断", { exact: true }).count(), 0);
   await openRecentPersonalChat();
   await page.locator(".personal-scope-notice").waitFor();
@@ -344,9 +405,9 @@ try {
   await page.getByRole("button", { name: "今日", exact: true }).click();
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.getByText("echo personal approval check", { exact: true }).waitFor();
-  assert.equal(await page.locator(".personal-overview span:first-child strong").innerText(), "1");
+  assert.match(await page.locator(".personal-daily-summary").innerText(), /1 项需要你处理/);
   assert.equal(await page.getByText("echo approval-check", { exact: true }).count(), 0);
-  await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "最近文件" }) }).getByRole("button", { name: /demo.md/ }).click();
+  await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "最近结果" }) }).getByRole("button", { name: /demo.md/ }).click();
   await page.getByRole("heading", { name: "助理生成的文件" }).waitFor();
   await page.getByRole("heading", { name: "demo.md" }).waitFor();
   await page.screenshot({ path: new URL("material-desktop.png", out).pathname, fullPage: true });
@@ -394,7 +455,7 @@ try {
   queuedSession.queuedTurn.status = "paused";
   queuedSession.queuedTurn.reason = "上一轮未成功，排队已暂停";
   await page.reload();
-  await page.getByRole("button", { name: /排队待核对.*上一轮未成功/ }).waitFor();
+  await page.getByRole("button", { name: /待核对.*上一轮未成功/ }).waitFor();
   await page.evaluate(() => { location.hash = "/project/_personal/thread/_personal-session"; });
   await page.getByRole("button", { name: "撤回到草稿" }).waitFor();
   await page.getByRole("button", { name: "撤回到草稿" }).click();
@@ -404,7 +465,109 @@ try {
   assert.deepEqual(steeredMessages, ["下一个待办"]);
   queueFlow = false;
   releaseJobEvents?.();
-  await page.getByText("云端 Codex 任务已完成。").waitFor();
+  await page.waitForFunction(() => document.querySelector(".composer-shell textarea")?.getAttribute("placeholder") === "向个人助理发送消息");
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.getByRole("heading", { name: "可以交办" }).waitFor();
+  const beforePrompt = submittedMessages;
+  const draftSaved = page.waitForResponse((response) => response.url().includes("/api/chat/sessions/_personal-new-1/draft") && response.request().method() === "PATCH");
+  await page.locator(".personal-today .personal-guide").getByRole("button", { name: /调研一个问题/ }).click();
+  await page.locator(".session-current[data-session-id='_personal-new-1']").waitFor();
+  assert.match(await composer.inputValue(), /帮我调研这个问题/);
+  await draftSaved;
+  assert.match(sessions.find((item) => item.id === "_personal-new-1").draft.input, /帮我调研这个问题/);
+  assert.equal(submittedMessages, beforePrompt);
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.getByRole("heading", { name: "关注事项" }).waitFor();
+  await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).click();
+  await page.getByRole("textbox", { name: "事项名称" }).fill("周末前整理行程");
+  await page.getByRole("textbox", { name: "下一步" }).fill("核对酒店和车次");
+  const yesterdayLocal = new Date(Date.now() - 86_400_000);
+  await page.locator('.personal-commitment-editor input[type="datetime-local"]').fill(new Date(yesterdayLocal.getTime() - yesterdayLocal.getTimezoneOffset() * 60_000).toISOString().slice(0, 16));
+  await page.getByRole("button", { name: "添加事项" }).click();
+  await page.getByText("周末前整理行程", { exact: true }).waitFor();
+  pending = [];
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.getByText("1 项关注事项今天或此前到期").waitFor();
+  assert.equal(personalCommitments.length, 1);
+  const commitmentDraftSaved = page.waitForResponse((response) => response.url().includes("/api/chat/sessions/_personal-new-2/draft") && response.request().method() === "PATCH");
+  await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
+  await page.locator(".session-current[data-session-id='_personal-new-2']").waitFor();
+  await commitmentDraftSaved;
+  assert.match(await composer.inputValue(), /周末前整理行程[\s\S]*核对酒店和车次/);
+  assert.equal(personalCommitments[0].sessionId, "_personal-new-2");
+  assert.equal(submittedMessages, beforePrompt);
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.locator(".personal-commitments").getByRole("button", { name: "继续草稿" }).waitFor();
+  await page.getByText(/对话草稿未发送/).waitFor();
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("today-commitment-active-390.png", out).pathname });
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("today-commitment-active-320.png", out).pathname });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "完成 周末前整理行程" }).click();
+  await page.getByText("已完成 1 项").waitFor();
+  assert.equal(personalCommitments[0].status, "done");
+  await page.locator(".personal-completed summary").click();
+  personalCommitments[0].revision += 1;
+  await page.getByRole("button", { name: "重新跟进 周末前整理行程" }).click();
+  await page.getByText("stale", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "刷新关注事项" }).click();
+  await page.waitForFunction(() => !document.querySelector(".personal-commitments .warn-text"));
+  await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).click();
+  await page.getByRole("textbox", { name: "事项名称" }).fill("给家人整理照片");
+  await page.getByRole("button", { name: "添加事项" }).click();
+  await page.getByText("给家人整理照片", { exact: true }).waitFor();
+  failNextCommitmentLink = true;
+  const beforeRetry = newSessionCount;
+  await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
+  await page.getByText(/temporary link failure.*重试将沿用该对话/).waitFor();
+  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).click();
+  await page.locator(`.session-current[data-session-id='_personal-new-${beforeRetry + 1}']`).waitFor();
+  assert.equal(newSessionCount, beforeRetry + 1);
+  assert.equal(personalCommitments[1].sessionId, `_personal-new-${beforeRetry + 1}`);
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("today-commitments-390.png", out).pathname });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.locator(".sidebar .nav-item").filter({ hasText: "设置" }).click();
+  await page.getByRole("heading", { name: "连接服务" }).waitFor();
+  const callableCalendar = page.locator(".personal-settings .connected-service-row").filter({ hasText: "Calendar" });
+  assert.equal(await page.locator(".personal-settings .connected-service-row").filter({ hasText: "Gmail" }).getByRole("button", { name: "起草" }).count(), 0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  assert.ok(await callableCalendar.getByRole("button", { name: "起草" }).evaluate((element) => element.getBoundingClientRect().height >= 44));
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await callableCalendar.getByRole("button", { name: "起草" }).click();
+  await page.locator(`.session-current[data-session-id='_personal-new-${newSessionCount}']`).waitFor();
+  assert.match(await composer.inputValue(), /已连接服务 "Calendar"[\s\S]*我的任务是/);
+  assert.equal(submittedMessages, beforePrompt);
+  oldCommitmentApi = true;
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.getByText("服务器尚未更新个人事项功能", { exact: true }).waitFor();
+  assert.equal(await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).isDisabled(), true);
+  assert.equal(await page.locator(".personal-commitments").getByText("暂无关注事项。").count(), 0);
+  const reminderPage = await context.newPage();
+  reminderPage.on("pageerror", (error) => errors.push(error.message));
+  await reminderPage.addInitScript((endpoint) => {
+    if (!("PushManager" in window)) Object.defineProperty(window, "PushManager", { configurable: true, value: class {} });
+    const registration = { scope: `${location.origin}/`, active: { scriptURL: `${location.origin}/codex-cloud-sw.js` }, pushManager: { getSubscription: async () => ({ endpoint }) } };
+    Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { getRegistrations: async () => [registration], getRegistration: async () => registration } });
+  }, personalPushEndpoint);
+  await reminderPage.goto(`${baseUrl}#/project/_personal/today`);
+  await reminderPage.locator(".sidebar .nav-item").filter({ hasText: "设置" }).click();
+  await reminderPage.getByLabel("到期时在本机浏览器提醒我").waitFor();
+  await reminderPage.setViewportSize({ width: 390, height: 844 });
+  await reminderPage.getByLabel("到期时在本机浏览器提醒我").check();
+  await reminderPage.getByLabel("安静时段开始").fill("21:30");
+  await reminderPage.getByRole("button", { name: "保存提醒设置" }).click();
+  await reminderPage.getByText("提醒设置已保存。").waitFor();
+  assert.deepEqual(personalReminderSettings, { enabled: true, timeZone: "Asia/Shanghai", quietStart: "21:30", quietEnd: "08:00" });
+  assert.equal(await reminderPage.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await reminderPage.screenshot({ path: new URL("personal-reminders-390.png", out).pathname, fullPage: true });
+  await reminderPage.close();
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

@@ -18,7 +18,7 @@ function safeAuthorizationUrl(value: string | null) {
   } catch { return undefined; }
 }
 
-export default function ConnectedServices({ repoId }: { repoId: string }) {
+export default function ConnectedServices({ repoId, onPrepare }: { repoId: string; onPrepare?: (appName: string) => void }) {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -75,12 +75,15 @@ export default function ConnectedServices({ repoId }: { repoId: string }) {
         return <article className="connected-service-row" key={app.id}>
           {app.callable ? <CheckCircle2 size={18} /> : <Link2 size={18} />}
           <span><strong>{app.name}</strong><small>{state}{!app.enabled && app.accessible ? " · 配置未启用" : ""}</small><small>{app.description}</small></span>
-          {href ? <a className="mini-action" href={href} target="_blank" rel="noopener noreferrer" aria-label={`${app.callable ? "管理" : "连接"}${app.name}`}><ExternalLink size={14} />{app.callable ? "管理" : "前往授权"}</a> : !app.callable ? <a className="mini-action" href="https://chatgpt.com/apps" target="_blank" rel="noopener noreferrer" aria-label={`在官方目录查找${app.name}`}><ExternalLink size={14} />官方目录</a> : null}
+          <div className="connected-service-actions">
+            {catalog?.runtimeVerified && app.callable === true && onPrepare && <button type="button" className="mini-action" onClick={() => onPrepare(app.name)}>起草</button>}
+            {href ? <a className="mini-action" href={href} target="_blank" rel="noopener noreferrer" aria-label={`${app.callable ? "管理" : "连接"}${app.name}`}><ExternalLink size={14} />{app.callable ? "管理" : "前往授权"}</a> : !app.callable ? <a className="mini-action" href="https://chatgpt.com/apps" target="_blank" rel="noopener noreferrer" aria-label={`在官方目录查找${app.name}`}><ExternalLink size={14} />官方目录</a> : null}
+          </div>
         </article>;
       })}
     </div>
     {!loading && !error && apps.length === 0 && <p className="empty-copy">{query ? "没有匹配的服务。" : "当前没有可展示的服务。可前往官方目录管理连接，或查看已配置的 MCP 服务。"}</p>}
     <a className="mini-action connected-all-apps" href="https://chatgpt.com/apps" target="_blank" rel="noopener noreferrer"><ExternalLink size={14} />管理全部服务</a>
-    <details className="connected-permission-details"><summary>授权与权限说明</summary><p>服务授权由官方页面处理，可能与同账号的工作空间共用。外发、修改、删除和付费操作需要单独确认；这里不会获取本机软件或设备权限。</p></details>
+    <details className="connected-permission-details"><summary>授权与权限说明</summary><p>“可调用”只表示工具在当前运行时可用，不保证具体账号数据可读或业务操作成功。服务授权由官方页面处理，可能与同账号的工作空间共用。外发、修改、删除和付费操作需要单独确认；这里不会获取本机软件或设备权限。</p></details>
   </section>;
 }

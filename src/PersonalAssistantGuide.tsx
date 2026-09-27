@@ -14,7 +14,7 @@ function taskHint(title: string, fallback: string, connected: { mail: boolean | 
   return fallback;
 }
 
-export default function PersonalAssistantGuide({ onChoose, onConnect }: { onChoose: (prompt: string) => void; onConnect: () => void }) {
+export default function PersonalAssistantGuide({ onChoose, onConnect, heading = "今天想处理什么？" }: { onChoose: (prompt: string) => void; onConnect: () => void; heading?: string }) {
   const [connected, setConnected] = useState<{ mail: boolean | null; calendar: boolean | null } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -31,7 +31,7 @@ export default function PersonalAssistantGuide({ onChoose, onConnect }: { onChoo
     return () => controller.abort();
   }, []);
   return <section className="personal-guide" aria-label="个人助理任务建议">
-    <h3>今天想处理什么？</h3>
+    <h3>{heading}</h3>
     <div className="personal-task-list">
       {tasks.map(({ icon: Icon, title, prompt, hint }) => <div className="personal-task-choice" key={title}>
         <button className="personal-task-primary" type="button" onClick={() => onChoose(prompt)}>

@@ -6988,6 +6988,8 @@ pre {
 .connected-service-list { display: grid; }
 .connected-service-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--border); }
 .connected-service-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.connected-service-actions { display: flex; justify-self: end; flex-wrap: wrap; gap: 6px; }
+.connected-service-actions .mini-action { white-space: nowrap; }
 .connected-service-row strong { font-size: 14px; }
 .connected-service-row small { font-size: 12px; color: var(--muted); }
 .connected-service-row a { text-decoration: none; }
@@ -6999,19 +7001,62 @@ pre {
 .personal-page { width: min(100%, 920px); margin: 0 auto; padding: 24px 28px 56px; overflow-wrap: anywhere; }
 .personal-page-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
 .personal-page-header h1 { margin: 3px 0 0; font-size: 26px; line-height: 1.2; }
-.personal-overview { display: flex; gap: 28px; padding: 12px 0 18px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 13px; }
-.personal-overview span { display: flex; align-items: baseline; gap: 6px; }
-.personal-overview strong { color: var(--ink); font-size: 22px; }
+.personal-daily-summary { margin: 9px 0 0; color: var(--muted-strong); font-size: 14px; }
+.personal-today .personal-guide { width: 100%; margin: 0; padding: 20px 0; border-bottom: 1px solid var(--border); }
+.personal-today .personal-guide h3 { margin-bottom: 10px; font-size: 16px; }
+.personal-today .personal-task-primary { min-height: 58px; }
+.personal-priority-section { border-left: 3px solid var(--warn); padding-left: 14px; }
 .personal-list-section { padding: 20px 0; border-bottom: 1px solid var(--border); }
 .personal-list-section h2 { margin: 0 0 10px; font-size: 16px; }
+.personal-list-section h2 small { margin-left: 5px; color: var(--muted); font-size: 12px; font-weight: 500; }
+.personal-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.personal-section-heading h2 { margin-bottom: 0; }
+.personal-section-heading .mini-action { min-height: 44px; }
+.personal-section-actions { display: flex; align-items: center; gap: 4px; }
+.personal-section-actions > button { min-width: 44px; min-height: 44px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
+.personal-section-actions > button:disabled { opacity: .5; cursor: default; }
+.personal-brief-source { margin-top: 10px !important; font-size: 12px; }
+.personal-brief-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 58px; padding: 8px 4px; border-bottom: 1px solid var(--border); }
+.personal-brief-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.personal-brief-row strong { font-size: 14px; }
+.personal-brief-row small { color: var(--muted); font-size: 12px; }
+.personal-reminder-settings { display: grid; gap: 12px; margin-top: 18px; }
+.personal-reminder-toggle { display: flex; align-items: center; gap: 10px; min-height: 44px; font-size: 14px; }
+.personal-reminder-toggle input { width: 18px; height: 18px; }
+.personal-reminder-times { display: flex; flex-wrap: wrap; gap: 12px; }
+.personal-reminder-times label { display: grid; gap: 5px; font-size: 12px; color: var(--muted-strong); }
+.personal-reminder-times input { min-height: 44px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font: inherit; }
+.personal-reminder-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.personal-reminder-settings > button { justify-self: start; min-height: 44px; }
+.personal-reminder-settings p { margin: 0; font-size: 12px; }
+.personal-commitment-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 65px; padding: 9px 4px; border-bottom: 1px solid var(--border); }
+.personal-commitment-copy { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.personal-commitment-copy strong { font-size: 14px; }
+.personal-commitment-copy small { color: var(--muted); font-size: 12px; }
+.personal-commitment-actions { display: flex; align-items: center; gap: 4px; }
+.personal-commitment-actions button { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
+.personal-commitment-actions button:hover { background: var(--surface); }
+.personal-commitment-actions button:disabled { opacity: .5; cursor: default; }
+.personal-commitment-editor { display: grid; gap: 10px; padding: 12px 0; }
+.personal-commitment-editor input, .personal-commitment-editor textarea { width: 100%; min-height: 44px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font: inherit; }
+.personal-commitment-editor label { display: grid; gap: 5px; color: var(--muted-strong); font-size: 12px; }
+.personal-commitment-editor small { color: var(--muted); font-size: 12px; }
+.personal-commitment-editor > div { display: flex; gap: 8px; }
+.personal-commitment-editor > div button { min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
+.personal-commitment-editor > div button:disabled { opacity: .5; cursor: default; }
+.personal-completed { margin-top: 12px; color: var(--muted-strong); font-size: 13px; }
+.personal-completed summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
 .personal-list-section p { margin: 0 0 12px; color: var(--muted-strong); line-height: 1.5; }
 .personal-list-section > a { display: inline-flex; margin-left: 12px; }
 .personal-task-row { display: grid; grid-template-columns: minmax(0, 1fr) 20px; align-items: center; width: 100%; min-height: 60px; gap: 12px; padding: 9px 4px; border: 0; border-bottom: 1px solid var(--border); background: transparent; text-align: left; cursor: pointer; }
 .personal-task-row:hover { background: var(--surface); }
+.personal-task-info, .personal-task-info:hover { background: transparent; cursor: default; }
+.personal-task-info > svg { color: var(--muted); }
 .personal-task-row:disabled { opacity: .6; cursor: default; }
 .personal-task-row > span { display: grid; gap: 4px; min-width: 0; }
 .personal-task-row strong { font-size: 14px; }
 .personal-task-row small, .personal-empty { color: var(--muted); font-size: 12px; }
+.personal-task-row strong, .personal-task-row small { overflow-wrap: anywhere; }
 .personal-secondary-link { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 52px; padding: 8px 4px; border: 0; background: transparent; text-align: left; cursor: pointer; }
 .personal-secondary-link svg:last-child { margin-left: auto; }
 .personal-state-warning { padding: 10px 12px; border-left: 3px solid var(--warn); background: #fff8e9; }
@@ -7049,8 +7094,11 @@ pre {
   .personal-page { padding: 18px 16px max(40px, env(safe-area-inset-bottom)); }
   .personal-page-header { align-items: flex-start; }
   .personal-page-header h1 { font-size: 23px; }
+  .personal-daily-summary { max-width: 26ch; line-height: 1.4; }
   .personal-page-header .command-button { min-height: 44px; white-space: nowrap; }
-  .personal-overview { gap: 12px; justify-content: space-between; }
+  .personal-today .personal-guide { margin: 0; }
+  .personal-commitment-row { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .personal-commitment-actions { justify-content: flex-end; }
   .personal-list-section .mini-action { min-height: 44px; }
   .space-switch button { min-height: 44px; }
   .workspace:has(.personal-scope-notice) .topbar-actions { display: none; }
@@ -7073,7 +7121,7 @@ pre {
   .personal-guide h3 { font-size: 18px; }
   .personal-task-list { grid-template-columns: minmax(0, 1fr); }
   .connected-service-row { grid-template-columns: 20px minmax(0, 1fr); }
-  .connected-service-row > a, .connected-service-row > small { grid-column: 2; justify-self: start; }
+  .connected-service-actions { grid-column: 2; justify-self: start; }
   .session-content-grid .composer-shell .attach-button,
   .session-content-grid .composer-shell .send-button,
   .session-content-grid .composer-shell .clear-chat { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }

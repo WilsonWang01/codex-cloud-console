@@ -266,10 +266,15 @@ input.on("line", (line) => {
       } }, queuedFirstRegression ? 2_600 : 650);
     }
     if (personalDeletionRegression) {
-      send({ method: "turn/completed", params: {
-        threadId: message.params?.threadId,
-        turn: { id: turnId, status: "completed" },
-      } }, 900);
+      const finishWhenReleased = () => {
+        const gate = process.env.FAKE_PERSONAL_DELETE_GATE_PATH;
+        if (gate && !fsSync.existsSync(gate)) return setTimeout(finishWhenReleased, 20);
+        send({ method: "turn/completed", params: {
+          threadId: message.params?.threadId,
+          turn: { id: turnId, status: "completed" },
+        } });
+      };
+      finishWhenReleased();
     }
     if (outcomeContractRegression) {
       const missingMarker = requestText.includes("missing marker");
@@ -845,6 +850,7 @@ await check("personal and work reuse authentication without sharing threads or s
   const stateRoot = path.join(root, "state");
   const bin = path.join(root, "bin");
   const capturePath = path.join(root, "requests.jsonl");
+  const personalDeleteGate = path.join(root, "release-personal-delete-turn");
   const port = await freePort();
   await fs.mkdir(path.join(cloudRoot, "workspace", "sample-app"), { recursive: true });
   await fs.mkdir(stateRoot, { recursive: true });
@@ -856,8 +862,8 @@ await check("personal and work reuse authentication without sharing threads or s
     env: { ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot,
       CODEX_WORKSPACE_ROOT: path.join(cloudRoot, "workspace"), CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"),
       CODEX_PERSONAL_MODE: "shared", CODEX_PERSONAL_ROOT: path.join(cloudRoot, "personal"), CODEX_PERSONAL_WORKER: "1",
-      CODEX_CLOUD_WEBHOOK_TOKEN: "shared-test-token-only", CODEX_TURN_TIMEOUT_MS: "2000", CODEX_ALLOW_LOCAL_FALLBACK: "0",
-      FAKE_SHARED_PERSONAL: "1", FAKE_CAPTURE_PATH: capturePath, PATH: `${bin}:${process.env.PATH}` },
+      CODEX_CLOUD_WEBHOOK_TOKEN: "shared-test-token-only", CODEX_TURN_TIMEOUT_MS: "5000", CODEX_ALLOW_LOCAL_FALLBACK: "0",
+      FAKE_SHARED_PERSONAL: "1", FAKE_CAPTURE_PATH: capturePath, FAKE_PERSONAL_DELETE_GATE_PATH: personalDeleteGate, PATH: `${bin}:${process.env.PATH}` },
   });
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -925,10 +931,67 @@ await check("personal and work reuse authentication without sharing threads or s
       body: JSON.stringify({ label: "称呼", value: "回归测试称呼" }),
     });
     assert.equal(createdFact.response.status, 201);
+    const createdCommitment = await jsonRequest(base, "/api/personal/commitments", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "回归测试个人事项", nextStep: "整理资料", dueAt: "2026-10-02T09:00:00.000Z" }),
+    });
+    assert.equal(createdCommitment.response.status, 201);
+    const firstBrief = await jsonRequest(base, "/api/personal/brief");
+    assert.equal(firstBrief.response.status, 200);
+    assert.ok(firstBrief.data.brief.items.some((item) => item.title === "回归测试个人事项" && item.detail === "新增关注事项"));
+    const reviewedBrief = await jsonRequest(base, "/api/personal/brief/review", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ through: firstBrief.data.brief.until }),
+    });
+    assert.equal(reviewedBrief.response.status, 200);
+    assert.equal((await jsonRequest(base, "/api/personal/brief")).data.brief.total, 0);
+    const invalidReview = await jsonRequest(base, "/api/personal/brief/review", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ through: "2999-01-01T00:00:00.000Z" }),
+    });
+    assert.equal(invalidReview.response.status, 400);
+    const pushEndpoint = "https://push.example.test/sub/personal-regression";
+    const subscription = { endpoint: pushEndpoint, keys: { p256dh: "test-p256dh", auth: "test-auth" } };
+    const pushSubscribed = await jsonRequest(base, "/api/notifications/push/subscribe", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription, personalTimeZone: "Asia/Shanghai" }),
+    });
+    assert.equal(pushSubscribed.response.status, 200);
+    const defaultReminder = await jsonRequest(base, "/api/personal/reminders/status", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: pushEndpoint }),
+    });
+    assert.equal(defaultReminder.data.settings.enabled, false);
+    assert.equal(defaultReminder.data.settings.timeZone, "Asia/Shanghai");
+    const enabledReminder = await jsonRequest(base, "/api/personal/reminders", {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: pushEndpoint, settings: { enabled: true, timeZone: "Asia/Shanghai", quietStart: "22:00", quietEnd: "08:00" } }),
+    });
+    assert.equal(enabledReminder.response.status, 200);
+    await jsonRequest(base, "/api/notifications/push/subscribe", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription }),
+    });
+    assert.equal((await jsonRequest(base, "/api/personal/reminders/status", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: pushEndpoint }),
+    })).data.settings.enabled, true, "重新订阅不应取消个人提醒");
+    const concurrentSettings = { enabled: false, timeZone: "Asia/Shanghai", quietStart: "21:00", quietEnd: "07:00" };
+    const concurrentWrites = await Promise.all([
+      jsonRequest(base, "/api/personal/reminders", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: pushEndpoint, settings: concurrentSettings }) }),
+      jsonRequest(base, "/api/notifications/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subscription }) }),
+    ]);
+    assert.ok(concurrentWrites.every(({ response }) => response.status === 200));
+    assert.deepEqual((await jsonRequest(base, "/api/personal/reminders/status", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: pushEndpoint }),
+    })).data.settings, concurrentSettings, "并发重新订阅不能覆盖已保存的提醒偏好");
+    const wrongSpaceLink = await jsonRequest(base, `/api/personal/commitments/${createdCommitment.data.commitment.id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, sessionId: sessions[0].sessionId }),
+    });
+    assert.equal(wrongSpaceLink.response.status, 404);
     const factSession = await jsonRequest(base, "/api/chat/sessions", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "Fact test" }),
     });
     assert.equal(factSession.response.status, 200);
+    const linkedCommitment = await jsonRequest(base, `/api/personal/commitments/${createdCommitment.data.commitment.id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, sessionId: factSession.data.activeSessionId }),
+    });
+    assert.equal(linkedCommitment.response.status, 200);
     const withFact = await jsonRequest(base, "/api/chat", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "outcome contract regression with fact" }),
@@ -936,6 +999,14 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(withFact.data.ok, true);
     const factStarts = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "thread/start" && request.params.cwd === path.join(cloudRoot, "personal"));
     assert.match(factStarts.at(-1).params.developerInstructions, /回归测试称呼/);
+    assert.match(factStarts.at(-1).params.developerInstructions, /回归测试个人事项/);
+    const completedCommitment = await jsonRequest(base, `/api/personal/commitments/${createdCommitment.data.commitment.id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: linkedCommitment.data.commitment.revision, status: "done" }),
+    });
+    assert.equal(completedCommitment.response.status, 200);
+    const completedBrief = await jsonRequest(base, "/api/personal/brief");
+    assert.ok(completedBrief.data.brief.items.some((item) => item.title === "回归测试个人事项" && item.detail === "关注事项已完成"));
     const deletedFact = await jsonRequest(base, `/api/personal/facts/${createdFact.data.fact.id}`, { method: "DELETE" });
     assert.equal(deletedFact.response.status, 200);
     const removedFactSession = await jsonRequest(base, "/api/chat/sessions", {
@@ -949,6 +1020,7 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(withoutFact.data.ok, true);
     const updatedStarts = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "thread/start" && request.params.cwd === path.join(cloudRoot, "personal"));
     assert.doesNotMatch(updatedStarts.at(-1).params.developerInstructions, /回归测试称呼/);
+    assert.doesNotMatch(updatedStarts.at(-1).params.developerInstructions, /回归测试个人事项/);
     const attachmentBytes = Buffer.from("personal upload regression\n");
     const uploaded = await jsonRequest(base, "/api/uploads", {
       method: "POST", headers: { "content-type": "application/json" },
@@ -1012,9 +1084,16 @@ await check("personal and work reuse authentication without sharing threads or s
       body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "personal deletion regression" }),
     });
     assert.equal(activePersonalTurn.status, 200);
+    let personalTurnStarted = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await fs.readFile(capturePath, "utf8")).includes("personal deletion regression")) { personalTurnStarted = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(personalTurnStarted, true, "个人会话必须启动后才能测试运行中删除保护");
     const blockedDuringTurn = await jsonRequest(base, `/api/personal/files?path=${encodeURIComponent(uploadPath)}`, { method: "DELETE" });
     assert.equal(blockedDuringTurn.response.status, 409);
     assert.deepEqual(await fs.readFile(path.join(cloudRoot, "personal", uploadPath)), attachmentBytes);
+    await fs.writeFile(personalDeleteGate, "released");
     await activePersonalTurn.text();
     const removed = await jsonRequest(base, `/api/personal/files?path=${encodeURIComponent(uploadPath)}`, { method: "DELETE" });
     assert.equal(removed.response.status, 200, JSON.stringify(removed.data));
