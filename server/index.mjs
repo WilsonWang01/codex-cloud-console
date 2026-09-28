@@ -14,7 +14,7 @@ import { normalizeAppServerThreadMessages } from "./app-server-normalizers.mjs";
 import { pluginCatalogPage } from "./plugin-catalog.mjs";
 import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mjs";
 import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "./run-safety.mjs";
-import { createApprovalBroker, approvalDigest } from "./approval-broker.mjs";
+import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource } from "./external-automation.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
@@ -2466,6 +2466,12 @@ const approvalBroker = createApprovalBroker({
 
 async function appServerRequestResult(method, params = {}) {
   const job = findTurnJob(params) || findCompactJob(params);
+  if (job?.unattendedPersonalSchedule) {
+    job.unattendedApprovalDenied = true;
+    recordAppServerRequestDecision(method, params, "declined-unattended");
+    emitJobEvent(job, "status", { text: "个人计划请求人工确认，已拒绝；本次运行将失败并暂停计划" });
+    return declineAppServerRequest(method, "无人值守的个人计划不能请求人工确认或扩大权限");
+  }
   recordAppServerRequestDecision(method, params, "pending");
   try {
     const result = await approvalBroker.request(method, params, { repoId: job?.repoId, sessionId: job?.sessionId });
@@ -3049,6 +3055,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   const job = createServerJob("turn", repo, session, runtime);
   job.maxRuntimeMs = options.maxRuntimeMs;
   job.automationRunId = options.automationRunId || null;
+  job.unattendedPersonalSchedule = options.unattendedPersonalSchedule === true;
+  job.unattendedApprovalDenied = false;
   job.makeSessionActive = options.makeSessionActive !== false;
   job.requireExistingThread = options.requireExistingThread === true;
   job.queuedTurnId = options.queuedTurnId || null;
@@ -6824,6 +6832,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
       automationRunId: runId,
+      unattendedPersonalSchedule: options.trigger === "personal-schedule",
       maxRuntimeMs: options.maxRuntimeMs,
     });
     activeAutomationRuns.set(runId, job);
@@ -6856,12 +6865,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         ? await verifyAutomationArtifact(completionContract, runRepo)
         : null;
       const completion = artifact && !artifact.satisfied ? artifact : markerCompletion;
-      const completed = result.ok && completion.satisfied;
+      const unattendedApprovalDenied = Boolean(job.unattendedApprovalDenied);
+      const completed = result.ok && completion.satisfied && !unattendedApprovalDenied;
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
       const error = needsExternalReview ? result.externalActionReview.reason
         : personalWriteObserved ? "检测到连接服务写入；请在对应服务核对结果，个人计划已暂停。"
+          : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
           : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await appendAutomationRunEventWithRetry(

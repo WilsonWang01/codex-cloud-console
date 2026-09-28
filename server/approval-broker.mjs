@@ -22,7 +22,7 @@ export function approvalDigest(method, params) {
   return crypto.createHash("sha256").update(JSON.stringify(canonical({ method, params }))).digest("hex");
 }
 
-function denied(method, reason) {
+export function declineAppServerRequest(method, reason) {
   if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
     return { decision: "decline" };
   }
@@ -80,7 +80,7 @@ export function createApprovalBroker({ timeoutMs = 5 * 60_000, onChange = () => 
     if (input.decision === "accept") {
       result = accepted(item.method, item.params, input);
     } else {
-      try { result = denied(item.method, reason || "Request declined"); }
+      try { result = declineAppServerRequest(item.method, reason || "Request declined"); }
       catch (error) { result = error; }
     }
     pending.delete(item.id);
