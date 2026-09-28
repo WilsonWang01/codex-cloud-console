@@ -18,7 +18,11 @@ Muse 的官方安全说明把连接器动作交给独立权限裁决，并将具
 
 - `npm run verify:approvals`：共享与专用回调均不进入待审批队列；命令请求立即拒绝，输入请求立即报错；普通交互会话仍走原审批代理。覆盖新版、旧版及 MCP elicitation 的拒绝响应形状。
 - `npm run verify:local`：通过，包含 app-server 模拟回归、个人计划、自动化恢复及审批测试；未启动真实模型回合。
-- 待发布后补充线上健康、持久数据、浏览器和任务空闲检查。本轮没有实际触发个人定时计划或第三方动作。
+- `CODEX_CLOUD_SAFETY_UI_URL=http://127.0.0.1:5178/ npm run verify:personal:ui`：通过；`node --check server/index.mjs` 和 `git diff --check`：通过。
+- 部署前与切换前均确认 EC2 没有活跃任务或运行。备份 `/home/ubuntu/codex-cloud/backups/pre-unattended-approval-20260928.tar.gz` 可列出内容，SHA-256 为 `9770464cf2ebf32ee91107bc6de2e5fc9c64bda1a870047b53067834707cfc48`。
+- 发布 `e6fa827` 后，systemd 服务正常，严格健康检查为 `healthy: true`、`partial: false`、`appServer: true`；持久记录保持 200 条自动化运行、34 个会话，且没有活跃运行。此前的完整认证与会话备份仍保留。
+- 通过只读 SSH 隧道检查线上 `#/automations/_personal`：320、390、1280 像素宽度下深链接和三个起步动作正常，无水平溢出、断线提示或浏览器报错。
+- 本轮没有实际触发个人定时计划、模型回合或第三方动作；线上检查只证明部署健康和页面无明显回归，不证明真实审批回合的端到端行为。
 
 ## 未解决
 
