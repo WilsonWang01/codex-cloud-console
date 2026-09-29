@@ -14,9 +14,18 @@ const item = (overrides = {}) => ({
 
 test("only explicitly non-read-only MCP calls enter external review", () => {
   assert.equal(externalWriteAttempt(item({ readOnlyHint: true })), null);
+  assert.equal(externalWriteAttempt(item({ readOnlyHint: null })), null);
   assert.deepEqual(externalWriteAttempt(item({ appContext: null })), { id: "write-1", server: "codex_apps", tool: "create_event", status: "inProgress" });
   assert.equal(externalWriteAttempt(item({ type: "commandExecution" })), null);
   assert.deepEqual(externalWriteAttempt(item()), { id: "write-1", server: "Calendar", tool: "create_event", status: "inProgress" });
+});
+
+test("personal flows review MCP calls without a verified read-only hint", () => {
+  const unknown = externalWriteAttempt(item({ readOnlyHint: null }), { includeUnverified: true });
+  assert.deepEqual(unknown, { id: "write-1", server: "Calendar", tool: "create_event", status: "inProgress", unverifiedReadOnly: true });
+  assert.equal(externalWriteAttempt(item({ readOnlyHint: true }), { includeUnverified: true }), null);
+  const attempts = new Map([[unknown.id, unknown]]);
+  assert.match(unresolvedExternalAction(attempts, { ok: false, turnId: "turn-unknown" }).reason, /未声明只读/);
 });
 
 test("all successful write receipts and a successful turn clear review", () => {

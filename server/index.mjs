@@ -3057,6 +3057,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   job.automationRunId = options.automationRunId || null;
   job.unattendedPersonalSchedule = options.unattendedPersonalSchedule === true;
   job.unattendedApprovalDenied = false;
+  job.reviewUnverifiedMcpCalls = options.reviewUnverifiedMcpCalls === true;
+  job.externalActionInterruptRequested = false;
   job.makeSessionActive = options.makeSessionActive !== false;
   job.requireExistingThread = options.requireExistingThread === true;
   job.queuedTurnId = options.queuedTurnId || null;
@@ -3422,11 +3424,19 @@ function handleAppServerNotification(rpcMessage) {
     }
     auditAppServerItem(params.item || {}, job, owner);
     if (turnJob) {
-      const attempt = externalWriteAttempt(params.item);
+      const attempt = externalWriteAttempt(params.item, { includeUnverified: turnJob.reviewUnverifiedMcpCalls });
       if (attempt && !turnJob.externalWriteItems.has(attempt.id)) {
         turnJob.externalWriteItems.set(attempt.id, { ...attempt, startedAt: Date.now() });
         persistExternalWriteReview(turnJob);
         armExternalWriteTimeout(turnJob);
+        if (turnJob.reviewUnverifiedMcpCalls && !turnJob.externalActionInterruptRequested) {
+          turnJob.externalActionInterruptRequested = true;
+          turnJob.cancelRequested = true;
+          emitJobEvent(turnJob, "status", { text: "个人流程遇到未确认只读的连接服务操作，正在中断并等待核对" });
+          if (turnJob.threadId && turnJob.turnId) {
+            appServerClientForJob(turnJob).request("turn/interrupt", { threadId: turnJob.threadId, turnId: turnJob.turnId }, 20_000).catch(() => null);
+          }
+        }
       }
     }
     const statusText = formatAppServerItemStatus(params.item);
@@ -6833,6 +6843,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       requireExistingThread: options.requireExistingThread === true,
       automationRunId: runId,
       unattendedPersonalSchedule: options.trigger === "personal-schedule",
+      reviewUnverifiedMcpCalls: ["personal-test", "personal-schedule"].includes(options.trigger),
       maxRuntimeMs: options.maxRuntimeMs,
     });
     activeAutomationRuns.set(runId, job);
@@ -6869,9 +6880,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       const completed = result.ok && completion.satisfied && !unattendedApprovalDenied;
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
+      const personalKnownWriteObserved = [...job.externalWriteItems.values()].some((item) => !item.unverifiedReadOnly);
+      const personalActionDisposition = options.trigger === "personal-schedule" ? "个人计划已暂停" : "本次试运行不能确认通过";
+      const personalExternalActionError = personalKnownWriteObserved
+        ? `检测到连接服务写入；请在对应服务核对结果，${personalActionDisposition}。`
+        : `连接服务操作未声明只读；请核对是否造成外部修改，${personalActionDisposition}。`;
       const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
       const error = needsExternalReview ? result.externalActionReview.reason
-        : personalWriteObserved ? "检测到连接服务写入；请在对应服务核对结果，个人计划已暂停。"
+        : personalWriteObserved ? personalExternalActionError
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
           : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");

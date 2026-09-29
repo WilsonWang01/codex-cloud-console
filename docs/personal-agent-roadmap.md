@@ -1,6 +1,6 @@
 # Personal Agent 统一产品与技术方案
 
-状态：已整合的开发基线，阶段状态见第九节；逐项证据见[个人/API/移动验收](acceptance/2026-09-26-personal-api-mobile.md)、[个人引导与连接验收](acceptance/2026-09-26-personal-onboarding-connections.md)、[第二轮本地实现验收](acceptance/2026-09-26-personal-second-iteration.md)、[外部操作可靠性迭代](acceptance/2026-09-27-personal-agent-reliability-iteration.md)、[个人流程试运行与线上验收](acceptance/2026-09-28-personal-trial-gate.md)和[无人值守审批验收](acceptance/2026-09-28-personal-unattended-approval.md)。更新日期：2026-09-28。原调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`；[第二轮对标与体验审查](competitor-benchmark-2026-09-26.md)基于 `5d07e80`，补充当前差距、复现问题及下一轮优先级。
+状态：已整合的开发基线，阶段状态见第九节；逐项证据见[个人/API/移动验收](acceptance/2026-09-26-personal-api-mobile.md)、[个人引导与连接验收](acceptance/2026-09-26-personal-onboarding-connections.md)、[第二轮本地实现验收](acceptance/2026-09-26-personal-second-iteration.md)、[外部操作可靠性迭代](acceptance/2026-09-27-personal-agent-reliability-iteration.md)、[个人流程试运行与线上验收](acceptance/2026-09-28-personal-trial-gate.md)、[无人值守审批验收](acceptance/2026-09-28-personal-unattended-approval.md)和[未声明只读连接器动作验收](acceptance/2026-09-29-personal-unverified-mcp.md)。更新日期：2026-09-29。原调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`；[第二轮对标与体验审查](competitor-benchmark-2026-09-26.md)基于 `5d07e80`，补充当前差距、复现问题及下一轮优先级。
 
 本文整合 `docs/research/2026-09-26-personal-agent-benchmark.md` 的对标、代码发现和后端演进建议，以及原四项需求方案，作为后续开发、review、验收的唯一计划入口。原调研保留为日期固定的证据档案，其中旧阶段顺序与接口建议以本文的整合决定为准。
 

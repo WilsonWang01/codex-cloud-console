@@ -247,10 +247,13 @@ input.on("line", (line) => {
       const isReadOnly = requestText.includes("read only");
       const isTimeout = requestText.includes("timeout");
       const isFailure = requestText.includes("tool failure");
-      const item = { type: "mcpToolCall", id: "external-write-regression", server: "connected-calendar", tool: "create_event", status: "inProgress", readOnlyHint: isReadOnly, appContext: requestText.includes("no app context") ? null : { connectorId: "fixture-calendar", actionName: "create_event" } };
+      const item = { type: "mcpToolCall", id: "external-write-regression", server: "connected-calendar", tool: "create_event", status: "inProgress", readOnlyHint: requestText.includes("missing hint") ? null : isReadOnly, appContext: requestText.includes("no app context") ? null : { connectorId: "fixture-calendar", actionName: "create_event" } };
       send({ method: "item/started", params: { threadId: message.params?.threadId, turnId, item } }, 20);
       if (!isTimeout) {
         send({ method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed" } } }, 65);
+        send({ method: "thread/tokenUsage/updated", params: {
+          threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+        } }, 75);
         send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: "completed" } } }, 90);
       }
     } else if (queueRegressionNext) {
@@ -1283,6 +1286,33 @@ await check("personal and work reuse authentication without sharing threads or s
       body: JSON.stringify({ revision: 2, runId: writeTrialStatus.data.test.id, confirmResult: true }),
     });
     assert.equal(blockedWriteApproval.response.status, 409);
+    const interruptsBeforeUnknown = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "turn/interrupt").length;
+    const unknownRoutine = await jsonRequest(base, "/api/personal/routines", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "只读状态未知", prompt: "external write regression missing hint" }),
+    });
+    assert.equal(unknownRoutine.response.status, 201);
+    const unknownRoutineId = unknownRoutine.data.routine.id;
+    const unknownTrial = await jsonRequest(base, `/api/personal/routines/${unknownRoutineId}/test`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 1, confirmModelCost: true }),
+    });
+    assert.equal(unknownTrial.response.status, 200, JSON.stringify(unknownTrial.data));
+    let unknownTrialStatus;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      unknownTrialStatus = await jsonRequest(base, `/api/personal/routines/${unknownRoutineId}/test`);
+      if (unknownTrialStatus.data.test?.status === "needs_reconciliation") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(unknownTrialStatus.data.test?.status, "needs_reconciliation");
+    assert.match(unknownTrialStatus.data.test.error, /未声明只读/);
+    const interruptsAfterUnknown = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "turn/interrupt").length;
+    assert.ok(interruptsAfterUnknown > interruptsBeforeUnknown);
+    const blockedUnknownApproval = await jsonRequest(base, `/api/personal/routines/${unknownRoutineId}/test/approve`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: 2, runId: unknownTrialStatus.data.test.id, confirmResult: true }),
+    });
+    assert.equal(blockedUnknownApproval.response.status, 409);
     const { data: status } = await jsonRequest(base, "/api/status");
     assert.equal(status.codex.authenticated, true);
     assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);
@@ -2380,6 +2410,9 @@ await check("atomic installer gates on strict health, prunes, and rolls back", a
   await fs.mkdir(path.join(sourceRoot, "ops"), { recursive: true });
   await fs.mkdir(previousRelease, { recursive: true });
   await fs.mkdir(binDir, { recursive: true });
+  if (process.platform === "darwin") {
+    await fs.writeFile(path.join(binDir, "tar"), '#!/bin/sh\nexec /usr/bin/tar -b 1 "$@"\n', { mode: 0o755 });
+  }
   await fs.writeFile(path.join(sourceRoot, "package-lock.json"), "{}\n");
   await fs.writeFile(path.join(sourceRoot, "source-marker.txt"), "source data remains intact\n");
   for (const folder of ["docs/research", "test-results", "playwright-report"]) {
