@@ -3579,14 +3579,18 @@ export function App() {
   const refresh = useCallback(async () => {
     setIsRefreshing(true);
     try {
-      const healthResponse = await fetch("/healthz");
-      const quick = (await parseJsonResponse(healthResponse)) as HealthCheckResponse;
-      const quickStatus = statusWithHealth(statusRef.current, quick);
-      statusRef.current = quickStatus;
-      setStatus(quickStatus);
-      setCloudConnection(connectionFromStatus(quickStatus));
+      try {
+        const healthResponse = await fetch("/healthz", { cache: "no-store" });
+        const quick = (await parseJsonResponse(healthResponse)) as HealthCheckResponse;
+        const quickStatus = statusWithHealth(statusRef.current, quick);
+        statusRef.current = quickStatus;
+        setStatus(quickStatus);
+        setCloudConnection(connectionFromStatus(quickStatus));
+      } catch {
+        // A failed quick check must not prevent the authoritative status request.
+      }
 
-      const next = await api<ConsoleStatus>("/api/status");
+      const next = await api<ConsoleStatus>("/api/status", { cache: "no-store" });
       statusRef.current = next;
       setStatus(next);
       setStatusReady(true);

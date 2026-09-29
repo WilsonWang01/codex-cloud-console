@@ -38,7 +38,15 @@ let submissions = 0;
 let steers = 0;
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
-await context.route("**/healthz", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(status.health) }));
+let failQuickHealth = true;
+let quickHealthFailed = false;
+await context.route("**/healthz", (route) => {
+  if (failQuickHealth) {
+    quickHealthFailed = true;
+    return route.abort("failed");
+  }
+  return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(status.health) });
+});
 await context.route("**/api/**", async (route) => {
   const req = route.request(); const url = new URL(req.url());
   const body = req.postDataJSON() || {};
@@ -105,6 +113,10 @@ const out = new URL("../docs/research/acceptance/safety-ui-2026-09-22/", import.
 await fs.mkdir(out, { recursive: true });
 try {
   await page.goto(`${baseUrl}#/agent`);
+  await page.locator(".topbar-actions .status-pill").first().getByText("云端 Codex 在线").waitFor();
+  assert.equal(quickHealthFailed, true);
+  assert.equal(navigation.requests.some(({ path }) => path === "/api/status"), true);
+  failQuickHealth = false;
   await page.getByRole("button", { name: /README.md/ }).click();
   const editor = page.locator(".file-editor-card textarea");
   await editor.fill("A 项目的未保存修改");
@@ -202,7 +214,7 @@ try {
   const navigationChecks = await verifyNavigationPerformance({ page, baseUrl, sessions, navigation, waitUntil, out });
   const reviewChecks = await verifyReviewSafety({ page, baseUrl, waitUntil, out });
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["跨项目文件保护", "延迟上传归属", "草稿冲突保留与解决", "桌面与移动端无横向溢出", "迟到会话操作不覆盖新项目", "发送失败保留草稿", "等待接受期间禁止重复提交", "发送成功保留等待期间的新输入", "流式初始化失败保留草稿", "成功发送后清空已提交草稿", "冲突处理不覆盖期间的新输入", ...streamChecks, ...navigationChecks, ...reviewChecks], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["快速健康检查失败仍可读取完整状态", "跨项目文件保护", "延迟上传归属", "草稿冲突保留与解决", "桌面与移动端无横向溢出", "迟到会话操作不覆盖新项目", "发送失败保留草稿", "等待接受期间禁止重复提交", "发送成功保留等待期间的新输入", "流式初始化失败保留草稿", "成功发送后清空已提交草稿", "冲突处理不覆盖期间的新输入", ...streamChecks, ...navigationChecks, ...reviewChecks], screenshots: out.pathname }, null, 2));
 } finally {
   releaseUpload(); createGate?.resolve(); submissionGate?.resolve(); draftReadGate?.resolve(); await browser.close();
 }
