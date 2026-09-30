@@ -7,6 +7,7 @@ const commitments = [
   { id: "due", title: "续签资料", nextStep: "核对", status: "active", dueAt: "2026-09-27T09:00:00.000Z", createdAt: "2026-09-25T09:00:00.000Z", updatedAt: "2026-09-25T09:00:00.000Z", sessionId: null },
   { id: "done", title: "准备材料", status: "done", dueAt: null, completedAt: "2026-09-27T08:00:00.000Z", createdAt: "2026-09-26T10:00:00.000Z", updatedAt: "2026-09-27T08:00:00.000Z", sessionId: "personal-1" },
   { id: "old", title: "旧事项", status: "active", dueAt: "2026-09-25T08:00:00.000Z", createdAt: "2026-09-25T08:00:00.000Z", updatedAt: "2026-09-25T08:00:00.000Z" },
+  { id: "stale", title: "过期旧事项", status: "active", dueAt: "2026-09-18T08:00:00.000Z", createdAt: "2026-09-18T08:00:00.000Z", updatedAt: "2026-09-18T08:00:00.000Z" },
 ];
 
 test("brief shows bounded, sourced changes after review without clearing newer events", () => {
@@ -21,11 +22,15 @@ test("brief shows bounded, sourced changes after review without clearing newer e
   assert.equal(buildPersonalBrief(commitments, [{ ...runs[0], id: "later", finishedAt: "2026-09-27T10:00:00.500Z" }], brief.until, new Date(now.getTime() + 1000)).total, 1);
 });
 
-test("reminders exclude completed and stale items and do not expose private titles", () => {
+test("reminders catch up after a short outage, exclude stale items, and hide private titles", () => {
   const reminders = personalReminderItems(commitments, now);
-  assert.equal(reminders.length, 1);
-  assert.match(reminders[0].id, /personal-due:due/);
-  assert.doesNotMatch(JSON.stringify(reminders), /续签资料|核对|旧事项/);
+  assert.deepEqual(reminders.map((item) => item.id), [
+    "personal-due:old:2026-09-25T08:00:00.000Z",
+    "personal-due:due:2026-09-27T09:00:00.000Z",
+  ]);
+  assert.doesNotMatch(JSON.stringify(reminders), /续签资料|核对|旧事项|过期旧事项/);
+  assert.equal(personalReminderItems([{ ...commitments[0], dueAt: "2026-09-20T10:00:00.000Z" }], now).length, 1);
+  assert.equal(personalReminderItems([{ ...commitments[0], dueAt: "2026-09-20T09:59:59.999Z" }], now).length, 0);
   assert.equal(personalReminderItems(Array.from({ length: 7 }, (_, index) => ({ ...commitments[0], id: `due-${index}` })), now).length, 7);
 });
 

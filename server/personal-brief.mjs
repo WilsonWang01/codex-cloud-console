@@ -1,4 +1,5 @@
 const DAY_MS = 24 * 60 * 60 * 1000;
+const REMINDER_CATCHUP_MS = 7 * DAY_MS;
 
 function validTime(value) {
   const time = Date.parse(value || "");
@@ -37,7 +38,7 @@ export function buildPersonalBrief(commitments, runs, reviewedAt, now = new Date
 }
 
 export function personalReminderItems(commitments, now = new Date()) {
-  const earliest = now.getTime() - DAY_MS;
+  const earliest = now.getTime() - REMINDER_CATCHUP_MS;
   return commitments
     .filter((item) => item.status === "active" && validTime(item.dueAt) && validTime(item.dueAt) >= earliest && validTime(item.dueAt) <= now.getTime())
     .sort((a, b) => Date.parse(a.dueAt) - Date.parse(b.dueAt))
