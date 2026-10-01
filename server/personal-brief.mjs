@@ -41,7 +41,7 @@ export function personalReminderItems(commitments, now = new Date()) {
   const earliest = now.getTime() - REMINDER_CATCHUP_MS;
   return commitments
     .filter((item) => item.status === "active" && validTime(item.dueAt) && validTime(item.dueAt) >= earliest && validTime(item.dueAt) <= now.getTime())
-    .sort((a, b) => Date.parse(a.dueAt) - Date.parse(b.dueAt))
+    .sort((a, b) => Date.parse(b.dueAt) - Date.parse(a.dueAt))
     .map((item) => ({
       id: `personal-due:${item.id}:${item.dueAt}`, type: "personal-reminder", tone: "warning",
       title: "个人关注事项已到期", body: "打开个人助理的今日页面查看详情。",

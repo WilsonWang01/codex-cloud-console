@@ -25,13 +25,17 @@ test("brief shows bounded, sourced changes after review without clearing newer e
 test("reminders catch up after a short outage, exclude stale items, and hide private titles", () => {
   const reminders = personalReminderItems(commitments, now);
   assert.deepEqual(reminders.map((item) => item.id), [
-    "personal-due:old:2026-09-25T08:00:00.000Z",
     "personal-due:due:2026-09-27T09:00:00.000Z",
+    "personal-due:old:2026-09-25T08:00:00.000Z",
   ]);
   assert.doesNotMatch(JSON.stringify(reminders), /续签资料|核对|旧事项|过期旧事项/);
   assert.equal(personalReminderItems([{ ...commitments[0], dueAt: "2026-09-20T10:00:00.000Z" }], now).length, 1);
   assert.equal(personalReminderItems([{ ...commitments[0], dueAt: "2026-09-20T09:59:59.999Z" }], now).length, 0);
-  assert.equal(personalReminderItems(Array.from({ length: 7 }, (_, index) => ({ ...commitments[0], id: `due-${index}` })), now).length, 7);
+  const backlog = Array.from({ length: 7 }, (_, index) => ({
+    ...commitments[0], id: `due-${index}`, dueAt: new Date(now.getTime() - (index + 1) * 12 * 60 * 60 * 1000).toISOString(),
+  })).reverse();
+  assert.deepEqual(personalReminderItems(backlog, now).slice(0, 5).map((item) => item.id.split(":")[1]),
+    ["due-0", "due-1", "due-2", "due-3", "due-4"]);
 });
 
 test("quiet hours respect timezone, wrap midnight, and reject invalid settings", () => {
