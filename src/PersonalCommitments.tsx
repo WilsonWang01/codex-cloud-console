@@ -15,6 +15,23 @@ export type PersonalCommitment = {
   completedAt: string | null;
 };
 
+const pendingLinksKey = "codex-cloud:personal-commitment-pending-links";
+
+function restorePendingLinks(): Record<string, string> {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(pendingLinksKey) || "{}");
+    if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
+    return Object.fromEntries(Object.entries(saved).slice(0, 100).filter(([id, sessionId]) =>
+      id.length > 0 && id.length <= 128 && typeof sessionId === "string" && sessionId.length > 0 && sessionId.length <= 128)) as Record<string, string>;
+  } catch { return {}; }
+}
+
+function persistPendingLinks(links: Record<string, string>) {
+  try { sessionStorage.setItem(pendingLinksKey, JSON.stringify(links)); }
+  catch { /* Storage can be unavailable; in-page retry still works. */ }
+  return links;
+}
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, { cache: "no-store", ...options });
   if (url === "/api/personal/commitments" && response.status === 404) throw new Error("服务器尚未更新个人事项功能");
@@ -53,7 +70,7 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
   const [dueAt, setDueAt] = useState("");
   const [showAll, setShowAll] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [pendingLinks, setPendingLinks] = useState<Record<string, string>>({});
+  const [pendingLinks, setPendingLinks] = useState<Record<string, string>>(restorePendingLinks);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -102,6 +119,9 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
         method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: item.revision }),
       });
       setItems((previous) => previous.filter((entry) => entry.id !== item.id));
+      const remainingLinks = { ...pendingLinks };
+      delete remainingLinks[item.id];
+      setPendingLinks(persistPendingLinks(remainingLinks));
       if (editing === item.id) resetEditor();
     } catch (cause) { setError(cause instanceof Error ? cause.message : "删除失败"); }
     finally { setBusy(""); }
@@ -113,12 +133,14 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
     try {
       if (!startedSessionId) startedSessionId = await onStart(item);
       if (!startedSessionId) { setError("新对话未创建，请稍后重试"); return; }
-      setPendingLinks((previous) => ({ ...previous, [item.id]: startedSessionId! }));
+      setPendingLinks(persistPendingLinks({ ...pendingLinks, [item.id]: startedSessionId }));
       const result = await request<{ commitment: PersonalCommitment }>(`/api/personal/commitments/${encodeURIComponent(item.id)}`, {
         method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: item.revision, sessionId: startedSessionId }),
       });
       setItems((previous) => previous.map((entry) => entry.id === item.id ? result.commitment : entry));
-      setPendingLinks((previous) => { const next = { ...previous }; delete next[item.id]; return next; });
+      const remainingLinks = { ...pendingLinks };
+      delete remainingLinks[item.id];
+      setPendingLinks(persistPendingLinks(remainingLinks));
       onContinue(startedSessionId);
     } catch (cause) { setError(`${cause instanceof Error ? cause.message : "操作失败"}${startedSessionId ? "；对话已建立，重试将沿用该对话" : ""}`); }
     finally { setBusy(""); }

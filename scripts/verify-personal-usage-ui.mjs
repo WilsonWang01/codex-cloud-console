@@ -255,6 +255,12 @@ await context.route("**/api/**", async (route) => {
     Object.assign(sessions.find((item) => item.repoId === repoId), body);
     return send({ ok: true, runtime: body });
   }
+  const selectedSession = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/select$/);
+  if (selectedSession && req.method() === "POST") {
+    const sessionId = decodeURIComponent(selectedSession[1]);
+    if (!sessions.some((item) => item.id === sessionId && item.repoId === body.repoId)) return send({ ok: false, error: "wrong space" }, 404);
+    return send({ ok: true, authoritative: true, repoId: body.repoId, activeSessionId: sessionId, sessions: sessions.filter((item) => item.repoId === body.repoId), messages: [] });
+  }
   const draft = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft$/);
   if (draft) {
     const session = sessions.find((item) => item.id === decodeURIComponent(draft[1]));
@@ -631,10 +637,14 @@ try {
   const beforeRetry = newSessionCount;
   await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
   await page.getByText(/temporary link failure.*重试将沿用该对话/).waitFor();
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-2"]), `_personal-new-${beforeRetry + 1}`);
+  await page.reload();
+  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).waitFor();
   await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).click();
   await page.locator(`.session-current[data-session-id='_personal-new-${beforeRetry + 1}']`).waitFor();
   assert.equal(newSessionCount, beforeRetry + 1);
   assert.equal(personalCommitments[1].sessionId, `_personal-new-${beforeRetry + 1}`);
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-2"]), undefined);
   await page.evaluate(() => { location.hash = "/project/_personal/today"; });
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
