@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
+import { parseEnv } from "node:util";
 
 const backupPath = process.argv[2] || process.env.CODEX_CLOUD_PRE_SWITCH_BACKUP;
 if (!backupPath) throw new Error("需要发布前备份的 before.json 路径");
@@ -21,8 +21,7 @@ if (runs.runs.some((run) => ["queued", "running", "canceling"].includes(run.stat
 const units = execFileSync("systemctl", ["list-units", "--state=running", "--no-legend", "--plain"], { encoding: "utf8" });
 if (units.split("\n").some((line) => line.trim().split(/\s+/)[0]?.startsWith("codex-auto-"))) throw new Error("存在运行定时服务，停止发布");
 // Read deployment authentication only into memory; never print the configuration or token.
-const require = createRequire(path.join(current, "package.json"));
-const env = require("dotenv").parse(execFileSync("sudo", ["cat", "/etc/codex-cloud-console.env"], { stdio: ["ignore", "pipe", "ignore"] }));
+const env = parseEnv(execFileSync("sudo", ["cat", "/etc/codex-cloud-console.env"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
 const headers = { "x-codex-cloud-token": env.CODEX_CLOUD_WEBHOOK_TOKEN };
 const response = await fetch("http://127.0.0.1:8787/api/codex/app-host/status", { headers, signal: AbortSignal.timeout(10_000) });
 if (!response.ok) throw new Error("无法确认控制台任务空闲，停止发布");
