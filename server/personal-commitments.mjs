@@ -49,7 +49,7 @@ export function createPersonalCommitmentsStore(filePath) {
   const mutate = (operation) => {
     const result = pending.then(async () => {
       const commitments = await read();
-      const result = operation(commitments);
+      const result = await operation(commitments);
       await write(commitments);
       return result;
     });
@@ -92,6 +92,25 @@ export function createPersonalCommitmentsStore(filePath) {
       item.revision += 1;
       item.updatedAt = new Date().toISOString();
       return item;
+    }),
+    startDraft: (id, revision, { getSession, ensureSession, pendingSessionId }) => mutate(async (commitments) => {
+      const item = commitments.find((entry) => entry.id === id);
+      if (!item) throw inputError("个人事项不存在", 404);
+      if (item.status !== "active") throw inputError("事项已完成，请先重新跟进", 409);
+      const linked = item.sessionId ? await getSession(item.sessionId) : null;
+      if (linked) return { commitment: item, session: linked };
+      find(commitments, id, revision);
+      const legacy = pendingSessionId ? await getSession(pendingSessionId) : null;
+      const reservedId = item.pendingDraftSessionId || legacy?.id || `sess-${crypto.randomUUID()}`;
+      // Persist the reservation before writing the chat store so retries survive either write failing.
+      item.pendingDraftSessionId = reservedId;
+      await write(commitments);
+      const session = await ensureSession(reservedId, item);
+      item.sessionId = session.id;
+      delete item.pendingDraftSessionId;
+      item.revision += 1;
+      item.updatedAt = new Date().toISOString();
+      return { commitment: item, session };
     }),
     remove: (id, revision) => mutate((commitments) => {
       const item = find(commitments, id, revision);

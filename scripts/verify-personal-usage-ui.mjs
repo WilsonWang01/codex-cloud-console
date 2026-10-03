@@ -55,8 +55,7 @@ let briefReviewedAt = null;
 const briefEvent = { id: "run:recent-personal:completed", kind: "completed", title: "资料整理完成", detail: "定时任务已完成", time: new Date().toISOString(), sessionId: "_personal-session" };
 const personalPushEndpoint = "https://push.example.test/personal-browser";
 let personalReminderSettings = { enabled: false, timeZone: "Asia/Shanghai", quietStart: "22:00", quietEnd: "08:00" };
-let failNextCommitmentLink = false;
-let failNextCommitmentLinkMissing = false;
+let failNextCommitmentDraftResponse = false;
 let oldCommitmentApi = false;
 let usageRace = false;
 let usageFailure = false;
@@ -180,14 +179,30 @@ await context.route("**/api/**", async (route) => {
     }
     return send({ ok: true, commitments: personalCommitments });
   }
+  const commitmentDraft = url.pathname.match(/^\/api\/personal\/commitments\/([^/]+)\/draft$/);
+  if (commitmentDraft && req.method() === "POST") {
+    const item = personalCommitments.find((entry) => entry.id === commitmentDraft[1]);
+    if (!item) return send({ ok: false, error: "not found" }, 404);
+    let session = sessions.find((entry) => entry.id === item.sessionId && entry.repoId === "_personal");
+    if (!session) {
+      if (item.revision !== body.revision) return send({ ok: false, error: "stale" }, 409);
+      session = sessions.find((entry) => entry.id === body.pendingSessionId && entry.repoId === "_personal");
+      if (!session) {
+        const id = `_personal-new-${++newSessionCount}`;
+        session = { ...sessions.find((entry) => entry.repoId === "_personal"), id, title: item.title, goal: null, draft: { input: `请帮我推进这项个人事项：${item.title}\n当前下一步：${item.nextStep}`, attachments: [], revision: 1 } };
+        sessions.push(session);
+      }
+      Object.assign(item, { sessionId: session.id, revision: item.revision + 1, updatedAt: new Date().toISOString() });
+    }
+    if (failNextCommitmentDraftResponse) { failNextCommitmentDraftResponse = false; return send({ ok: false, error: "temporary draft response failure" }, 503); }
+    return send({ ok: true, repoId: "_personal", activeSessionId: session.id, sessions: sessions.filter((entry) => entry.repoId === "_personal"), messages: [], commitment: item });
+  }
   if (url.pathname.startsWith("/api/personal/commitments/")) {
     const id = url.pathname.split("/").at(-1);
     const item = personalCommitments.find((entry) => entry.id === id);
     if (!item) return send({ ok: false, error: "not found" }, 404);
     if (item.revision !== body.revision) return send({ ok: false, error: "stale" }, 409);
     if (req.method() === "DELETE") { personalCommitments = personalCommitments.filter((entry) => entry.id !== id); return send({ ok: true, commitment: item }); }
-    if (body.sessionId && failNextCommitmentLink) { failNextCommitmentLink = false; return send({ ok: false, error: "temporary link failure" }, 503); }
-    if (body.sessionId && failNextCommitmentLinkMissing) { failNextCommitmentLinkMissing = false; return send({ ok: false, error: "个人对话不存在" }, 404); }
     if (body.sessionId && !sessions.some((session) => session.id === body.sessionId && session.repoId === "_personal")) return send({ ok: false, error: "个人对话不存在" }, 404);
     Object.assign(item, Object.fromEntries(Object.entries(body).filter(([key]) => ["title", "nextStep", "dueAt", "status", "sessionId"].includes(key))));
     item.revision += 1;
@@ -605,10 +620,8 @@ try {
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.getByText("1 项关注事项今天或此前到期").waitFor();
   assert.equal(personalCommitments.length, 1);
-  const commitmentDraftSaved = page.waitForResponse((response) => response.url().includes("/api/chat/sessions/_personal-new-2/draft") && response.request().method() === "PATCH");
   await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
   await page.locator(".session-current[data-session-id='_personal-new-2']").waitFor();
-  await commitmentDraftSaved;
   assert.match(await composer.inputValue(), /周末前整理行程[\s\S]*核对酒店和车次/);
   assert.equal(personalCommitments[0].sessionId, "_personal-new-2");
   assert.equal(submittedMessages, beforePrompt);
@@ -635,18 +648,24 @@ try {
   await page.getByRole("textbox", { name: "事项名称" }).fill("给家人整理照片");
   await page.getByRole("button", { name: "添加事项" }).click();
   await page.getByText("给家人整理照片", { exact: true }).waitFor();
-  failNextCommitmentLink = true;
+  failNextCommitmentDraftResponse = true;
   const beforeRetry = newSessionCount;
   await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
-  await page.getByText(/temporary link failure.*重试将沿用该对话/).waitFor();
-  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-2"]), `_personal-new-${beforeRetry + 1}`);
+  await page.getByText(/temporary draft response failure.*重试会沿用已创建的草稿/).waitFor();
+  assert.equal(await page.evaluate(() => sessionStorage.getItem("codex-cloud:personal-commitment-pending-links")), null);
   await page.reload();
-  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).waitFor();
-  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).click();
+  await page.locator(".personal-commitments").getByRole("button", { name: "继续草稿" }).waitFor();
+  await page.locator(".personal-commitments").getByRole("button", { name: "继续草稿" }).click();
   await page.locator(`.session-current[data-session-id='_personal-new-${beforeRetry + 1}']`).waitFor();
   assert.equal(newSessionCount, beforeRetry + 1);
   assert.equal(personalCommitments[1].sessionId, `_personal-new-${beforeRetry + 1}`);
   assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-2"]), undefined);
+  const otherTab = await context.newPage();
+  await otherTab.goto(new URL("#/project/_personal/today", process.env.CODEX_CLOUD_SAFETY_UI_URL || "http://127.0.0.1:18787/").href);
+  await otherTab.locator(".personal-commitment-row").filter({ hasText: "给家人整理照片" }).getByRole("button", { name: "继续草稿" }).click();
+  await otherTab.locator(`.session-current[data-session-id='_personal-new-${beforeRetry + 1}']`).waitFor();
+  assert.equal(newSessionCount, beforeRetry + 1);
+  await otherTab.close();
   await page.evaluate(() => { location.hash = "/project/_personal/today"; });
   await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).click();
   await page.getByRole("textbox", { name: "事项名称" }).fill("核对失效草稿");
@@ -657,26 +676,24 @@ try {
   await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).waitFor();
   const beforeStaleLink = newSessionCount;
   await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).click();
-  await page.getByText(/原对话已不存在，已清除关联记录/).waitFor();
-  assert.equal(newSessionCount, beforeStaleLink);
-  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-3"]), undefined);
-  await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
   await page.locator(`.session-current[data-session-id='_personal-new-${beforeStaleLink + 1}']`).waitFor();
   assert.equal(personalCommitments[2].sessionId, `_personal-new-${beforeStaleLink + 1}`);
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-3"]), undefined);
   await page.evaluate(() => { location.hash = "/project/_personal/today"; });
   await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).click();
-  await page.getByRole("textbox", { name: "事项名称" }).fill("核对新建草稿同步");
+  await page.getByRole("textbox", { name: "事项名称" }).fill("迁移之前的个人草稿");
   await page.getByRole("button", { name: "添加事项" }).click();
-  await page.getByText("核对新建草稿同步", { exact: true }).waitFor();
-  failNextCommitmentLinkMissing = true;
-  const beforeFreshMissing = newSessionCount;
-  await page.locator(".personal-commitment-row").filter({ hasText: "核对新建草稿同步" }).getByRole("button", { name: "起草" }).click();
-  await page.getByText(/个人对话不存在；对话已建立，重试将沿用该对话/).waitFor();
-  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-4"]), `_personal-new-${beforeFreshMissing + 1}`);
-  await page.locator(".personal-commitment-row").filter({ hasText: "核对新建草稿同步" }).getByRole("button", { name: "重试关联" }).click();
-  await page.locator(`.session-current[data-session-id='_personal-new-${beforeFreshMissing + 1}']`).waitFor();
-  assert.equal(newSessionCount, beforeFreshMissing + 1);
-  assert.equal(personalCommitments[3].sessionId, `_personal-new-${beforeFreshMissing + 1}`);
+  await page.getByText("迁移之前的个人草稿", { exact: true }).waitFor();
+  const legacySessionId = "_personal-legacy-draft";
+  sessions.push({ ...sessions.find((entry) => entry.repoId === "_personal"), id: legacySessionId, goal: null, draft: { input: "用户编辑过的旧草稿", attachments: [], revision: 2 } });
+  await page.evaluate((id) => sessionStorage.setItem("codex-cloud:personal-commitment-pending-links", JSON.stringify({ "commitment-4": id })), legacySessionId);
+  await page.reload();
+  const beforeLegacy = newSessionCount;
+  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).click();
+  await page.locator(`.session-current[data-session-id='${legacySessionId}']`).waitFor();
+  assert.equal(newSessionCount, beforeLegacy);
+  assert.equal(personalCommitments[3].sessionId, legacySessionId);
+  assert.equal(await composer.inputValue(), "用户编辑过的旧草稿");
   await page.evaluate(() => { location.hash = "/project/_personal/today"; });
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);

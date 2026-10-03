@@ -32,3 +32,70 @@ test("personal commitments persist, reject stale edits and only expose active bo
     assert.equal((await store.list())[0].status, "done");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+
+test("draft reservations survive failed linking and restart, concurrent retries reuse the draft", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-draft-"));
+  try {
+    const file = path.join(root, "commitments.json");
+    let store = createPersonalCommitmentsStore(file);
+    const item = await store.create({ title: "核对行程" });
+    const sessions = new Map();
+    let creations = 0;
+    const callbacks = {
+      getSession: async (id) => sessions.get(id) || null,
+      ensureSession: async (id) => {
+        if (!sessions.has(id)) { sessions.set(id, { id, draft: "用户草稿" }); creations += 1; }
+        return sessions.get(id);
+      },
+    };
+    const rename = fs.rename.bind(fs);
+    let writes = 0;
+    const failedWrite = t.mock.method(fs, "rename", async (...args) => {
+      if (++writes === 2) throw new Error("interrupted after creating draft");
+      return rename(...args);
+    });
+    await assert.rejects(store.startDraft(item.id, item.revision, callbacks), /interrupted/);
+    failedWrite.mock.restore();
+    const reserved = (await store.list())[0];
+    assert.equal(reserved.sessionId, null);
+    assert.equal(reserved.pendingDraftSessionId, [...sessions.keys()][0]);
+    assert.equal(reserved.revision, item.revision);
+    store = createPersonalCommitmentsStore(file);
+    const results = await Promise.all(Array.from({ length: 3 }, () => store.startDraft(item.id, item.revision, callbacks)));
+    assert.equal(new Set(results.map((result) => result.session.id)).size, 1);
+    assert.equal(creations, 1);
+    assert.equal((await store.list())[0].pendingDraftSessionId, undefined);
+    assert.equal(results[0].commitment.revision, item.revision + 1);
+    assert.equal(results[0].session.draft, "用户草稿");
+    sessions.clear();
+    await assert.rejects(store.startDraft(item.id, item.revision, callbacks), { statusCode: 409 });
+    const replaced = await store.startDraft(item.id, results[0].commitment.revision, callbacks);
+    assert.notEqual(replaced.session.id, results[0].session.id);
+    assert.equal(creations, 2);
+    const completed = await store.update(item.id, { revision: replaced.commitment.revision, status: "done" });
+    await assert.rejects(store.startDraft(item.id, completed.revision, callbacks), { statusCode: 409 });
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("old browser pending links reuse a personal draft and first-write failure cannot create a draft", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-draft-legacy-"));
+  try {
+    const file = path.join(root, "commitments.json");
+    const store = createPersonalCommitmentsStore(file);
+    const item = await store.create({ title: "整理资料" });
+    const legacy = { id: "legacy-personal", draft: "用户修改后的草稿" };
+    let ensuredId;
+    const result = await store.startDraft(item.id, item.revision, {
+      pendingSessionId: legacy.id,
+      getSession: async (id) => id === legacy.id ? legacy : null,
+      ensureSession: async (id) => { ensuredId = id; return legacy; },
+    });
+    assert.equal(ensuredId, legacy.id);
+    assert.equal(result.session.draft, legacy.draft);
+    const failing = await store.create({ title: "不应创建" });
+    t.mock.method(fs, "rename", async () => { throw new Error("reservation write failed"); });
+    let called = false;
+    await assert.rejects(store.startDraft(failing.id, failing.revision, { getSession: async () => null, ensureSession: async () => { called = true; } }));
+    assert.equal(called, false);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});

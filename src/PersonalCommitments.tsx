@@ -27,8 +27,11 @@ function restorePendingLinks(): Record<string, string> {
 }
 
 function persistPendingLinks(links: Record<string, string>) {
-  try { sessionStorage.setItem(pendingLinksKey, JSON.stringify(links)); }
-  catch { /* Storage can be unavailable; in-page retry still works. */ }
+  try {
+    if (Object.keys(links).length) sessionStorage.setItem(pendingLinksKey, JSON.stringify(links));
+    else sessionStorage.removeItem(pendingLinksKey);
+  }
+  catch { /* Keep legacy migration state in memory when storage is unavailable. */ }
   return links;
 }
 
@@ -55,7 +58,7 @@ function dueLabel(iso: string | null) {
 
 export default function PersonalCommitments({ sessions, onStart, onContinue, onDueCountChange }: {
   sessions: Array<{ id: string; isDraft?: boolean; messageCount?: number }>;
-  onStart: (item: PersonalCommitment) => Promise<string | null>;
+  onStart: (item: PersonalCommitment, pendingSessionId?: string) => Promise<PersonalCommitment | null>;
   onContinue: (sessionId: string) => void;
   onDueCountChange: (count: number) => void;
 }) {
@@ -73,6 +76,7 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
   const [pendingLinks, setPendingLinks] = useState<Record<string, string>>(restorePendingLinks);
 
   const clearPendingLink = (id: string) => {
+    if (!pendingLinks[id]) return;
     const remaining = { ...pendingLinks };
     delete remaining[id];
     setPendingLinks(persistPendingLinks(remaining));
@@ -133,26 +137,13 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
   const start = async (item: PersonalCommitment) => {
     if (busy) return;
     setBusy(item.id); setError("");
-    let startedSessionId: string | null = pendingLinks[item.id] || null;
-    const retryingMissingLink = Boolean(startedSessionId && !sessions.some((session) => session.id === startedSessionId));
     try {
-      if (!startedSessionId) startedSessionId = await onStart(item);
-      if (!startedSessionId) { setError("新对话未创建，请稍后重试"); return; }
-      setPendingLinks(persistPendingLinks({ ...pendingLinks, [item.id]: startedSessionId }));
-      const result = await request<{ commitment: PersonalCommitment }>(`/api/personal/commitments/${encodeURIComponent(item.id)}`, {
-        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: item.revision, sessionId: startedSessionId }),
-      });
-      setItems((previous) => previous.map((entry) => entry.id === item.id ? result.commitment : entry));
+      const commitment = await onStart(item, pendingLinks[item.id]);
+      if (!commitment?.sessionId) { setError("草稿尚未打开，请重试；已创建的草稿会继续保留。"); return; }
+      setItems((previous) => previous.map((entry) => entry.id === item.id ? commitment : entry));
       clearPendingLink(item.id);
-      onContinue(startedSessionId);
-    } catch (cause) {
-      if (cause instanceof Error && cause.message === "个人对话不存在" && retryingMissingLink) {
-        clearPendingLink(item.id);
-        setError("原对话已不存在，已清除关联记录；请再次点击“起草”创建新对话。");
-      } else {
-        setError(`${cause instanceof Error ? cause.message : "操作失败"}${startedSessionId ? "；对话已建立，重试将沿用该对话" : ""}`);
-      }
-    }
+      onContinue(commitment.sessionId);
+    } catch (cause) { setError(`${cause instanceof Error ? cause.message : "操作失败"}；重试会沿用已创建的草稿。`); }
     finally { setBusy(""); }
   };
 

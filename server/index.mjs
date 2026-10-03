@@ -10648,6 +10648,42 @@ app.post("/api/personal/commitments", async (req, res) => {
   catch (error) { sendRouteError(res, error); }
 });
 
+app.post("/api/personal/commitments/:id/draft", async (req, res) => {
+  try {
+    if (!personalExecutionAvailable || !repos.some((repo) => repo.id === personalRepoId)) return res.status(503).json({ ok: false, error: "个人空间执行不可用" });
+    const result = await personalCommitmentsStore.startDraft(req.params.id, req.body?.revision, {
+      pendingSessionId: typeof req.body?.pendingSessionId === "string" ? req.body.pendingSessionId.slice(0, 128) : null,
+      getSession: async (id) => {
+        const session = (await readChatStore()).sessions[id];
+        return session?.repoId === personalRepoId ? session : null;
+      },
+      ensureSession: (id, item) => mutateChatStore((store) => {
+        const existing = store.sessions[id];
+        if (existing) {
+          if (existing.repoId !== personalRepoId) throw Object.assign(new Error("个人对话不存在"), { statusCode: 404 });
+          return existing;
+        }
+        const input = [
+          `请帮我推进这项个人事项：${item.title}`,
+          item.nextStep ? `当前下一步：${item.nextStep}` : "",
+          item.dueAt ? `我记录的到期时间（UTC）：${item.dueAt}` : "",
+          "请先核对现状，给出下一步并执行你当前有权限完成的部分。对外发送、修改日历、删除数据或产生费用前，先展示具体动作并征得我确认。",
+        ].filter(Boolean).join("\n");
+        const session = normalizeSession({ id, repoId: personalRepoId, title: item.title, messages: [], draft: { input, attachments: [], revision: 1, updatedAt: new Date().toISOString() } }, personalRepoId);
+        store.sessions[id] = session;
+        return session;
+      }),
+    });
+    await mutateChatStore((store) => {
+      if (!store.sessions[result.session.id]) throw Object.assign(new Error("个人对话不存在，请重试"), { statusCode: 404 });
+      store.activeByRepo[personalRepoId] = result.session.id;
+    });
+    const summary = await getRepoSessions(personalRepoId, { sync: false, preserveLocalActive: true });
+    const messages = await getChatMessages(personalRepoId, result.session.id, { timeout: appServerFastReadTimeoutMs });
+    res.json({ ok: true, repoId: personalRepoId, activeSessionId: result.session.id, sessions: summary.sessions, messages, commitment: result.commitment });
+  } catch (error) { sendRouteError(res, error); }
+});
+
 app.patch("/api/personal/commitments/:id", async (req, res) => {
   try {
     if (req.body?.sessionId !== undefined && req.body.sessionId !== null) {

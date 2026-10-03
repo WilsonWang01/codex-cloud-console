@@ -4601,6 +4601,21 @@ export function App() {
   };
   const newChatSession = () => { void createChatSession(); };
 
+  const preparePersonalCommitment = async (item: PersonalCommitment, pendingSessionId?: string) => {
+    if (busyAction || isLoadingChatHistory || selectedRepo.kind !== "personal") return null;
+    const repo = selectedRepo;
+    const requestSeq = ++chatLoadSeq.current;
+    setBusyAction("personal-commitment-draft");
+    try {
+      await saveComposerDraft(repo.id, activeSessionId, chatInput, chatAttachments);
+      const result = await api<ChatHistoryResponse & { commitment: PersonalCommitment }>(`/api/personal/commitments/${encodeURIComponent(item.id)}/draft`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: item.revision, pendingSessionId }),
+      });
+      return applyChatHistory(result, repo, requestSeq) ? result.commitment : null;
+    } finally { setBusyAction(null); }
+  };
+
   const prepareGitHubIssue = async (number: number) => {
     if (busyAction || isLoadingChatHistory || selectedRepo.kind === "personal") return;
     const repoId = selectedRepo.id;
@@ -6089,7 +6104,7 @@ export function App() {
           onOpenMaterial={(filePath) => { setSelectedPersonalFilePath(filePath); setActiveView("materials"); }}
           onNew={() => { setActiveView("cli"); void newChatSession(); }}
           onChooseTask={(prompt) => { void createChatSession(prompt).then((created) => { if (created) setActiveView("cli"); }); }}
-          onStartCommitment={(item) => createChatSession(`请帮我推进这项个人事项：${item.title}${item.nextStep ? `\n当前下一步：${item.nextStep}` : ""}${item.dueAt ? `\n我记录的到期时间：${new Date(item.dueAt).toLocaleString()}` : ""}\n请先核对现状，给出下一步并执行你当前有权限完成的部分。对外发送、修改日历、删除数据或产生费用前，先展示具体动作并征得我确认。`)}
+          onStartCommitment={preparePersonalCommitment}
           onConnections={() => setActiveView("settings")}
           onOpenAutomation={(automationId) => { setSelectedAutomationId(automationId); setActiveView("automations"); }}
           onAcknowledgeAttention={(itemId) => { void acknowledgeAttention([itemId]); }}
@@ -6440,7 +6455,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   onOpenMaterial: (filePath: string) => void;
   onNew: () => void;
   onChooseTask: (prompt: string) => void;
-  onStartCommitment: (item: PersonalCommitment) => Promise<string | null>;
+  onStartCommitment: (item: PersonalCommitment, pendingSessionId?: string) => Promise<PersonalCommitment | null>;
   onConnections: () => void;
   onOpenAutomation: (automationId: string) => void;
   onAcknowledgeAttention: (itemId: string) => void;
