@@ -159,7 +159,7 @@ function summarizeUserInputs(content) {
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
     if (block.type === "text" && typeof block.text === "string") chunks.push(block.text);
-    else if (block.type === "image" && typeof block.url === "string") chunks.push(`[图片] ${block.url}`);
+    else if (block.type === "image" && typeof block.url === "string") chunks.push(block.url.startsWith("data:") ? "[图片] 内嵌图片" : `[图片] ${block.url}`);
     else if (block.type === "localImage" || block.type === "mention") {
       // Render local files as attachment cards instead of noisy absolute paths.
     }

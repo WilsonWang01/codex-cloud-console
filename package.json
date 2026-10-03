@@ -30,6 +30,7 @@
     "verify:clients": "node --test scripts/verify-api-clients.mjs",
     "verify:external-client": "node --test scripts/verify-external-client-example.mjs",
     "verify:model-api": "node --test scripts/verify-model-api.mjs",
+    "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
     "verify:automation-events": "node --test scripts/verify-automation-events.mjs",
     "verify:usage": "node --test scripts/verify-run-usage.mjs",
     "verify:admission": "node --test scripts/verify-run-admission.mjs scripts/verify-run-budget.mjs",

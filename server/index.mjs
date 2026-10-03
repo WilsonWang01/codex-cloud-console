@@ -17,7 +17,7 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
-import { createModelApiHandler, modelApiProtocol, modelApiTurnText, sendModelApiError } from "./model-api.mjs";
+import { authenticateModelApiRequest, createModelApiHandler, modelApiJsonLimit, modelApiProtocol, modelApiTurnText, sendModelApiError } from "./model-api.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
 import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
@@ -102,11 +102,15 @@ app.use((req, res, next) => {
   }
   return next();
 });
-app.use((req, res, next) => {
-  const protocol = modelApiProtocol(req.path);
-  if (!protocol) return next();
-  express.json({ limit: "128kb" })(req, res, (error) => {
-    if (error) return sendModelApiError(res, protocol, Object.assign(new Error("请求正文不是有效 JSON 或超过 128 KiB"), { statusCode: error.status || 400 }));
+app.use("/api/automations/:id/v1", async (req, res, next) => {
+  const protocol = modelApiProtocol(`${req.baseUrl}${req.path}`);
+  if (req.method !== "POST" || !protocol) return next();
+  try {
+    // Authenticate before buffering the larger image payload; recheck when accepting the task.
+    await authenticateModelApiRequest(req, protocol, (request, token) => authenticateAutomationTrigger(request, { token, allowLocalDevelopment: false }));
+  } catch (error) { return sendModelApiError(res, protocol, error); }
+  express.json({ limit: modelApiJsonLimit })(req, res, (error) => {
+    if (error) return sendModelApiError(res, protocol, Object.assign(new Error("请求正文不是有效 JSON 或超过 12 MiB"), { statusCode: error.status || 400 }));
     return next();
   });
 });
@@ -1984,10 +1988,10 @@ function inlineShellCommand(command, limit = 180) {
   return `${text.slice(0, limit - 1)}…`;
 }
 
-async function appServerTurnParams(threadId, repo, runtime, message, attachments = []) {
+async function appServerTurnParams(threadId, repo, runtime, message, attachments = [], imageInputs = []) {
   return {
     threadId,
-    input: await buildUserInputs(repo, message, attachments),
+    input: [...await buildUserInputs(repo, message, attachments), ...imageInputs],
     cwd: repo.path,
     approvalPolicy: runtime.approval,
     sandboxPolicy: appServerSandboxPolicy(runtime, repo),
@@ -3087,7 +3091,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
         await finishTurnJob(job, false, 130, "Turn cancelled before start");
         return;
       }
-      const result = await appServerClientForJob(job).request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments), 30_000);
+      const result = await appServerClientForJob(job).request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs), 30_000);
       job.turnId = result?.turn?.id || null;
       if (job.completed) {
         if (job.threadId && job.turnId) {
@@ -6770,6 +6774,7 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
     sessionId: heartbeatSource?.sessionId || req.body?.sessionId,
     heartbeatWorktreePath: heartbeatSource?.worktreePath || null,
     worktree: req.body?.worktree !== false,
+    imageInputs: req.modelApiImageInputs,
   };
 }
 
@@ -6858,6 +6863,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       unattendedPersonalSchedule: options.trigger === "personal-schedule",
       reviewUnverifiedMcpCalls: ["personal-test", "personal-schedule"].includes(options.trigger),
       maxRuntimeMs: options.maxRuntimeMs,
+      imageInputs: options.imageInputs,
     });
     activeAutomationRuns.set(runId, job);
     if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {
@@ -11668,8 +11674,8 @@ async function modelApiRunSnapshot(id) {
 
 const handleModelApi = createModelApiHandler({
   authenticate: (req, token) => authenticateAutomationTrigger(req, { token, allowLocalDevelopment: false }),
-  submit: (req, body) => {
-    const internal = Object.assign(Object.create(req), { body });
+  submit: (req, body, imageInputs) => {
+    const internal = Object.assign(Object.create(req), { body, modelApiImageInputs: imageInputs });
     const key = automationTriggerIdempotencyKey(internal, req.params.id, "webhook", req.apiClient.id);
     if (key.error) throw automationRequestError(400, key.error);
     return serializeAutomationTrigger(key.key, () => submitAutomationTriggerRequest(internal, "webhook"));

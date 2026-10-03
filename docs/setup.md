@@ -153,7 +153,7 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 完整的参数契约、Node.js 后台 job 示例、超时恢复和错误处理见[作为后端服务接入](backend-integration.md)。
 
-OpenAI / Anthropic SDK 的文本和 SSE 接入地址、认证、幂等键与兼容限制见[协议适配说明](model-api-adapters.md)。已有多站点 Caddy 使用该文档的 `--model-api` 候选配置流程，不覆盖整份站点配置。
+OpenAI / Anthropic SDK 的文本、内嵌图片输入和文本 SSE 接入地址、认证、幂等键与兼容限制见[协议适配说明](model-api-adapters.md)。已有多站点 Caddy 使用该文档的 `--model-api` 候选配置流程，不覆盖整份站点配置。
 
 在已通过网页登录认证的控制台打开“调用与用量”，输入服务名、勾选它允许触发的自动化，再创建令牌。令牌只显示一次；服务端只保存 SHA-256 摘要，需在调用方自己的安全配置中保存明文。创建令牌不会运行模型，实际触发 Webhook/Heartbeat 会运行既有自动化，需先确认模型额度和任务影响。
 

@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
 import { runExternalClient } from "./external-client-example.mjs";
+import { modelApiJsonLimit } from "../server/model-api.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -2144,12 +2145,50 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(anthropicResult.data.content[0].text, "接口验收通过");
     assert.equal(anthropicResult.data.usage.output_tokens, 30);
     assert.equal(anthropicResult.response.headers.get("x-codex-cloud-output-limit"), "unsupported-acknowledged");
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const bluePng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC";
+    const imageHeaders = { ...modelHeaders, "idempotency-key": "model-api-images-0001" };
+    const imageBody = { ...modelBody, messages: [{ role: "user", content: [
+      { type: "text", text: "model api regression compare images" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${png}`, detail: "auto" } },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${bluePng}` } },
+    ] }] };
+    const imagesFirst = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: imageHeaders, body: JSON.stringify(imageBody) });
+    assert.equal(imagesFirst.response.status, 200, JSON.stringify(imagesFirst.data));
+    assert.equal(imagesFirst.data.choices[0].message.content, "接口验收通过");
+    const capturedImages = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((item) => item.method === "turn/start" && item.params.input.some((block) => block.type === "image")).at(-1);
+    assert.deepEqual(capturedImages.params.input.filter((block) => block.type === "image"), [
+      { type: "image", url: `data:image/png;base64,${png}`, detail: "auto" },
+      { type: "image", url: `data:image/png;base64,${bluePng}`, detail: "auto" },
+    ]);
+    const imagesRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === imagesFirst.response.headers.get("x-codex-cloud-run-id"));
+    assert.equal(imagesRun.prompt.includes(png), false);
+    assert.match(imagesRun.prompt, /"sha256"/);
+    const imagesReplay = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: imageHeaders, body: JSON.stringify(imageBody) });
+    assert.equal(imagesReplay.data.id, imagesFirst.data.id);
+    const changedImageBody = structuredClone(imageBody);
+    changedImageBody.messages[0].content[1].image_url.url = `data:image/png;base64,${bluePng}`;
+    const imagesConflict = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: imageHeaders, body: JSON.stringify(changedImageBody) });
+    assert.equal(imagesConflict.response.status, 409);
+    const anthropicImage = await jsonRequest(baseUrl, anthropicPath, { method: "POST", headers: { ...anthropicHeaders, "idempotency-key": "model-api-images-anthropic-0001" }, body: JSON.stringify({ ...anthropicBody, messages: [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: png } }, { type: "text", text: "model api regression" },
+    ] }] }) });
+    assert.equal(anthropicImage.response.status, 200, JSON.stringify(anthropicImage.data));
+    assert.equal(anthropicImage.data.content[0].text, "接口验收通过");
+    const beforeInvalidImages = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.length;
+    const invalidImageBody = structuredClone(imageBody);
+    invalidImageBody.messages[0].content[1].image_url.url = "http://169.254.169.254/latest/meta-data";
+    const invalidImages = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { ...modelHeaders, "idempotency-key": "model-api-bad-image-0001" }, body: JSON.stringify(invalidImageBody) });
+    assert.equal(invalidImages.response.status, 400);
+    assert.equal((JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.length, beforeInvalidImages);
     const badJson = await jsonRequest(baseUrl, anthropicPath, { method: "POST", headers: anthropicHeaders, body: "{not json" });
     assert.equal(badJson.response.status, 400);
     assert.equal(badJson.data.type, "error");
     assert.equal(badJson.data.error.type, "invalid_request_error");
-    const hugeBody = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify({ ...modelBody, ignored: "x".repeat(140000) }) });
+    const hugeBody = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify({ ...modelBody, ignored: "x".repeat(modelApiJsonLimit) }) });
     assert.equal(hugeBody.response.status, 413);
+    const unauthenticatedHugeBody = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ignored: "x".repeat(modelApiJsonLimit) }) });
+    assert.equal(unauthenticatedHugeBody.response.status, 401);
     const modelOutOfScope = await jsonRequest(baseUrl, "/api/automations/sample-hourly/v1/chat/completions", { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
     assert.equal(modelOutOfScope.response.status, 401);
     await jsonRequest(baseUrl, `/api/clients/${modelClient.data.client.id}/revoke`, { method: "POST" });

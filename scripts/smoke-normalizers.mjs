@@ -49,6 +49,13 @@ const knownMessages = normalizeAppServerThreadMessages({
 assert(knownMessages.length === 1, "known item normalization regressed");
 assert(knownMessages[0].time === "2026-07-02T00:00:00.000Z", "known item did not inherit stable thread timestamp");
 
+const inlineImageMessages = normalizeAppServerThreadMessages({ turns: [{ id: "turn-inline-image", items: [{
+  id: "user-inline-image", type: "userMessage", content: [{ type: "text", text: "看图" },
+    { type: "image", url: "data:image/png;base64,private-image-payload" }],
+}] }] });
+assert(inlineImageMessages[0].text.includes("内嵌图片"), "inline image should remain visible as an input label");
+assert(!JSON.stringify(inlineImageMessages).includes("private-image-payload"), "inline image data must not be copied to normalized chat history");
+
 const uploadMessages = normalizeAppServerThreadMessages(
   {
     createdAt: "2026-07-02T00:00:00Z",

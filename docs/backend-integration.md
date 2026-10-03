@@ -2,7 +2,7 @@
 
 Codex Cloud 的核心是**既有自动化任务的异步执行接口**。适合 CI 检查、调研服务、个人 Agent 的后台任务：业务服务提交事件，保存运行 ID，查询进度及结果，需要时显式取消。
 
-需要用官方 SDK 接入文本请求时，另有 [OpenAI Chat Completions / Anthropic Messages 协议适配](model-api-adapters.md)，支持文本和 SSE 子集。它不是完整的模型 API，尤其不保证请求级输出 token 上限；下文仍描述原有的异步任务契约。
+需要用官方 SDK 接入文本或内嵌图片请求时，另有 [OpenAI Chat Completions / Anthropic Messages 协议适配](model-api-adapters.md)，支持文本、图片输入和文本 SSE 子集。它不是完整的模型 API，尤其不保证请求级输出 token 上限；下文仍描述原有的异步任务契约，不新增异步 API 的图片字段。
 
 ## 接入前准备
 
