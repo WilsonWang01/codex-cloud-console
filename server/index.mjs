@@ -16,7 +16,7 @@ import { buildReviewSnapshotFromDiff, handleReviewRoutes } from "./review-git.mj
 import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "./run-safety.mjs";
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
-import { clientCanReadRun, externalRunView, scopedHeartbeatSource } from "./external-automation.mjs";
+import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
 import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
@@ -6754,6 +6754,9 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
     triggerRequestHash,
     completionContract,
     prompt: req.body?.prompt,
+    model: req.body?.model,
+    reasoning: req.body?.reasoning,
+    search: req.body?.search,
     sessionId: heartbeatSource?.sessionId || req.body?.sessionId,
     heartbeatWorktreePath: heartbeatSource?.worktreePath || null,
     worktree: req.body?.worktree !== false,
@@ -11479,12 +11482,14 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   const automation = automations.find((item) => item.id === req.params.id);
   if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
   if (automation.personalRoutine) return res.status(403).json({ ok: false, error: "个人流程只能从已登录的控制台手动运行" });
+  const scopedClient = !["legacy-shared", "local-development"].includes(req.apiClient.id);
   if (!String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim() &&
     !["legacy-shared", "local-development"].includes(req.apiClient.id)) {
     return res.status(400).json({ ok: false, error: "Idempotency-Key is required for API clients" });
   }
   let completionContract;
   try {
+    validateExternalTriggerInput(req.body, { trigger, scoped: scopedClient });
     completionContract = automationCompletionContractForRequest(req, automation);
   } catch (error) {
     return res.status(400).json({ ok: false, error: error.message, output: error.message });
@@ -11539,10 +11544,6 @@ async function processAutomationTriggerRequest(req, res, trigger) {
     }
   }
   const repo = getRepoById(automation.repoId);
-  const scopedClient = !["legacy-shared", "local-development"].includes(req.apiClient.id);
-  if (scopedClient && req.body?.worktree === false) {
-    return res.status(400).json({ ok: false, error: "API client runs require a detached worktree" });
-  }
   let heartbeatSource = null;
   if (scopedClient && trigger === "heartbeat") {
     const requestedSessionId = String(req.body?.sessionId || "").trim();

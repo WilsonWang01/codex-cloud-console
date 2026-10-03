@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
+import { runExternalClient } from "./external-client-example.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -2033,7 +2034,13 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(repoCwdDenied.response.status, 400);
     assert.match(repoCwdDenied.data.error, /detached worktree/);
     const scopedPrompt = "outcome contract regression legacy no contract";
-    const scopedBody = JSON.stringify({ prompt: scopedPrompt });
+    const scopedBody = JSON.stringify({ prompt: scopedPrompt, model: "gpt-6-astra", reasoning: "ultra", search: false });
+    for (const input of [{ sessionId: "existing-console-chat" }, { search: "false" }, { model: {} }, { reasoning: "typo" }, { runner: "shell" }, { sandbox: "danger-full-access" }]) {
+      const invalidTrigger = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+        method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-invalid-body-0001" }, body: JSON.stringify(input),
+      });
+      assert.equal(invalidTrigger.response.status, 400, JSON.stringify(invalidTrigger.data));
+    }
     const clientTrigger = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
       method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-test-0001" }, body: scopedBody,
     });
@@ -2058,6 +2065,9 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(scopedCompleted?.status, "completed");
     const completedProgress = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, { headers: scopedHeaders });
     assert.equal(completedProgress.response.status, 200);
+    const integrationResult = await runExternalClient({ command: "status", origin: baseUrl, token: newClient.data.token, automationId: "sample-on-demand", runId: clientTrigger.data.run.id });
+    assert.equal(integrationResult.status, "completed");
+    assert.equal(integrationResult.model, "gpt-6-astra");
     assert.ok(completedProgress.data.eventCursor >= 1);
     assert.equal(completedProgress.data.run.eventCursor, completedProgress.data.eventCursor);
     assert.ok(completedProgress.data.events.some((event) => event.type === "queued"));
@@ -2069,6 +2079,13 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(invalidCursor.response.status, 400);
     const originalClientRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === clientTrigger.data.run.id);
     assert.notEqual(originalClientRun.worktreePath, repoRoot);
+    assert.equal(originalClientRun.model, "gpt-6-astra");
+    assert.equal(originalClientRun.reasoning, "ultra");
+    const externalThreadStart = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse)
+      .find((request) => request.method === "thread/start" && request.params.cwd === originalClientRun.worktreePath);
+    assert.equal(externalThreadStart?.params.model, "gpt-6-astra");
+    assert.equal(externalThreadStart?.params.config.model_reasoning_effort, "ultra");
+    assert.equal(externalThreadStart?.params.config.tools.web_search, false);
     const chatStateFile = path.join(stateRoot, "chat-history.json");
     const chatBeforeTamper = await fs.readFile(chatStateFile, "utf8");
     const chatWithMissingThread = JSON.parse(chatBeforeTamper);
@@ -2102,6 +2119,11 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       body: JSON.stringify({ sessionId: originalClientRun.sessionId, prompt: scopedPrompt }),
     });
     assert.equal(competingHeartbeat.response.status, 403);
+    const competingWebhook = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token, "idempotency-key": "scoped-cross-webhook-0001", "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: originalClientRun.sessionId, prompt: scopedPrompt }),
+    });
+    assert.equal(competingWebhook.response.status, 400);
     const competingResult = await jsonRequest(baseUrl, clientTrigger.data.run.resultPath, {
       headers: { "x-codex-cloud-token": competingClient.data.token },
     });

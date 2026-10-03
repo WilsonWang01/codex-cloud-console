@@ -151,6 +151,8 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 ### 独立调用方
 
+完整的参数契约、Node.js 后台 job 示例、超时恢复和错误处理见[作为后端服务接入](backend-integration.md)。
+
 在已通过网页登录认证的控制台打开“调用与用量”，输入服务名、勾选它允许触发的自动化，再创建令牌。令牌只显示一次；服务端只保存 SHA-256 摘要，需在调用方自己的安全配置中保存明文。创建令牌不会运行模型，实际触发 Webhook/Heartbeat 会运行既有自动化，需先确认模型额度和任务影响。
 
 调用方使用 `x-codex-cloud-token` 提交令牌，并为每个业务事件提供 8–160 字符的 `Idempotency-Key`。同一服务重试同一事件时复用该键；同键不同请求会返回 409，失败终态也不会被静默重跑。独立调用方不能指定 `worktree:false`；所授权仓库需要可解析 `HEAD` 的 Git 提交。令牌仅能触发创建时选择的自动化、读取和请求取消自己的运行，不能查看管理页面或批准自己的任务。旧共享令牌仍兼容，统计中标记为 `legacy-shared`，不会被当作某个新服务。
@@ -161,11 +163,12 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 ```bash
 node scripts/external-client-example.mjs submit my-app-review business-event-20260926 --wait
+node scripts/external-client-example.mjs heartbeat my-app-review follow-up-event-20261004 --wait
 node scripts/external-client-example.mjs status my-app-review run-id --wait
 node scripts/external-client-example.mjs cancel my-app-review run-id
 ```
 
-轮询中断只停止本地等待，不自动取消服务器任务；取消必须显式运行第三条命令。参考客户端默认使用该自动化已保存的 prompt，不接受外部任意命令。测试使用本地假服务端，不触发模型。
+轮询中断只停止本地等待，不自动取消服务器任务；取消必须显式运行 `cancel`。参考客户端默认使用自动化已保存的 prompt，也可作为 Node.js 模块传入经过审核的 `input.prompt/model/reasoning/search/completionContract`；HTTP API 校验参数，Webhook 不允许指定已有会话。客户端统一限制请求及等待期限，有限重试网络和临时网关错误，返回进度游标并保留恢复所需的任务/事件 ID。测试使用本地假服务端，不触发模型。
 
 独立令牌的项目范围、隔离工作树和并发限制**不是操作系统沙箱**：当前执行器仍与控制台共用系统用户、Codex 进程和环境。不要把令牌给不受信任的服务，也不要让外部输入直接驱动有高权限的任意命令；对外开放前需要独立 worker、最小权限和出站边界验收。旧共享令牌权限更宽，应迁移为独立令牌并按需撤销。
 
