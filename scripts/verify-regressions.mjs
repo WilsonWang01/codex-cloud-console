@@ -116,6 +116,7 @@ const initDelay = Number(process.env.FAKE_INIT_DELAY_MS || 0);
 const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
 const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
 const threads = [];
+let modelApiText = null;
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
@@ -210,6 +211,9 @@ input.on("line", (line) => {
     send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [] } } });
     return send({ method: "thread/archived", params: { threadId: message.params.threadId } }, 20);
   }
+  if (message.method === "thread/read" && message.params?.includeTurns && modelApiText) {
+    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: "turn-model-api", items: [{ type: "agentMessage", text: modelApiText }] }] } } });
+  }
   if (message.method === "thread/archive" && message.params?.threadId === "thread-archive-race") {
     return send({ id: message.id, result: {} }, 250);
   }
@@ -233,6 +237,15 @@ input.on("line", (line) => {
   }
   if (message.method === "turn/start") {
     const requestText = JSON.stringify(message.params || {});
+    if (requestText.includes("model api regression")) {
+      modelApiText = requestText.includes("long output") ? "验收".repeat(2500) : "接口验收通过";
+      send({ id: message.id, result: { turn: { id: "turn-model-api" } } });
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: "turn-model-api", delta: modelApiText.slice(0, 2) } }, 40);
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: "turn-model-api", delta: modelApiText.slice(2) } }, 150);
+      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
+      send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: "turn-model-api", status: "completed" } } }, 300);
+      return;
+    }
     const turnId = requestText.includes("cancel regression") ? "turn-cancel-regression" : "turn-regression";
     const progressRegression = requestText.includes("progress regression");
     const queuedFirstRegression = requestText.includes("progress regression queue first");
@@ -2086,6 +2099,62 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(externalThreadStart?.params.model, "gpt-6-astra");
     assert.equal(externalThreadStart?.params.config.model_reasoning_effort, "ultra");
     assert.equal(externalThreadStart?.params.config.tools.web_search, false);
+    const modelClient = await jsonRequest(baseUrl, "/api/clients", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "model-api-regression", automationIds: ["sample-on-demand"] }),
+    });
+    const modelPath = "/api/automations/sample-on-demand/v1/chat/completions";
+    const modelBody = { model: "gpt-6-sol", reasoning_effort: "high", messages: [{ role: "system", content: "只用中文" }, { role: "user", content: "model api regression" }] };
+    const modelHeaders = { authorization: `Bearer ${modelClient.data.token}`, "content-type": "application/json", "idempotency-key": "model-api-regression-0001", origin: "https://external-service.example" };
+    const missingModelToken = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(modelBody) });
+    assert.equal(missingModelToken.response.status, 401);
+    assert.equal(missingModelToken.data.error.type, "authentication_error");
+    const modelComplete = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
+    assert.equal(modelComplete.response.status, 200, JSON.stringify(modelComplete.data));
+    assert.equal(modelComplete.data.choices[0].message.content, "接口验收通过");
+    assert.equal(modelComplete.data.usage.total_tokens, 130);
+    const modelRunId = modelComplete.response.headers.get("x-codex-cloud-run-id");
+    const modelRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === modelRunId);
+    assert.equal(modelRun.clientId, modelClient.data.client.id);
+    assert.equal(modelRun.status, "completed");
+    assert.equal(modelRun.worktreePolicy, "detached-worktree");
+    assert.notEqual(modelRun.worktreePath, originalClientRun.worktreePath);
+    assert.equal(modelRun.model, "gpt-6-sol");
+    assert.equal(modelRun.reasoning, "high");
+    const modelReplay = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
+    assert.equal(modelReplay.data.id, modelComplete.data.id);
+    const modelConflict = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify({ ...modelBody, reasoning_effort: "low" }) });
+    assert.equal(modelConflict.response.status, 409);
+    const modelStream = await fetch(new URL(modelPath, baseUrl), { method: "POST", headers: modelHeaders, body: JSON.stringify({ ...modelBody, stream: true, stream_options: { include_usage: true } }) });
+    const modelStreamRaw = await modelStream.text();
+    assert.match(modelStreamRaw, /接口验收通过/);
+    assert.match(modelStreamRaw, /\[DONE\]/);
+    assert.match(modelStreamRaw, /"total_tokens":130/);
+    const longHeaders = { ...modelHeaders, "idempotency-key": "model-api-long-0001" };
+    const longBody = { ...modelBody, messages: [{ role: "user", content: "model api regression long output" }] };
+    const longFirst = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: longHeaders, body: JSON.stringify(longBody) });
+    assert.equal(longFirst.data.choices[0].message.content, "验收".repeat(2500));
+    const longReplay = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: longHeaders, body: JSON.stringify(longBody) });
+    assert.equal(longReplay.data.choices[0].message.content, longFirst.data.choices[0].message.content);
+    const anthropicHeaders = { "x-api-key": modelClient.data.token, "content-type": "application/json", "idempotency-key": "model-api-anthropic-0001", "anthropic-version": "2023-06-01", "x-codex-cloud-allow-unbounded-output": "true" };
+    const anthropicPath = "/api/automations/sample-on-demand/v1/messages";
+    const anthropicBody = { model: "gpt-6-sol", messages: [{ role: "user", content: "model api regression" }], max_tokens: 1024 };
+    const anthropicResult = await jsonRequest(baseUrl, anthropicPath, { method: "POST", headers: anthropicHeaders, body: JSON.stringify(anthropicBody) });
+    assert.equal(anthropicResult.response.status, 200);
+    assert.equal(anthropicResult.data.content[0].text, "接口验收通过");
+    assert.equal(anthropicResult.data.usage.output_tokens, 30);
+    assert.equal(anthropicResult.response.headers.get("x-codex-cloud-output-limit"), "unsupported-acknowledged");
+    const badJson = await jsonRequest(baseUrl, anthropicPath, { method: "POST", headers: anthropicHeaders, body: "{not json" });
+    assert.equal(badJson.response.status, 400);
+    assert.equal(badJson.data.type, "error");
+    assert.equal(badJson.data.error.type, "invalid_request_error");
+    const hugeBody = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify({ ...modelBody, ignored: "x".repeat(140000) }) });
+    assert.equal(hugeBody.response.status, 413);
+    const modelOutOfScope = await jsonRequest(baseUrl, "/api/automations/sample-hourly/v1/chat/completions", { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
+    assert.equal(modelOutOfScope.response.status, 401);
+    await jsonRequest(baseUrl, `/api/clients/${modelClient.data.client.id}/revoke`, { method: "POST" });
+    const modelRevoked = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
+    assert.equal(modelRevoked.response.status, 401);
     const chatStateFile = path.join(stateRoot, "chat-history.json");
     const chatBeforeTamper = await fs.readFile(chatStateFile, "utf8");
     const chatWithMissingThread = JSON.parse(chatBeforeTamper);
@@ -2351,11 +2420,17 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
       res.end(body);
       return;
     }
+    if (req.url === "/api/automations/demo/v1/chat/completions") {
+      req.resume();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ authorization: req.headers.authorization, cloudToken: req.headers["x-codex-cloud-token"] || null }));
+      return;
+    }
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("upstream-not-found");
   });
   await new Promise((resolve) => upstream.listen(upstreamPort, "127.0.0.1", resolve));
-  await fs.writeFile(credentialsPath, `url=http://127.0.0.1:${upstreamPort}/\nusername=test\npassword=test\n`);
+  await fs.writeFile(credentialsPath, `url=http://127.0.0.1:${upstreamPort}/\nusername=test\npassword=test\ntoken=ambient-proxy-token\n`);
   await fs.writeFile(secretPath, "must-not-be-served");
   await fs.rm(symlinkPath, { force: true });
   await fs.symlink(secretPath, symlinkPath);
@@ -2395,6 +2470,10 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     const cachedStatus = await fetch(`http://127.0.0.1:${proxyPort}/api/notifications/push/status`);
     assert.equal(cachedStatus.status, 200);
     await cachedStatus.arrayBuffer();
+    const modelProxy = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/v1/chat/completions`, {
+      method: "POST", headers: { authorization: "Bearer isolated-client-token", "content-type": "application/json" }, body: "{}",
+    });
+    assert.deepEqual(await modelProxy.json(), { authorization: "Bearer isolated-client-token", cloudToken: null });
     const cacheMode = (await fs.stat(cachePath)).mode & 0o777;
     assert.equal(cacheMode, 0o600);
     const callbackPath = "/callback/allowed-regression";

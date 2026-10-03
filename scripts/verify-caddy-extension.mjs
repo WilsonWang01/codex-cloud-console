@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { assertCaddyRouteExtension, extendAutomationRoutes } from "../ops/extend-caddy-automation-routes.mjs";
+import { assertCaddyRouteExtension, extendAutomationRoutes, extendModelApiRoutes } from "../ops/extend-caddy-automation-routes.mjs";
 
 const source = `example.com {
 \t@automation_trigger path_regexp automation_trigger ^/api/automations/[^/]+/(webhook|heartbeat)$
@@ -65,4 +65,14 @@ test("Caddy extension CLI runs through a release symlink", async () => {
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+test("model API exposure is limited to two POST routes and preserves existing result/cancel routes", () => {
+  const current = extendAutomationRoutes(source);
+  const updated = extendModelApiRoutes(current);
+  assert.match(updated, /method POST\n\t\tpath_regexp automation_model_api \^\/api\/automations\/\[\^\/\]\+\/v1\/\(chat\/completions\|messages\)\$/);
+  assert.match(updated, /flush_interval -1/);
+  assert.equal(updated.replace(/\t@automation_model_api \{[\s\S]*?\n\t\}\n\thandle @automation_model_api \{[\s\S]*?\n\t\}\n/, ""), current);
+  assert.equal(extendModelApiRoutes(updated), updated);
+  assert.throws(() => extendModelApiRoutes(updated.replace("flush_interval -1", "flush_interval 10s")), /differ/);
 });

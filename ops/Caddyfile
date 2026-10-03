@@ -39,6 +39,15 @@ http://{$CODEX_CLOUD_PUBLIC_IP} {
 	handle @automation_cancel {
 		reverse_proxy 127.0.0.1:8787
 	}
+	@automation_model_api {
+		method POST
+		path_regexp automation_model_api ^/api/automations/[^/]+/v1/(chat/completions|messages)$
+	}
+	handle @automation_model_api {
+		reverse_proxy 127.0.0.1:8787 {
+			flush_interval -1
+		}
+	}
 	handle {
 		basicauth {
 			{$CODEX_CLOUD_BASIC_USER} {$CODEX_CLOUD_BASIC_HASH}

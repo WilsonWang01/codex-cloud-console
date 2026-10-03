@@ -17,6 +17,7 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
+import { createModelApiHandler, modelApiProtocol, modelApiTurnText, sendModelApiError } from "./model-api.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
 import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
@@ -93,13 +94,21 @@ app.use((req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
   if (/^\/api\/automations\/[^/]+\/(webhook|heartbeat)$/.test(req.path) ||
-    /^\/api\/automations\/[^/]+\/runs\/[^/]+\/cancel$/.test(req.path)) return next();
+    /^\/api\/automations\/[^/]+\/runs\/[^/]+\/cancel$/.test(req.path) || modelApiProtocol(req.path)) return next();
   const origin = String(req.get("origin") || "").replace(/\/+$/, "");
   const localOrigin = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(origin);
   if ((origin && origin !== publicOrigin && !localOrigin) || req.get("sec-fetch-site") === "cross-site") {
     return res.status(403).json({ ok: false, error: "Cross-site mutation request rejected" });
   }
   return next();
+});
+app.use((req, res, next) => {
+  const protocol = modelApiProtocol(req.path);
+  if (!protocol) return next();
+  express.json({ limit: "128kb" })(req, res, (error) => {
+    if (error) return sendModelApiError(res, protocol, Object.assign(new Error("请求正文不是有效 JSON 或超过 128 KiB"), { statusCode: error.status || 400 }));
+    return next();
+  });
 });
 app.use(express.json({ limit: process.env.CODEX_UPLOAD_JSON_LIMIT || "32mb" }));
 const maxStoredChatMessages = 80;
@@ -5121,6 +5130,7 @@ function normalizeAutomationRun(run = {}) {
     updatedAt: String(run.updatedAt || startedAt),
     finishedAt: run.finishedAt ? String(run.finishedAt) : null,
     threadId: run.threadId ? String(run.threadId) : null,
+    ...(run.turnId ? { turnId: String(run.turnId) } : {}),
     sessionId: run.sessionId ? String(run.sessionId) : null,
     worktreePath: run.worktreePath ? String(run.worktreePath) : null,
     worktreePolicy: String(run.worktreePolicy || "none"),
@@ -6654,9 +6664,9 @@ async function auditTimelineMessagesForSession(repoId, session, existingIds = ne
   return [...records.values()].map(normalizeChatMessage).filter((item) => item.text);
 }
 
-async function authenticateAutomationTrigger(req) {
+async function authenticateAutomationTrigger(req, { token, allowLocalDevelopment = true } = {}) {
   const expected = String(process.env.CODEX_CLOUD_WEBHOOK_TOKEN || process.env.AUTOMATION_WEBHOOK_TOKEN || "").trim();
-  const provided = String(req.get("x-codex-cloud-token") || "").trim();
+  const provided = String(token ?? req.get("x-codex-cloud-token") ?? "").trim();
   if (expected) {
     const providedBytes = Buffer.from(provided);
     const expectedBytes = Buffer.from(expected);
@@ -6666,7 +6676,7 @@ async function authenticateAutomationTrigger(req) {
   }
   const client = await apiClientStore.authenticate(provided, req.params.id);
   if (client) return client;
-  if (!expected && process.env.NODE_ENV !== "production" && !provided) return { id: "local-development" };
+  if (allowLocalDevelopment && !expected && process.env.NODE_ENV !== "production" && !provided) return { id: "local-development" };
   return null;
 }
 
@@ -6900,6 +6910,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           status: needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
+          turnId: job.turnId,
           summary: job.output || "",
           usage: runUsageFromProtocol(job.rawTurnUsage),
           error,
@@ -11479,37 +11490,51 @@ async function handleAutomationTriggerRequest(req, res, trigger) {
 }
 
 async function processAutomationTriggerRequest(req, res, trigger) {
+  try {
+    const payload = await submitAutomationTriggerRequest(req, trigger);
+    res.locals.runId = payload.run.id;
+    res.locals.deduplicated = Boolean(payload.deduplicated);
+    return res.json(payload);
+  } catch (error) {
+    if (error.retryAfterMs) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
+    return res.status(error.statusCode || 500).json({ ok: false, error: error.message, output: error.message });
+  }
+}
+
+function automationRequestError(statusCode, message, retryAfterMs = 0) {
+  return Object.assign(new Error(message), { statusCode, retryAfterMs });
+}
+
+async function submitAutomationTriggerRequest(req, trigger) {
   const automation = automations.find((item) => item.id === req.params.id);
-  if (!automation) return res.status(404).json({ ok: false, output: "Unknown automation" });
-  if (automation.personalRoutine) return res.status(403).json({ ok: false, error: "个人流程只能从已登录的控制台手动运行" });
+  if (!automation) throw automationRequestError(404, "Unknown automation");
+  if (automation.personalRoutine) throw automationRequestError(403, "个人流程只能从已登录的控制台手动运行");
   const scopedClient = !["legacy-shared", "local-development"].includes(req.apiClient.id);
   if (!String(req.get("idempotency-key") || req.get("x-codex-idempotency-key") || "").trim() &&
     !["legacy-shared", "local-development"].includes(req.apiClient.id)) {
-    return res.status(400).json({ ok: false, error: "Idempotency-Key is required for API clients" });
+    throw automationRequestError(400, "Idempotency-Key is required for API clients");
   }
   let completionContract;
   try {
     validateExternalTriggerInput(req.body, { trigger, scoped: scopedClient });
     completionContract = automationCompletionContractForRequest(req, automation);
   } catch (error) {
-    return res.status(400).json({ ok: false, error: error.message, output: error.message });
+    throw automationRequestError(400, error.message);
   }
   const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger, req.apiClient.id);
-  if (idempotency.error) return res.status(400).json({ ok: false, error: idempotency.error });
+  if (idempotency.error) throw automationRequestError(400, idempotency.error);
   if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
   const triggerIdempotencyHash = automationTriggerHash(idempotency.key);
   const triggerRequestHash = automationTriggerRequestHash(req, automation, trigger, completionContract);
   pruneAutomationTriggerIdempotency();
   const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
   if (existing) {
+    if (existing.requestHash && existing.requestHash !== triggerRequestHash) {
+      throw automationRequestError(409, "同一 Idempotency-Key 不能用于不同请求");
+    }
     try {
       const payload = await refreshAutomationTriggerPayload(existing.payload || await existing.promise);
-      if (existing.requestHash && existing.requestHash !== triggerRequestHash) {
-        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能用于不同请求" });
-      }
-      res.locals.runId = payload?.run?.id || null;
-      res.locals.deduplicated = true;
-      return res.json({ ...payload, deduplicated: true });
+      return { ...payload, deduplicated: true };
     } catch {
       automationTriggerIdempotency.delete(idempotency.key);
     }
@@ -11526,10 +11551,10 @@ async function processAutomationTriggerRequest(req, res, trigger) {
     if (matched) {
       const stored = runs.find((run) => run.id === matched.recoveryRunId) || matched;
       if (stored.triggerRequestHash && stored.triggerRequestHash !== triggerRequestHash) {
-        return res.status(409).json({ ok: false, error: "同一 Idempotency-Key 不能用于不同请求" });
+        throw automationRequestError(409, "同一 Idempotency-Key 不能用于不同请求");
       }
       if (!stored.triggerRequestHash) {
-        return res.status(409).json({ ok: false, error: "历史运行缺少请求摘要，无法验证幂等重放；请先核对原任务" });
+        throw automationRequestError(409, "历史运行缺少请求摘要，无法验证幂等重放；请先核对原任务");
       }
       const payload = { ok: true, run: externalRunView(stored, automation.id), output: `${automation.name}: ${trigger} app-server run already accepted` };
       automationTriggerIdempotency.set(idempotency.key, {
@@ -11538,9 +11563,7 @@ async function processAutomationTriggerRequest(req, res, trigger) {
         requestHash: triggerRequestHash,
         expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
       });
-      res.locals.runId = stored.id;
-      res.locals.deduplicated = true;
-      return res.json({ ...payload, deduplicated: true, recovered: true });
+      return { ...payload, deduplicated: true, recovered: true };
     }
   }
   const repo = getRepoById(automation.repoId);
@@ -11551,11 +11574,11 @@ async function processAutomationTriggerRequest(req, res, trigger) {
       clientId: req.apiClient.id, automationId: automation.id, repoId: repo.id, sessionId: requestedSessionId,
     });
     if (requestedSessionId && !source) {
-      return res.status(403).json({ ok: false, error: "Heartbeat session is outside this API client's automation scope" });
+      throw automationRequestError(403, "Heartbeat session is outside this API client's automation scope");
     }
     if (source) {
       if (source.status !== "completed") {
-        return res.status(409).json({ ok: false, error: "Previous run needs review before this session can continue" });
+        throw automationRequestError(409, "Previous run needs review before this session can continue");
       }
       try {
         const previousSession = (await readChatStore()).sessions[source.sessionId];
@@ -11567,14 +11590,13 @@ async function processAutomationTriggerRequest(req, res, trigger) {
         if (executionRepo.path === await fs.realpath(repo.path)) throw new Error("Previous run used the repository cwd");
         heartbeatSource = { sessionId: source.sessionId, worktreePath: executionRepo.path };
       } catch (error) {
-        return res.status(409).json({ ok: false, error: `Heartbeat worktree is unavailable: ${error.message}` });
+        throw automationRequestError(409, `Heartbeat worktree is unavailable: ${error.message}`);
       }
     }
   }
   const rate = consumeAutomationTriggerRate(req, automation.id);
   if (!rate.ok) {
-    res.setHeader("Retry-After", String(Math.ceil(rate.retryAfterMs / 1000)));
-    return res.status(429).json({ ok: false, error: "Automation trigger rate limit exceeded", retryAfterMs: rate.retryAfterMs });
+    throw automationRequestError(429, "Automation trigger rate limit exceeded", rate.retryAfterMs);
   }
   const runPromise = startAppServerAutomationRun(
     automation,
@@ -11606,7 +11628,6 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   }
   try {
     const payload = await runPromise;
-    res.locals.runId = payload.run.id;
     if (idempotency.key) {
       automationTriggerIdempotency.set(idempotency.key, {
         promise: Promise.resolve(payload),
@@ -11615,13 +11636,50 @@ async function processAutomationTriggerRequest(req, res, trigger) {
         expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
       });
     }
-    return res.json(payload);
+    return payload;
   } catch (error) {
     if (idempotency.key) automationTriggerIdempotency.delete(idempotency.key);
-    if (error.statusCode === 429) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
-    return res.status([409, 429].includes(error.statusCode) ? error.statusCode : 500).json({ ok: false, error: error.message, output: error.message });
+    throw automationRequestError([409, 429].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs);
   }
 }
+
+const modelApiResultReads = new Map();
+async function modelApiRunSnapshot(id) {
+  const job = activeAutomationRuns.get(id);
+  if (job && !job.completed) return { id, status: "running", summary: job.output || "" };
+  const run = (await readAutomationRuns()).runs.find((item) => item.id === id);
+  if (!run) return null;
+  let summary = job?.output || run.summary || "";
+  if (!job && run.status === "completed" && summary.length >= 4000) {
+    let reading = modelApiResultReads.get(id);
+    if (!reading) {
+      reading = (async () => {
+        if (!run.turnId || !run.threadId) throw automationRequestError(502, "完整回合定位不可用；不能用摘要冒充完整结果");
+        const response = await codexAppServerRequest("thread/read", { threadId: run.threadId, includeTurns: true }, 10_000);
+        if (!response.ok) throw automationRequestError(502, "完整回合读取失败；请稍后使用原键重试");
+        return modelApiTurnText(response.result?.thread, run.turnId);
+      })().finally(() => modelApiResultReads.delete(id));
+      modelApiResultReads.set(id, reading);
+    }
+    summary = await reading;
+  }
+  return { ...externalRunView(run, run.automationId), summary };
+}
+
+const handleModelApi = createModelApiHandler({
+  authenticate: (req, token) => authenticateAutomationTrigger(req, { token, allowLocalDevelopment: false }),
+  submit: (req, body) => {
+    const internal = Object.assign(Object.create(req), { body });
+    const key = automationTriggerIdempotencyKey(internal, req.params.id, "webhook", req.apiClient.id);
+    if (key.error) throw automationRequestError(400, key.error);
+    return serializeAutomationTrigger(key.key, () => submitAutomationTriggerRequest(internal, "webhook"));
+  },
+  snapshot: modelApiRunSnapshot,
+  record: (metric) => apiClientStore.record(metric),
+  timeoutMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
+});
+app.post("/api/automations/:id/v1/chat/completions", (req, res) => handleModelApi(req, res, "openai"));
+app.post("/api/automations/:id/v1/messages", (req, res) => handleModelApi(req, res, "anthropic"));
 
 app.post("/api/automations/:id/webhook", (req, res) => {
   return handleAutomationTriggerRequest(req, res, "webhook");

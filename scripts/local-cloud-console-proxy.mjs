@@ -4,6 +4,7 @@ import http from "node:http";
 import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { modelApiProtocol } from "../server/model-api.mjs";
 
 const port = Number(process.env.CODEX_CLOUD_CONSOLE_PORT || 18787);
 const host = process.env.CODEX_CLOUD_CONSOLE_HOST || "127.0.0.1";
@@ -16,6 +17,7 @@ const credentialsPath =
 const cachePath = process.env.CODEX_CLOUD_CONSOLE_CACHE || `${process.env.HOME}/.codex/cloud-console-proxy-cache.json`;
 const proxyFreshCacheTtlMs = Number(process.env.CODEX_CLOUD_CONSOLE_FRESH_CACHE_TTL_MS || 8_000);
 const proxyHeaderTimeoutMs = Math.max(500, Number(process.env.CODEX_CLOUD_CONSOLE_HEADER_TIMEOUT_MS || 15_000));
+const proxyModelApiHeaderTimeoutMs = Math.max(1000, Math.min(930_000, Number(process.env.CODEX_CLOUD_CONSOLE_MODEL_API_TIMEOUT_MS || 330_000)));
 const proxyHealthHeaderTimeoutMs = Math.max(500, Number(process.env.CODEX_CLOUD_CONSOLE_HEALTH_TIMEOUT_MS || 8_000));
 const proxyBufferedIdleTimeoutMs = Math.max(1_000, Number(process.env.CODEX_CLOUD_CONSOLE_BUFFER_IDLE_TIMEOUT_MS || 20_000));
 const proxyGetRetryLimit = Math.min(3, Math.max(0, Number(process.env.CODEX_CLOUD_CONSOLE_GET_RETRY_LIMIT || 1)));
@@ -525,8 +527,9 @@ function createHttpProxy() {
     const requestId = proxyRequestId();
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
-    if (credentials.token) headers["x-codex-cloud-token"] = credentials.token;
-    if (targetUrl.protocol === "https:" && credentials.password) headers.authorization = authHeader;
+    const isModelApiRequest = req.method === "POST" && Boolean(modelApiProtocol(targetUrl.pathname));
+    if (credentials.token && !isModelApiRequest) headers["x-codex-cloud-token"] = credentials.token;
+    if (targetUrl.protocol === "https:" && credentials.password && !isModelApiRequest) headers.authorization = authHeader;
     delete headers["proxy-connection"];
     delete headers["connection"];
     delete headers["accept-encoding"];
@@ -557,7 +560,7 @@ function createHttpProxy() {
       const responseTimer = setTimeout(() => {
         if (responded) return;
         upstream?.destroy(new Error("upstream did not send headers in time"));
-      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : proxyHeaderTimeoutMs);
+      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : isModelApiRequest ? proxyModelApiHeaderTimeoutMs : proxyHeaderTimeoutMs);
 
       upstream = transport.request(
         {
@@ -646,6 +649,11 @@ function createHttpProxy() {
         if (canRetry && sendCachedResponse(targetUrl, res)) return;
         sendProxyError(res, 502, error.message || "upstream request failed", targetUrl, requestId, { cause: String(error.code || "upstream-error") });
       });
+      if (isModelApiRequest) {
+        const closeUpstream = () => upstream.destroy();
+        res.once("close", closeUpstream);
+        upstream.once("close", () => res.off("close", closeUpstream));
+      }
 
       if (canRetry) {
         upstream.end();

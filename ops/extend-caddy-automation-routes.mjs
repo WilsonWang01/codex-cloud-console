@@ -19,6 +19,28 @@ const newRoutes = `\t@automation_result {
 \t\treverse_proxy 127.0.0.1:8787
 \t}
 `;
+const modelRoutes = `\t@automation_model_api {
+\t\tmethod POST
+\t\tpath_regexp automation_model_api ^/api/automations/[^/]+/v1/(chat/completions|messages)$
+\t}
+\thandle @automation_model_api {
+\t\treverse_proxy 127.0.0.1:8787 {
+\t\t\tflush_interval -1
+\t\t}
+\t}
+`;
+
+export function extendModelApiRoutes(source) {
+  if (source.includes("@automation_model_api")) {
+    if (source.includes(modelRoutes)) return source;
+    throw new Error("Existing model API routes differ from the expected configuration");
+  }
+  const first = source.indexOf(triggerBlock);
+  if (first < 0 || source.indexOf(triggerBlock, first + triggerBlock.length) >= 0) {
+    throw new Error("Expected exactly one existing automation trigger block");
+  }
+  return source.slice(0, first + triggerBlock.length) + modelRoutes + source.slice(first + triggerBlock.length);
+}
 
 export function extendAutomationRoutes(source) {
   if (source.includes("@automation_result") || source.includes("@automation_cancel")) {
@@ -36,7 +58,7 @@ function adapt(configPath) {
   return JSON.parse(execFileSync("caddy", ["adapt", "--config", configPath, "--adapter", "caddyfile"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
 }
 
-function withoutAddedRoutes(config) {
+function withoutAddedRoutes(config, names) {
   const copy = structuredClone(config);
   for (const server of Object.values(copy.apps?.http?.servers || {})) {
     for (const route of server.routes || []) {
@@ -44,7 +66,7 @@ function withoutAddedRoutes(config) {
         if (!Array.isArray(handler.routes)) continue;
         handler.routes = handler.routes.filter((child) => {
           const matcher = child.match?.[0] || {};
-          return !["automation_result", "automation_cancel"].some((name) => matcher.path_regexp?.name === name);
+          return !names.some((name) => matcher.path_regexp?.name === name);
         });
       }
     }
@@ -66,23 +88,24 @@ function canonicalGroupIds(value) {
   return visit(value);
 }
 
-export function assertCaddyRouteExtension(before, after) {
-  if (JSON.stringify(canonicalGroupIds(withoutAddedRoutes(after))) !== JSON.stringify(canonicalGroupIds(before))) {
+export function assertCaddyRouteExtension(before, after, names = ["automation_result", "automation_cancel"]) {
+  if (JSON.stringify(canonicalGroupIds(withoutAddedRoutes(after, names))) !== JSON.stringify(canonicalGroupIds(before))) {
     throw new Error("Caddy routes outside the two new API matchers changed");
   }
   const serialized = JSON.stringify(after);
-  for (const name of ["automation_result", "automation_cancel"]) {
+  for (const name of names) {
     assert.equal(serialized.split(`"name":"${name}"`).length - 1, 1, `Missing or duplicated ${name} matcher`);
   }
 }
 
 if (process.argv[1] && await fs.realpath(process.argv[1]).catch(() => null) === fileURLToPath(import.meta.url)) {
-  const [sourcePath, candidatePath] = process.argv.slice(2);
+  const [sourcePath, candidatePath, mode] = process.argv.slice(2);
   if (!sourcePath || !candidatePath) throw new Error("Usage: node extend-caddy-automation-routes.mjs SOURCE CANDIDATE");
+  if (mode && mode !== "--model-api") throw new Error("Unknown extension mode");
   const source = await fs.readFile(sourcePath, "utf8");
-  const candidate = extendAutomationRoutes(source);
+  const candidate = mode ? extendModelApiRoutes(source) : extendAutomationRoutes(source);
   await fs.writeFile(candidatePath, candidate, { mode: 0o600, flag: "wx" });
-  assertCaddyRouteExtension(adapt(sourcePath), adapt(candidatePath));
+  assertCaddyRouteExtension(adapt(sourcePath), adapt(candidatePath), mode ? ["automation_model_api"] : undefined);
   execFileSync("caddy", ["validate", "--config", candidatePath, "--adapter", "caddyfile"], { stdio: "ignore" });
   process.stdout.write("Caddy candidate validated; all pre-existing routes remain unchanged.\n");
 }

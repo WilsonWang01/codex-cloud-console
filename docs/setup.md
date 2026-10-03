@@ -153,6 +153,8 @@ curl --fail-with-body -X POST "$CODEX_CLOUD_URL/api/automations/my-app-review/we
 
 完整的参数契约、Node.js 后台 job 示例、超时恢复和错误处理见[作为后端服务接入](backend-integration.md)。
 
+OpenAI / Anthropic SDK 的文本和 SSE 接入地址、认证、幂等键与兼容限制见[协议适配说明](model-api-adapters.md)。已有多站点 Caddy 使用该文档的 `--model-api` 候选配置流程，不覆盖整份站点配置。
+
 在已通过网页登录认证的控制台打开“调用与用量”，输入服务名、勾选它允许触发的自动化，再创建令牌。令牌只显示一次；服务端只保存 SHA-256 摘要，需在调用方自己的安全配置中保存明文。创建令牌不会运行模型，实际触发 Webhook/Heartbeat 会运行既有自动化，需先确认模型额度和任务影响。
 
 调用方使用 `x-codex-cloud-token` 提交令牌，并为每个业务事件提供 8–160 字符的 `Idempotency-Key`。同一服务重试同一事件时复用该键；同键不同请求会返回 409，失败终态也不会被静默重跑。独立调用方不能指定 `worktree:false`；所授权仓库需要可解析 `HEAD` 的 Git 提交。令牌仅能触发创建时选择的自动化、读取和请求取消自己的运行，不能查看管理页面或批准自己的任务。旧共享令牌仍兼容，统计中标记为 `legacy-shared`，不会被当作某个新服务。
