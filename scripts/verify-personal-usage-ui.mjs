@@ -56,6 +56,7 @@ const briefEvent = { id: "run:recent-personal:completed", kind: "completed", tit
 const personalPushEndpoint = "https://push.example.test/personal-browser";
 let personalReminderSettings = { enabled: false, timeZone: "Asia/Shanghai", quietStart: "22:00", quietEnd: "08:00" };
 let failNextCommitmentLink = false;
+let failNextCommitmentLinkMissing = false;
 let oldCommitmentApi = false;
 let usageRace = false;
 let usageFailure = false;
@@ -186,7 +187,8 @@ await context.route("**/api/**", async (route) => {
     if (item.revision !== body.revision) return send({ ok: false, error: "stale" }, 409);
     if (req.method() === "DELETE") { personalCommitments = personalCommitments.filter((entry) => entry.id !== id); return send({ ok: true, commitment: item }); }
     if (body.sessionId && failNextCommitmentLink) { failNextCommitmentLink = false; return send({ ok: false, error: "temporary link failure" }, 503); }
-    if (body.sessionId && !sessions.some((session) => session.id === body.sessionId && session.repoId === "_personal")) return send({ ok: false, error: "wrong space" }, 404);
+    if (body.sessionId && failNextCommitmentLinkMissing) { failNextCommitmentLinkMissing = false; return send({ ok: false, error: "个人对话不存在" }, 404); }
+    if (body.sessionId && !sessions.some((session) => session.id === body.sessionId && session.repoId === "_personal")) return send({ ok: false, error: "个人对话不存在" }, 404);
     Object.assign(item, Object.fromEntries(Object.entries(body).filter(([key]) => ["title", "nextStep", "dueAt", "status", "sessionId"].includes(key))));
     item.revision += 1;
     item.updatedAt = new Date().toISOString();
@@ -646,6 +648,36 @@ try {
   assert.equal(personalCommitments[1].sessionId, `_personal-new-${beforeRetry + 1}`);
   assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-2"]), undefined);
   await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).click();
+  await page.getByRole("textbox", { name: "事项名称" }).fill("核对失效草稿");
+  await page.getByRole("button", { name: "添加事项" }).click();
+  await page.getByText("核对失效草稿", { exact: true }).waitFor();
+  await page.evaluate(() => sessionStorage.setItem("codex-cloud:personal-commitment-pending-links", JSON.stringify({ "commitment-3": "missing-personal-session" })));
+  await page.reload();
+  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).waitFor();
+  const beforeStaleLink = newSessionCount;
+  await page.locator(".personal-commitments").getByRole("button", { name: "重试关联" }).click();
+  await page.getByText(/原对话已不存在，已清除关联记录/).waitFor();
+  assert.equal(newSessionCount, beforeStaleLink);
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-3"]), undefined);
+  await page.locator(".personal-commitments").getByRole("button", { name: "起草" }).click();
+  await page.locator(`.session-current[data-session-id='_personal-new-${beforeStaleLink + 1}']`).waitFor();
+  assert.equal(personalCommitments[2].sessionId, `_personal-new-${beforeStaleLink + 1}`);
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
+  await page.locator(".personal-commitments").getByRole("button", { name: "添加" }).click();
+  await page.getByRole("textbox", { name: "事项名称" }).fill("核对新建草稿同步");
+  await page.getByRole("button", { name: "添加事项" }).click();
+  await page.getByText("核对新建草稿同步", { exact: true }).waitFor();
+  failNextCommitmentLinkMissing = true;
+  const beforeFreshMissing = newSessionCount;
+  await page.locator(".personal-commitment-row").filter({ hasText: "核对新建草稿同步" }).getByRole("button", { name: "起草" }).click();
+  await page.getByText(/个人对话不存在；对话已建立，重试将沿用该对话/).waitFor();
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("codex-cloud:personal-commitment-pending-links") || "{}")["commitment-4"]), `_personal-new-${beforeFreshMissing + 1}`);
+  await page.locator(".personal-commitment-row").filter({ hasText: "核对新建草稿同步" }).getByRole("button", { name: "重试关联" }).click();
+  await page.locator(`.session-current[data-session-id='_personal-new-${beforeFreshMissing + 1}']`).waitFor();
+  assert.equal(newSessionCount, beforeFreshMissing + 1);
+  assert.equal(personalCommitments[3].sessionId, `_personal-new-${beforeFreshMissing + 1}`);
+  await page.evaluate(() => { location.hash = "/project/_personal/today"; });
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   await page.screenshot({ path: new URL("today-commitments-390.png", out).pathname });
@@ -932,5 +964,5 @@ try {
   }
   status.automations.push(...savedAutomations);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态预填只读范例且不运行模型", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "失效旧草稿关联可清除并重新起草，新草稿首次关联异常仍可复用", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态预填只读范例且不运行模型", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

@@ -72,6 +72,12 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
   const [reloadKey, setReloadKey] = useState(0);
   const [pendingLinks, setPendingLinks] = useState<Record<string, string>>(restorePendingLinks);
 
+  const clearPendingLink = (id: string) => {
+    const remaining = { ...pendingLinks };
+    delete remaining[id];
+    setPendingLinks(persistPendingLinks(remaining));
+  };
+
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -119,9 +125,7 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
         method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: item.revision }),
       });
       setItems((previous) => previous.filter((entry) => entry.id !== item.id));
-      const remainingLinks = { ...pendingLinks };
-      delete remainingLinks[item.id];
-      setPendingLinks(persistPendingLinks(remainingLinks));
+      clearPendingLink(item.id);
       if (editing === item.id) resetEditor();
     } catch (cause) { setError(cause instanceof Error ? cause.message : "删除失败"); }
     finally { setBusy(""); }
@@ -130,6 +134,7 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
     if (busy) return;
     setBusy(item.id); setError("");
     let startedSessionId: string | null = pendingLinks[item.id] || null;
+    const retryingMissingLink = Boolean(startedSessionId && !sessions.some((session) => session.id === startedSessionId));
     try {
       if (!startedSessionId) startedSessionId = await onStart(item);
       if (!startedSessionId) { setError("新对话未创建，请稍后重试"); return; }
@@ -138,11 +143,16 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
         method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision: item.revision, sessionId: startedSessionId }),
       });
       setItems((previous) => previous.map((entry) => entry.id === item.id ? result.commitment : entry));
-      const remainingLinks = { ...pendingLinks };
-      delete remainingLinks[item.id];
-      setPendingLinks(persistPendingLinks(remainingLinks));
+      clearPendingLink(item.id);
       onContinue(startedSessionId);
-    } catch (cause) { setError(`${cause instanceof Error ? cause.message : "操作失败"}${startedSessionId ? "；对话已建立，重试将沿用该对话" : ""}`); }
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === "个人对话不存在" && retryingMissingLink) {
+        clearPendingLink(item.id);
+        setError("原对话已不存在，已清除关联记录；请再次点击“起草”创建新对话。");
+      } else {
+        setError(`${cause instanceof Error ? cause.message : "操作失败"}${startedSessionId ? "；对话已建立，重试将沿用该对话" : ""}`);
+      }
+    }
     finally { setBusy(""); }
   };
 
