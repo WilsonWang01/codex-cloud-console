@@ -67,12 +67,14 @@ test("Caddy extension CLI runs through a release symlink", async () => {
   }
 });
 
-test("model API exposure is limited to two POST routes and preserves existing result/cancel routes", () => {
+test("model API exposure is limited to four POST routes and preserves existing result/cancel routes", () => {
   const current = extendAutomationRoutes(source);
   const updated = extendModelApiRoutes(current);
-  assert.match(updated, /method POST\n\t\tpath_regexp automation_model_api \^\/api\/automations\/\[\^\/\]\+\/v1\/\(chat\/completions\|messages\)\$/);
+  assert.match(updated, /method POST\n\t\tpath_regexp automation_model_api \^\/api\/automations\/\[\^\/\]\+\/v1\/\(chat\/completions\|messages\|responses\|images\/generations\)\$/);
   assert.match(updated, /flush_interval -1/);
   assert.equal(updated.replace(/\t@automation_model_api \{[\s\S]*?\n\t\}\n\thandle @automation_model_api \{[\s\S]*?\n\t\}\n/, ""), current);
   assert.equal(extendModelApiRoutes(updated), updated);
+  const previous = updated.replace("chat/completions|messages|responses|images/generations", "chat/completions|messages");
+  assert.equal(extendModelApiRoutes(previous), updated);
   assert.throws(() => extendModelApiRoutes(updated.replace("flush_interval -1", "flush_interval 10s")), /differ/);
 });

@@ -118,6 +118,7 @@ const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
 const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
 const threads = [];
 let modelApiText = null;
+let modelApiImages = [];
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
@@ -213,7 +214,7 @@ input.on("line", (line) => {
     return send({ method: "thread/archived", params: { threadId: message.params.threadId } }, 20);
   }
   if (message.method === "thread/read" && message.params?.includeTurns && modelApiText) {
-    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: "turn-model-api", items: [{ type: "agentMessage", text: modelApiText }] }] } } });
+    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: "turn-model-api", items: [{ type: "agentMessage", text: modelApiText }, ...modelApiImages] }] } } });
   }
   if (message.method === "thread/archive" && message.params?.threadId === "thread-archive-race") {
     return send({ id: message.id, result: {} }, 250);
@@ -240,6 +241,7 @@ input.on("line", (line) => {
     const requestText = JSON.stringify(message.params || {});
     if (requestText.includes("model api regression")) {
       modelApiText = requestText.includes("long output") ? "验收".repeat(2500) : "接口验收通过";
+      modelApiImages = requestText.includes("generated output") ? [{ id: "ig-fixture", type: "imageGeneration", status: "completed", failure: null, result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", revisedPrompt: "图片输出验收" }] : [];
       send({ id: message.id, result: { turn: { id: "turn-model-api" } } });
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: "turn-model-api", delta: modelApiText.slice(0, 2) } }, 40);
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: "turn-model-api", delta: modelApiText.slice(2) } }, 150);
@@ -2191,6 +2193,37 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(unauthenticatedHugeBody.response.status, 401);
     const modelOutOfScope = await jsonRequest(baseUrl, "/api/automations/sample-hourly/v1/chat/completions", { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
     assert.equal(modelOutOfScope.response.status, 401);
+    const responsesPath = "/api/automations/sample-on-demand/v1/responses";
+    const responsesBody = { model: "gpt-6-sol", input: "model api regression generated output", tools: [{ type: "image_generation" }], store: false };
+    const responsesHeaders = { ...modelHeaders, "idempotency-key": "model-api-responses-output-0001" };
+    const outputResponse = await jsonRequest(baseUrl, responsesPath, { method: "POST", headers: responsesHeaders, body: JSON.stringify(responsesBody) });
+    assert.equal(outputResponse.response.status, 200, JSON.stringify(outputResponse.data));
+    assert.equal(outputResponse.data.output.find((item) => item.type === "image_generation_call").result, png);
+    assert.equal(outputResponse.data.usage.total_tokens, 130);
+    const streamedResponse = await fetch(new URL(responsesPath, baseUrl), { method: "POST", headers: responsesHeaders, body: JSON.stringify({ ...responsesBody, stream: true }) });
+    const streamedRaw = await streamedResponse.text();
+    assert.match(streamedRaw, /event: response.completed/);
+    assert.ok(streamedRaw.includes(png));
+    const outputRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === outputResponse.response.headers.get("x-codex-cloud-run-id"));
+    assert.equal(JSON.stringify(outputRun).includes(png), false);
+    const generationsPath = "/api/automations/sample-on-demand/v1/images/generations";
+    const generationsBody = { model: "gpt-6-sol", prompt: "model api regression generated output", response_format: "b64_json" };
+    const generationsHeaders = { ...modelHeaders, "idempotency-key": "model-api-generations-output-0001" };
+    const generation = await jsonRequest(baseUrl, generationsPath, { method: "POST", headers: generationsHeaders, body: JSON.stringify(generationsBody) });
+    assert.equal(generation.response.status, 200, JSON.stringify(generation.data));
+    assert.equal(generation.data.data[0].b64_json, png);
+    const generationReplay = await jsonRequest(baseUrl, generationsPath, { method: "POST", headers: generationsHeaders, body: JSON.stringify(generationsBody) });
+    assert.deepEqual(generationReplay.data, generation.data);
+    const noGeneration = await jsonRequest(baseUrl, generationsPath, { method: "POST", headers: { ...generationsHeaders, "idempotency-key": "model-api-generations-empty-0001" }, body: JSON.stringify({ ...generationsBody, prompt: "model api regression no image" }) });
+    assert.equal(noGeneration.response.status, 502);
+    assert.equal(noGeneration.data.error.code, "no_image_generated");
+    for (const endpoint of [responsesPath, generationsPath]) {
+      const anonymous = await jsonRequest(baseUrl, endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      assert.equal(anonymous.response.status, 401);
+      assert.equal(anonymous.data.error.type, "authentication_error");
+      const oversized = await jsonRequest(baseUrl, endpoint, { method: "POST", headers: modelHeaders, body: JSON.stringify({ ignored: "x".repeat(modelApiJsonLimit) }) });
+      assert.equal(oversized.response.status, 413);
+    }
     await jsonRequest(baseUrl, `/api/clients/${modelClient.data.client.id}/revoke`, { method: "POST" });
     const modelRevoked = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: modelHeaders, body: JSON.stringify(modelBody) });
     assert.equal(modelRevoked.response.status, 401);
@@ -2301,6 +2334,13 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(rateLimitedTrigger.response.status, 429);
     assert.ok(Number(rateLimitedTrigger.response.headers.get("retry-after")) >= 1);
     await new Promise((resolve) => setTimeout(resolve, 400));
+    // The preceding timed-out task may still be releasing admission under load.
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const status = await jsonRequest(baseUrl, "/api/codex/app-host/status");
+      if (!status.data.activeJobs?.length) break;
+      assert.ok(attempt < 29, "preceding regression task did not release admission");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     const progressTriggerKey = "regression-idempotency-progress";
     const promptQueryToken = "progress-query-token-123456789";
     const promptHeaderToken = "progress-header-token-123456789";
@@ -2312,7 +2352,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
         worktree: false,
       }),
     });
-    assert.equal(progressTrigger.response.status, 200);
+    assert.equal(progressTrigger.response.status, 200, JSON.stringify(progressTrigger.data));
     let progressRun = null;
     for (let attempt = 0; attempt < 12; attempt += 1) {
       const runs = await jsonRequest(baseUrl, "/api/automations/runs?automationId=sample-research");
@@ -2459,7 +2499,7 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
       res.end(body);
       return;
     }
-    if (req.url === "/api/automations/demo/v1/chat/completions") {
+    if (["chat/completions", "messages", "responses", "images/generations"].some((route) => req.url === `/api/automations/demo/v1/${route}`)) {
       req.resume();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ authorization: req.headers.authorization, cloudToken: req.headers["x-codex-cloud-token"] || null }));
@@ -2509,10 +2549,12 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     const cachedStatus = await fetch(`http://127.0.0.1:${proxyPort}/api/notifications/push/status`);
     assert.equal(cachedStatus.status, 200);
     await cachedStatus.arrayBuffer();
-    const modelProxy = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/v1/chat/completions`, {
-      method: "POST", headers: { authorization: "Bearer isolated-client-token", "content-type": "application/json" }, body: "{}",
-    });
-    assert.deepEqual(await modelProxy.json(), { authorization: "Bearer isolated-client-token", cloudToken: null });
+    for (const route of ["chat/completions", "messages", "responses", "images/generations"]) {
+      const modelProxy = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/v1/${route}`, {
+        method: "POST", headers: { authorization: "Bearer isolated-client-token", "content-type": "application/json" }, body: "{}",
+      });
+      assert.deepEqual(await modelProxy.json(), { authorization: "Bearer isolated-client-token", cloudToken: null });
+    }
     const cacheMode = (await fs.stat(cachePath)).mode & 0o777;
     assert.equal(cacheMode, 0o600);
     const callbackPath = "/callback/allowed-regression";
@@ -2666,6 +2708,17 @@ exec /usr/bin/readlink "$@"
       env: { ...installerEnv, FAKE_HEALTH_MODE: "recover", FAKE_NPM_FAIL_PRUNE: "1" },
     });
     assert.notEqual(pruneFailed.code, 0);
+    assert.equal(await fs.realpath(currentLink), activeRelease);
+    assert.equal((await fs.readdir(releaseRoot)).length, 1);
+
+    const preSwitchCheck = path.join(binDir, "pre-switch-check");
+    await fs.writeFile(preSwitchCheck, "#!/bin/sh\necho 'active task detected' >&2\nexit 1\n", { mode: 0o755 });
+    const busy = await runCaptured("bash", installerArgs, {
+      cwd: projectRoot,
+      env: { ...installerEnv, CODEX_CLOUD_PRE_SWITCH_CHECK: preSwitchCheck, FAKE_HEALTH_MODE: "recover" },
+    });
+    assert.notEqual(busy.code, 0);
+    assert.match(busy.stderr, /active task detected/);
     assert.equal(await fs.realpath(currentLink), activeRelease);
     assert.equal((await fs.readdir(releaseRoot)).length, 1);
 

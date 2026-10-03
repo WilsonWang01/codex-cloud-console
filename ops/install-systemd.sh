@@ -10,6 +10,7 @@ HEALTH_URL="${CODEX_CLOUD_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
 HEALTH_ATTEMPTS="${CODEX_CLOUD_HEALTH_ATTEMPTS:-90}"
 HEALTH_INTERVAL_SECONDS="${CODEX_CLOUD_HEALTH_INTERVAL_SECONDS:-2}"
 KEEP_RELEASES="${CODEX_CLOUD_KEEP_RELEASES:-1}"
+PRE_SWITCH_CHECK="${CODEX_CLOUD_PRE_SWITCH_CHECK:-}"
 SERVICE_USER="${CODEX_CLOUD_SERVICE_USER:-ubuntu}"
 RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RELEASE_DIR="${RELEASE_ROOT}/${RELEASE_ID}"
@@ -120,6 +121,14 @@ NPM_BIN="$(command -v npm)"
   cd "$RELEASE_DIR"
   sudo -u "$SERVICE_USER" "$NPM_BIN" ls --omit=dev --depth=0 >/dev/null
 )
+
+if [[ -n "$PRE_SWITCH_CHECK" ]]; then
+  if [[ "$PRE_SWITCH_CHECK" != /* || ! -x "$PRE_SWITCH_CHECK" ]]; then
+    echo "CODEX_CLOUD_PRE_SWITCH_CHECK must be an absolute executable path." >&2
+    exit 1
+  fi
+  "$PRE_SWITCH_CHECK"
+fi
 
 rm -f "${CURRENT_LINK}.next"
 ln -s "$RELEASE_DIR" "${CURRENT_LINK}.next"

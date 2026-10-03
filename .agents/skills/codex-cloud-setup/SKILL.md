@@ -13,7 +13,7 @@ description: 引导用户注册或复用 AWS 账号、选择 EC2 配置、连接
 
 - 首次接触 AWS、注册、选型、费用：[从零部署指南](../../../docs/aws-getting-started.md)。
 - 安装、环境文件、HTTPS、更新、外部调用：[部署与接入](../../../docs/setup.md)。
-- 业务后端、OpenAI/Anthropic SDK：[异步任务 API](../../../docs/backend-integration.md) 与[模型协议适配](../../../docs/model-api-adapters.md)。两种协议只是文本、内嵌图片输入和文本 SSE 子集，底层仍是 Codex；不得声称音视频/PDF/图片生成、`max_tokens` 预算、客户端工具调用或 Claude 模型已支持。图片体积上限与原生输入留存边界按文档解释。
+- 业务后端、OpenAI/Anthropic SDK：[异步任务 API](../../../docs/backend-integration.md) 与[模型协议适配](../../../docs/model-api-adapters.md)。Chat / Responses / Images / Messages 是图文输入、文本与生成图片输出的子集，底层仍是 Codex；图片输出依赖已有原生工具，不自动启用付费服务。不得声称音视频/PDF、`max_tokens` 预算、客户端工具调用或 Claude 模型已支持，不把 Chat/Messages 图片扩展称为官方标准。图片体积上限、工具控制及留存边界按文档解释。
 - 登录、SSM、SSH 和连接故障：[实例访问](../../../docs/aws-instance-access.md)。
 - 产品功能与使用：[README](../../../README.md)；权限边界：[SECURITY](../../../SECURITY.md)。
 - 用户询问个人助理、API 计量或移动适配：[统一产品与技术方案](../../../docs/personal-agent-roadmap.md)，它是对标调研与四项需求整合后的开发基线；按阶段状态区分现有与拟议能力，不得把草案当作现成配置。

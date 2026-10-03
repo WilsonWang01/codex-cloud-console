@@ -21,7 +21,7 @@ const newRoutes = `\t@automation_result {
 `;
 const modelRoutes = `\t@automation_model_api {
 \t\tmethod POST
-\t\tpath_regexp automation_model_api ^/api/automations/[^/]+/v1/(chat/completions|messages)$
+\t\tpath_regexp automation_model_api ^/api/automations/[^/]+/v1/(chat/completions|messages|responses|images/generations)$
 \t}
 \thandle @automation_model_api {
 \t\treverse_proxy 127.0.0.1:8787 {
@@ -33,6 +33,8 @@ const modelRoutes = `\t@automation_model_api {
 export function extendModelApiRoutes(source) {
   if (source.includes("@automation_model_api")) {
     if (source.includes(modelRoutes)) return source;
+    const previous = modelRoutes.replace("chat/completions|messages|responses|images/generations", "chat/completions|messages");
+    if (source.includes(previous) && source.indexOf(previous) === source.lastIndexOf(previous)) return source.replace(previous, modelRoutes);
     throw new Error("Existing model API routes differ from the expected configuration");
   }
   const first = source.indexOf(triggerBlock);
@@ -89,7 +91,7 @@ function canonicalGroupIds(value) {
 }
 
 export function assertCaddyRouteExtension(before, after, names = ["automation_result", "automation_cancel"]) {
-  if (JSON.stringify(canonicalGroupIds(withoutAddedRoutes(after, names))) !== JSON.stringify(canonicalGroupIds(before))) {
+  if (JSON.stringify(canonicalGroupIds(withoutAddedRoutes(after, names))) !== JSON.stringify(canonicalGroupIds(withoutAddedRoutes(before, names)))) {
     throw new Error("Caddy routes outside the two new API matchers changed");
   }
   const serialized = JSON.stringify(after);

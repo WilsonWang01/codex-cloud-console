@@ -41,7 +41,7 @@ http://{$CODEX_CLOUD_PUBLIC_IP} {
 	}
 	@automation_model_api {
 		method POST
-		path_regexp automation_model_api ^/api/automations/[^/]+/v1/(chat/completions|messages)$
+		path_regexp automation_model_api ^/api/automations/[^/]+/v1/(chat/completions|messages|responses|images/generations)$
 	}
 	handle @automation_model_api {
 		reverse_proxy 127.0.0.1:8787 {

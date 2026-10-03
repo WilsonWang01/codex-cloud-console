@@ -17,7 +17,8 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
-import { authenticateModelApiRequest, createModelApiHandler, modelApiJsonLimit, modelApiProtocol, modelApiTurnText, sendModelApiError } from "./model-api.mjs";
+import { authenticateModelApiRequest, createModelApiHandler, modelApiJsonLimit, modelApiProtocol, sendModelApiError } from "./model-api.mjs";
+import { modelApiTurnResult } from "./model-api-output.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
 import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
@@ -11650,25 +11651,26 @@ async function submitAutomationTriggerRequest(req, trigger) {
 }
 
 const modelApiResultReads = new Map();
+async function modelApiRunResult(id) {
+  let reading = modelApiResultReads.get(id);
+  if (!reading) {
+    reading = (async () => {
+      const run = (await readAutomationRuns()).runs.find((item) => item.id === id);
+      if (!run?.turnId || !run.threadId) throw automationRequestError(502, "完整回合定位不可用；不能用摘要冒充完整结果");
+      const response = await codexAppServerRequest("thread/read", { threadId: run.threadId, includeTurns: true }, 10_000);
+      if (!response.ok) throw automationRequestError(502, "完整回合读取失败；请稍后使用原键重试");
+      return modelApiTurnResult(response.result?.thread, run.turnId, { generatedImagesRoot });
+    })().finally(() => modelApiResultReads.delete(id));
+    modelApiResultReads.set(id, reading);
+  }
+  return reading;
+}
 async function modelApiRunSnapshot(id) {
   const job = activeAutomationRuns.get(id);
   if (job && !job.completed) return { id, status: "running", summary: job.output || "" };
   const run = (await readAutomationRuns()).runs.find((item) => item.id === id);
   if (!run) return null;
-  let summary = job?.output || run.summary || "";
-  if (!job && run.status === "completed" && summary.length >= 4000) {
-    let reading = modelApiResultReads.get(id);
-    if (!reading) {
-      reading = (async () => {
-        if (!run.turnId || !run.threadId) throw automationRequestError(502, "完整回合定位不可用；不能用摘要冒充完整结果");
-        const response = await codexAppServerRequest("thread/read", { threadId: run.threadId, includeTurns: true }, 10_000);
-        if (!response.ok) throw automationRequestError(502, "完整回合读取失败；请稍后使用原键重试");
-        return modelApiTurnText(response.result?.thread, run.turnId);
-      })().finally(() => modelApiResultReads.delete(id));
-      modelApiResultReads.set(id, reading);
-    }
-    summary = await reading;
-  }
+  const summary = job?.output || run.summary || "";
   return { ...externalRunView(run, run.automationId), summary };
 }
 
@@ -11681,11 +11683,14 @@ const handleModelApi = createModelApiHandler({
     return serializeAutomationTrigger(key.key, () => submitAutomationTriggerRequest(internal, "webhook"));
   },
   snapshot: modelApiRunSnapshot,
+  result: modelApiRunResult,
   record: (metric) => apiClientStore.record(metric),
   timeoutMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
 });
 app.post("/api/automations/:id/v1/chat/completions", (req, res) => handleModelApi(req, res, "openai"));
 app.post("/api/automations/:id/v1/messages", (req, res) => handleModelApi(req, res, "anthropic"));
+app.post("/api/automations/:id/v1/responses", (req, res) => handleModelApi(req, res, "responses"));
+app.post("/api/automations/:id/v1/images/generations", (req, res) => handleModelApi(req, res, "images"));
 
 app.post("/api/automations/:id/webhook", (req, res) => {
   return handleAutomationTriggerRequest(req, res, "webhook");

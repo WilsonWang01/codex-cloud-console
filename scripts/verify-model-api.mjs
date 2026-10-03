@@ -3,7 +3,11 @@ import test from "node:test";
 import express from "express";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createModelApiHandler, modelApiProtocol, modelApiTurnText, modelApiUsage, normalizeModelApiRequest } from "../server/model-api.mjs";
+import { modelApiTurnResult } from "../server/model-api-output.mjs";
 
 const input = { model: "gpt-6-sol", messages: [{ role: "user", content: "你好" }] };
 const normalize = (body, protocol = "openai", options) => normalizeModelApiRequest(body, protocol, options);
@@ -101,6 +105,8 @@ test("unsupported features and malformed input fail closed before execution", ()
 test("routing and token usage do not invent models or unknown counts", () => {
   assert.equal(modelApiProtocol("/api/automations/demo/v1/messages"), "anthropic");
   assert.equal(modelApiProtocol("/api/automations/demo/v1/chat/completions"), "openai");
+  assert.equal(modelApiProtocol("/api/automations/demo/v1/responses"), "responses");
+  assert.equal(modelApiProtocol("/api/automations/demo/v1/images/generations"), "images");
   for (const url of ["/v1/messages", "/api/clients", "/api/automations/demo/v1/messages/other"]) assert.equal(modelApiProtocol(url), null);
   assert.equal(modelApiUsage({}, "openai"), null);
   assert.deepEqual(modelApiUsage({}, "anthropic"), { input_tokens: null, output_tokens: null });
@@ -152,6 +158,8 @@ async function fixture(task, options = {}) {
   });
   app.post("/api/automations/:id/v1/chat/completions", (req, res) => handler(req, res, "openai"));
   app.post("/api/automations/:id/v1/messages", (req, res) => handler(req, res, "anthropic"));
+  app.post("/api/automations/:id/v1/responses", (req, res) => handler(req, res, "responses"));
+  app.post("/api/automations/:id/v1/images/generations", (req, res) => handler(req, res, "images"));
   const server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -161,6 +169,111 @@ async function fixture(task, options = {}) {
 
 const headers = { authorization: "Bearer fixture-token", "idempotency-key": "fixture-event-0001", "content-type": "application/json" };
 const post = (origin, body, extra = {}) => fetch(`${origin}/api/automations/demo/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify(body), ...extra });
+
+test("Responses and Images normalize supported fields and reject controls that cannot be enforced", () => {
+  const response = normalize({ model: input.model, input: [{ role: "user", content: [{ type: "input_text", text: "编辑" }, { type: "input_image", image_url: `data:image/png;base64,${png}` }] }],
+    tools: [{ type: "image_generation" }], instructions: "简洁", reasoning: { effort: "medium" }, store: false }, "responses");
+  assert.equal(response.imageInputs[1].url, `data:image/png;base64,${png}`);
+  assert.equal(response.body.reasoning, "medium");
+  assert.match(response.body.prompt, /native image generation tool/);
+  assert.equal(normalize({ model: input.model, prompt: "生成图片", response_format: "b64_json", n: 1 }, "images").requireImages, true);
+  for (const extra of [{ store: true }, { previous_response_id: "resp-1" }, { tools: [{ type: "image_generation", quality: "high" }] }, { tools: [] }, { reasoning: { summary: "auto" } }, { tool_choice: "required" }, { input: [{ type: "image_generation_call", result: png }] }, { input: [{ role: "user", content: [{ type: "input_file", file_id: "file-1" }] }] }]) {
+    assert.throws(() => normalize({ model: input.model, input: "画图", ...extra }, "responses"), { statusCode: 400 });
+  }
+  assert.throws(() => normalize({ model: input.model, input: "画图", max_output_tokens: 100 }, "responses"), { code: "unsupported_output_limit" });
+  for (const extra of [{ n: 2 }, { response_format: "url" }, { quality: "high" }, { size: "1024x1024" }, { stream: true }, { prompt: "" }]) {
+    assert.throws(() => normalize({ model: input.model, prompt: "画图", ...extra }, "images"), { statusCode: 400 });
+  }
+});
+
+test("image outputs are exact-turn, bounded native artifacts, not paths in text", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "model-image-output-"));
+  const generatedImagesRoot = path.join(root, "generated");
+  await fs.mkdir(generatedImagesRoot);
+  const image = { id: "ig-1", type: "imageGeneration", status: "completed", result: png, failure: null, revisedPrompt: "实际提示" };
+  const thread = (items) => ({ turns: [{ id: "wanted", items }, { id: "other", items: [{ ...image, result: bluePng }] }] });
+  try {
+    const result = await modelApiTurnResult(thread([{ type: "agentMessage", text: "/etc/passwd" }, image]), "wanted");
+    assert.equal(result.summary, "/etc/passwd");
+    assert.equal(result.images.length, 1);
+    assert.equal(result.images[0].b64_json, png);
+    assert.equal(result.images[0].media_type, "image/png");
+    const savedPath = path.join(generatedImagesRoot, "output.png");
+    await fs.writeFile(savedPath, Buffer.from(png, "base64"));
+    assert.equal((await modelApiTurnResult(thread([{ ...image, result: "", savedPath }]), "wanted", { generatedImagesRoot })).images[0].b64_json, png);
+    const outside = path.join(root, "secret.png");
+    await fs.writeFile(outside, Buffer.from(png, "base64"));
+    const link = path.join(generatedImagesRoot, "linked.png");
+    await fs.symlink(outside, link);
+    for (const bad of [{ ...image, result: "https://example.com/image.png" }, { ...image, savedPath: outside }, { ...image, savedPath: link },
+      { ...image, failure: { type: "usageLimitExceeded" } }, { ...image, status: "inProgress" }, { ...image, result: Buffer.from("<svg/>").toString("base64") },
+      { ...image, result: Buffer.alloc(8 * 1024 * 1024 + 1).toString("base64") }]) {
+      await assert.rejects(modelApiTurnResult(thread([bad]), "wanted", { generatedImagesRoot }), { statusCode: 502 });
+    }
+    await assert.rejects(modelApiTurnResult(thread(Array(5).fill(image)), "wanted"), { code: "image_output_too_large" });
+    await assert.rejects(modelApiTurnResult(thread([image]), "missing"), { code: "result_unavailable" });
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+const outputImages = [{ id: "ig-1", b64_json: png, media_type: "image/png", revised_prompt: "实际提示" }];
+test("official OpenAI SDK gets image bytes from Images and Responses, including streaming and replay", async () => {
+  await fixture(async (f) => {
+    const client = new OpenAI({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo/v1`, maxRetries: 0 });
+    const body = { model: input.model, prompt: "画图", response_format: "b64_json" };
+    const opts = { headers: { "Idempotency-Key": "sdk-image-output-0001" } };
+    const generated = await client.images.generate(body, opts);
+    assert.equal(generated.data[0].b64_json, png);
+    assert.equal(generated.output_format, "png");
+    assert.deepEqual(await client.images.generate(body, opts), generated);
+    assert.equal(f.submits, 1);
+    const request = { model: input.model, input: "画图", tools: [{ type: "image_generation" }], store: false };
+    const response = await client.responses.create(request, { headers: { "Idempotency-Key": "sdk-response-output-0001" } });
+    assert.equal(response.output_text, "你好，世界");
+    assert.equal(response.output.find((item) => item.type === "image_generation_call").result, png);
+    assert.equal(response.output.find((item) => item.type === "image_generation_call").output_format, "png");
+    assert.equal(response.usage.total_tokens, 130);
+    const stream = client.responses.stream(request, { headers: { "Idempotency-Key": "sdk-response-output-0002" } });
+    const events = [];
+    stream.on("event", (event) => events.push(event));
+    const final = await stream.finalResponse();
+    assert.equal(final.output.find((item) => item.type === "image_generation_call").result, png);
+    assert.equal(final.output_text, "你好，世界");
+    assert.ok(events.some((event) => event.type === "response.output_item.done" && event.item.type === "image_generation_call"));
+    assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index));
+    assert.ok(f.metrics.some((row) => row.trigger === "image-generations"));
+    assert.ok(f.metrics.some((row) => row.trigger === "responses"));
+  }, { result: async () => ({ summary: "你好，世界", images: outputImages }) });
+});
+
+test("Chat and Messages expose explicitly nonstandard image extensions without inventing image content blocks", async () => {
+  await fixture(async (f) => {
+    const openai = new OpenAI({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo/v1`, maxRetries: 0 });
+    const completion = await openai.chat.completions.create(input, { headers: { "Idempotency-Key": "sdk-output-extension-0001" } });
+    assert.equal(completion.choices[0].message.content, "你好，世界");
+    assert.equal(completion.codex_cloud.images[0].b64_json, png);
+    const chunks = [];
+    for await (const chunk of await openai.chat.completions.create({ ...input, stream: true }, { headers: { "Idempotency-Key": "sdk-output-extension-0002" } })) chunks.push(chunk);
+    assert.equal(chunks.find((chunk) => chunk.codex_cloud)?.codex_cloud.images[0].b64_json, png);
+    const anthropic = new Anthropic({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo`, maxRetries: 0, defaultHeaders: { "x-codex-cloud-allow-unbounded-output": "true" } });
+    const message = await anthropic.messages.create({ ...input, max_tokens: 100 }, { headers: { "Idempotency-Key": "sdk-output-extension-0003" } });
+    assert.deepEqual(message.content, [{ type: "text", text: "你好，世界" }]);
+    assert.equal(message.codex_cloud.images[0].b64_json, png);
+    const res = await fetch(`${f.origin}/api/automations/demo/v1/messages`, { method: "POST", headers: { ...headers, "x-codex-cloud-allow-unbounded-output": "true", "idempotency-key": "sdk-output-extension-0004" }, body: JSON.stringify({ ...input, max_tokens: 100, stream: true }) });
+    assert.match(await res.text(), /"codex_cloud":\{"images":/);
+  }, { result: async () => ({ summary: "你好，世界", images: outputImages }) });
+});
+
+test("image generation never reports success for an empty or unavailable image result", async () => {
+  await fixture(async (f) => {
+    const client = new OpenAI({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo/v1`, maxRetries: 0 });
+    await assert.rejects(client.images.generate({ model: input.model, prompt: "画图" }, { headers: { "Idempotency-Key": "sdk-output-empty-0001" } }), (error) => error.status === 502 && error.code === "no_image_generated");
+  });
+  await fixture(async (f) => {
+    const client = new OpenAI({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo/v1`, maxRetries: 0 });
+    const stream = client.responses.stream({ model: input.model, input: "画图" }, { headers: { "Idempotency-Key": "sdk-output-failed-0001" } });
+    await assert.rejects(stream.finalResponse());
+  }, { result: async () => { throw Object.assign(new Error("图片不存在"), { statusCode: 502, code: "image_result_unavailable" }); } });
+});
 
 test("official OpenAI SDK can create, replay and stream text completions", async () => {
   await fixture(async (f) => {

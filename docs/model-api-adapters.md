@@ -1,19 +1,20 @@
 # OpenAI / Anthropic 协议接入
 
-本项目提供 **OpenAI Chat Completions 和 Anthropic Messages 的文本、内嵌图片输入与文本 SSE 子集适配**，可接入官方 SDK。底层始终是已有自动化中的 Codex Agent，不是 OpenAI 模型 API 的透明代理，也不会调用 Claude。长任务、恢复与取消仍推荐[异步任务 API](backend-integration.md)。
+本项目提供 **OpenAI Chat Completions、Responses、Images Generations 和 Anthropic Messages 的子集适配**，支持文本、内嵌图片输入和生成图片结果，可接入官方 SDK。底层始终是已有自动化中的 Codex Agent，不是 OpenAI 模型 API 的透明代理，也不会调用 Claude。长任务、恢复与取消仍推荐[异步任务 API](backend-integration.md)。
 
 ## 先明确边界
 
 | 能力 | 当前支持 |
 | --- | --- |
-| 请求和响应 | OpenAI `messages → choices[0].message.content`；Anthropic `messages/system → content[text]` |
+| 请求和响应 | Chat `messages → choices[0].message.content`；Messages `messages/system → content[text]`；Responses `input → output`；Images `prompt → data[b64_json]` |
 | 文本历史 | 保留角色和内容边界，转换成 Codex 单轮的 JSON 对话记录；不是原生模型消息通道 |
 | 图片输入 | user 消息中的 PNG/JPEG/WebP Base64；作为原生 Codex `image` 输入，不当作文本或仅做 OCR |
+| 图片输出 | 精确原回合的原生 `imageGeneration` 结果；Responses `image_generation_call.result`、Images `data[].b64_json`，或 Chat/Messages 的 `codex_cloud.images` 扩展 |
 | 流式输出 | 真实 Agent 文本增量；OpenAI SSE chunks / `[DONE]`，Anthropic具名 SSE 事件 |
 | 执行隔离 | 每个新事件使用独立会话和 Git 工作树；完整历史由调用方逐次传入 |
 | 幂等、撤销与统计 | 复用独立调用方令牌、运行记录、并发及请求限制；两类调用进入“调用与用量” |
 | 模型与推理 | `model` 使用实际 Codex 模型 ID；OpenAI `reasoning_effort` / Anthropic `output_config.effort` |
-| 不支持 | Responses API、模型列表 API、远程图片 URL/Files API/GIF、音频/视频/PDF 内容块、图片或音频生成接口、客户端 `tools/tool_calls/tool_use/tool_result`、JSON Schema、采样参数、assistant 预填充、Anthropic beta/缓存控制 |
+| 不支持 | Responses 的保存/查询/previous_response_id、模型列表、Images Edits/multipart、远程图片 URL/Files API/GIF、音频/视频/PDF、音频生成、客户端 `tools/tool_calls/tool_use/tool_result`、JSON Schema、采样参数、assistant 预填充、Anthropic beta/缓存控制 |
 
 **重要：Codex 无法原生兑现请求级 `max_tokens/max_completion_tokens`。** 默认返回 400，而不是假装预算生效。Anthropic 的 SDK 必须提供 `max_tokens`，因此只有在调用方明确接受“不应用该输出上限”后，才可加 `x-codex-cloud-allow-unbounded-output: true`。这不限制推理或总 token 消耗，也不会截断输出。需要严格逐请求 token 预算的业务不能使用本适配器。
 
@@ -28,7 +29,7 @@ Codex 自身的仓库工具、联网和连接服务仍由服务器策略决定�
 | OpenAI | `https://你的域名/api/automations/自动化ID/v1` | `Authorization: Bearer <调用方令牌>` |
 | Anthropic | `https://你的域名/api/automations/自动化ID` | `x-api-key: <调用方令牌>`，SDK 自动追加 `/v1/messages` |
 
-实际接口是 `POST /api/automations/:id/v1/chat/completions` 和 `POST /api/automations/:id/v1/messages`，不提供域名根目录的 `/v1`。Anthropic 也接受 Bearer，但两个认证头冲突时拒绝。支持 `anthropic-version: 2023-06-01`。
+接口均为 `POST /api/automations/:id/v1/` 下的 `chat/completions`、`messages`、`responses`、`images/generations`，不提供域名根目录的 `/v1`。Anthropic 也接受 Bearer，但两个认证头冲突时拒绝。支持 `anthropic-version: 2023-06-01`。
 
 每次调用必须设置稳定的 `Idempotency-Key`：8–160 位 ASCII 字母、数字或 `._:-`。业务事件创建时保存该键，重试不能换键，同键变更文本/模型/推理强度返回 409。同键可以改用流式读取最终结果，不会重新执行模型。不要把示例中的事件 ID 作为所有用户请求的固定值。
 
@@ -129,7 +130,54 @@ const result = await client.messages.create({
 - 图片按消息中的出现顺序编号，prompt 只记录所属消息、序号、MIME、内容哈希和默认 detail；原始图片走原生输入。同键换图返回 409，不重复执行。文本/SSE 输出格式不变。
 - 本项目不再在运行索引、聊天文本里复制 Base64，也不新增上传临时目录；Codex 自身的原始 thread/history **仍可能保存图片输入**，不能把本适配器当作无留存服务。控制台文本显示“内嵌图片”，本轮不新增 API 图片缩略图。
 
-参考：[Codex 原生输入](https://developers.openai.com/codex/app-server)、[OpenAI 图片输入](https://developers.openai.com/api/docs/guides/images-vision)、[Anthropic 图片内容块](https://platform.claude.com/docs/en/build-with-claude/vision)。音视频、文档解析与图片生成是不同链路，尚未提供对应协议适配。
+参考：[Codex 原生输入](https://developers.openai.com/codex/app-server)、[OpenAI 图片输入](https://developers.openai.com/api/docs/guides/images-vision)、[Anthropic 图片内容块](https://platform.claude.com/docs/en/build-with-claude/vision)。音视频、文档解析仍未提供对应协议适配。
+
+## 图片生成与输出
+
+以下调用会执行实际模型和图片工具，可能产生额外额度消耗。**服务器必须已经具有可用的 Codex 原生图片生成能力**；适配器不会自动启用工具、申请权限、安装图片服务或注册新的付费账户。这里的 `model` 仍是 Codex 主模型 ID，不是 `gpt-image-*`，不能单独选择底层图片工具模型。
+
+推荐通过 Responses 进行图文输入和图片输出，复用前文 OpenAI 客户端：
+
+```js
+const response = await client.responses.create({
+  model: "gpt-6-sol",
+  input: "生成一张简洁的产品示意图",
+  tools: [{ type: "image_generation" }],
+  reasoning: { effort: "medium" },
+  store: false,
+}, { headers: { "Idempotency-Key": event.persistedId } });
+for (const item of response.output) {
+  if (item.type === "image_generation_call") {
+    const bytes = Buffer.from(item.result, "base64");
+    // 交给业务自己的私有文件存储，不将调用方令牌放进公开 URL。
+  }
+}
+```
+
+- `input` 支持字符串或消息数组；内容块支持 `input_text`、历史 `output_text` 和 user 的内嵌 `input_image`（`image_url` 为 data URL，detail 仅 auto）。最后一条必须是 user。用图片输入和编辑描述可以请求编辑，但不承诺掩码、精确尺寸等 Images Edits 控制。
+- 支持 `instructions`、`reasoning.effort`、`store:false`；`tools` 只能是 `[{type:"image_generation"}]`。这是请求 Codex 使用已有原生工具，不是把官方 Responses 工具配置原样传入 CLI。拒绝工具模型、size/quality/background/action 等未能原生兑现的控制，不会用提示词冒充这些参数生效。
+- `stream:true` 或 `client.responses.stream()` 支持官方 SSE 事件。文本和完整图片在原回合完成后发出 `response.output_item.done` 与 `response.completed`，**不是实时图片预览**，没有 partial image 事件。`max_output_tokens` 同样需要显式接受不应用输出预算。
+- `store:false` 仅指不提供官方 Responses 存储/查询契约，不阻止 Codex 保存本地历史。重试用同一事件键，后续编辑用完整输入自行维护上下文，不支持 `previous_response_id`。
+
+只需图片时也可用 Images 风格入口：
+
+```js
+const result = await client.images.generate({
+  model: "gpt-6-sol", // Codex 主模型，不是 GPT Image 模型 ID
+  prompt: "生成一张简洁的产品示意图",
+  n: 1,
+  response_format: "b64_json",
+}, { headers: { "Idempotency-Key": event.persistedId } });
+const bytes = Buffer.from(result.data[0].b64_json, "base64");
+```
+
+Images 当前支持的参数只有 `model/prompt/n/response_format`，`n` 只能为 1，只返回第一张实际生成的图片；不能强制底层工具恰好生成一张或限制其费用，多图结果请用 Responses。仅非流式、Base64 输出；不生成匿名下载 URL。回合没有生成图片则返回 502 `no_image_generated`，不会拿文字或路径冒充图片交付。
+
+既有 Chat / Messages 非流式响应会附带 **非标准扩展** `codex_cloud.images: [{id,b64_json,media_type,revised_prompt?}]`，原文本字段不变。流式时扩展出现在 Chat 最后一个 stop chunk、Messages 的 `message_delta`；Anthropic 高级流累积器可能不保留扩展，需读取原始事件或改用 Responses / Images。不能假设其存在官方的图片输出 content block。
+
+所有入口最多输出 4 张 PNG/JPEG/WebP、解码总计 8 MiB（单张也最多 8 MiB）；过大、失效、文件不可读或图片生成失败明确返回错误。只导出原 thread 中**精确 turn 的原生图片生成项**，不扫描模型文本里的路径、不从远程地址抓图、不导出其他回合图片。保存文件须在既有 generated_images 目录，拒绝越界与符号链接逃逸。运行索引不保存 Base64，没有新增结果缓存目录；原 Codex 历史及生成文件仍会保留，删除原产物可能导致幂等重放无法再取图。
+
+图片结果采用 [OpenAI 图片输出](https://developers.openai.com/api/docs/guides/image-generation) 的 Base64 字段，图片质量、权限、计费仍由实际工具和账号决定。当前 Codex 回合 `usage` 不保证覆盖图片工具的独立计费，不是精确图片费用账单。
 
 ## 结果、超时和计量
 
@@ -140,7 +188,7 @@ const result = await client.messages.create({
 - 流开始后发生执行失败、取消、重启中断、待核对状态，会发送协议错误事件，不发送成功终止标记。流中的中间文本只是进度，不是已验收的交付。
 - `usage` 来自 Codex 当前 Agent 回合，可能包含内部工具循环与推理，不等于可见文本的计数。OpenAI 保留总输入/缓存输入；Anthropic 把缓存读取量单列。未知时 OpenAI `usage:null`；Anthropic计数为 `null`（明确的兼容扩展），绝不伪造为 0。流开始时通常未知，终态事件才提供实际计数；要求所有计数必为数字的第三方网关需适配这一差异。
 - 运行成功仍会检查该自动化既有的完成契约。聊天型自动化不要配置只适用于开发交付的固定完成标记，否则普通答案会被判失败。
-- 长答案在摘要达到保留上限时，从原 Codex thread 的精确 turn 读取，不扩大运行索引，也不复制一份结果缓存。原回合不可用时返回错误，不能拿截断摘要冒充完整答案。单次可见结果最多 4 MiB；超出时需从原任务交付文件获取。
+- 终态从原 Codex thread 的精确 turn 读取完整文本及图片，不扩大运行索引，也不复制一份结果缓存。原回合不可用时返回错误，不能拿截断摘要冒充完整答案。单次可见文本最多 4 MiB，图片按上文单独限制。
 
 ## 反向代理和验收
 
@@ -151,10 +199,12 @@ node ops/extend-caddy-automation-routes.mjs \
   /etc/caddy/Caddyfile /tmp/codex-caddy-model-candidate --model-api
 ```
 
-工具只增加两条 POST 路由的匹配器，开启即时流式刷新，并校验所有原路由语义不变；管理员再原子替换、reload 和健康检查。失败恢复原配置。不要打印含认证哈希的配置。
+工具只增加四条 POST 路由的匹配器，或升级既有两条路由的匹配器，开启即时流式刷新，并校验其他原路由语义不变；管理员再原子替换、reload 和健康检查。失败恢复原配置。不要打印含认证哈希的配置。
 
 新版本机控制台代理也可使用同样的路径：会保留调用方的 Bearer / API key，不注入本机默认共享令牌或 Basic 登录。必须自行提供独立调用方令牌。非流式等待默认 330 秒，可用 `CODEX_CLOUD_CONSOLE_MODEL_API_TIMEOUT_MS` 与远端等待上限匹配。生产业务服务仍推荐直接使用 HTTPS 地址。
 
-本地 `npm run verify:model-api` 使用两套官方 SDK 和内存执行器；`npm run verify:regressions` 验证真实 Express 路由、假 Codex app-server、隔离 Git 工作树、运行持久化、原生图片参数、作用域、重放与撤销。图片 JSON 在令牌认证后解析。安装了 Codex CLI 时，另可运行 `npm run verify:model-api:codex`：使用独立测试 HOME 和本机模拟 provider，捕获真实 CLI 的 `input_image` 序列化，返回刻意的非重试错误，不访问付费模型。这些测试不证明真实模型的图像理解效果。
+安装器支持 `CODEX_CLOUD_PRE_SWITCH_CHECK=/绝对路径/可信可执行文件`，在构建后、切换前执行门禁，非零退出则保持原版本。现有 EC2 可使用 `ops/check-release-idle.mjs`，通过 `CODEX_CLOUD_PRE_SWITCH_BACKUP` 指向已校验备份的 before.json（含原 current 及受保护状态 hashes）；门禁只检查空闲和状态，不运行模型，也不打印配置令牌。
+
+本地 `npm run verify:model-api` 使用两套官方 SDK 和内存执行器，验证图片输入/输出、Responses 流事件、Images 返回和路径边界；`npm run verify:regressions` 验证真实 Express 路由、假 Codex app-server、隔离 Git 工作树、运行持久化、原生图片参数与结果、作用域、重放与撤销。图片 JSON 在令牌认证后解析。安装了 Codex CLI 时，另可运行 `npm run verify:model-api:codex`：使用独立测试 HOME 和本机模拟 provider，捕获真实 CLI 的 `input_image` 序列化，返回刻意的非重试错误，不访问付费模型。这些测试不证明真实模型的图像理解或生成质量。
 
 协议参考：[OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[Anthropic SSE](https://platform.claude.com/docs/en/build-with-claude/streaming)。本项目只承诺上文列出的子集。

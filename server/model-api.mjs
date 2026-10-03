@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { createHash } from "node:crypto";
+import { responsesBody } from "./model-api-output.mjs";
 
 export const modelApiJsonLimit = 12 * 1024 * 1024;
 const maxImageBytes = 4 * 1024 * 1024;
@@ -8,6 +9,8 @@ const maxImagesBytes = 8 * 1024 * 1024;
 const fields = {
   openai: new Set(["model", "messages", "stream", "stream_options", "reasoning_effort", "n", "max_tokens", "max_completion_tokens"]),
   anthropic: new Set(["model", "messages", "system", "stream", "max_tokens", "output_config"]),
+  responses: new Set(["model", "input", "instructions", "stream", "reasoning", "tools", "store", "max_output_tokens"]),
+  images: new Set(["model", "prompt", "n", "response_format"]),
 };
 const efforts = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const pending = new Set(["queued", "running", "canceling"]);
@@ -17,8 +20,47 @@ const fail = (message, param = null, statusCode = 400, code = "invalid_request")
 const object = (value) => Boolean(value && typeof value === "object" && !Array.isArray(value));
 
 export function modelApiProtocol(path) {
-  const match = /^\/api\/automations\/[^/]+\/v1\/(chat\/completions|messages)$/.exec(path);
-  return match ? match[1] === "messages" ? "anthropic" : "openai" : null;
+  const match = /^\/api\/automations\/[^/]+\/v1\/(chat\/completions|messages|responses|images\/generations)$/.exec(path);
+  return match ? { messages: "anthropic", responses: "responses", "images/generations": "images", "chat/completions": "openai" }[match[1]] : null;
+}
+
+function normalizeOutputRequest(body, protocol, options) {
+  let messages, effort, generate = protocol === "images";
+  if (protocol === "images") {
+    if (typeof body.prompt !== "string" || !body.prompt.trim()) fail("prompt 必须是非空文本", "prompt");
+    if (body.n !== undefined && body.n !== 1) fail("当前仅支持 n=1", "n");
+    if (body.response_format !== undefined && body.response_format !== "b64_json") fail("仅支持 response_format: b64_json，不发布匿名图片 URL", "response_format");
+    messages = [{ role: "user", content: body.prompt }];
+  } else {
+    if (body.store !== undefined && body.store !== false) fail("仅支持 store:false；Codex 本地历史仍会保留", "store");
+    if (body.tools !== undefined) {
+      if (!Array.isArray(body.tools) || body.tools.length !== 1 || !object(body.tools[0]) || body.tools[0].type !== "image_generation" || Object.keys(body.tools[0]).length !== 1) {
+        fail("tools 仅支持 [{type: image_generation}]；工具模型、质量、尺寸等控制尚不能保证生效", "tools");
+      }
+      generate = true;
+    }
+    if (body.reasoning !== undefined) {
+      if (!object(body.reasoning) || Object.keys(body.reasoning).some((key) => key !== "effort")) fail("reasoning 仅支持 effort", "reasoning");
+      effort = body.reasoning.effort;
+    }
+    messages = typeof body.input === "string" ? [{ role: "user", content: body.input }] : body.input;
+    if (!Array.isArray(messages)) fail("input 需要文本或消息数组", "input");
+    messages = messages.map((message) => {
+      if (!object(message) || Object.keys(message).some((key) => !["type", "role", "content"].includes(key)) || (message.type !== undefined && message.type !== "message")) fail("input 仅支持消息，不支持文件、工具输出和 previous_response_id", "input");
+      return { role: message.role, content: typeof message.content === "string" ? message.content : Array.isArray(message.content) ? message.content.map((part) => {
+        if (!object(part)) fail("无效 input 内容块", "input");
+        if (["input_text", "output_text"].includes(part.type) && Object.keys(part).every((key) => ["type", "text"].includes(key))) return { type: "text", text: part.text };
+        if (part.type === "input_image" && Object.keys(part).every((key) => ["type", "image_url", "detail"].includes(key))) return { type: "image_url", image_url: { url: part.image_url, ...(part.detail !== undefined ? { detail: part.detail } : {}) } };
+        fail("input 仅支持 input_text、output_text 历史和内嵌 input_image", "input");
+      }) : message.content };
+    });
+    if (body.instructions !== undefined) messages.unshift({ role: "developer", content: textContent(body.instructions, "instructions") });
+  }
+  const normalized = normalizeModelApiRequest({ model: body.model, messages, ...(body.stream !== undefined ? { stream: body.stream } : {}),
+    ...(effort !== undefined ? { reasoning_effort: effort } : {}), ...(body.max_output_tokens !== undefined ? { max_completion_tokens: body.max_output_tokens } : {}) }, "openai", options);
+  if (generate) normalized.body.prompt += "\nUse the native image generation tool to fulfill the final request. Return completed generated images, not shell-created files, URLs, paths, or invented Base64. If unavailable, explain the failure honestly.";
+  normalized.requireImages = protocol === "images";
+  return normalized;
 }
 
 function textContent(value, param) {
@@ -92,7 +134,8 @@ function messageContent(value, protocol, role, param, images) {
 export function normalizeModelApiRequest(body, protocol, { allowUnboundedOutput = false } = {}) {
   if (!object(body)) fail("请求正文必须是 JSON 对象");
   for (const key of Object.keys(body)) if (!fields[protocol].has(key)) fail(`尚不支持参数 ${key}，不能静默忽略`, key, 400, "unsupported_parameter");
-  if (typeof body.model !== "string" || !/^[A-Za-z0-9._:-]{2,64}$/.test(body.model) || body.model.startsWith("claude")) {
+  if (protocol === "responses" || protocol === "images") return normalizeOutputRequest(body, protocol, { allowUnboundedOutput });
+  if (typeof body.model !== "string" || !/^[A-Za-z0-9._:-]{2,64}$/.test(body.model) || /^(claude|gpt-image-)/.test(body.model)) {
     fail("model 必须是当前 Codex 账号支持的模型 ID；Anthropic 协议不会调用 Claude 模型", "model");
   }
   if (body.stream !== undefined && typeof body.stream !== "boolean") fail("stream 必须是布尔值", "stream");
@@ -174,7 +217,8 @@ function apiError(protocol, error) {
 export function sendModelApiError(res, protocol, error) {
   if (res.destroyed || res.writableEnded) return;
   if (res.headersSent) {
-    res.end(`${protocol === "anthropic" ? "event: error\n" : ""}data: ${JSON.stringify(apiError(protocol, error))}\n\n`);
+    const body = protocol === "responses" ? { type: "error", code: error.code || "api_error", message: error.message, param: error.param || null } : apiError(protocol, error);
+    res.end(`${["anthropic", "responses"].includes(protocol) ? "event: error\n" : ""}data: ${JSON.stringify(body)}\n\n`);
     return;
   }
   if (error.retryAfterMs) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1000)));
@@ -206,13 +250,16 @@ export function modelApiTurnText(thread, turnId) {
 }
 
 function responseBody(run, protocol) {
+  if (protocol === "responses") return responsesBody(run);
+  if (protocol === "images") return { created: Math.floor(Date.parse(run.startedAt) / 1000), output_format: run.images[0].media_type.slice(6), data: run.images.slice(0, 1).map(({ b64_json, revised_prompt }) => ({ b64_json, ...(revised_prompt ? { revised_prompt } : {}) })) };
+  const extension = run.images?.length ? { codex_cloud: { images: run.images } } : {};
   const common = { id: `${protocol === "openai" ? "chatcmpl" : "msg"}_${run.id}`, model: run.model };
   if (protocol === "anthropic") return {
-    ...common, type: "message", role: "assistant", content: [{ type: "text", text: run.summary || "" }],
+    ...common, ...extension, type: "message", role: "assistant", content: [{ type: "text", text: run.summary || "" }],
     stop_reason: "end_turn", stop_sequence: null, usage: modelApiUsage(run, protocol),
   };
   return {
-    ...common, object: "chat.completion", created: Math.floor(Date.parse(run.startedAt) / 1000),
+    ...common, ...extension, object: "chat.completion", created: Math.floor(Date.parse(run.startedAt) / 1000),
     choices: [{ index: 0, message: { role: "assistant", content: run.summary || "", refusal: null }, finish_reason: "stop", logprobs: null }],
     usage: modelApiUsage(run, protocol),
   };
@@ -231,6 +278,7 @@ async function bounded(task, signal) {
 
 function streamWriter(res, protocol, run, signal) {
   const common = responseBody(run, protocol);
+  let sequence = 0;
   const write = async (event, data) => {
     signal.throwIfAborted();
     const frame = `${event ? `event: ${event}\n` : ""}data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
@@ -244,16 +292,20 @@ function streamWriter(res, protocol, run, signal) {
     id: common.id, model: run.model, created: common.created, object: "chat.completion.chunk",
     choices: [{ index: 0, delta, finish_reason, logprobs: null }], usage: null,
   });
+  const responseEvent = (type, data) => write(type, { type, sequence_number: sequence++, ...data });
   return {
     async start() {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("X-Accel-Buffering", "no");
       res.flushHeaders();
+      if (protocol === "responses") return responseEvent("response.created", { response: { ...common, status: "in_progress", output: [], usage: null } });
       if (protocol === "openai") return write(null, chunk({ role: "assistant", content: "" }));
       await write("message_start", { type: "message_start", message: { ...common, content: [], stop_reason: null } });
       await write("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
     },
     async delta(text) {
+      // Responses images and text are published from the exact completed turn, not mutable progress summaries.
+      if (protocol === "responses") return;
       for (let start = 0; start < text.length;) {
         let end = Math.min(start + 8192, text.length);
         if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
@@ -263,15 +315,32 @@ function streamWriter(res, protocol, run, signal) {
         start = end;
       }
     },
-    ping: () => write(protocol === "anthropic" ? "ping" : null, protocol === "anthropic" ? { type: "ping" } : chunk({})),
+    ping: () => protocol === "responses" ? responseEvent("response.in_progress", { response: { ...common, status: "in_progress", output: [], usage: null } }) : write(protocol === "anthropic" ? "ping" : null, protocol === "anthropic" ? { type: "ping" } : chunk({})),
     async finish(final, includeUsage) {
+      if (protocol === "responses") {
+        const response = responseBody(final, protocol);
+        for (const [index, item] of response.output.entries()) {
+          await responseEvent("response.output_item.added", { output_index: index, item: item.type === "message" ? { ...item, status: "in_progress", content: [] } : { ...item, status: "in_progress", result: "" } });
+          if (item.type === "message") {
+            await responseEvent("response.content_part.added", { item_id: item.id, output_index: index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+            await responseEvent("response.output_text.delta", { item_id: item.id, output_index: index, content_index: 0, delta: item.content[0].text });
+            await responseEvent("response.output_text.done", { item_id: item.id, output_index: index, content_index: 0, text: item.content[0].text });
+            await responseEvent("response.content_part.done", { item_id: item.id, output_index: index, content_index: 0, part: item.content[0] });
+          }
+          await responseEvent("response.output_item.done", { output_index: index, item });
+        }
+        await responseEvent("response.completed", { response });
+        res.end();
+        return;
+      }
+      const extension = final.images?.length ? { codex_cloud: { images: final.images } } : {};
       if (protocol === "openai") {
-        await write(null, chunk({}, "stop"));
+        await write(null, { ...chunk({}, "stop"), ...extension });
         if (includeUsage) await write(null, { ...chunk({}), choices: [], usage: modelApiUsage(final, protocol) });
         await write(null, "[DONE]");
       } else {
         await write("content_block_stop", { type: "content_block_stop", index: 0 });
-        await write("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: modelApiUsage(final, protocol) });
+        await write("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: modelApiUsage(final, protocol), ...extension });
         await write("message_stop", { type: "message_stop" });
       }
       res.end();
@@ -279,7 +348,7 @@ function streamWriter(res, protocol, run, signal) {
   };
 }
 
-export function createModelApiHandler({ authenticate, submit, snapshot, record, timeoutMs = 300_000, pollMs = 250 }) {
+export function createModelApiHandler({ authenticate, submit, snapshot, result, record, timeoutMs = 300_000, pollMs = 250 }) {
   const waitTimeout = Number.isFinite(timeoutMs) ? Math.min(900_000, Math.max(1000, timeoutMs)) : 300_000;
   const waiters = new Map();
   let total = 0;
@@ -335,11 +404,18 @@ export function createModelApiHandler({ authenticate, submit, snapshot, record, 
         }
         if (!pending.has(current.status)) {
           if (current.status !== "completed") fail("Codex 任务未成功完成，请通过 result-path 查询错误及待核对状态", null, 502, "codex_run_failed");
+          const final = result ? { ...current, ...await bounded(result(runId), signal) } : current;
+          if (normalized.requireImages && !final.images?.length) fail("回合完成但没有生成图片；请核对 Codex 图片能力和账号权限", null, 502, "no_image_generated");
+          if (!await bounded(authenticate(req, token), signal)) fail("令牌已失效；不能返回完成结果", null, 401);
+          if (writer && protocol !== "responses" && final.summary !== emitted) {
+            if (!final.summary.startsWith(emitted)) fail("最终输出已修订；请用原键非流式重试", null, 502, "stream_revised");
+            await writer.delta(final.summary.slice(emitted.length));
+          }
           metricStatus = 200;
-          if (writer) await writer.finish(current, normalized.includeUsage);
+          if (writer) await writer.finish(final, normalized.includeUsage);
           else {
             res.setHeader("x-codex-cloud-usage-status", current.usage?.status || "unknown");
-            res.json(responseBody(current, protocol));
+            res.json(responseBody(final, protocol));
           }
           return;
         }
@@ -360,7 +436,7 @@ export function createModelApiHandler({ authenticate, submit, snapshot, record, 
         total -= 1;
       }
       if (req.apiClient && metricStatus !== 429) {
-        void record({ clientId: req.apiClient.id, automationId: req.params.id, trigger: protocol === "openai" ? "chat-completions" : "messages", status: metricStatus, runId, deduplicated, durationMs: Date.now() - startedAt })
+        void record({ clientId: req.apiClient.id, automationId: req.params.id, trigger: { openai: "chat-completions", anthropic: "messages", responses: "responses", images: "image-generations" }[protocol], status: metricStatus, runId, deduplicated, durationMs: Date.now() - startedAt })
           .catch((error) => console.error(`模型协议调用指标保存失败: ${error.message}`));
       }
     }
