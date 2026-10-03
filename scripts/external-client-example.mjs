@@ -55,7 +55,7 @@ export async function runExternalClient({ command, automationId, eventId = "", r
   const deadline = Date.now() + timeoutMs;
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const operationSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-  const delay = (ms) => sleep(Math.min(ms, Math.max(1, deadline - Date.now())), undefined, { signal: operationSignal });
+  const delay = (ms) => sleep(Math.min(ms, 2_147_483_647), undefined, { signal: operationSignal });
   let current;
   let cursor = 0;
   let lastStatus;
