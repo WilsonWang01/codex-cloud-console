@@ -27,6 +27,8 @@
 
 首轮 GitHub CI 捕获了本机未复现的计时边界：把 Retry-After 睡眠裁剪到剩余毫秒，可能因定时器取整而在总期限前额外发出一次请求。已修复为保留原退避/轮询间隔，由统一 AbortSignal 在期限到达时中断等待；不通过放宽测试断言掩盖问题。
 
+修复后，15 项客户端测试连续执行 15 轮全部通过；完整本地回归再次通过，[GitHub CI](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/37139246338) 成功。功能提交为 `c68bad6`，计时修复为 `eb18da8`。
+
 所有测试使用假服务端或隔离的临时状态/模拟 Codex，没有运行付费模型、发送邮件、修改日历或触发远端 GitHub 写入。
 
 ## 架构与剩余边界
@@ -36,3 +38,17 @@
 接口仍是异步任务 API，不是 OpenAI 兼容聊天接口。完成通知推送、隔离文件下载、外部编排及不可信多租户 worker 尚未实现。工作执行器共享系统用户和 Codex 账号，隔离工作树不是安全沙箱。幂等窗口默认 24 小时，超出窗口的未知任务须人工核对；客户端/回调中止无法撤销服务器任务或已开始的外部操作。
 
 接入文档：[作为后端服务接入](../backend-integration.md)。
+
+## 发布验收
+
+- 已在现有 EC2 发布 `eb18da8273f20b680acf34b9e6c900ea86f6029b`，当前目录为 `/home/ubuntu/codex-cloud/releases/console/20261003T171125Z-2542806`。没有新增 AWS 资源、改变账号权限或升级 CLI；CLI 仍是 0.157.1。
+- 发布前后检查对话、压缩及自动化空闲；避开现有整点任务后切换。安装器备份保护、原子切换、严格健康及失败回退保持原有实现。部署成功，`strictOk: true`、`partial: false`，Codex 登录正常。
+- 备份位于 `/home/ubuntu/codex-cloud/backups/pre-api-integration-20261003T170700Z/state-personal-config.tar.gz`，已检查 tar 可列举、权限为 0600，SHA-256 为 `f1b4d75f9e6643f23b9d8bd37d61883cf750404f1897dd34775a841e4b01f4f8`。状态清单保存于同目录 `before.json`。
+- 34 个会话、200 条自动化运行记录及个人关注事项/事实/流程文件，发布前后哈希与存在性全部一致。状态、个人文件、用户仓库及其未提交变更没有清理。验收后只移除旧代码发布和本次临时源码，保留备份。
+- 线上 `server/index.mjs`、请求校验模块、参考客户端和 `dist/index.html` 的哈希与本机对应文件一致；线上加载的校验模块确实拒绝 Webhook 会话复用。
+- 公网 Webhook 和结果查询携带无效令牌返回应用层 JSON 401，不落入 Basic Auth 或重定向；没有创建测试令牌或运行模型。
+- 发布后通过真实浏览器打开“调用与用量”，云端在线、项目及会话列表加载成功，页面无控制台 warning/error。此项仅验证发布后的连接与页面可用性，不宣称完整重验手机/桌面交互。
+
+### 预检发现的既有运维问题
+
+`codex-auto-invest-guba-hourly.service` 在本次切换前失败：脚本仍指向已不存在的 `/home/ubuntu/codex-cloud/console/scripts/run-cloud-automation-via-api.mjs`，不是本轮代码或模型引起。已保留原任务与失败记录，没有立即重跑、修改计划或自动恢复调用。已向用户询问是否允许检查并修复同类失效路径，因为恢复计划后会重新消耗模型额度；本报告记录时尚未取得该项确认。
