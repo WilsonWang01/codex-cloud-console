@@ -23,13 +23,20 @@
 - `npm run verify:local`：最终版本通过；包含构建、schema、认证、隔离任务、恢复、计量、个人空间与 GitHub 等全量回归。
 - `npm run verify:model-api`：14 组通过；两套官方 SDK、图片顺序/正文哈希/换图冲突、格式/体积限制、错误终态与流式收据。
 - `npm run verify:regressions`：9 组通过；真实 Express、假 Codex、真实隔离 Git 工作树；捕获 `turn/start` 原生图片块，认证先于超大 JSON、持久化索引不包含原图、无效图不新建任务。
-- `npm run verify:model-api:codex`：本机 Codex CLI 0.160.0 通过。独立临时 HOME/CODEX_HOME、本机 HTTP provider、虚构令牌；捕获真实 `input_image` 和原图 data URL 后返回刻意的非重试错误。这验证序列化，不是成功模型回合。
+- `npm run verify:model-api:codex`：本机 Codex CLI 0.160.0、生产服务器 CLI 0.157.1 均通过。独立临时 HOME/CODEX_HOME、回环 HTTP provider、虚构令牌；捕获真实 `input_image` 和原图 data URL 后返回刻意的非重试错误。这验证序列化，不是成功模型回合。
 - normalizer 检查：原上传附件不回归，内嵌图片不复制 Base64。
 - `git diff --check`：通过。既有主 chunk 502.19 kB 提示仍在；本轮没有前端布局改动，不宣称新增手机/桌面视觉验收。
 
 ## 发布状态
 
-本地验收完成；GitHub CI、EC2 备份、同版本 CLI 的本机模拟 provider 检查及线上健康检查待补记。预检：34 个保存会话、200 条运行记录，无活动自动化和定时服务，控制台无运行中 turn/compaction；服务器 CLI 为 0.157.1。
+- 功能提交 `074af4b8f326324a8ce329127487d15ea5e74748` 已推送 main；[GitHub CI](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/37144827987) 通过。
+- 发布前确认没有活动自动化和定时服务，控制台无运行中 turn/compaction；保留原服务器 CLI 0.157.1，不改账户、权限和定时任务。
+- 备份 `/home/ubuntu/codex-cloud/backups/pre-model-images-20261003T183847Z/state-personal-config.tar.gz`，1,041,207 字节；归档可列举且 SHA256 校验通过：`8526ac850685c6dbe89713c1c9de6ea71b65a772fe278adac2b8c9f7d898d416`。备份包含原状态、个人空间及服务配置，未读取登录凭据正文。
+- EC2 当前版本 `/home/ubuntu/codex-cloud/releases/console/20261003T184016Z-2549055`；部署退出码 0，进程目录与部署源码哈希核对通过，严格健康检查 200、`strictOk:true`、`partial:false`。
+- 发布前后受保护状态文件哈希一致，保存会话仍为 34 个、运行记录仍为 200 条。原数据、工作树、个人空间及 Codex 历史保留。
+- 旧代码版本仅在新版本健康检查通过、服务目录确认、`lsof` 确认无打开文件后删除；临时源码和安装归档已清理，校验后的备份保留。
+- 刷新本机代理后，`http://127.0.0.1:18787/healthz` 严格健康检查通过。公网健康页仍要求原有 Basic 认证，未认证返回 401，未开放为匿名端点。
+- 公网与本机代理的 OpenAI / Anthropic 路由用刻意无效令牌复查：均返回 401、`authentication_error` 协议 JSON，且没有 Basic 认证挑战。没有为此创建真实调用方或执行模型回合。
 
 ## 客观限制
 
