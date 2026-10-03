@@ -33,7 +33,16 @@
 
 ## 发布状态
 
-本地验收完成。预检：34 个保存会话、200 条运行记录，控制台无活动 turn/compaction，无运行中的自动化及定时服务；服务器磁盘可用约 6.7 GiB。GitHub CI、EC2 备份与线上发布结果待补记。
+- 功能提交 `f3a686e28acae52b0658d7a4cb12211a8592611b` 与门禁零依赖修复 `c919edcb9d1479b8064eb40f95d6fe2fe0b1577e` 已推送 main；[功能 CI](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/37147374473)、[最终版本 CI](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/37147707233) 均通过。
+- 发布前和构建后门禁均通过：34 个保存会话、200 条运行记录，控制台无活动 turn/compaction，无运行中的自动化及定时服务；预检磁盘可用约 6.7 GiB。
+- 第一次分离发布因 systemd 环境展开导致备份参数为空，退出码 2；发生在版本切换前，没有重启服务。修正为不展开传入脚本的环境变量后重新执行，部署退出码 0。
+- 已校验备份 `/home/ubuntu/codex-cloud/backups/pre-model-output-20261003T192400Z-retry/state-personal-config.tar.gz`，1,032,593 字节；SHA256 `bcd0ef4c8aeb2e43d0505061a8663d8f5110153bac4d6674076bb31a00768c7c`。归档列举与摘要校验通过，包含状态、个人空间及服务配置，不读取或复制 Codex 登录凭据。
+- 线上当前版本 `/home/ubuntu/codex-cloud/releases/console/20261003T192734Z-2551975`，主进程 `2552294`；进程目录及三个后端模块的源码哈希核对通过。
+- 严格健康检查 200、`strictOk:true`、`partial:false`。公网四条 POST 路由分别以无效令牌确认 401 协议 JSON、无 Basic 认证挑战；其他 Caddy 站点及原认证路由保持不变。
+- 发布前后受保护状态哈希完全一致，保存会话仍为 34 个、运行记录仍为 200 条；工作树、个人空间、原 Codex 历史和生成文件不在清理范围。
+- 新版本通过检查后，确认旧目录无打开文件才删除旧代码；临时源码和下载归档已清理，校验后的数据备份保留，仅保留当前代码版本。
+- 本机代理刷新后严格健康检查及四条 API 路由的独立认证检查通过，不注入默认共享令牌，没有创建真实测试调用方或运行模型。
+- 服务器只读能力探测返回 `imageGeneration:true`；这不是实际图片生成成功或计费权限的证据。
 
 ## 客观限制
 
