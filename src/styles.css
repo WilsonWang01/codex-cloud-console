@@ -7269,11 +7269,17 @@ pre {
 .personal-file-actions a, .personal-file-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); text-decoration: none; cursor: pointer; }
 .personal-fact-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px 44px; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .personal-fact-row > span { display: grid; gap: 3px; min-width: 0; }
+.personal-fact-row strong { overflow-wrap: anywhere; }
 .personal-fact-row small { color: var(--muted); overflow-wrap: anywhere; }
+.personal-facts-header { display: flex; align-items: start; gap: 8px; }
+.personal-facts-header p { flex: 1; min-width: 0; }
+.personal-facts-header button { display: grid; place-items: center; width: 44px; height: 44px; flex: 0 0 44px; border: 0; background: transparent; color: var(--text); cursor: pointer; }
 .personal-fact-row button { display: grid; place-items: center; width: 44px; height: 44px; border: 0; background: transparent; cursor: pointer; }
 .personal-fact-editor { display: grid; gap: 8px; margin-top: 14px; }
 .personal-fact-editor input, .personal-fact-editor textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font: inherit; }
-.personal-fact-editor > div { display: flex; gap: 8px; }
+.personal-fact-editor > div, .personal-fact-conflict > div { display: flex; gap: 8px; flex-wrap: wrap; }
+.personal-fact-conflict { border-left: 3px solid var(--border); padding-left: 12px; overflow-wrap: anywhere; }
+.personal-fact-conflict p { margin: 6px 0; }
 .personal-fact-editor button { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
 .personal-fact-editor button:disabled { opacity: .5; cursor: default; }
 .composer-shell { position: relative; }

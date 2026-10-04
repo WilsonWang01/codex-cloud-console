@@ -10530,7 +10530,7 @@ app.patch("/api/personal/facts/:id", async (req, res) => {
 });
 
 app.delete("/api/personal/facts/:id", async (req, res) => {
-  try { res.json({ ok: true, fact: await personalFactsStore.remove(req.params.id) }); }
+  try { res.json({ ok: true, fact: await personalFactsStore.remove(req.params.id, req.body) }); }
   catch (error) { sendRouteError(res, error); }
 });
 

@@ -1187,7 +1187,9 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(completedCommitment.response.status, 200);
     const completedBrief = await jsonRequest(base, "/api/personal/brief");
     assert.ok(completedBrief.data.brief.items.some((item) => item.title === "回归测试个人事项" && item.detail === "关注事项已完成"));
-    const deletedFact = await jsonRequest(base, `/api/personal/facts/${createdFact.data.fact.id}`, { method: "DELETE" });
+    const deletedFact = await jsonRequest(base, `/api/personal/facts/${createdFact.data.fact.id}`, {
+      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: createdFact.data.fact.revision }),
+    });
     assert.equal(deletedFact.response.status, 200);
     const removedFactSession = await jsonRequest(base, "/api/chat/sessions", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "Removed fact test" }),

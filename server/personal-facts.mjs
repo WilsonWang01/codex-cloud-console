@@ -7,8 +7,8 @@ function factError(message, statusCode = 400) {
 }
 
 function cleanFact(value, field, max) {
-  const text = String(value || "").trim();
-  if (!text || text.length > max) throw factError(`${field} must be between 1 and ${max} characters`);
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || text.length > max) throw factError(`${field}需为 1–${max} 个字符`);
   return text;
 }
 
@@ -17,7 +17,16 @@ export function createPersonalFactsStore(filePath) {
   const read = async () => {
     try {
       const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
-      return Array.isArray(parsed?.facts) ? parsed.facts : [];
+      if (parsed?.version !== 1 || !Array.isArray(parsed.facts)) throw factError("个人事实数据格式无效", 500);
+      const ids = new Set();
+      return parsed.facts.map((fact) => {
+        const revision = fact?.revision === undefined ? 1 : fact.revision;
+        if (!fact || typeof fact.id !== "string" || !fact.id || ids.has(fact.id)
+          || typeof fact.label !== "string" || typeof fact.value !== "string"
+          || !Number.isSafeInteger(revision) || revision < 1) throw factError("个人事实数据格式无效", 500);
+        ids.add(fact.id);
+        return { ...fact, revision };
+      });
     } catch (error) {
       if (error?.code === "ENOENT") return [];
       throw error;
@@ -41,27 +50,35 @@ export function createPersonalFactsStore(filePath) {
     pending = result.catch(() => null);
     return result;
   };
+  const find = (facts, id, revision) => {
+    const fact = facts.find((item) => item.id === id);
+    if (!fact) throw factError("个人事实已删除或不存在", 404);
+    if (revision === undefined) throw factError("请刷新页面后再修改个人事实", 428);
+    if (!Number.isSafeInteger(revision) || revision < 1) throw factError("个人事实版本无效");
+    if (revision !== fact.revision) throw factError("个人事实已在其他页面修改，请核对最新内容", 409);
+    return fact;
+  };
   return {
     list: read,
     create: (payload) => mutate((facts) => {
-      if (facts.length >= 50) throw factError("Personal facts limit reached", 409);
+      if (facts.length >= 50) throw factError("个人事实已达到 50 条上限", 409);
       const now = new Date().toISOString();
-      const fact = { id: crypto.randomUUID(), label: cleanFact(payload?.label, "label", 80), value: cleanFact(payload?.value, "value", 300), source: "user", createdAt: now, updatedAt: now };
+      const fact = { id: crypto.randomUUID(), label: cleanFact(payload?.label, "事实名称", 80), value: cleanFact(payload?.value, "事实内容", 300), source: "user", revision: 1, createdAt: now, updatedAt: now };
       facts.push(fact);
       return fact;
     }),
     update: (id, payload) => mutate((facts) => {
-      const fact = facts.find((item) => item.id === id);
-      if (!fact) throw factError("Personal fact not found", 404);
-      fact.label = cleanFact(payload?.label, "label", 80);
-      fact.value = cleanFact(payload?.value, "value", 300);
+      const fact = find(facts, id, payload?.revision);
+      if (fact.revision === Number.MAX_SAFE_INTEGER) throw factError("个人事实版本已达到上限", 409);
+      fact.label = cleanFact(payload?.label, "事实名称", 80);
+      fact.value = cleanFact(payload?.value, "事实内容", 300);
+      fact.revision += 1;
       fact.updatedAt = new Date().toISOString();
       return fact;
     }),
-    remove: (id) => mutate((facts) => {
-      const index = facts.findIndex((item) => item.id === id);
-      if (index < 0) throw factError("Personal fact not found", 404);
-      return facts.splice(index, 1)[0];
+    remove: (id, payload) => mutate((facts) => {
+      const fact = find(facts, id, payload?.revision);
+      return facts.splice(facts.indexOf(fact), 1)[0];
     }),
   };
 }

@@ -50,6 +50,7 @@ let personalFiles = [
   { path: ".codex-cloud/uploads/2026-09-26/notes.txt", name: "notes.txt", kind: "input", size: 12, updatedAt: new Date().toISOString(), previewable: true, mimeType: "text/plain; charset=utf-8" },
 ];
 let personalFacts = [];
+let personalFactsReadFailure = false;
 let personalCommitments = [];
 let briefReviewedAt = null;
 const briefEvent = { id: "run:recent-personal:completed", kind: "completed", title: "资料整理完成", detail: "定时任务已完成", time: new Date().toISOString(), sessionId: "_personal-session" };
@@ -166,7 +167,8 @@ await context.route("**/api/**", async (route) => {
   if (url.pathname === "/api/personal/reminders/status") return body.endpoint === personalPushEndpoint ? send({ ok: true, settings: personalReminderSettings }) : send({ ok: false, error: "未订阅" }, 404);
   if (url.pathname === "/api/personal/reminders" && req.method() === "PATCH") { personalReminderSettings = body.settings; return send({ ok: true, settings: personalReminderSettings }); }
   if (url.pathname === "/api/personal/facts") {
-    if (req.method() === "POST") { const fact = { id: `fact-${personalFacts.length + 1}`, label: body.label, value: body.value, source: "user", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; personalFacts.push(fact); return send({ ok: true, fact }, 201); }
+    if (req.method() === "POST") { const fact = { id: `fact-${personalFacts.length + 1}`, label: body.label, value: body.value, source: "user", revision: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; personalFacts.push(fact); return send({ ok: true, fact }, 201); }
+    if (personalFactsReadFailure) return send({ ok: false, error: "模拟网络故障" }, 503);
     return send({ ok: true, facts: personalFacts });
   }
   if (url.pathname === "/api/personal/commitments") {
@@ -214,7 +216,8 @@ await context.route("**/api/**", async (route) => {
     const id = url.pathname.split("/").at(-1);
     const fact = personalFacts.find((item) => item.id === id);
     if (!fact) return send({ ok: false, error: "not found" }, 404);
-    if (req.method() === "PATCH") { fact.label = body.label; fact.value = body.value; fact.updatedAt = new Date().toISOString(); return send({ ok: true, fact }); }
+    if (body.revision !== fact.revision) return send({ ok: false, error: "个人事实已在其他页面修改，请核对最新内容" }, 409);
+    if (req.method() === "PATCH") { fact.label = body.label; fact.value = body.value; fact.revision += 1; fact.updatedAt = new Date().toISOString(); return send({ ok: true, fact }); }
     if (req.method() === "DELETE") { personalFacts = personalFacts.filter((item) => item.id !== id); return send({ ok: true, fact }); }
   }
   if (url.pathname === "/api/uploads" && req.method() === "POST") { uploadedCount += 1; return send({ ok: true, files: body.files.map((file, index) => ({ name: file.name, path: `.codex-cloud/uploads/2026-09-26/${uploadedCount}-${index}-${file.name}`, mimeType: file.type, size: 12, kind: file.type.startsWith("image/") ? "image" : "file", source: "personal-upload" })) }); }
@@ -529,9 +532,76 @@ try {
   await page.getByRole("textbox", { name: "事实内容" }).fill("小李");
   await page.getByRole("button", { name: "保存修改" }).click();
   await page.getByText("小李", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "编辑 称呼" }).click();
+  await page.getByRole("textbox", { name: "事实内容" }).fill("手机尚未保存的修改");
+  const otherDevice = await context.newPage();
+  await otherDevice.goto(page.url());
+  await otherDevice.getByRole("button", { name: "编辑 称呼" }).click();
+  await otherDevice.getByRole("textbox", { name: "事实内容" }).fill("电脑已保存的最新内容");
+  await otherDevice.getByRole("button", { name: "保存修改" }).click();
+  await otherDevice.getByText("电脑已保存的最新内容", { exact: true }).waitFor();
+  await otherDevice.close();
+  await page.getByRole("button", { name: "保存修改" }).click();
+  const factConflict = page.getByRole("region", { name: "个人事实冲突" });
+  await factConflict.waitFor();
+  assert.match(await factConflict.innerText(), /电脑已保存的最新内容/);
+  assert.equal(await page.getByRole("textbox", { name: "事实内容" }).inputValue(), "手机尚未保存的修改");
+  assert.equal(await page.getByRole("button", { name: "保存修改" }).isDisabled(), true);
+  for (const width of [1280, 390, 320]) {
+    await page.setViewportSize({ width, height: width === 1280 ? 900 : 844 });
+    await factConflict.scrollIntoViewIfNeeded();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    const smallButtons = await page.locator(".personal-facts button").evaluateAll((buttons) => buttons.filter((button) => {
+      const rect = button.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && (rect.width < 44 || rect.height < 44);
+    }).map((button) => button.textContent));
+    assert.deepEqual(smallButtons, []);
+    await page.screenshot({ path: new URL(`personal-facts-conflict-${width}.png`, out).pathname });
+  }
+  await factConflict.getByRole("button", { name: "保留我的修改继续编辑" }).click();
+  assert.equal(personalFacts[0].value, "电脑已保存的最新内容", "conflict resolution must not automatically save");
+  await page.getByRole("button", { name: "保存修改" }).click();
+  await page.getByText("手机尚未保存的修改", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "编辑 称呼" }).click();
+  await page.getByRole("textbox", { name: "事实内容" }).fill("不应覆盖");
+  personalFacts[0].value = "另一次最新内容";
+  personalFacts[0].revision += 1;
+  await page.getByRole("button", { name: "保存修改" }).click();
+  await factConflict.getByRole("button", { name: "使用最新内容" }).click();
+  assert.equal(await page.getByRole("textbox", { name: "事实内容" }).inputValue(), "另一次最新内容");
+  await page.getByRole("textbox", { name: "事实内容" }).fill("网络错误时仍保留");
+  personalFacts[0].value = "网络中断前更新";
+  personalFacts[0].revision += 1;
+  personalFactsReadFailure = true;
+  await page.getByRole("button", { name: "保存修改" }).click();
+  await page.getByText("无法读取最新事实，你的输入已保留，请稍后再试。", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("textbox", { name: "事实内容" }).inputValue(), "网络错误时仍保留");
+  assert.equal(personalFacts[0].value, "网络中断前更新");
+  personalFactsReadFailure = false;
+  await page.getByRole("button", { name: "保存修改" }).click();
+  await factConflict.getByRole("button", { name: "使用最新内容" }).click();
+  await page.getByRole("button", { name: "取消编辑" }).click();
+  personalFacts[0].value = "删除前又被更新";
+  personalFacts[0].revision += 1;
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "删除 称呼" }).click();
+  await page.getByText("删除前又被更新", { exact: true }).waitFor();
+  assert.equal(personalFacts.length, 1, "stale delete must preserve the fact");
+  await page.getByRole("button", { name: "编辑 称呼" }).click();
+  await page.getByRole("textbox", { name: "事实内容" }).fill("被删除后保留的草稿");
+  personalFacts = [];
+  await page.getByRole("button", { name: "保存修改" }).click();
+  await factConflict.getByText("这条事实已被删除", { exact: true }).waitFor();
+  await factConflict.getByRole("button", { name: "转为新事实草稿" }).click();
+  assert.equal(personalFacts.length, 0, "deleted fact must not be resurrected automatically");
+  assert.equal(await page.getByRole("textbox", { name: "事实内容" }).inputValue(), "被删除后保留的草稿");
+  await page.getByRole("button", { name: "添加事实" }).click();
+  await page.getByText("被删除后保留的草稿", { exact: true }).waitFor();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "删除 称呼" }).click();
+  await page.locator(".personal-fact-row").waitFor({ state: "detached" });
   assert.equal(personalFacts.length, 0);
+  await page.setViewportSize({ width: 1280, height: 900 });
   pending.push({ id: "personal-approval-test", method: "item/commandExecution/requestApproval", digest: "personal-digest", owner: { repoId: "_personal", sessionId: "_personal-session" }, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), params: { command: "echo personal approval check", cwd: "/tmp/personal" } });
   await page.getByRole("button", { name: "今日", exact: true }).click();
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
