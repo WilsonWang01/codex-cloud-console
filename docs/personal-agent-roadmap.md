@@ -4,7 +4,7 @@
 
 本文整合 `docs/research/2026-09-26-personal-agent-benchmark.md` 的对标、代码发现和后端演进建议，以及原四项需求方案，作为后续开发、review、验收的唯一计划入口。原调研保留为日期固定的证据档案，其中旧阶段顺序与接口建议以本文的整合决定为准。
 
-最新增量验收见[只读浏览与会话活动时间](acceptance/2026-10-05-personal-activity-time.md)：查看或刷新旧对话的运行时不再伪造最新活动，真实设置同步与主动修改仍保留。此前的[个人事实跨设备冲突保护](acceptance/2026-10-04-personal-fact-conflicts.md)校验事实版本并保留冲突输入；[事项草稿服务端恢复](acceptance/2026-10-03-personal-draft-server-recovery.md)沿用可恢复的会话预留；[个人计划试运行门禁](acceptance/2026-09-28-personal-trial-gate.md)要求成功试运行及人工确认，正文修改会暂停计划。生产发布状态以最新验收记录为准；本轮更新日期：2026-10-05。
+最新增量验收见[只读浏览与会话活动时间](acceptance/2026-10-05-personal-activity-time.md)：运行时观察采用真正只读的 `thread/read`，官方排序采用 `recencyAt`，查看或刷新旧对话不再伪造最新活动，主动修改仍保留。最终生产手机/桌面验收通过，历史不可靠时间不做猜测性回填。此前的[个人事实跨设备冲突保护](acceptance/2026-10-04-personal-fact-conflicts.md)校验事实版本并保留冲突输入；[事项草稿服务端恢复](acceptance/2026-10-03-personal-draft-server-recovery.md)沿用可恢复的会话预留；[个人计划试运行门禁](acceptance/2026-09-28-personal-trial-gate.md)要求成功试运行及人工确认，正文修改会暂停计划。生产发布状态以最新验收记录为准；本轮更新日期：2026-10-05。
 
 用户已授权按方案开发、验收和 review，并在备份和检查运行任务后授权本轮 EC2 变更及一次限时只读模型验证。本文同时记录设计与阶段状态，不能把未通过的验收项视为已实现；没有授权创建额外计费资源、发送邮件或未评估的执行器权限迁移。AWS 注册与部署步骤见 [AWS 从零部署](aws-getting-started.md)。
 
