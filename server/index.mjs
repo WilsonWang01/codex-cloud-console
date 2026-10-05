@@ -990,7 +990,7 @@ async function refreshSessionRuntimeFromAppServer(repo, session, options = {}) {
     ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
   };
   const runtime = mergeAppServerRuntimeWithPending(session, appServerRuntime);
-  return (await updateSessionRuntime(repo.id, session.id, runtime, { makeActive: false })) || session;
+  return (await updateSessionRuntime(repo.id, session.id, runtime, { makeActive: false, touchActivity: false })) || session;
 }
 
 async function readChatStore() {
@@ -1837,7 +1837,7 @@ async function saveChatMessages(repoId, sessionHint, messages) {
   });
 }
 
-async function updateSessionRuntime(repoId, sessionId, runtime = {}, { makeActive = true } = {}) {
+async function updateSessionRuntime(repoId, sessionId, runtime = {}, { makeActive = true, touchActivity = true } = {}) {
   return mutateChatStore((store) => {
     const session = store.sessions[sessionId];
     if (!session || session.repoId !== repoId) return null;
@@ -1845,7 +1845,7 @@ async function updateSessionRuntime(repoId, sessionId, runtime = {}, { makeActiv
       {
         ...session,
         ...runtime,
-        updatedAt: new Date().toISOString(),
+        updatedAt: touchActivity ? new Date().toISOString() : session.updatedAt,
       },
       repoId,
     );
@@ -3390,7 +3390,7 @@ function handleAppServerNotification(rpcMessage) {
             ...runtime, ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
           }, { clearPending: Boolean(job) });
         })
-        .then((mergedRuntime) => updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, mergedRuntime, { makeActive: false }))
+        .then((mergedRuntime) => updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, mergedRuntime, { makeActive: false, touchActivity: Boolean(job) }))
         .catch((error) => {
           if (job) emitJobEvent(job, "error", { message: `设置同步失败: ${error.message}` });
         });

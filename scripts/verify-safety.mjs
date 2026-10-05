@@ -23,6 +23,84 @@ function storage() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) };
 }
 
+test("只读运行时同步保留活跃时间与草稿，无变化不写盘，主动修改仍更新时间", async () => {
+  const previous = "2026-09-01T00:00:00.000Z";
+  let writes = 0;
+  const store = { version: 2, activeByRepo: { personal: "recent" }, sessions: {
+    old: { id: "old", repoId: "personal", updatedAt: previous, model: "gpt-6-sol", draft: { input: "保留草稿", revision: 7 } },
+    recent: { id: "recent", repoId: "personal", updatedAt: "2026-10-01T00:00:00.000Z" },
+  } };
+  const context = {
+    enqueueWrite: createKeyedQueue(), readChatStore: async () => store, chatHistoryPath: "fixture.json",
+    atomicWriteJson: async () => { writes += 1; }, normalizeSession: (session) => session,
+  };
+  vm.createContext(context);
+  vm.runInContext(section(source, "async function mutateChatStore(", "async function updateQueuedTurn("), context);
+  vm.runInContext(section(source, "async function updateSessionRuntime(", "async function appendChatTurn("), context);
+  const original = JSON.stringify(store);
+  await context.updateSessionRuntime("personal", "old", { model: "gpt-6-sol" }, { makeActive: false, touchActivity: false });
+  assert.equal(JSON.stringify(store), original);
+  assert.equal(writes, 0);
+  await context.updateSessionRuntime("personal", "old", { model: "gpt-6-astra" }, { makeActive: false, touchActivity: false });
+  assert.equal(store.sessions.old.updatedAt, previous);
+  assert.equal(store.sessions.old.model, "gpt-6-astra");
+  assert.equal(store.activeByRepo.personal, "recent");
+  assert.deepEqual(store.sessions.old.draft, { input: "保留草稿", revision: 7 });
+  assert.equal(writes, 1);
+  assert.equal(await context.updateSessionRuntime("work", "old", {}, { touchActivity: false }), null);
+  assert.equal(writes, 1);
+  await context.updateSessionRuntime("personal", "old", { model: "gpt-6-sol" });
+  assert.notEqual(store.sessions.old.updatedAt, previous);
+  assert.equal(store.activeByRepo.personal, "old");
+  assert.equal(writes, 2);
+});
+
+test("页面刷新和无任务设置通知不产生新活跃记录，保留个人权限与待应用模型", async () => {
+  const updates = [];
+  const session = { id: "old", codexSessionId: "thread-old", model: "pending-model", reasoning: "high",
+    pendingTurnRuntime: { model: "pending-model", reasoning: "high", updatedAt: "2026-09-01T00:00:00.000Z" } };
+  let response = { ok: true, result: { model: "server-model", reasoning: "low" } };
+  let job = null;
+  const permissions = { sandbox: "workspace-write", approval: "on-request" };
+  const context = {
+    activeTurns: new Map(), activeCompactions: new Map(), makeSessionKey: (repoId, id) => `${repoId}:${id}`,
+    codexAppServerRequest: async () => response, personalSessionRuntime: () => permissions,
+    runtimeFromAppServerSettings: (value) => value, normalizePendingTurnRuntime: (pending) => pending,
+    pendingTurnRuntimeApplied: (pending, runtime) => pending.model === runtime.model && pending.reasoning === runtime.reasoning,
+    updateSessionRuntime: async (repoId, id, runtime, options) => { updates.push({ repoId, id, runtime, options }); return { ...session, ...runtime }; },
+    ownerFromParams: (params) => ({ threadId: params.threadId }), findTurnJob: () => job, findCompactJob: () => null,
+    threadOwners: new Map([["thread-old", { repoId: "personal", sessionId: "old" }]]), rememberOwner() {},
+    findStoredSessionByThreadId: async () => ({ session }), personalRepoId: "personal", emitJobEvent() {},
+  };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function mergeAppServerRuntimeWithPending(", "function normalizeApprovalPolicy("), context);
+  vm.runInContext(section(source, "async function refreshSessionRuntimeFromAppServer(", "async function readChatStore("), context);
+  vm.runInContext(section(source, "function handleAppServerNotification(", "async function appServerProbe("), context);
+  const repo = { id: "personal", kind: "personal", path: "/tmp/personal" };
+  const refreshed = await context.refreshSessionRuntimeFromAppServer(repo, session);
+  assert.equal(refreshed.model, session.model);
+  assert.equal(refreshed.pendingTurnRuntime, session.pendingTurnRuntime);
+  assert.equal(refreshed.sandbox, permissions.sandbox);
+  assert.equal(refreshed.approval, permissions.approval);
+  assert.equal(updates.at(-1).options.touchActivity, false);
+  assert.equal(updates.at(-1).options.makeActive, false);
+  response = { ok: false };
+  assert.equal(await context.refreshSessionRuntimeFromAppServer(repo, session), session);
+  assert.equal(updates.length, 1);
+  context.activeTurns.set("personal:old", {});
+  assert.equal(await context.refreshSessionRuntimeFromAppServer(repo, session), session);
+  assert.equal(updates.length, 1);
+  context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-old", model: "server-model" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(updates.at(-1).options.touchActivity, false);
+  assert.equal(updates.at(-1).runtime.model, session.model);
+  assert.equal(updates.at(-1).runtime.sandbox, permissions.sandbox);
+  job = { repoId: "personal", sessionId: "old", threadId: "thread-old", runtime: permissions };
+  context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-old", model: "server-model" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(updates.at(-1).options.touchActivity, true);
+});
+
 test("紧凑状态写入无损保留字段、备份、权限及原子失败保护", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-state-storage-"));
   const file = path.join(root, "state.json");

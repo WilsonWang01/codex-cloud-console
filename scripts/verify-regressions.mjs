@@ -1825,6 +1825,11 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     runtimeStore.sessions[sessionId].codexSessionId = "thread-runtime-regression";
     runtimeStore.sessions[sessionId].model = "gpt-5.4-mini";
     runtimeStore.sessions[sessionId].reasoning = "low";
+    runtimeStore.sessions[sessionId].sandbox = "danger-full-access";
+    runtimeStore.sessions[sessionId].approval = "never";
+    runtimeStore.sessions[sessionId].search = true;
+    const previousActivity = "2026-09-01T00:00:00.000Z";
+    runtimeStore.sessions[sessionId].updatedAt = previousActivity;
     await fs.writeFile(path.join(stateRoot, "chat-history.json"), JSON.stringify(runtimeStore));
     const primedThreadState = await jsonRequest(
       baseUrl,
@@ -1832,6 +1837,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     );
     assert.equal(primedThreadState.response.status, 200);
     assert.equal(primedThreadState.data.runtime.model, "gpt-5.4-mini");
+    const refreshedStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    assert.deepEqual(refreshedStore, runtimeStore, "只读 thread-state 不改变活跃时间、草稿或会话排序来源");
     const runtimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -1849,6 +1856,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(runtimePatch.data.runtime.reasoning, "high");
     assert.equal(runtimePatch.data.appServerRuntime.model, "gpt-5.4-mini");
     assert.equal(runtimePatch.data.appliesOnNextTurn, true);
+    const patchedStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    assert.notEqual(patchedStore.sessions[sessionId].updatedAt, previousActivity, "主动设置模型仍记录活跃时间");
     const pendingThreadState = await jsonRequest(
       baseUrl,
       `/api/codex/thread-state?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`,
@@ -1856,6 +1865,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(pendingThreadState.response.status, 200);
     assert.equal(pendingThreadState.data.runtime.model, "gpt-5.6-terra");
     assert.equal(pendingThreadState.data.runtime.reasoning, "high");
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")), patchedStore,
+      "刷新待应用模型不触碰会话时间或丢失 pendingTurnRuntime");
     const gpt56RuntimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },

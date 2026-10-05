@@ -1050,6 +1050,36 @@ try {
     await page.screenshot({ path: new URL(`personal-routine-starters-${width}.png`, out).pathname });
   }
   status.automations.push(...savedAutomations);
+  const savedSessions = sessions.splice(0);
+  const template = savedSessions.find((session) => session.repoId === "_personal");
+  sessions.push(...savedSessions.filter((session) => session.repoId !== "_personal"),
+    { ...template, id: "_personal-session", title: "上周旅行安排", isDraft: false, goal: null, queuedTurn: null, externalActionReview: null,
+      updatedAt: "2026-09-01T00:00:00.000Z", draft: { input: "", attachments: [], revision: 0 } },
+    { ...template, id: "_personal-recent", title: "今天的阅读记录", isDraft: false, goal: null, queuedTurn: null, externalActionReview: null,
+      updatedAt: "2026-10-01T00:00:00.000Z", draft: { input: "", attachments: [], revision: 0 } });
+  for (const width of [320, 390, 1280]) {
+    await page.setViewportSize({ width, height: width === 1280 ? 900 : 844 });
+    await page.goto(`${baseUrl}#/project/_personal/today`);
+    await page.reload();
+    await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
+    const recentRows = page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "继续对话" }) }).locator(".personal-task-row");
+    await recentRows.filter({ hasText: "上周旅行安排" }).waitFor();
+    const before = await recentRows.allTextContents();
+    assert.match(before[0], /今天的阅读记录/);
+    assert.match(before[1], /上周旅行安排/);
+    await recentRows.filter({ hasText: "上周旅行安排" }).click();
+    await page.getByPlaceholder("向个人助理发送消息").waitFor();
+    await page.reload();
+    await page.getByPlaceholder("向个人助理发送消息").waitFor();
+    await page.goto(`${baseUrl}#/project/_personal/today`);
+    await recentRows.filter({ hasText: "上周旅行安排" }).waitFor();
+    assert.deepEqual(await recentRows.allTextContents(), before, "查看并刷新旧对话不改变今日列表的时间与次序");
+    await page.getByText("目前没有需要你决定的事项", { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    await page.screenshot({ path: new URL(`personal-activity-${width}.png`, out).pathname, fullPage: true });
+  }
+  sessions.splice(0, sessions.length, ...savedSessions);
   assert.deepEqual(errors, []);
+  console.log("320/390/1280px：打开并刷新旧对话后，今日列表时间与排序保持一致。");
   console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "失效旧草稿关联可清除并重新起草，新草稿首次关联异常仍可复用", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态预填只读范例且不运行模型", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }
