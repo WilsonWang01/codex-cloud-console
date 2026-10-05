@@ -225,7 +225,14 @@ input.on("line", (line) => {
     return send({ id: message.id, error: { code: -32000, message: "injected thread/list failure" } });
   }
   if (message.method === "thread/start") return send({ id: message.id, result: { thread: { id: "thread-regression" } } });
+  if (message.method === "thread/read" && message.params?.threadId === "thread-runtime-regression") {
+    return send({ id: message.id, result: { thread: { id: message.params.threadId, model: "gpt-5.4-mini", reasoningEffort: "low",
+      recencyAt: Date.parse("2026-09-01T00:00:00.000Z") / 1000, updatedAt: Date.now() / 1000, turns: [] } } });
+  }
   if (message.method === "thread/resume") {
+    if (message.params?.threadId === "thread-runtime-regression" && !message.params?.model) {
+      return send({ id: message.id, error: { code: -32000, message: "readonly observation must not resume" } });
+    }
     const matched = message.params?.threadId === "thread-runtime-matched";
     return send({
       id: message.id,
@@ -1839,6 +1846,10 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(primedThreadState.data.runtime.model, "gpt-5.4-mini");
     const refreshedStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
     assert.deepEqual(refreshedStore, runtimeStore, "只读 thread-state 不改变活跃时间、草稿或会话排序来源");
+    const readonlyThread = await jsonRequest(baseUrl, `/api/codex/thread-read?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
+    assert.equal(readonlyThread.response.status, 200);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")), runtimeStore,
+      "官方元数据更新而 recencyAt 未变化时，不改会话活动时间");
     const runtimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -1867,6 +1878,9 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(pendingThreadState.data.runtime.reasoning, "high");
     assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")), patchedStore,
       "刷新待应用模型不触碰会话时间或丢失 pendingTurnRuntime");
+    await jsonRequest(baseUrl, `/api/codex/thread-read?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")), patchedStore,
+      "较旧的官方 recencyAt 不覆盖用户刚修改模型的本地活动时间");
     const gpt56RuntimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },

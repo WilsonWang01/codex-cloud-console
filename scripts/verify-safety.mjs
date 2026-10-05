@@ -59,12 +59,16 @@ test("页面刷新和无任务设置通知不产生新活跃记录，保留个�
   const updates = [];
   const session = { id: "old", codexSessionId: "thread-old", model: "pending-model", reasoning: "high",
     pendingTurnRuntime: { model: "pending-model", reasoning: "high", updatedAt: "2026-09-01T00:00:00.000Z" } };
-  let response = { ok: true, result: { model: "server-model", reasoning: "low" } };
+  let response = { ok: true, result: { thread: { model: "server-model", reasoning: "low" } } };
   let job = null;
   const permissions = { sandbox: "workspace-write", approval: "on-request" };
   const context = {
     activeTurns: new Map(), activeCompactions: new Map(), makeSessionKey: (repoId, id) => `${repoId}:${id}`,
-    codexAppServerRequest: async () => response, personalSessionRuntime: () => permissions,
+    codexAppServerRequest: async (method, params) => {
+      assert.equal(method, "thread/read", "只读观察不得恢复或修改线程");
+      assert.deepEqual(JSON.parse(JSON.stringify(params)), { threadId: "thread-old", includeTurns: false });
+      return response;
+    }, personalSessionRuntime: () => permissions,
     runtimeFromAppServerSettings: (value) => value, normalizePendingTurnRuntime: (pending) => pending,
     pendingTurnRuntimeApplied: (pending, runtime) => pending.model === runtime.model && pending.reasoning === runtime.reasoning,
     updateSessionRuntime: async (repoId, id, runtime, options) => { updates.push({ repoId, id, runtime, options }); return { ...session, ...runtime }; },
@@ -99,6 +103,40 @@ test("页面刷新和无任务设置通知不产生新活跃记录，保留个�
   context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-old", model: "server-model" } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(updates.at(-1).options.touchActivity, true);
+});
+
+test("官方会话活动采用 recencyAt，不把恢复或元数据写入当作新对话", () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(section(source, "function appThreadTime(", "function appThreadSessionId("), context);
+  const old = 1_700_000_000, metadata = old + 10_000;
+  assert.equal(context.appThreadActivityTime({ recencyAt: old, updatedAt: metadata }), new Date(old * 1000).toISOString());
+  assert.equal(context.appThreadActivityTime({ recency_at: old, updated_at: metadata }), new Date(old * 1000).toISOString());
+  assert.equal(context.appThreadActivityTime({ recencyAt: null, updatedAt: old }), new Date(old * 1000).toISOString());
+  assert.equal(context.appThreadActivityTime({}, new Date(old * 1000).toISOString()), new Date(old * 1000).toISOString());
+  assert.equal(context.appThreadActivityTime({ recencyAt: metadata, updatedAt: metadata + 1 }), new Date(metadata * 1000).toISOString());
+  assert.equal(context.appThreadActivityTime({ recencyAt: old, updatedAt: metadata + 1 }, new Date(metadata * 1000).toISOString()),
+    new Date(metadata * 1000).toISOString(), "只读列表不能倒退用户主动修改记录的时间");
+  for (const code of [
+    section(source, "async function upsertThreadNotificationSession(", "async function importAppServerThreadSession("),
+    section(source, "async function importAppServerThreadSession(", "async function listAppServerThreads("),
+    section(source, "async function upsertAppServerThreads(", "async function syncAppServerThreads("),
+    section(source, "async function updateStoredSessionFromOfficialThread(", "function scheduleThreadSummaryRefresh("),
+  ]) assert.match(code, /appThreadActivityTime\(thread/);
+});
+
+test("迟到的官方只读响应不覆盖写入队列中的较新活动时间", async () => {
+  const current = { id: "one", repoId: "personal", codexSessionId: "thread-one", updatedAt: "2026-10-05T12:00:00.000Z" };
+  const store = { activeByRepo: {}, sessions: { one: current } };
+  const context = { mutateChatStore: async (mutator) => mutator(store), normalizeSession: (session) => session, sessionSummary: (session) => session };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function appThreadTime(", "function appThreadSessionId("), context);
+  vm.runInContext(section(source, "async function patchStoredThreadSession(", "async function removeStoredThreadSession("), context);
+  await context.patchStoredThreadSession("thread-one", { updatedAt: "2026-10-05T10:00:00.000Z", messageCount: 4 }, { preserveActivity: true });
+  assert.equal(store.sessions.one.updatedAt, current.updatedAt);
+  assert.equal(store.sessions.one.messageCount, 4);
+  await context.patchStoredThreadSession("thread-one", { updatedAt: "2026-10-05T13:00:00.000Z" }, { preserveActivity: true });
+  assert.equal(store.sessions.one.updatedAt, "2026-10-05T13:00:00.000Z");
 });
 
 test("紧凑状态写入无损保留字段、备份、权限及原子失败保护", async () => {

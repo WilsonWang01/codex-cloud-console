@@ -980,13 +980,12 @@ async function refreshSessionRuntimeFromAppServer(repo, session, options = {}) {
   if (!session?.codexSessionId) return session;
   const permissions = repo.kind === "personal" ? personalSessionRuntime(session) : null;
   if (permissions && (activeTurns.has(makeSessionKey(repo.id, session.id)) || activeCompactions.has(makeSessionKey(repo.id, session.id)))) return session;
-  const response = await codexAppServerRequest("thread/resume", {
-    threadId: session.codexSessionId, cwd: repo.path,
-    ...(permissions ? { sandbox: permissions.sandbox, approvalPolicy: permissions.approval } : {}),
+  const response = await codexAppServerRequest("thread/read", {
+    threadId: session.codexSessionId, includeTurns: false,
   }, options.timeout || 20_000);
   if (!response.ok) return session;
   const appServerRuntime = {
-    ...runtimeFromAppServerSettings(response.result || {}, session),
+    ...runtimeFromAppServerSettings(response.result?.thread || {}, session),
     ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
   };
   const runtime = mergeAppServerRuntimeWithPending(session, appServerRuntime);
@@ -1248,6 +1247,13 @@ function appThreadTitle(thread = {}) {
   return sessionTitle(title);
 }
 
+function appThreadActivityTime(thread = {}, fallback = null) {
+  // CLI metadata updates (including resume) are not necessarily conversation activity.
+  const observed = appThreadTime(thread.recencyAt || thread.recency_at || thread.updatedAt || thread.updated_at || fallback || thread.createdAt || thread.created_at);
+  const previous = fallback ? appThreadTime(fallback) : null;
+  return previous && Date.parse(previous) > Date.parse(observed) ? previous : observed;
+}
+
 function appThreadSessionId(threadId) {
   return `app-${String(threadId || "").replace(/[^A-Za-z0-9._-]+/g, "-")}`;
 }
@@ -1325,7 +1331,9 @@ async function patchStoredThreadSession(threadId, patch = {}, options = {}) {
         ...session,
         ...patch,
         codexSessionId: threadId,
-        updatedAt: patch.updatedAt || new Date().toISOString(),
+        updatedAt: options.preserveActivity
+          ? appThreadActivityTime({ recencyAt: patch.updatedAt }, session.updatedAt)
+          : patch.updatedAt || new Date().toISOString(),
       },
       session.repoId,
     );
@@ -1387,7 +1395,7 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
         ...ownerSession,
         title: appThreadTitle(thread),
         createdAt: appThreadTime(thread.createdAt || thread.created_at || ownerSession.createdAt),
-        updatedAt: appThreadTime(thread.updatedAt || thread.updated_at || ownerSession.updatedAt),
+        updatedAt: appThreadActivityTime(thread, ownerSession.updatedAt),
         codexSessionId: threadId,
       },
       repo.id,
@@ -1418,7 +1426,7 @@ async function importAppServerThreadSession(repo, threadId, title = "新会话")
       repoId: repo.id,
       title: thread?.name || thread?.title || thread?.preview ? appThreadTitle(thread) : title,
       createdAt: appThreadTime(thread?.createdAt || thread?.created_at),
-      updatedAt: appThreadTime(thread?.updatedAt || thread?.updated_at || thread?.createdAt || thread?.created_at),
+      updatedAt: appThreadActivityTime(thread),
       messages: [],
       codexSessionId: threadId,
       ...runtime,
@@ -1536,7 +1544,7 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
         repoId: repo.id,
         title: hasOfficialName ? officialTitle : existing?.title && existing.title !== "新会话" ? existing.title : officialTitle,
         createdAt: appThreadTime(thread.createdAt || thread.created_at),
-        updatedAt: appThreadTime(thread.updatedAt || thread.updated_at || thread.createdAt || thread.created_at),
+        updatedAt: appThreadActivityTime(thread, existing?.updatedAt),
         codexSessionId: threadId,
         model: keepPendingTurnRuntime?.model || threadRuntime.model,
         reasoning: keepPendingTurnRuntime?.reasoning || threadRuntime.reasoning,
@@ -1719,8 +1727,7 @@ async function updateStoredSessionFromOfficialThread(session, repo, official = {
   if (!session?.codexSessionId || !official?.ok) return null;
   const officialMessages = (official.messages || []).map(normalizeChatMessage).filter((item) => item.text);
   const thread = official.thread || {};
-  const updatedAt =
-    appThreadTime(thread.updatedAt || thread.updated_at || officialMessages.at(-1)?.time || session.updatedAt || session.createdAt);
+  const updatedAt = appThreadActivityTime(thread, session.updatedAt || officialMessages.at(-1)?.time || session.createdAt);
   const hasOfficialName = Boolean(String(thread.name || thread.title || "").trim());
   const patch = {
     title: hasOfficialName ? appThreadTitle(thread) : session.title,
@@ -1731,7 +1738,7 @@ async function updateStoredSessionFromOfficialThread(session, repo, official = {
     goal: session.goal || null,
     compactedAt: session.compactedAt || null,
   };
-  const summary = await patchStoredThreadSession(session.codexSessionId, patch, { makeActive: Boolean(options.makeActive) });
+  const summary = await patchStoredThreadSession(session.codexSessionId, patch, { makeActive: Boolean(options.makeActive), preserveActivity: true });
   const key = threadStateCacheKey(session);
   const cached = threadStateCacheByKey.get(key);
   if (cached) {
