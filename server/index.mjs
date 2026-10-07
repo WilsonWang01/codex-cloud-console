@@ -978,18 +978,23 @@ function runtimeFromAppServerSettings(result = {}, fallback = {}) {
 
 async function refreshSessionRuntimeFromAppServer(repo, session, options = {}) {
   if (!session?.codexSessionId) return session;
-  const permissions = repo.kind === "personal" ? personalSessionRuntime(session) : null;
-  if (permissions && (activeTurns.has(makeSessionKey(repo.id, session.id)) || activeCompactions.has(makeSessionKey(repo.id, session.id)))) return session;
+  const key = makeSessionKey(repo.id, session.id);
+  if (activeTurns.has(key) || activeCompactions.has(key)) return session;
   const response = await codexAppServerRequest("thread/read", {
     threadId: session.codexSessionId, includeTurns: false,
   }, options.timeout || 20_000);
   if (!response.ok) return session;
-  const appServerRuntime = {
-    ...runtimeFromAppServerSettings(response.result?.thread || {}, session),
-    ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
-  };
-  const runtime = mergeAppServerRuntimeWithPending(session, appServerRuntime);
-  return (await updateSessionRuntime(repo.id, session.id, runtime, { makeActive: false, touchActivity: false })) || session;
+  return (await updateSessionRuntime(repo.id, session.id, (current) => {
+    // A read started before a local setting change cannot undo that newer intent.
+    const fields = ["codexSessionId", "model", "reasoning", "sandbox", "approval", "search", "pendingTurnRuntime"];
+    if (fields.some((field) => JSON.stringify(current[field]) !== JSON.stringify(session[field]))
+        || activeTurns.has(key) || activeCompactions.has(key)) return null;
+    const permissions = repo.kind === "personal" ? personalSessionRuntime(current) : null;
+    return mergeAppServerRuntimeWithPending(current, {
+      ...runtimeFromAppServerSettings(response.result?.thread || {}, current),
+      ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
+    });
+  }, { makeActive: false, touchActivity: false })) || session;
 }
 
 async function readChatStore() {
@@ -1848,10 +1853,12 @@ async function updateSessionRuntime(repoId, sessionId, runtime = {}, { makeActiv
   return mutateChatStore((store) => {
     const session = store.sessions[sessionId];
     if (!session || session.repoId !== repoId) return null;
+    const patch = typeof runtime === "function" ? runtime(session) : runtime;
+    if (!patch) return session;
     store.sessions[sessionId] = normalizeSession(
       {
         ...session,
-        ...runtime,
+        ...patch,
         updatedAt: touchActivity ? new Date().toISOString() : session.updatedAt,
       },
       repoId,
@@ -3390,14 +3397,14 @@ function handleAppServerNotification(rpcMessage) {
     const routeOwner = job ? { repoId: job.repoId, sessionId: job.sessionId } : owner.threadId ? threadOwners.get(owner.threadId) : null;
     const runtime = runtimeFromAppServerSettings(params, job?.runtime || {});
     if (routeOwner) {
-      findStoredSessionByThreadId(owner.threadId || job?.threadId || "")
-        .then(({ session }) => {
-          const permissions = routeOwner.repoId === personalRepoId ? personalSessionRuntime(job?.runtime || session || {}) : null;
-          return mergeAppServerRuntimeWithPending(session || {}, {
-            ...runtime, ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
-          }, { clearPending: Boolean(job) });
-        })
-        .then((mergedRuntime) => updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, mergedRuntime, { makeActive: false, touchActivity: Boolean(job) }))
+      updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, (session) => {
+        if (session.codexSessionId !== (owner.threadId || job?.threadId)) return null;
+        const permissions = routeOwner.repoId === personalRepoId ? personalSessionRuntime(session) : null;
+        return mergeAppServerRuntimeWithPending(session, {
+          ...runtimeFromAppServerSettings(params, job?.runtime || session),
+          ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
+        }, { clearPending: Boolean(job) });
+      }, { makeActive: false, touchActivity: Boolean(job) })
         .catch((error) => {
           if (job) emitJobEvent(job, "error", { message: `设置同步失败: ${error.message}` });
         });

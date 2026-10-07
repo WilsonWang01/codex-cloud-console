@@ -229,6 +229,12 @@ input.on("line", (line) => {
     return send({ id: message.id, result: { thread: { id: message.params.threadId, model: "gpt-5.4-mini", reasoningEffort: "low",
       recencyAt: Date.parse("2026-09-01T00:00:00.000Z") / 1000, updatedAt: Date.now() / 1000, turns: [] } } });
   }
+  if (message.method === "thread/read" && message.params?.threadId === "thread-runtime-delayed") {
+    const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".runtime-read-release")
+      ? send({ id: message.id, result: { thread: { id: message.params.threadId, model: "gpt-5.4-mini", reasoningEffort: "low", turns: [] } } })
+      : setTimeout(reply, 10);
+    return reply();
+  }
   if (message.method === "thread/resume") {
     if (message.params?.threadId === "thread-runtime-regression" && !message.params?.model) {
       return send({ id: message.id, error: { code: -32000, message: "readonly observation must not resume" } });
@@ -1881,6 +1887,40 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     await jsonRequest(baseUrl, `/api/codex/thread-read?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
     assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")), patchedStore,
       "较旧的官方 recencyAt 不覆盖用户刚修改模型的本地活动时间");
+    const delayedStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    Object.assign(delayedStore.sessions[sessionId], { codexSessionId: "thread-runtime-delayed", model: "gpt-5.4-mini", reasoning: "low", pendingTurnRuntime: null });
+    await fs.writeFile(path.join(stateRoot, "chat-history.json"), JSON.stringify(delayedStore));
+    const delayedRead = jsonRequest(baseUrl, `/api/codex/thread-state?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`);
+    let runtimeReadStarted = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const requests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+      if (requests.some((item) => item.method === "thread/read" && item.params?.threadId === "thread-runtime-delayed")) {
+        runtimeReadStarted = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    let latestRuntimeStore;
+    try {
+      assert.ok(runtimeReadStarted, "先启动旧运行时读取，再交错修改设置");
+      const concurrentPatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
+        method: "PATCH", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repoId: "sample-app", model: "gpt-5.6-sol", reasoning: "max", sandbox: "workspace-write", approval: "on-request", search: false }),
+      });
+      assert.equal(concurrentPatch.response.status, 200);
+      latestRuntimeStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
+    } finally {
+      await fs.writeFile(capturePath + ".runtime-read-release", "release");
+    }
+    const lateRuntimeResponse = await delayedRead;
+    assert.equal(lateRuntimeResponse.response.status, 200);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")), latestRuntimeStore,
+      "迟到的 HTTP 观察不能覆盖模型、推理、权限、搜索、pending 或会话时间");
+    assert.equal(lateRuntimeResponse.data.runtime.model, "gpt-5.6-sol");
+    assert.equal(lateRuntimeResponse.data.runtime.reasoning, "max");
+    assert.equal(lateRuntimeResponse.data.runtime.sandbox, "workspace-write");
+    latestRuntimeStore.sessions[sessionId].codexSessionId = "thread-runtime-regression";
+    await fs.writeFile(path.join(stateRoot, "chat-history.json"), JSON.stringify(latestRuntimeStore));
     const gpt56RuntimePatch = await jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },

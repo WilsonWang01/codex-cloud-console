@@ -33,6 +33,7 @@ let createdToken = "";
 let personalLoginFlow = null;
 let includeNewModel = false;
 let selectedRuntime = null;
+let runtimeReadGate = null;
 let appsFailure = false;
 let appsDirectoryDenied = false;
 let submittedMessages = 0;
@@ -270,6 +271,16 @@ await context.route("**/api/**", async (route) => {
   }
   if (url.pathname === "/api/codex/app-status") return send({ ok: true, source: "app-server", authoritative: true, partial: false, account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" }, auth: { ok: true }, accountLogin: { active: personalLoginFlow, latest: personalLoginFlow, flows: personalLoginFlow ? [personalLoginFlow] : [] }, mcpServers: [], plugins: { installed: 0, enabled: 0, available: 0, names: [] }, skills: { enabled: 0, total: 0, names: [], items: [] }, features: { enabled: 0, total: 0, names: [] }, permissionProfiles: [], config: {}, gaps: [] });
   if (url.pathname === "/api/codex/models") return send({ ok: true, source: "app-server", authoritative: true, models: [{ id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium"] }, ...(includeNewModel ? [{ id: "gpt-6-astra", displayName: "GPT-6 Astra", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium", "ultra"] }] : [])] });
+  if (url.pathname === "/api/codex/thread-state" && runtimeReadGate) {
+    const gate = runtimeReadGate;
+    const session = sessions.find((item) => item.id === url.searchParams.get("sessionId"));
+    const runtime = { model: session.model, reasoning: session.reasoning, sandbox: session.sandbox, approval: session.approval, search: session.search };
+    gate.started();
+    await gate.wait;
+    await send({ ok: true, source: "app-server", authoritative: true, repoId, sessionId: session.id, runtime, config: {} });
+    gate.finished();
+    return;
+  }
   if (url.pathname.endsWith("/runtime") && req.method() === "PATCH") {
     selectedRuntime = body;
     Object.assign(sessions.find((item) => item.repoId === repoId), body);
@@ -1079,7 +1090,43 @@ try {
     await page.screenshot({ path: new URL(`personal-activity-${width}.png`, out).pathname, fullPage: true });
   }
   sessions.splice(0, sessions.length, ...savedSessions);
+  for (const width of [320, 390, 1280]) {
+    const personal = sessions.find((session) => session.id === "_personal-session");
+    Object.assign(personal, { model: "gpt-5.6-terra", reasoning: "medium", sandbox: "read-only", approval: "on-request" });
+    let release, started, finished;
+    const readStarted = new Promise((resolve) => { started = resolve; });
+    const readFinished = new Promise((resolve) => { finished = resolve; });
+    runtimeReadGate = { wait: new Promise((resolve) => { release = resolve; }), started, finished };
+    await page.setViewportSize({ width, height: width === 1280 ? 900 : 844 });
+    await page.goto(`${baseUrl}#/project/_personal/thread/_personal-session`);
+    await page.reload();
+    await readStarted;
+    await page.getByRole("button", { name: /^会话设置：/ }).click();
+    await page.locator(".personal-session-settings").getByRole("button", { name: /工作区权限/ }).click();
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: /^允许写入个人工作区/ }).click();
+    await page.getByRole("button", { name: /^会话设置：.*工作区写入/ }).waitFor();
+    await page.getByRole("button", { name: /^会话设置：/ }).click();
+    await page.locator(".personal-session-settings").getByRole("button", { name: /模型/ }).click();
+    await page.getByRole("button", { name: /GPT-6 Astra gpt-6-astra/ }).click();
+    await page.getByRole("button", { name: /^会话设置：GPT-6 Astra.*工作区写入/ }).waitFor();
+    runtimeReadGate = null;
+    const completed = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/codex/thread-state");
+    release();
+    await readFinished;
+    await (await completed).finished();
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await page.getByRole("button", { name: /^会话设置：GPT-6 Astra.*工作区写入/ }).waitFor();
+    assert.equal(personal.model, "gpt-6-astra");
+    assert.equal(personal.sandbox, "workspace-write");
+    assert.equal(personal.approval, "on-request");
+    await page.reload();
+    await page.getByRole("button", { name: /^会话设置：GPT-6 Astra.*工作区写入/ }).waitFor();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    await page.screenshot({ path: new URL(`personal-runtime-race-${width}.png`, out).pathname, fullPage: true });
+  }
   assert.deepEqual(errors, []);
+  console.log("320/390/1280px：迟到的设置读取不覆盖刚选择的模型或权限，刷新后选择仍保留。");
   console.log("320/390/1280px：打开并刷新旧对话后，今日列表时间与排序保持一致。");
   console.log(JSON.stringify({ ok: true, checks: ["个人/工作切换与草稿保留", "个人空间共用登录且可发送", "个人附件上传及移除", "打开模型列表发现新增模型并保留 medium", "一次性审批决定及个人/工作审批隔离", "调用/token 摘要、查询趋势与未知用量", "新客户端令牌仅显示一次", "7 个宽度无横向溢出及移动触控尺寸", "390px 个人/工作侧栏切换", "个人空间刷新旧工作页深链回到个人对话", "不展示其他项目的历史诊断", "弹窗被拦截时仍可打开账号授权链接", "个人事实增删改", "今日变化列表可查看并显式标记已读", "个人提醒可在 390px 开关、设置安静时段并保存", "今日结果直达预览与继续修改草稿", "排队消息撤回到草稿与本轮补充独立交互", "今日区分排队待发送与排队待核对", "今日展示持续目标与已配置计划", "场景建议新建个人会话并保存草稿但不自动发送", "用户维护的个人事项可创建、关联个人草稿、继续、完成，且手机无溢出", "到期事项进入今日概览，关联失败重试不重复建会话", "失效旧草稿关联可清除并重新起草，新草稿首次关联异常仍可复用", "390px 连接服务草稿按钮可触控且不溢出", "连接服务待核对状态跨刷新保留、逐项显示并可人工确认", "同一外部写入的自动化、队列和会话提醒只计一次", "无会话的自动化异常与未来计划可从今日直达", "个人计划页 320/390 无溢出，试运行及人工确认前不可启用计划", "个人流程创建编辑、归档恢复、今日入口和额度确认", "个人草稿一键预填流程且保留草稿", "个人对话跳转计划深链接不被写回", "个人计划空态预填只读范例且不运行模型", "按需任务隐藏无效暂停，自动化提醒可标记已核对且保留运行历史"], screenshots: out.pathname }, null, 2));
 } finally { await browser.close(); }

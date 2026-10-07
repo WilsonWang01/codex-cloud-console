@@ -71,7 +71,11 @@ test("页面刷新和无任务设置通知不产生新活跃记录，保留个�
     }, personalSessionRuntime: () => permissions,
     runtimeFromAppServerSettings: (value) => value, normalizePendingTurnRuntime: (pending) => pending,
     pendingTurnRuntimeApplied: (pending, runtime) => pending.model === runtime.model && pending.reasoning === runtime.reasoning,
-    updateSessionRuntime: async (repoId, id, runtime, options) => { updates.push({ repoId, id, runtime, options }); return { ...session, ...runtime }; },
+    updateSessionRuntime: async (repoId, id, runtime, options) => {
+      const patch = typeof runtime === "function" ? runtime(session) : runtime;
+      updates.push({ repoId, id, runtime: patch, options });
+      return { ...session, ...patch };
+    },
     ownerFromParams: (params) => ({ threadId: params.threadId }), findTurnJob: () => job, findCompactJob: () => null,
     threadOwners: new Map([["thread-old", { repoId: "personal", sessionId: "old" }]]), rememberOwner() {},
     findStoredSessionByThreadId: async () => ({ session }), personalRepoId: "personal", emitJobEvent() {},
@@ -103,6 +107,109 @@ test("页面刷新和无任务设置通知不产生新活跃记录，保留个�
   context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-old", model: "server-model" } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(updates.at(-1).options.touchActivity, true);
+});
+
+function runtimeRaceFixture() {
+  const session = { id: "one", repoId: "personal", codexSessionId: "thread-one", model: "gpt-6-sol", reasoning: "medium",
+    sandbox: "read-only", approval: "on-request", search: true, pendingTurnRuntime: null,
+    updatedAt: "2026-09-01T00:00:00.000Z", draft: { input: "保留草稿", revision: 3 } };
+  const store = { version: 2, activeByRepo: {}, sessions: { one: session } };
+  const context = {
+    enqueueWrite: createKeyedQueue(), readChatStore: async () => store, chatHistoryPath: "fixture.json",
+    atomicWriteJson: async () => {}, normalizeSession: (value) => value,
+    activeTurns: new Map(), activeCompactions: new Map(), makeSessionKey: (repoId, id) => `${repoId}:${id}`,
+    personalSessionRuntime: (value) => ({ sandbox: value.sandbox, approval: value.approval }),
+    runtimeFromAppServerSettings: (value, fallback = {}) => ({ model: value.model || fallback.model, reasoning: value.reasoning || fallback.reasoning,
+      sandbox: value.sandbox || fallback.sandbox, approval: value.approval || fallback.approval, search: fallback.search }),
+    normalizePendingTurnRuntime: (pending) => pending,
+    pendingTurnRuntimeApplied: (pending, runtime) => pending.model === runtime.model && pending.reasoning === runtime.reasoning,
+    ownerFromParams: (params) => ({ threadId: params.threadId }), findTurnJob: () => null, findCompactJob: () => null,
+    threadOwners: new Map([["thread-one", { repoId: "personal", sessionId: "one" }]]), rememberOwner() {},
+    personalRepoId: "personal", emitJobEvent() {},
+    findStoredSessionByThreadId: async () => ({ session: store.sessions.one }),
+  };
+  vm.createContext(context);
+  for (const [start, end] of [
+    ["function mergeAppServerRuntimeWithPending(", "function normalizeApprovalPolicy("],
+    ["async function refreshSessionRuntimeFromAppServer(", "async function readChatStore("],
+    ["async function mutateChatStore(", "async function updateQueuedTurn("],
+    ["async function updateSessionRuntime(", "async function appendChatTurn("],
+    ["function handleAppServerNotification(", "async function appServerProbe("],
+  ]) vm.runInContext(section(source, start, end), context);
+  return { context, store, session };
+}
+
+test("迟到的只读运行时响应不能覆盖新模型、推理、权限、搜索或待应用选择", async () => {
+  for (const patch of [
+    { model: "gpt-6-astra", reasoning: "high", sandbox: "workspace-write", pendingTurnRuntime: {
+      model: "gpt-6-astra", reasoning: "high", updatedAt: "2026-10-06T08:00:00.000Z" } },
+    { sandbox: "workspace-write" },
+    { search: false },
+    { codexSessionId: "thread-replaced" },
+    { pendingTurnRuntime: { model: "gpt-6-sol", reasoning: "medium", updatedAt: "2026-10-06T08:00:00.000Z" } },
+  ]) {
+    const { context, store, session } = runtimeRaceFixture();
+    const read = deferred();
+    context.codexAppServerRequest = () => read.promise;
+    const refreshing = context.refreshSessionRuntimeFromAppServer({ id: "personal", kind: "personal" }, session);
+    await context.updateSessionRuntime("personal", "one", patch);
+    const latest = JSON.stringify(store);
+    read.resolve({ ok: true, result: { thread: { model: "gpt-6-sol", reasoning: "medium" } } });
+    const result = await refreshing;
+    assert.equal(JSON.stringify(store), latest);
+    assert.equal(result, store.sessions.one, "响应返回最新会话，而不是过期请求快照");
+  }
+  const { context, store, session } = runtimeRaceFixture();
+  const read = deferred();
+  context.codexAppServerRequest = () => read.promise;
+  const refreshing = context.refreshSessionRuntimeFromAppServer({ id: "personal", kind: "personal" }, session);
+  await context.updateSessionRuntime("personal", "one", { draft: { input: "刚输入的草稿", revision: 4 } }, { touchActivity: false });
+  read.resolve({ ok: true, result: { thread: { model: "server-model", reasoning: "low" } } });
+  await refreshing;
+  assert.equal(store.sessions.one.model, "server-model", "无运行时冲突时仍同步官方设置");
+  assert.deepEqual(store.sessions.one.draft, { input: "刚输入的草稿", revision: 4 });
+  assert.equal(store.sessions.one.updatedAt, session.updatedAt);
+  for (const jobs of [context.activeTurns, context.activeCompactions]) {
+    jobs.clear();
+    const inFlight = deferred();
+    context.codexAppServerRequest = () => inFlight.promise;
+    const observing = context.refreshSessionRuntimeFromAppServer({ id: "personal", kind: "personal" }, store.sessions.one);
+    jobs.set("personal:one", {});
+    const before = JSON.stringify(store);
+    inFlight.resolve({ ok: true, result: { thread: { model: "older-model", reasoning: "medium" } } });
+    await observing;
+    assert.equal(JSON.stringify(store), before, "读取中途启动任务或压缩时，不再保存旧设置");
+    jobs.clear();
+  }
+});
+
+test("排队的设置通知在原子写入内读取最新选择，旧任务通知不清除新 pending", async () => {
+  const { context, store } = runtimeRaceFixture();
+  const blocked = deferred();
+  const blocker = context.enqueueWrite("chat", () => blocked.promise);
+  const pending = { model: "gpt-6-astra", reasoning: "high", updatedAt: "2026-10-06T08:00:00.000Z" };
+  const changing = context.updateSessionRuntime("personal", "one", { model: pending.model, reasoning: pending.reasoning,
+    sandbox: "workspace-write", search: false, pendingTurnRuntime: pending });
+  const job = { repoId: "personal", sessionId: "one", threadId: "thread-one", runtime: { model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only" } };
+  context.findTurnJob = () => job;
+  context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-one", model: "gpt-6-sol", reasoning: "medium" } });
+  blocked.resolve();
+  await blocker;
+  await changing;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(store.sessions.one.model, pending.model);
+  assert.equal(store.sessions.one.reasoning, pending.reasoning);
+  assert.equal(store.sessions.one.pendingTurnRuntime, pending);
+  assert.equal(store.sessions.one.sandbox, "workspace-write");
+  assert.equal(store.sessions.one.search, false);
+  context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-one", model: pending.model, reasoning: pending.reasoning } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(store.sessions.one.pendingTurnRuntime, null, "真正应用匹配选择后仍清除 pending");
+  await context.updateSessionRuntime("personal", "one", { codexSessionId: "replacement-thread" });
+  const before = JSON.stringify(store);
+  context.handleAppServerNotification({ method: "thread/settings/updated", params: { threadId: "thread-one", model: "old-model" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(JSON.stringify(store), before, "旧线程的通知不能写入替换后的线程");
 });
 
 test("官方会话活动采用 recencyAt，不把恢复或元数据写入当作新对话", () => {
