@@ -506,6 +506,72 @@ test("会话回写拒绝旧项目、旧请求及错误项目响应", () => {
   assert.equal(updates.length, 5);
 });
 
+function frontendRuntimeFixture() {
+  const context = {
+    useCallback: (fn) => fn, activeSessionId: "a", activeSessionIdRef: { current: "a" },
+    selectedRepoIdRef: { current: "personal" }, runtimePersistSeq: { current: 0 }, chatLoadSeq: { current: 1 },
+    chatRuntimeReadyRef: { current: true }, pendingRouteSessionRef: { current: null },
+    chatRuntimeRef: { current: { model: "old", reasoning: "medium", sandbox: "read-only", approval: "on-request", search: true } },
+    calls: [], changes: [], events: [], sessions: [{ id: "a" }],
+    setChatRuntime: (value) => context.changes.push(value),
+    setChatSessions: (value) => { context.sessions = typeof value === "function" ? value(context.sessions) : value; },
+    pushEvent: (event) => context.events.push(event), reasoningLabel: (value) => value,
+    loadThreadState: async () => { context.reloads = (context.reloads || 0) + 1; },
+    api: async (url, options) => { context.calls.push({ url, options }); return context.response; },
+    response: { runtime: { model: "saved" } },
+  };
+  vm.createContext(context);
+  const code = section(frontend, "  const persistChatRuntime =", "\n  useEffect(() => {\n    setCompactStatus");
+  vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + "\nglobalThis.persist = persistChatRuntime; globalThis.update = updateChatRuntime;", context);
+  return context;
+}
+
+test("设置更新在加载、待导航或旧会话回调时拒绝执行，正常选择仍能保存", async () => {
+  const context = frontendRuntimeFixture();
+  let evaluated = 0;
+  const update = (runtime) => { evaluated += 1; return { ...runtime, model: "new" }; };
+  context.chatRuntimeReadyRef.current = false;
+  context.update(update);
+  context.chatRuntimeReadyRef.current = true;
+  context.pendingRouteSessionRef.current = { repoId: "personal", sessionId: "b" };
+  context.update(update);
+  context.pendingRouteSessionRef.current = null;
+  context.activeSessionIdRef.current = "b";
+  context.update(update);
+  assert.equal(evaluated, 0);
+  assert.equal(context.calls.length, 0);
+  assert.equal(context.changes.length, 0);
+  context.activeSessionIdRef.current = "a";
+  context.update(update);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(evaluated, 1);
+  assert.equal(context.calls.length, 1);
+  assert.equal(JSON.parse(context.calls[0].options.body).model, "new");
+  assert.equal(context.chatRuntimeRef.current.model, "saved");
+});
+
+test("迟到的设置保存成功或失败不串到其他会话，返回同一会话也不接受旧代次", async () => {
+  for (const outcome of ["success", "failure"]) {
+    for (const change of ["session", "history", "loading", "navigation", "repo", "newer-save"]) {
+      const context = frontendRuntimeFixture();
+      const gate = deferred();
+      context.api = async () => { await gate.promise; if (outcome === "failure") throw new Error("old failure"); return { runtime: { model: "old response" } }; };
+      const pending = context.persist(context.chatRuntimeRef.current);
+      if (change === "session") context.activeSessionIdRef.current = "b";
+      if (change === "history") context.chatLoadSeq.current += 2;
+      if (change === "loading") context.chatRuntimeReadyRef.current = false;
+      if (change === "navigation") context.pendingRouteSessionRef.current = { sessionId: "b" };
+      if (change === "repo") context.selectedRepoIdRef.current = "work";
+      if (change === "newer-save") context.runtimePersistSeq.current += 1;
+      gate.resolve();
+      await pending;
+      assert.equal(context.changes.length, 0, `${outcome}/${change}`);
+      assert.equal(context.events.length, 0, `${outcome}/${change}`);
+      assert.equal(context.reloads || 0, 0, `${outcome}/${change}`);
+    }
+  }
+});
+
 test("项目切换清空编辑器且旧文件不能写入新项目", async () => {
   const context = {
     selectedRepo: { id: "A" }, selectedRepoIdRef: { current: "A" },
@@ -515,6 +581,7 @@ test("项目切换清空编辑器且旧文件不能写入新项目", async () =>
     useCallback: (fn) => fn, pushEvent() {}, window: { localStorage: storage() },
     detachConversationStream() {},
     chatHistoryController: { current: null },
+    chatRuntimeReadyRef: { current: true },
     setSelectedRepoId: (id) => { context.selectedRepo = { id }; }, setSelectedFile: (file) => { context.selectedFile = file; }, setFileDraft: (draft) => { context.fileDraft = draft; }, setIsLoadingChatHistory: (value) => { context.historyLoading = value; },
     api: async () => assert.fail("stale file must not be written"),
   };

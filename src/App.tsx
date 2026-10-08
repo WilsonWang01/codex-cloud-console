@@ -3409,9 +3409,7 @@ export function App() {
   const chatInputRef = useRef(chatInput);
   const chatAttachmentsRef = useRef<UploadedAttachment[]>(chatAttachments);
   const flushComposerDraftRef = useRef<() => Promise<void>>(async () => undefined);
-  const pendingRouteSessionRef = useRef<{ repoId: string; sessionId: string } | null>(
-    initialRoute.repoId && initialRoute.sessionId ? { repoId: initialRoute.repoId, sessionId: initialRoute.sessionId } : null,
-  );
+  const pendingRouteSessionRef = useRef(pendingRouteSession);
   const codexAppStatusLoadedRef = useRef(false);
   const codexAppStatusRepoIdRef = useRef("");
   const streamScope = useRef(new ConversationStreamScope()).current;
@@ -3464,6 +3462,10 @@ export function App() {
   const activeChatSessionRef = useRef(activeChatSession);
   activeChatSessionRef.current = activeChatSession;
   const activeRouteSessionId = activeChatSession?.codexSessionId || activeSessionId;
+  const chatHistoryLoading = isLoadingChatHistory || Boolean(pendingRouteSession);
+  const chatRuntimeReady = !chatHistoryLoading && !chatHistoryError && Boolean(activeChatSession);
+  const chatRuntimeReadyRef = useRef(chatRuntimeReady);
+  chatRuntimeReadyRef.current = chatRuntimeReady;
 
   const pushEvent = useCallback((event: Omit<RunEvent, "id" | "time">) => {
     setEvents((current) => [
@@ -3523,6 +3525,7 @@ export function App() {
       setFileDraft("");
       void flushComposerDraftRef.current();
       chatLoadSeq.current += 1;
+      chatRuntimeReadyRef.current = false;
       setIsLoadingChatHistory(true);
       setChatSessions([]);
       setActiveSessionId("");
@@ -4106,13 +4109,17 @@ export function App() {
     async (runtime: ChatRuntime, sessionId = activeSessionId, repoId = selectedRepoIdRef.current) => {
       if (!sessionId) return;
       const requestSeq = ++runtimePersistSeq.current;
+      const historySeq = chatLoadSeq.current;
+      const stillCurrent = () => requestSeq === runtimePersistSeq.current && historySeq === chatLoadSeq.current &&
+        selectedRepoIdRef.current === repoId && activeSessionIdRef.current === sessionId &&
+        chatRuntimeReadyRef.current && !pendingRouteSessionRef.current;
       try {
         const result = await api<ChatRuntimeResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ repoId, ...runtime }),
         });
-        if (requestSeq !== runtimePersistSeq.current || selectedRepoIdRef.current !== repoId) return;
+        if (!stillCurrent()) return;
         const nextRuntime = result.runtime ? { ...chatRuntimeRef.current, ...result.runtime } : runtime;
         chatRuntimeRef.current = nextRuntime;
         setChatRuntime(nextRuntime);
@@ -4131,9 +4138,10 @@ export function App() {
           });
         }
       } catch (error) {
+        if (!stillCurrent()) return;
         const message = error instanceof Error ? error.message : "runtime 设置保存失败";
         pushEvent({ tone: "warn", title: "设置未保存", body: message });
-        if (sessionId === activeSessionId && selectedRepoIdRef.current === repoId) void loadThreadState(sessionId);
+        void loadThreadState(sessionId);
       }
     },
     [activeSessionId, loadThreadState, pushEvent],
@@ -4141,6 +4149,7 @@ export function App() {
 
   const updateChatRuntime = useCallback(
     (value: ChatRuntime | ((current: ChatRuntime) => ChatRuntime)) => {
+      if (!chatRuntimeReadyRef.current || pendingRouteSessionRef.current || activeSessionIdRef.current !== activeSessionId) return;
       const nextRuntime = typeof value === "function" ? value(chatRuntimeRef.current) : value;
       chatRuntimeRef.current = nextRuntime;
       setChatRuntime(nextRuntime);
@@ -4164,6 +4173,18 @@ export function App() {
       setReviewActivity(null);
     }
     const activeSession = nextSessions.find((session) => session.id === nextActiveSessionId);
+    if (activeSession) {
+      const current = chatRuntimeRef.current;
+      const runtime = {
+        model: activeSession.model || current.model,
+        reasoning: activeSession.reasoning || current.reasoning,
+        sandbox: activeSession.sandbox || current.sandbox,
+        approval: activeSession.approval || current.approval,
+        search: typeof activeSession.search === "boolean" ? activeSession.search : current.search,
+      };
+      chatRuntimeRef.current = runtime;
+      setChatRuntime(runtime);
+    }
     const hasLocalDraft = Boolean(composerDrafts.recover(repo.id, nextActiveSessionId));
     const draft = hydrateChatDraft(repo, activeSession?.draft || null, nextActiveSessionId);
     hydratedDraftRef.current = hasLocalDraft ? null : {
@@ -4186,6 +4207,7 @@ export function App() {
       chatHistoryController.current = controller;
       detachConversationStream();
       const requestSeq = ++chatLoadSeq.current;
+      chatRuntimeReadyRef.current = false;
       setIsLoadingChatHistory(true);
       try {
         const params = new URLSearchParams({ repoId });
@@ -4638,6 +4660,7 @@ export function App() {
     if (!sessionId || sessionId === activeSessionId || pendingAction || isLoadingChatHistory) return;
     detachConversationStream();
     const requestSeq = ++chatLoadSeq.current;
+    chatRuntimeReadyRef.current = false;
     setIsLoadingChatHistory(true);
     setBusyAction("select-session");
     try {
@@ -6027,7 +6050,7 @@ export function App() {
         }}
         sessions={chatSessions}
         activeSessionId={activeSessionId}
-        historyLoading={isLoadingChatHistory}
+        historyLoading={chatHistoryLoading}
         mobileOpen={mobileSidebarOpen}
         onClose={() => setMobileSidebarOpen(false)}
         onSelectView={(view) => { if (view === "materials") setSelectedPersonalFilePath(""); setActiveView(view); }}
@@ -6317,7 +6340,8 @@ export function App() {
               busyAction={busyAction}
               codexAccountBusy={codexAccountBusy}
               mcpLoginBusy={mcpLoginBusy}
-              historyLoading={isLoadingChatHistory}
+              historyLoading={chatHistoryLoading}
+              runtimeReady={chatRuntimeReady}
               historyError={chatHistoryError}
             />
           </div>
@@ -9061,6 +9085,7 @@ function CloudChat({
   codexAccountBusy,
   mcpLoginBusy,
   historyLoading,
+  runtimeReady,
   historyError,
 }: {
   status: ConsoleStatus;
@@ -9133,6 +9158,7 @@ function CloudChat({
   codexAccountBusy: "login" | "cancel" | "logout" | null;
   mcpLoginBusy: string | null;
   historyLoading: boolean;
+  runtimeReady: boolean;
   historyError: string;
 }) {
   const endRef = useRef<HTMLDivElement | null>(null);
@@ -9144,6 +9170,12 @@ function CloudChat({
   const [commandIndex, setCommandIndex] = useState(0);
   const [draggingAttachments, setDraggingAttachments] = useState(false);
   const [activePanel, setActivePanel] = useState<"model" | "reasoning" | "goal" | "status" | "auto" | "sessions" | "capabilities" | "permissions" | "diff" | "review" | "guide" | "connections" | "sessionSettings" | null>(null);
+  const runtimePanelOpen = activePanel === "model" || activePanel === "reasoning" || activePanel === "permissions" || activePanel === "sessionSettings";
+  const panelVisible = activePanel && (runtimeReady || !runtimePanelOpen);
+  const runtimeUnavailableLabel = historyLoading ? "同步中" : "暂不可用";
+  useEffect(() => {
+    setActivePanel((current) => current === "model" || current === "reasoning" || current === "permissions" || current === "sessionSettings" ? null : current);
+  }, [repo.id, activeSessionId, runtimeReady]);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const [compactViewport, setCompactViewport] = useState(() => window.matchMedia("(max-width: 820px)").matches);
   useEffect(() => {
@@ -9663,6 +9695,7 @@ function CloudChat({
       hint: activeModel?.displayName || runtime.model,
       icon: <Sparkles size={17} />,
       aliases: ["gpt", "runtime"],
+      disabled: !runtimeReady,
       run: () => setActivePanel("model"),
     },
     {
@@ -9672,6 +9705,7 @@ function CloudChat({
       hint: reasoningLabel(runtime.reasoning),
       icon: <Brain size={17} />,
       aliases: ["think", "effort"],
+      disabled: !runtimeReady,
       run: () => setActivePanel("reasoning"),
     },
     {
@@ -9681,6 +9715,7 @@ function CloudChat({
       hint: runtime.search ? "当前开启" : "当前关闭",
       icon: <Globe2 size={17} />,
       aliases: ["web", "browse"],
+      disabled: !runtimeReady,
       run: () => onRuntime((current) => ({ ...current, search: !current.search })),
     },
     {
@@ -10167,8 +10202,8 @@ function CloudChat({
           </div>
         )}
 
-        {activePanel && compactViewport && <button className="command-panel-backdrop" type="button" aria-label="关闭面板" onClick={() => setActivePanel(null)} />}
-        {activePanel && (
+        {panelVisible && compactViewport && <button className="command-panel-backdrop" type="button" aria-label="关闭面板" onClick={() => setActivePanel(null)} />}
+        {panelVisible && (
           <div
             className="command-panel"
             ref={panelRef}
@@ -10506,6 +10541,7 @@ function CloudChat({
                   <button
                     key={model.id}
                     className={cx(runtime.model === model.id && "selected")}
+                    disabled={!runtimeReady}
                     onClick={() => {
                       const supportedReasoning = model.supportedReasoningEfforts?.length
                         ? runtimeReasoning.filter((level) => model.supportedReasoningEfforts?.includes(level))
@@ -10534,6 +10570,7 @@ function CloudChat({
                   <button
                     key={level}
                     className={cx(runtime.reasoning === level && "selected")}
+                    disabled={!runtimeReady}
                     onClick={() => {
                       onRuntime((current) => ({ ...current, reasoning: level }));
                       setActivePanel(null);
@@ -10888,21 +10925,22 @@ function CloudChat({
         </div>}
         <div className="composer-footer app-composer-footer">
           <div className="composer-footer-left">
-            {repo.kind === "personal" ? <><button type="button" onClick={() => setActivePanel("sessionSettings")} aria-label={`会话设置：${activeModel?.displayName || runtime.model}，${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}`}><SlidersHorizontal size={15} />{activeModel?.displayName || runtime.model} · {permissionLabel(runtime.sandbox)}</button>
+            {repo.kind === "personal" ? <><button type="button" disabled={!runtimeReady} onClick={() => setActivePanel("sessionSettings")} aria-label={`会话设置：${runtimeReady ? `${activeModel?.displayName || runtime.model}，${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}` : runtimeUnavailableLabel}`}><SlidersHorizontal size={15} />{runtimeReady ? `${activeModel?.displayName || runtime.model} · ${permissionLabel(runtime.sandbox)}` : `会话设置${runtimeUnavailableLabel}`}</button>
             <button className="footer-save-routine" type="button" onClick={() => onSaveRoutine(input.trim())} disabled={historyLoading || queueRestoreBusy || uploadingAttachments || !input.trim() || input.trim().length > 8000 || attachments.length > 0} title={attachments.length ? "带附件的草稿不能直接保存为流程" : input.trim().length > 8000 ? "流程任务最多 8000 字" : "保存草稿为流程，不会发送消息"} aria-label="保存草稿为流程"><BookmarkPlus size={16} /></button></> : <>
             <button type="button" onClick={() => onInput("/")} disabled={Boolean(busyAction)} title="指令" aria-label="打开 Codex 指令">
               <Command size={14} />
               /
             </button>
             <button
-              className={cx("footer-permission-chip", runtime.sandbox === "danger-full-access" && "full-access")}
+              className={cx("footer-permission-chip", runtimeReady && runtime.sandbox === "danger-full-access" && "full-access")}
               type="button"
+              disabled={!runtimeReady}
               onClick={() => setActivePanel("permissions")}
-              title={`${runtime.sandbox} · approval ${runtime.approval}`}
-              aria-label={`权限：${permissionRuntimeLabel(runtime.sandbox, runtime.approval)}`}
+              title={runtimeReady ? `${runtime.sandbox} · approval ${runtime.approval}` : runtimeUnavailableLabel}
+              aria-label={`权限：${runtimeReady ? permissionRuntimeLabel(runtime.sandbox, runtime.approval) : runtimeUnavailableLabel}`}
             >
               <ShieldCheck size={14} />
-              {permissionLabel(runtime.sandbox)}
+              {runtimeReady ? permissionLabel(runtime.sandbox) : runtimeUnavailableLabel}
             </button>
             </>}
           </div>
@@ -10913,8 +10951,8 @@ function CloudChat({
                 目标
               </button>
             )}
-            <button type="button" onClick={() => { onRefreshModels(); setActivePanel("model"); }} aria-label={`模型：${activeModel?.displayName || runtime.model}`}>{activeModel?.displayName || runtime.model}</button>
-            <button type="button" onClick={() => setActivePanel("reasoning")} aria-label={`推理深度：${reasoningLabel(runtime.reasoning)}`}>{reasoningLabel(runtime.reasoning)}</button>
+            <button type="button" disabled={!runtimeReady} onClick={() => { onRefreshModels(); setActivePanel("model"); }} aria-label={`模型：${runtimeReady ? activeModel?.displayName || runtime.model : runtimeUnavailableLabel}`}>{runtimeReady ? activeModel?.displayName || runtime.model : runtimeUnavailableLabel}</button>
+            <button type="button" disabled={!runtimeReady} onClick={() => setActivePanel("reasoning")} aria-label={`推理深度：${runtimeReady ? reasoningLabel(runtime.reasoning) : runtimeUnavailableLabel}`}>{runtimeReady ? reasoningLabel(runtime.reasoning) : runtimeUnavailableLabel}</button>
             {showFooterContext && (
               <button className={cx("footer-context-chip", contextState)} type="button" onClick={() => setActivePanel("status")} title={contextDetail} aria-label={`上下文：${contextDetail}`}>
                 {compactStatus?.running && <Loader2 size={12} className="spin" />}

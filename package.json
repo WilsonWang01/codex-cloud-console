@@ -49,6 +49,7 @@
     "verify:github-api": "node scripts/verify-github-api.mjs",
     "verify:github:ui": "node scripts/verify-github-ui.mjs",
     "verify:safety:ui": "node scripts/verify-safety-ui.mjs",
+    "verify:runtime:ui": "node scripts/verify-runtime-ui.mjs",
     "verify:personal:ui": "node scripts/verify-personal-usage-ui.mjs",
     "verify:runtime": "node scripts/verify-runtime-package.mjs",
     "verify:api": "node scripts/smoke-api.mjs",
