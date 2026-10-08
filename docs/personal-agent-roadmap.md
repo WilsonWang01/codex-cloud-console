@@ -4,7 +4,7 @@
 
 本文整合 `docs/research/2026-09-26-personal-agent-benchmark.md` 的对标、代码发现和后端演进建议，以及原四项需求方案，作为后续开发、review、验收的唯一计划入口。原调研保留为日期固定的证据档案，其中旧阶段顺序与接口建议以本文的整合决定为准。
 
-最新增量验收见[会话切换的设置归属保护](acceptance/2026-10-08-personal-runtime-switch.md)：加载时隐藏旧模型和权限、禁用设置，关闭旧设置面板，迟到的保存响应不能串到新会话；手机/桌面及完整本地回归通过，尚未发布。此前的[慢速刷新不覆盖新设置](acceptance/2026-10-07-personal-runtime-race.md)在保存时核对最新模型与个人权限，设置通知也在同一次保存中合并，已发布并完成生产只读复验；[只读浏览与会话活动时间](acceptance/2026-10-05-personal-activity-time.md)采用真正只读的 `thread/read` 及官方排序 `recencyAt`，历史不可靠时间不做猜测性回填；[个人事实跨设备冲突保护](acceptance/2026-10-04-personal-fact-conflicts.md)保留冲突输入；[事项草稿服务端恢复](acceptance/2026-10-03-personal-draft-server-recovery.md)沿用可恢复的会话预留；[个人计划试运行门禁](acceptance/2026-09-28-personal-trial-gate.md)要求试运行及人工确认，正文修改会暂停计划。生产状态以最新验收记录为准；本轮更新日期：2026-10-08。
+最新增量验收见[会话切换的设置归属保护](acceptance/2026-10-08-personal-runtime-switch.md)：加载时隐藏旧模型和权限、禁用设置，关闭旧设置面板，迟到的保存响应不能串到新会话；手机/桌面、完整本地回归及 GitHub 检查通过，备份和数据对账后已发布，生产只读页面验收通过。此前的[慢速刷新不覆盖新设置](acceptance/2026-10-07-personal-runtime-race.md)在保存时核对最新模型与个人权限，设置通知也在同一次保存中合并；[只读浏览与会话活动时间](acceptance/2026-10-05-personal-activity-time.md)采用真正只读的 `thread/read` 及官方排序 `recencyAt`，历史不可靠时间不做猜测性回填；[个人事实跨设备冲突保护](acceptance/2026-10-04-personal-fact-conflicts.md)保留冲突输入；[事项草稿服务端恢复](acceptance/2026-10-03-personal-draft-server-recovery.md)沿用可恢复的会话预留；[个人计划试运行门禁](acceptance/2026-09-28-personal-trial-gate.md)要求试运行及人工确认，正文修改会暂停计划。生产状态以最新验收记录为准；本轮更新日期：2026-10-08。
 
 用户已授权按方案开发、验收和 review，并在备份和检查运行任务后授权本轮 EC2 变更及一次限时只读模型验证。本文同时记录设计与阶段状态，不能把未通过的验收项视为已实现；没有授权创建额外计费资源、发送邮件或未评估的执行器权限迁移。AWS 注册与部署步骤见 [AWS 从零部署](aws-getting-started.md)。
 
