@@ -8,7 +8,13 @@
 
 第一轮前后 10 项受保护状态条目及 4 份部署配置哈希一致，34 个会话、200 条运行记录保留。审计日志和能力缓存属于预期可变化数据，未用旧快照覆盖。个人工作区当时没有文件；未修改工作项目目录或 Codex 登录/历史。
 
-安全补丁和本机代理的最终发布结果将在全部检查通过后补充，不能把第一轮成功视作本报告全部验收完成。
+最终 EC2 版本为 `20261022T112352Z-3887553`，精确来源 `a7caddeb7128e2ac72ba6a4fb7b2433550533aac`，包含安全补丁 `60df207` 与测试等待修复 `a7cadde`。独立发布单元退出码 0；2026-10-22 19:27:43 CST 再次严格健康通过，无活动任务或压缩任务。生产 `proxy-addr` 实装 2.0.8，生产依赖审计 0 项。
+
+本机现有 LaunchAgent 已切换到 `~/.codex/cloud-console-runtime/m1-a7cadde/` 固定版本目录，PID 10812，仍只监听 `127.0.0.1:18787`，不依赖原 dirty checkout 的后续修改。`/api/local/release` 与 `/api/release` 返回同一提交，后端、代理、锁文件、页面入口四项哈希均一致；来源锁文件不再被裁剪修改。原 plist 保留可回退。临时 18788 验收进程已停止，两份本轮旧本机候选代码已移除。
+
+最终真实页面验收通过个人今日 → 工作历史会话 → 调用与用量 → 个人切换，能读取原历史，已登录且云端在线；当前工作会话 `GPT-6-Sol / low` 的显式选择保留，未改成默认 medium。只读操作后再次核对 10 项状态和 4 份配置哈希均一致，仍为 34 会话、200 运行。重启期间个人页面曾显示邮箱连接待检查、日历状态待确认，本轮没有重新授权、读取第三方业务数据或据此宣称连接器完整闭环通过。
+
+实际 UI 截图保存在忽略目录 `docs/research/acceptance/m1-deploy-2026-10-22/` 的 `today-production.png`、`work-production.png`、`usage-production.png`，未把历史聊天截图推到公开仓库。无认证远程 `/api/release` 返回 401，未开放免认证管理接口。
 
 ## 备份与恢复验证
 
@@ -21,6 +27,8 @@ EC2 备份目录：`/home/ubuntu/codex-cloud/backups/pre-m1-20261022`，目录 0
 - 原本机 LaunchAgent 已备份到 `~/.codex/cloud-console-backups/m1-20261022/original.plist`，未修改用户其他工作树。
 
 备份在原实例磁盘上，只用于本次回退，不是异地容灾。新版本若产生数据，回退只切代码，不能恢复旧状态覆盖新数据。
+
+安全补丁前另建 `pre-m1-security-20261022`，同样实际解包校验：状态配置归档 SHA-256 `b784e8e1779b0d87f5735ef7b4cafacd0c1f74f0595f56a199df2d0ea46094a5`，代码归档 `53f30db4892e43b3cf51fe4fff06daa7c1eb2b03e999508ad6a3df15886767b4`。最终健康、数据对账、归档哈希及无打开文件检查通过后，删除旧 M1 代码目录与初版暂存源码，共回收 43,564 KiB，运行目录只保留最终版本；两份已验证归档保留。
 
 ## 发布中发现并修复的依赖问题
 
@@ -39,7 +47,9 @@ EC2 备份目录：`/home/ubuntu/codex-cloud/backups/pre-m1-20261022`，目录 0
 
 测试补充：Express 实际使用的 `proxy-addr` 回环、非信任来源、伪造转发头和异常 IPv6 子网；安装器审计失败不切换、不删除原版本。`npm run verify:local` 全部通过；`verify:status:ui` 通过首屏、局部错误、超时、恢复及 30 次重载，84 次状态请求、0 次写入。
 
-首次 CI [39769628624](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39769628624) 审计通过，但回归失败：测试只等待模型任务结束，没有等待自动化结果持久化与并发名额释放，下一提交得到 429。补充等待已有 `activeRunIds` 为空且模型任务为空，不修改生产并发上限，不跳过断言，不以无条件重试掩盖。修复后的 CI 和最终生产复查结果待补。
+首次 CI [39769628624](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39769628624) 审计通过，但回归失败：测试只等待模型任务结束，没有等待自动化结果持久化与并发名额释放，下一提交得到 429。补充等待已有 `activeRunIds` 为空且模型任务为空，不修改生产并发上限，不跳过断言，不以无条件重试掩盖。修复后的本地回归及 [CI 39770031394](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39770031394) 全部通过，CI 使用 Linux / Node 22，包含全量 verify:local 和安全审计。
+
+代码 review 结论：变更限定于五项依赖锁定版本、审计发布检查及对应回归；无跨主版本升级，无自动 audit fix，无新增执行权限。安装器审计错误停在切换前，删除候选而保留当前服务；保留锁文件不妨碍裁剪开发依赖。没有发现本轮改动遗留的 P0/P1，但这不是对整个项目未知问题的保证。
 
 公告来源：[proxy-addr](https://github.com/advisories/GHSA-jqcg-44mw-7w3h)、[shell-quote](https://github.com/advisories/GHSA-pqg4-j6r4-53mv)、[source-map-js](https://github.com/advisories/GHSA-68fv-2mgg-jv7q)、[Vite/launch-editor](https://github.com/advisories/GHSA-587h-7wmj-h5pm)。
 

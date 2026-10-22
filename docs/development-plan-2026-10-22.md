@@ -1,6 +1,6 @@
 # Codex Cloud 下一阶段开发方案
 
-状态：用户已确认完整方案，原生 goal 已启用，从 M1 开始。日期：2026-10-22，Asia/Shanghai。
+状态：用户已确认完整方案，原生 goal 已启用；M1 已验收并部署 EC2/本机代理，线上 `a7cadde`，下一项 M2/A01。M2-M5 未完成。日期：2026-10-22，Asia/Shanghai。
 
 本方案建立在[本轮现状分析](reviews/2026-10-22-next-stage-assessment.md)和[现有统一路线图](personal-agent-roadmap.md)之上。确认后作为下一阶段的执行顺序，保留旧路线图的需求和验收编号；历史报告继续作为证据，不重复开发已完成能力。
 
