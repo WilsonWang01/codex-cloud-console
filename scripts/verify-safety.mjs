@@ -148,6 +148,7 @@ test("页面刷新和无任务设置通知不产生新活跃记录，保留个�
   };
   vm.createContext(context);
   vm.runInContext(section(source, "function mergeAppServerRuntimeWithPending(", "function normalizeApprovalPolicy("), context);
+  vm.runInContext(section(source, "function runtimeSelectionMatches(", "function createServerJob("), context);
   vm.runInContext(section(source, "async function refreshSessionRuntimeFromAppServer(", "async function readChatStore("), context);
   vm.runInContext(section(source, "function handleAppServerNotification(", "async function appServerProbe("), context);
   const repo = { id: "personal", kind: "personal", path: "/tmp/personal" };
@@ -196,6 +197,7 @@ function runtimeRaceFixture() {
   };
   vm.createContext(context);
   for (const [start, end] of [
+    ["function runtimeSelectionMatches(", "function createServerJob("],
     ["function mergeAppServerRuntimeWithPending(", "function normalizeApprovalPolicy("],
     ["async function refreshSessionRuntimeFromAppServer(", "async function readChatStore("],
     ["async function mutateChatStore(", "async function updateQueuedTurn("],
@@ -204,6 +206,26 @@ function runtimeRaceFixture() {
   ]) vm.runInContext(section(source, start, end), context);
   return { context, store, session };
 }
+
+test("旧任务与排队任务的显式模型不改变新保存的选择，旧通知也不能撤销权限", async () => {
+  const { context, store } = runtimeRaceFixture();
+  const runtime = { model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only", approval: "on-request", search: true };
+  const selected = { ...runtime, runtimeSelectionId: "selection-one" };
+  const job = { session: { ...selected }, runtime };
+  assert.equal(context.jobRuntimePatch(job, selected, true).pendingTurnRuntime, null);
+  assert.deepEqual(Object.keys(context.jobRuntimePatch(job, { ...selected, runtimeSelectionId: "selection-two" })), []);
+  const overriddenJob = { session: { ...selected }, runtime: { ...runtime, model: "explicit-automation-model" } };
+  const overridePatch = context.jobRuntimePatch(overriddenJob, selected, true);
+  assert.equal(overridePatch.model, undefined, "任务保持自己的显式模型，界面仍保留用户选择");
+  assert.equal(overridePatch.pendingTurnRuntime.model, selected.model, "后续协议读取仍保留用户选择供下一轮应用");
+  await context.updateSessionRuntime("personal", "one", { ...selected, sandbox: "workspace-write" });
+  const before = JSON.stringify(store);
+  context.handleAppServerNotification({ method: "thread/settings/updated", params: {
+    threadId: "thread-one", model: "older-model", sandbox: "read-only", approval: "on-request",
+  } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(JSON.stringify(store), before, "没有对应当前任务的旧设置通知不能撤销明确选择");
+});
 
 test("迟到的只读运行时响应不能覆盖新模型、推理、权限、搜索或待应用选择", async () => {
   for (const patch of [

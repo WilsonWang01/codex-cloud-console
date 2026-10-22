@@ -39,6 +39,7 @@ import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
 const serializeNotificationDelivery = createKeyedQueue();
+const serializeSessionTransition = createKeyedQueue();
 
 const app = express();
 app.set("trust proxy", "loopback");
@@ -646,6 +647,7 @@ function normalizeSession(item, repoId) {
     sandbox: repoId === personalRepoId ? personalSessionRuntime(item || {}).sandbox : item?.sandbox ? String(item.sandbox) : null,
     approval: repoId === personalRepoId ? "on-request" : item?.approval ? String(item.approval) : null,
     search: typeof item?.search === "boolean" ? item.search : null,
+    runtimeSelectionId: typeof item?.runtimeSelectionId === "string" ? item.runtimeSelectionId.slice(0, 64) : null,
     pendingTurnRuntime: normalizePendingTurnRuntime(item?.pendingTurnRuntime, item),
     tokenUsage: normalizeTokenUsage(item?.tokenUsage),
     goal: item?.goal && typeof item.goal === "object" ? item.goal : null,
@@ -986,7 +988,7 @@ async function refreshSessionRuntimeFromAppServer(repo, session, options = {}) {
   if (!response.ok) return session;
   return (await updateSessionRuntime(repo.id, session.id, (current) => {
     // A read started before a local setting change cannot undo that newer intent.
-    const fields = ["codexSessionId", "model", "reasoning", "sandbox", "approval", "search", "pendingTurnRuntime"];
+    const fields = ["codexSessionId", "model", "reasoning", "sandbox", "approval", "search", "pendingTurnRuntime", "runtimeSelectionId"];
     if (fields.some((field) => JSON.stringify(current[field]) !== JSON.stringify(session[field]))
         || activeTurns.has(key) || activeCompactions.has(key)) return null;
     const permissions = repo.kind === "personal" ? personalSessionRuntime(current) : null;
@@ -1500,6 +1502,7 @@ function sessionSummary(item) {
     approval: item.approval || null,
     search: typeof item.search === "boolean" ? item.search : null,
     runtimePending: Boolean(item.pendingTurnRuntime),
+    runtimeSelectionId: item.runtimeSelectionId || null,
     tokenUsage: item.tokenUsage || null,
     goal: item.goal || null,
     compactedAt: item.compactedAt || null,
@@ -2936,6 +2939,20 @@ async function persistJobToolAudits(job) {
   }
 }
 
+function runtimeSelectionMatches(current, runtime) {
+  return !current.runtimeSelectionId || ["model", "reasoning", "sandbox", "approval", "search"].every((field) => current[field] === runtime[field]);
+}
+
+function jobRuntimePatch(job, current, clearPending = false) {
+  if ((current.runtimeSelectionId || null) !== (job.session?.runtimeSelectionId || null)) return {};
+  if (!runtimeSelectionMatches(current, job.runtime)) {
+    return { pendingTurnRuntime: current.pendingTurnRuntime || {
+      model: current.model, reasoning: current.reasoning, updatedAt: new Date().toISOString(),
+    } };
+  }
+  return { ...job.runtime, ...(clearPending ? { pendingTurnRuntime: null } : {}) };
+}
+
 function createServerJob(kind, repo, session, runtime) {
   const key = makeSessionKey(repo.id, session.id);
   let resolvePromise;
@@ -3054,7 +3071,7 @@ async function resolveThreadForJob(job) {
   job.threadId = started?.thread?.id;
   if (!job.threadId) throw new Error("Codex app-server did not return a thread id");
   rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
-  await updateSessionRuntime(job.repoId, job.sessionId, { codexSessionId: job.threadId, ...job.runtime }, { makeActive: job.makeSessionActive !== false });
+  await updateSessionRuntime(job.repoId, job.sessionId, (current) => ({ codexSessionId: job.threadId, ...jobRuntimePatch(job, current) }), { makeActive: job.makeSessionActive !== false });
   emitJobEvent(job, "session", { codexSessionId: job.threadId, threadId: job.threadId });
   emitJobEvent(job, "status", { text: `已创建 app-server thread ${job.threadId.slice(0, 8)}` });
   return job.threadId;
@@ -3063,125 +3080,132 @@ async function resolveThreadForJob(job) {
 async function startTurnJob(repo, session, runtime, message, attachments = [], storedMessage = message, options = {}) {
   if (repo.kind === "personal") {
     if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行已被管理员停用"), { statusCode: 503 });
-    runtime = runtimeForRepo(repo, runtime);
   }
   const key = makeSessionKey(repo.id, session.id);
-  const storedSession = await readStoredSessionForJob(repo.id, session.id);
-  const storedQueuedTurn = storedSession.queuedTurn;
-  if (storedSession.externalActionReview) {
-    throw Object.assign(new Error("连接服务操作尚待核对。请先在对应服务检查结果，再确认已核对。"), { statusCode: 409 });
-  }
-  if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
-  if (options.queuedTurnId ? storedQueuedTurn?.id !== options.queuedTurnId || storedQueuedTurn.status !== "dispatching" : Boolean(storedQueuedTurn)) {
-    throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
-  }
-  const existing = activeTurns.get(key);
-  if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
-  const compact = activeCompactions.get(key);
-  if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
+  return serializeSessionTransition(key, async () => {
+    const storedSession = await readStoredSessionForJob(repo.id, session.id);
+    session = storedSession;
+    runtime = runtimeForRepo(repo, normalizeRuntime(runtime, session));
+    const storedQueuedTurn = storedSession.queuedTurn;
+    if (storedSession.externalActionReview) {
+      throw Object.assign(new Error("连接服务操作尚待核对。请先在对应服务检查结果，再确认已核对。"), { statusCode: 409 });
+    }
+    if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+    if (options.queuedTurnId ? storedQueuedTurn?.id !== options.queuedTurnId || storedQueuedTurn.status !== "dispatching" : Boolean(storedQueuedTurn)) {
+      throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
+    }
+    const existing = activeTurns.get(key);
+    if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
+    const compact = activeCompactions.get(key);
+    if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
 
-  const job = createServerJob("turn", repo, session, runtime);
-  job.maxRuntimeMs = options.maxRuntimeMs;
-  job.automationRunId = options.automationRunId || null;
-  job.unattendedPersonalSchedule = options.unattendedPersonalSchedule === true;
-  job.unattendedApprovalDenied = false;
-  job.reviewUnverifiedMcpCalls = options.reviewUnverifiedMcpCalls === true;
-  job.externalActionInterruptRequested = false;
-  job.makeSessionActive = options.makeSessionActive !== false;
-  job.requireExistingThread = options.requireExistingThread === true;
-  job.queuedTurnId = options.queuedTurnId || null;
-  job.message = message;
-  job.storedMessage = storedMessage;
-  activeTurns.set(key, job);
-  armTurnJobTimeout(job);
-  emitJobEvent(job, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null, jobId: job.id });
-  emitJobEvent(job, "status", { text: session.codexSessionId ? "已连接 Codex app-server，正在恢复 thread..." : "已连接 Codex app-server，正在启动 thread..." });
+    const job = createServerJob("turn", repo, session, runtime);
+    job.maxRuntimeMs = options.maxRuntimeMs;
+    job.automationRunId = options.automationRunId || null;
+    job.unattendedPersonalSchedule = options.unattendedPersonalSchedule === true;
+    job.unattendedApprovalDenied = false;
+    job.reviewUnverifiedMcpCalls = options.reviewUnverifiedMcpCalls === true;
+    job.externalActionInterruptRequested = false;
+    job.makeSessionActive = options.makeSessionActive !== false;
+    job.requireExistingThread = options.requireExistingThread === true;
+    job.queuedTurnId = options.queuedTurnId || null;
+    job.message = message;
+    job.storedMessage = storedMessage;
+    activeTurns.set(key, job);
+    armTurnJobTimeout(job);
+    emitJobEvent(job, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null, jobId: job.id });
+    emitJobEvent(job, "status", { text: session.codexSessionId ? "已连接 Codex app-server，正在恢复 thread..." : "已连接 Codex app-server，正在启动 thread..." });
 
-  (async () => {
-    try {
-      await resolveThreadForJob(job);
-      if (job.completed) return;
-      if (job.cancelRequested) {
-        await appServerClientForJob(job).request("thread/archive", { threadId: job.threadId }, 20_000).catch(() => null);
-        await finishTurnJob(job, false, 130, "Turn cancelled before start");
-        return;
-      }
-      const result = await appServerClientForJob(job).request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs), 30_000);
-      job.turnId = result?.turn?.id || null;
-      if (job.completed) {
-        if (job.threadId && job.turnId) {
+    (async () => {
+      try {
+        await resolveThreadForJob(job);
+        if (job.completed) return;
+        if (job.cancelRequested) {
+          await appServerClientForJob(job).request("thread/archive", { threadId: job.threadId }, 20_000).catch(() => null);
+          await finishTurnJob(job, false, 130, "Turn cancelled before start");
+          return;
+        }
+        const result = await appServerClientForJob(job).request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs), 30_000);
+        job.turnId = result?.turn?.id || null;
+        if (job.completed) {
+          if (job.threadId && job.turnId) {
+            await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+          }
+          return;
+        }
+        emitJobEvent(job, "accepted", { sessionId: session.id, threadId: job.threadId, turnId: job.turnId });
+        await updateSessionRuntime(
+          repo.id,
+          session.id,
+          (current) => jobRuntimePatch(job, current, true),
+          { makeActive: job.makeSessionActive !== false },
+        );
+        rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
+        if (job.cancelRequested && job.threadId && job.turnId) {
           await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
         }
-        return;
+        emitJobEvent(job, "status", { text: job.turnId ? `已启动 turn ${job.turnId.slice(0, 8)}` : "已启动 app-server turn" });
+      } catch (error) {
+        await finishTurnJob(job, false, 1, error.message || "Codex app-server turn/start failed");
       }
-      emitJobEvent(job, "accepted", { sessionId: session.id, threadId: job.threadId, turnId: job.turnId });
-      await updateSessionRuntime(
-        repo.id,
-        session.id,
-        { ...runtime, pendingTurnRuntime: null },
-        { makeActive: job.makeSessionActive !== false },
-      );
-      rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
-      if (job.cancelRequested && job.threadId && job.turnId) {
-        await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
-      }
-      emitJobEvent(job, "status", { text: job.turnId ? `已启动 turn ${job.turnId.slice(0, 8)}` : "已启动 app-server turn" });
-    } catch (error) {
-      await finishTurnJob(job, false, 1, error.message || "Codex app-server turn/start failed");
-    }
-  })();
-  return job;
+    })();
+    return job;
+  });
 }
 
 async function startReviewJob(repo, session, runtime, target = { type: "uncommittedChanges" }, delivery = "inline") {
   if (repo.kind === "personal") throw Object.assign(new Error("个人空间不是 Git 项目，不能运行代码审查"), { statusCode: 400 });
   const key = makeSessionKey(repo.id, session.id);
-  const storedQueuedTurn = (await readStoredSessionForJob(repo.id, session.id)).queuedTurn;
-  if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
-  if (storedQueuedTurn) {
-    throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
-  }
-  const existing = activeTurns.get(key);
-  if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
-  const compact = activeCompactions.get(key);
-  if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
-
-  const job = createServerJob("turn", repo, session, runtime);
-  job.message = "Codex review";
-  job.storedMessage = `/review ${target.type || "uncommittedChanges"}`;
-  activeTurns.set(key, job);
-  armTurnJobTimeout(job);
-  emitJobEvent(job, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null, jobId: job.id, mode: "review" });
-  emitJobEvent(job, "status", { text: "已连接 Codex app-server，正在启动官方 review..." });
-
-  (async () => {
-    try {
-      await resolveThreadForJob(job);
-      if (job.completed) return;
-      const result = await appServerClientForJob(job).request(
-        "review/start",
-        {
-          threadId: job.threadId,
-          target,
-          delivery,
-        },
-        30_000,
-      );
-      job.turnId = result?.turn?.id || result?.reviewTurnId || null;
-      if (job.completed) {
-        if (job.threadId && job.turnId) {
-          await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
-        }
-        return;
-      }
-      if (result?.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
-      rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
-      emitJobEvent(job, "status", { text: result?.reviewThreadId ? `已启动 detached review ${String(result.reviewThreadId).slice(0, 8)}` : "已启动官方 review" });
-    } catch (error) {
-      await finishTurnJob(job, false, 1, error.message || "Codex app-server review/start failed");
+  return serializeSessionTransition(key, async () => {
+    session = await readStoredSessionForJob(repo.id, session.id);
+    runtime = runtimeForRepo(repo, normalizeRuntime(runtime, session));
+    const storedQueuedTurn = session.queuedTurn;
+    if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+    if (storedQueuedTurn) {
+      throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
     }
-  })();
-  return job;
+    const existing = activeTurns.get(key);
+    if (existing && !existing.completed) throw new Error("当前会话已有正在运行的 turn");
+    const compact = activeCompactions.get(key);
+    if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
+
+    const job = createServerJob("turn", repo, session, runtime);
+    job.message = "Codex review";
+    job.storedMessage = `/review ${target.type || "uncommittedChanges"}`;
+    activeTurns.set(key, job);
+    armTurnJobTimeout(job);
+    emitJobEvent(job, "meta", { mocked: false, repo: repo.name, sessionId: session.id, codexSessionId: session.codexSessionId || null, jobId: job.id, mode: "review" });
+    emitJobEvent(job, "status", { text: "已连接 Codex app-server，正在启动官方 review..." });
+
+    (async () => {
+      try {
+        await resolveThreadForJob(job);
+        if (job.completed) return;
+        const result = await appServerClientForJob(job).request(
+          "review/start",
+          {
+            threadId: job.threadId,
+            target,
+            delivery,
+          },
+          30_000,
+        );
+        job.turnId = result?.turn?.id || result?.reviewTurnId || null;
+        if (job.completed) {
+          if (job.threadId && job.turnId) {
+            await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+          }
+          return;
+        }
+        if (result?.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
+        rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
+        emitJobEvent(job, "status", { text: result?.reviewThreadId ? `已启动 detached review ${String(result.reviewThreadId).slice(0, 8)}` : "已启动官方 review" });
+      } catch (error) {
+        await finishTurnJob(job, false, 1, error.message || "Codex app-server review/start failed");
+      }
+    })();
+    return job;
+  });
 }
 
 async function finishTurnJob(job, ok, code = 0, error = null) {
@@ -3204,9 +3228,9 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
   });
   try {
     if (job.threadId) {
-      await updateSessionRuntime(job.repoId, job.sessionId, {
+      await updateSessionRuntime(job.repoId, job.sessionId, (current) => ({
         codexSessionId: job.threadId,
-        ...job.runtime,
+        ...jobRuntimePatch(job, current),
         tokenUsage: normalizeTokenUsage(job.latestTokenUsage),
         goal: job.latestGoal,
         ...(job.externalWriteItems.size ? { externalActionReview } : {}),
@@ -3214,7 +3238,7 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
           job.session.title === "新会话" && job.storedMessage
             ? sessionTitle(job.storedMessage)
             : job.session.title,
-      }, { makeActive: job.makeSessionActive !== false });
+      }), { makeActive: job.makeSessionActive !== false });
     } else {
       await appendChatTurn(job.repoId, job.sessionId, job.storedMessage, job.output || job.stderr || effectiveError || "Codex completed without output.", false);
     }
@@ -3248,37 +3272,41 @@ async function finishTurnJob(job, ok, code = 0, error = null) {
 
 async function startCompactJob(repo, session, runtime) {
   const key = makeSessionKey(repo.id, session.id);
-  const existing = activeCompactions.get(key);
-  if (existing && !existing.completed) return existing;
-  const queuedTurn = (await readStoredSessionForJob(repo.id, session.id)).queuedTurn;
-  if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
-  if (queuedTurn) throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
-  if (activeTurns.get(key) && !activeTurns.get(key).completed) {
-    throw Object.assign(new Error("当前会话仍在回复，请先等待或停止"), { statusCode: 409 });
-  }
-  const job = createServerJob("compact", repo, session, runtime);
-  activeCompactions.set(key, job);
-  job.timeoutTimer = setTimeout(() => {
-    finishCompactJob(job, false, `主动压缩超过 ${Math.round(codexCompactTimeoutMs / 1000)} 秒未完成，已标记为失败。`).catch((error) => {
-      emitJobEvent(job, "error", { message: error.message || "主动压缩超时处理失败" });
-    });
-  }, codexCompactTimeoutMs);
-  job.timeoutTimer.unref?.();
-  emitJobEvent(job, "meta", { repoId: repo.id, sessionId: session.id, threadId: session.codexSessionId, jobId: job.id });
-  emitJobEvent(job, "status", { text: "正在连接 Codex app-server..." });
-
-  (async () => {
-    try {
-      if (!job.threadId) throw new Error("先发送一条消息建立 app-server thread，再压缩上下文。");
-      await resolveThreadForJob(job);
-      emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}，正在启动上下文压缩...` });
-      await appServerClientForJob(job).request("thread/compact/start", { threadId: job.threadId }, 30_000);
-      emitJobEvent(job, "status", { text: "正在压缩上下文..." });
-    } catch (error) {
-      await finishCompactJob(job, false, error.message || "主动压缩失败");
+  return serializeSessionTransition(key, async () => {
+    const existing = activeCompactions.get(key);
+    if (existing && !existing.completed) return existing;
+    session = await readStoredSessionForJob(repo.id, session.id);
+    runtime = runtimeForRepo(repo, normalizeRuntime(runtime, session));
+    const queuedTurn = session.queuedTurn;
+    if (removingSessions.has(key)) throw Object.assign(new Error("会话正在归档或删除"), { statusCode: 409 });
+    if (queuedTurn) throw Object.assign(new Error("此会话有未处理的排队消息，请先撤回或核对"), { statusCode: 409 });
+    if (activeTurns.get(key) && !activeTurns.get(key).completed) {
+      throw Object.assign(new Error("当前会话仍在回复，请先等待或停止"), { statusCode: 409 });
     }
-  })();
-  return job;
+    const job = createServerJob("compact", repo, session, runtime);
+    activeCompactions.set(key, job);
+    job.timeoutTimer = setTimeout(() => {
+      finishCompactJob(job, false, `主动压缩超过 ${Math.round(codexCompactTimeoutMs / 1000)} 秒未完成，已标记为失败。`).catch((error) => {
+        emitJobEvent(job, "error", { message: error.message || "主动压缩超时处理失败" });
+      });
+    }, codexCompactTimeoutMs);
+    job.timeoutTimer.unref?.();
+    emitJobEvent(job, "meta", { repoId: repo.id, sessionId: session.id, threadId: session.codexSessionId, jobId: job.id });
+    emitJobEvent(job, "status", { text: "正在连接 Codex app-server..." });
+
+    (async () => {
+      try {
+        if (!job.threadId) throw new Error("先发送一条消息建立 app-server thread，再压缩上下文。");
+        await resolveThreadForJob(job);
+        emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}，正在启动上下文压缩...` });
+        await appServerClientForJob(job).request("thread/compact/start", { threadId: job.threadId }, 30_000);
+        emitJobEvent(job, "status", { text: "正在压缩上下文..." });
+      } catch (error) {
+        await finishCompactJob(job, false, error.message || "主动压缩失败");
+      }
+    })();
+    return job;
+  });
 }
 
 async function finishCompactJob(job, ok, error = null) {
@@ -3399,11 +3427,15 @@ function handleAppServerNotification(rpcMessage) {
     if (routeOwner) {
       updateSessionRuntime(routeOwner.repoId, routeOwner.sessionId, (session) => {
         if (session.codexSessionId !== (owner.threadId || job?.threadId)) return null;
+        if (job && (session.runtimeSelectionId || null) !== (job.session?.runtimeSelectionId || null)) return null;
+        if (job && !runtimeSelectionMatches(session, job.runtime)) return null;
         const permissions = routeOwner.repoId === personalRepoId ? personalSessionRuntime(session) : null;
-        return mergeAppServerRuntimeWithPending(session, {
+        const observed = {
           ...runtimeFromAppServerSettings(params, job?.runtime || session),
           ...(permissions ? { sandbox: permissions.sandbox, approval: permissions.approval } : {}),
-        }, { clearPending: Boolean(job) });
+        };
+        if (!job && !runtimeSelectionMatches(session, observed)) return null;
+        return mergeAppServerRuntimeWithPending(session, observed, { clearPending: Boolean(job) });
       }, { makeActive: false, touchActivity: Boolean(job) })
         .catch((error) => {
           if (job) emitJobEvent(job, "error", { message: `设置同步失败: ${error.message}` });
@@ -9625,8 +9657,7 @@ app.post("/api/codex/thread-compact", async (req, res) => {
     const repo = getRepoById(req.body?.repoId);
     const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
     if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "先发送一条消息建立 app-server thread，再压缩上下文。" });
-    const runtime = normalizeRuntime(req.body, session);
-    const job = await startCompactJob(repo, session, runtime);
+    const job = await startCompactJob(repo, session, req.body);
     const result = await job.promise;
     res.status(result.ok ? 200 : 500).json({
       ok: result.ok,
@@ -9645,15 +9676,13 @@ app.post("/api/codex/thread-compact/stream", async (req, res) => {
   const repo = getRepoById(req.body?.repoId);
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
   if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "先发送一条消息建立 app-server thread，再压缩上下文。" });
-  const runtime = normalizeRuntime(req.body, session);
-
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
   try {
-    const job = await startCompactJob(repo, session, runtime);
+    const job = await startCompactJob(repo, session, req.body);
     subscribeJobEvents(job, res);
     await job.promise;
   } catch (error) {
@@ -9667,7 +9696,6 @@ app.post("/api/codex/thread-compact/stream", async (req, res) => {
 app.post("/api/codex/review/stream", async (req, res) => {
   const repo = getRepoById(req.body?.repoId);
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), "Review");
-  const runtime = normalizeRuntime(req.body, session);
   const targetType = String(req.body?.targetType || "uncommittedChanges");
   const target =
     targetType === "baseBranch"
@@ -9686,7 +9714,7 @@ app.post("/api/codex/review/stream", async (req, res) => {
   res.flushHeaders?.();
 
   try {
-    const job = await startReviewJob(repo, session, runtime, target, delivery);
+    const job = await startReviewJob(repo, session, req.body, target, delivery);
     subscribeJobEvents(job, res);
     await job.promise;
   } catch (error) {
@@ -10008,91 +10036,91 @@ app.post("/api/chat/sessions/:id/external-action-review/acknowledge", async (req
 
 app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
   const repo = getRepoById(req.body?.repoId || req.query?.repoId);
-  const store = await readChatStore();
-  const session = store.sessions[req.params.id];
-  if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+  const key = makeSessionKey(repo.id, req.params.id);
+  return serializeSessionTransition(key, async () => {
+    const store = await readChatStore();
+    const session = store.sessions[req.params.id];
+    if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
+    if (removingSessions.has(key)) return res.status(409).json({ ok: false, error: "会话正在归档或删除" });
 
-  const requestedRuntime = runtimeForRepo(repo, normalizeRuntime(req.body, session));
-  const storedRuntime = runtimeForRepo(repo, normalizeRuntime({}, session));
-  if ((requestedRuntime.sandbox !== storedRuntime.sandbox || requestedRuntime.approval !== storedRuntime.approval)
-      && (activeTurns.has(makeSessionKey(repo.id, session.id)) || activeCompactions.has(makeSessionKey(repo.id, session.id)))) {
-    return res.status(409).json({ ok: false, error: "当前会话正在运行，请等待完成后再修改权限" });
-  }
-  const turnRuntimeChanged =
-    requestedRuntime.model !== storedRuntime.model || requestedRuntime.reasoning !== storedRuntime.reasoning;
-  const modelList = await getModelListForRoute();
-  const availableModels = Array.isArray(modelList.data?.models) ? modelList.data.models : [];
-  const selectedModel = availableModels.find((model) => model.id === requestedRuntime.model);
-  if (availableModels.length && !selectedModel) {
-    return res.status(400).json({ ok: false, error: `Unknown Codex model: ${requestedRuntime.model}` });
-  }
-  if (
-    selectedModel?.supportedReasoningEfforts?.length &&
-    !selectedModel.supportedReasoningEfforts.includes(requestedRuntime.reasoning)
-  ) {
-    return res.status(400).json({
-      ok: false,
-      error: `${requestedRuntime.model} does not support reasoning effort ${requestedRuntime.reasoning}`,
-    });
-  }
-  let runtime = requestedRuntime;
-  let appServerSynced = false;
-  let appServerRuntime = null;
-  let pendingTurnRuntime = null;
-  let thread = null;
-
-  if (session.codexSessionId) {
-    const response = await codexAppServerRequest(
-      "thread/resume",
-      { threadId: session.codexSessionId, ...await appServerThreadParams(repo, requestedRuntime) },
-      20_000,
-    );
-    if (!response.ok) {
-      return res.status(502).json({
+    const requestedRuntime = runtimeForRepo(repo, normalizeRuntime(req.body, session));
+    const storedRuntime = runtimeForRepo(repo, normalizeRuntime({}, session));
+    if ((requestedRuntime.sandbox !== storedRuntime.sandbox || requestedRuntime.approval !== storedRuntime.approval)
+        && (activeTurns.has(makeSessionKey(repo.id, session.id)) || activeCompactions.has(makeSessionKey(repo.id, session.id)))) {
+      return res.status(409).json({ ok: false, error: "当前会话正在运行，请等待完成后再修改权限" });
+    }
+    const turnRuntimeChanged =
+      requestedRuntime.model !== storedRuntime.model || requestedRuntime.reasoning !== storedRuntime.reasoning;
+    const modelList = await getModelListForRoute();
+    const availableModels = Array.isArray(modelList.data?.models) ? modelList.data.models : [];
+    const selectedModel = availableModels.find((model) => model.id === requestedRuntime.model);
+    if (availableModels.length && !selectedModel) {
+      return res.status(400).json({ ok: false, error: `Unknown Codex model: ${requestedRuntime.model}` });
+    }
+    if (
+      selectedModel?.supportedReasoningEfforts?.length &&
+      !selectedModel.supportedReasoningEfforts.includes(requestedRuntime.reasoning)
+    ) {
+      return res.status(400).json({
         ok: false,
-        error: response.error,
-        repoId: repo.id,
-        sessionId: session.id,
-        runtime: normalizeRuntime({}, session),
-        appServerSynced: false,
+        error: `${requestedRuntime.model} does not support reasoning effort ${requestedRuntime.reasoning}`,
       });
     }
-    appServerSynced = true;
-    thread = response.result?.thread || null;
-    appServerRuntime = runtimeFromAppServerSettings(response.result || {}, requestedRuntime);
-    if (turnRuntimeChanged || session.pendingTurnRuntime) {
-      pendingTurnRuntime = {
-        model: requestedRuntime.model,
-        reasoning: requestedRuntime.reasoning,
-        updatedAt: new Date().toISOString(),
-      };
-    }
-    runtime = requestedRuntime;
-    rememberOwner({ threadId: session.codexSessionId }, { repoId: repo.id, sessionId: session.id });
-  }
+    let runtime = requestedRuntime;
+    let appServerSynced = false;
+    let appServerRuntime = null;
+    let pendingTurnRuntime = null;
+    let thread = null;
 
-  const updated = await updateSessionRuntime(
-    repo.id,
-    session.id,
-    { ...runtime, pendingTurnRuntime },
-    { makeActive: req.body?.makeActive !== false },
-  );
-  if (updated) {
+    const active = activeTurns.has(key) || activeCompactions.has(key);
+    if ((session.codexSessionId || active) && (turnRuntimeChanged || session.pendingTurnRuntime || active)) {
+      pendingTurnRuntime = { model: requestedRuntime.model, reasoning: requestedRuntime.reasoning, updatedAt: new Date().toISOString() };
+    }
+    if (session.codexSessionId && !active) {
+      const response = await codexAppServerRequest(
+        "thread/resume",
+        { threadId: session.codexSessionId, ...await appServerThreadParams(repo, requestedRuntime) },
+        20_000,
+      );
+      if (!response.ok) {
+        return res.status(502).json({
+          ok: false,
+          error: response.error,
+          repoId: repo.id,
+          sessionId: session.id,
+          runtime: normalizeRuntime({}, session),
+          appServerSynced: false,
+        });
+      }
+      appServerSynced = true;
+      thread = response.result?.thread || null;
+      appServerRuntime = runtimeFromAppServerSettings(response.result || {}, requestedRuntime);
+      runtime = requestedRuntime;
+      rememberOwner({ threadId: session.codexSessionId }, { repoId: repo.id, sessionId: session.id });
+    }
+
+    const updated = await updateSessionRuntime(
+      repo.id,
+      session.id,
+      { ...runtime, pendingTurnRuntime, runtimeSelectionId: crypto.randomUUID() },
+      { makeActive: req.body?.makeActive !== false },
+    );
+    if (!updated) return res.status(404).json({ ok: false, error: "Unknown session" });
     patchThreadStateCache(updated, { runtime: normalizeRuntime({}, updated) });
-  }
-  const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: req.body?.makeActive !== false && !session.codexSessionId });
-  res.json({
-    ok: true,
-    repoId: repo.id,
-    sessionId: session.id,
-    runtime: normalizeRuntime({}, updated || session),
-    session: updated ? sessionSummary(updated) : null,
-    sessions: summary.sessions,
-    activeSessionId: summary.activeSessionId,
-    appServerSynced,
-    appServerRuntime,
-    appliesOnNextTurn: Boolean(pendingTurnRuntime),
-    thread,
+    const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: req.body?.makeActive !== false && !session.codexSessionId });
+    res.json({
+      ok: true,
+      repoId: repo.id,
+      sessionId: session.id,
+      runtime: normalizeRuntime({}, updated || session),
+      session: updated ? sessionSummary(updated) : null,
+      sessions: summary.sessions,
+      activeSessionId: summary.activeSessionId,
+      appServerSynced,
+      appServerRuntime,
+      appliesOnNextTurn: Boolean(pendingTurnRuntime),
+      thread,
+    });
   });
 });
 
@@ -10869,8 +10897,6 @@ app.post("/api/chat", async (req, res) => {
   if (repo.kind === "personal" && !personalExecutionAvailable) return res.status(503).json({ ok: false, error: "个人空间执行已被管理员停用" });
   if (!message) return res.status(400).json({ ok: false, output: "Message is required" });
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message));
-  const runtime = normalizeRuntime(req.body, session);
-
   if (!(repo.kind === "personal" && personalRuntime.enabled) && !(await exists(repo.path))) {
     if (!allowLocalFallback) {
       return res.status(503).json({
@@ -10890,7 +10916,7 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
-  const job = await startTurnJob(repo, session, runtime, message, [], message);
+  const job = await startTurnJob(repo, session, req.body, message, [], message);
   const result = await job.promise;
 
   res.json({
@@ -10918,8 +10944,6 @@ app.post("/api/chat/stream", async (req, res) => {
   const attachmentLabel = attachments.length ? `\n\n附件: ${attachments.map((item) => item.relativePath).join(", ")}` : "";
   const storedMessage = `${message || "请查看我上传的附件。"}${attachmentLabel}`;
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""), sessionTitle(message || attachments[0]?.name || "附件"));
-  const runtime = normalizeRuntime(req.body, session);
-
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -10949,7 +10973,7 @@ app.post("/api/chat/stream", async (req, res) => {
   }
 
   try {
-    const job = await startTurnJob(repo, session, runtime, message, attachments, storedMessage);
+    const job = await startTurnJob(repo, session, req.body, message, attachments, storedMessage);
     subscribeJobEvents(job, res);
     await job.promise;
   } catch (error) {

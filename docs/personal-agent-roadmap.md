@@ -1,5 +1,7 @@
 # Personal Agent 统一产品与技术方案
 
+2026-10-22 M1/F03 增量：[设置竞争与任务回写保护](acceptance/2026-10-22-runtime-transitions.md)。同一会话的设置和启动检查按序执行，旧任务不能覆盖较新选择；本机 HTTP 竞争及原有设置 UI 验收通过，尚未部署 EC2。
+
 2026-10-22 M1/F02 增量：[首屏加载与断线恢复](acceptance/2026-10-22-status-recovery.md)。main `ca17893` 已通过本地、UI 和 GitHub CI 验收；健康与状态并行、有界等待、保留已有内容、重试及旧请求保护已实现；真实内置浏览器读取通过，尚未发布 EC2 或更新本机生产代理。
 
 2026-10-22 已确认规划：[现状与差距分析](reviews/2026-10-22-next-stage-assessment.md)、[下一阶段开发方案](development-plan-2026-10-22.md)、[持续推进 goal](goals/codex-cloud-reliable-agent-v1.md)。用户已确认完整 M1-M5 方案，原生 goal 已启用，既有每天 10:00 续做已通过应用工具更新并保持 `ACTIVE`，从 F01 日用量裁剪保护开始。下方早前“暂停”的记录是当时状态；历史验收保留。

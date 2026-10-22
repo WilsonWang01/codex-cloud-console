@@ -236,6 +236,11 @@ input.on("line", (line) => {
     return reply();
   }
   if (message.method === "thread/resume") {
+    if (message.params?.threadId === "thread-settings-race" && message.params?.model === "gpt-6-sol") {
+      const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".runtime-patch-release")
+        ? send({ id: message.id, result: { thread: { id: message.params.threadId } } }) : setTimeout(reply, 10);
+      return reply();
+    }
     if (message.params?.threadId === "thread-runtime-regression" && !message.params?.model) {
       return send({ id: message.id, error: { code: -32000, message: "readonly observation must not resume" } });
     }
@@ -1875,6 +1880,102 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(runtimePatch.data.appliesOnNextTurn, true);
     const patchedStore = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
     assert.notEqual(patchedStore.sessions[sessionId].updatedAt, previousActivity, "主动设置模型仍记录活跃时间");
+    const runtimeStatePath = path.join(stateRoot, "chat-history.json");
+    const beforeRace = await fs.readFile(runtimeStatePath, "utf8");
+    const raceStore = JSON.parse(beforeRace);
+    raceStore.sessions[sessionId].codexSessionId = "thread-settings-race";
+    await fs.writeFile(runtimeStatePath, JSON.stringify(raceStore));
+    const patchRuntime = (runtime) => jsonRequest(baseUrl, `/api/chat/sessions/${encodeURIComponent(sessionId)}/runtime`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repoId: "sample-app", makeActive: false, ...runtime }),
+    });
+    const capturedRpc = async () => (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+    const waitForRpc = async (predicate, after = 0) => {
+      for (let attempt = 0; attempt < 150; attempt++) {
+        if ((await capturedRpc()).slice(after).some(predicate)) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error("模拟 Codex 未收到预期请求");
+    };
+    let firstSelection, secondSelection;
+    try {
+      firstSelection = patchRuntime({ model: "gpt-6-sol", reasoning: "medium" });
+      await waitForRpc((item) => item.method === "thread/resume" && item.params.threadId === "thread-settings-race");
+      secondSelection = patchRuntime({ model: "gpt-6-astra", reasoning: "ultra", search: false });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    } finally {
+      await fs.writeFile(capturePath + ".runtime-patch-release", "release");
+      const responses = await Promise.all([firstSelection, secondSelection].filter(Boolean));
+      for (const result of responses) assert.equal(result.response.status, 200);
+    }
+    try {
+      const afterRace = JSON.parse(await fs.readFile(runtimeStatePath, "utf8")).sessions[sessionId];
+      assert.equal(afterRace.model, "gpt-6-astra", "慢旧 PATCH 不能在新选择完成后覆盖模型");
+      assert.equal(afterRace.reasoning, "ultra");
+      assert.equal(afterRace.search, false);
+      const activeStore = JSON.parse(await fs.readFile(runtimeStatePath, "utf8"));
+      Object.assign(activeStore.sessions[sessionId], { codexSessionId: "thread-regression", model: "gpt-6-sol", reasoning: "medium", search: true, pendingTurnRuntime: null });
+      await fs.writeFile(runtimeStatePath, JSON.stringify(activeStore));
+      const activeRpcStart = (await capturedRpc()).length;
+      const activeStream = await fetch(new URL("/api/chat/stream", baseUrl), {
+        method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(5_000),
+        body: JSON.stringify({ repoId: "sample-app", sessionId, message: "progress regression runtime selection" }),
+      });
+      await waitForRpc((item) => item.method === "turn/start", activeRpcStart);
+      const deniedPermissions = await patchRuntime({ sandbox: "read-only", approval: "on-request" });
+      assert.equal(deniedPermissions.response.status, 409, "运行中的权限变更必须拒绝");
+      const nextTurnSelection = await patchRuntime({ model: "gpt-6-astra", reasoning: "ultra", search: false });
+      assert.equal(nextTurnSelection.response.status, 200);
+      assert.equal(nextTurnSelection.data.appliesOnNextTurn, true);
+      assert.equal(nextTurnSelection.data.appServerSynced, false, "活动任务不被 thread/resume 改动");
+      await activeStream.text();
+      const afterActive = JSON.parse(await fs.readFile(runtimeStatePath, "utf8")).sessions[sessionId];
+      assert.equal(afterActive.model, "gpt-6-astra", "旧任务结束不能覆盖新选择");
+      assert.equal(afterActive.reasoning, "ultra");
+      assert.equal(afterActive.search, false);
+      assert.ok(afterActive.pendingTurnRuntime);
+      const nextRpcStart = (await capturedRpc()).length;
+      const nextTurn = await jsonRequest(baseUrl, "/api/chat", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repoId: "sample-app", sessionId, message: "outcome contract regression legacy no contract" }),
+      });
+      assert.equal(nextTurn.data.ok, true);
+      const nextStart = (await capturedRpc()).slice(nextRpcStart).find((item) => item.method === "turn/start");
+      assert.equal(nextStart.params.model, "gpt-6-astra");
+      assert.equal(JSON.parse(await fs.readFile(runtimeStatePath, "utf8")).sessions[sessionId].pendingTurnRuntime, null);
+
+      await fs.rm(capturePath + ".runtime-patch-release");
+      const barrierStore = JSON.parse(await fs.readFile(runtimeStatePath, "utf8"));
+      barrierStore.sessions[sessionId].codexSessionId = "thread-settings-race";
+      await fs.writeFile(runtimeStatePath, JSON.stringify(barrierStore));
+      const barrierRpcStart = (await capturedRpc()).length;
+      let changingPermissions, waitingStream;
+      try {
+        changingPermissions = patchRuntime({ model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only", approval: "on-request" });
+        await waitForRpc((item) => item.method === "thread/resume", barrierRpcStart);
+        const otherSession = await jsonRequest(baseUrl, personalRuntimePath, {
+          method: "PATCH", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(1_500),
+          body: JSON.stringify({ repoId: "_personal", search: false }),
+        });
+        assert.equal(otherSession.response.status, 200, "另一会话不能被当前设置锁阻塞");
+        waitingStream = await fetch(new URL("/api/chat/stream", baseUrl), {
+          method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(5_000),
+          body: JSON.stringify({ repoId: "sample-app", sessionId, message: "outcome contract regression legacy no contract" }),
+        });
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal((await capturedRpc()).slice(barrierRpcStart).some((item) => item.method === "turn/start"), false);
+      } finally {
+        await fs.writeFile(capturePath + ".runtime-patch-release", "release");
+        if (changingPermissions) assert.equal((await changingPermissions).response.status, 200);
+        if (waitingStream) await waitingStream.text();
+      }
+      const admittedStart = (await capturedRpc()).slice(barrierRpcStart).find((item) => item.method === "turn/start");
+      assert.equal(admittedStart.params.model, "gpt-6-sol");
+      assert.equal(admittedStart.params.sandboxPolicy.type, "readOnly", "任务采用锁内最新权限");
+      assert.equal(admittedStart.params.approvalPolicy, "on-request");
+    } finally {
+      await fs.writeFile(runtimeStatePath, beforeRace);
+    }
     const pendingThreadState = await jsonRequest(
       baseUrl,
       `/api/codex/thread-state?repoId=sample-app&sessionId=${encodeURIComponent(sessionId)}`,
