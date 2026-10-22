@@ -239,6 +239,7 @@ node scripts/local-cloud-console-proxy.mjs
 - `ECONNRESET` / `interrupted-response`：连接或响应中断；`ECONNREFUSED`：服务暂不可达。
 - `upstream-http` + `forwarded`：远端实际返回了 5xx（服务器错误），与代理自身连接失败不同。
 - `recovered`：只读请求按原有策略重试后成功；`stale-cache`：失败后回退旧通知状态，**不证明云端健康或数据最新**。
+- `stream-closed`：流式传输中断，不代表云端任务已停止；应继续从任务状态核对，不能据此自动重跑任务。
 
 这些诊断不增加重试次数或延长超时，不自动重放 POST/PATCH 等写请求，也不代表已经排除了所有断线原因。错误编号只关联本机代理的主转发链路，不是完整的后端调用追踪；OAuth 辅助转发和后台缓存刷新尚未纳入此记录。
 
