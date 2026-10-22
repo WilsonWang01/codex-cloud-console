@@ -6,6 +6,7 @@ import vm from "node:vm";
 import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createRequire } from "node:module";
 import ts from "typescript";
 import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "../server/run-safety.mjs";
 import { handleReviewRoutes } from "../server/review-git.mjs";
@@ -18,6 +19,19 @@ const { ConversationStreamScope } = await import(`data:text/javascript;base64,${
 const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(draftSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
+
+test("代理来源仅信任回环，映射 IPv6 子网不能错误信任任意 IPv4", () => {
+  const require = createRequire(import.meta.url);
+  const proxyAddr = createRequire(require.resolve("express"))("proxy-addr");
+  assert.match(source, /app\.set\("trust proxy", "loopback"\)/);
+  const trust = proxyAddr.compile("loopback");
+  assert.equal(trust("127.0.0.1"), true);
+  assert.equal(trust("::1"), true);
+  assert.equal(trust("::ffff:127.0.0.1"), true);
+  assert.equal(trust("203.0.113.1"), false);
+  assert.equal(proxyAddr.compile("::ffff:10.0.0.0/8")("203.0.113.1"), false);
+  assert.equal(proxyAddr({ socket: { remoteAddress: "203.0.113.1" }, headers: { "x-forwarded-for": "127.0.0.1" } }, trust), "203.0.113.1");
+});
 
 test("取消中仍属于活动任务，已取消与待核对各自保留含义", () => {
   const context = {

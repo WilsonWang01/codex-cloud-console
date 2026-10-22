@@ -2917,6 +2917,7 @@ exec "$@"
   await fs.writeFile(path.join(binDir, "npm"), `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_NPM_CALLS"
 if [ "$1" = "prune" ] && [ "$FAKE_NPM_FAIL_PRUNE" = "1" ]; then exit 1; fi
+if [ "$1" = "audit" ] && [ "$FAKE_NPM_FAIL_AUDIT" = "1" ]; then exit 1; fi
 exit 0
 `, { mode: 0o755 });
   await fs.writeFile(
@@ -2994,13 +2995,21 @@ exec /usr/bin/readlink "$@"
     assert.equal((await fs.readdir(releaseRoot)).length, 1);
     assert.equal(await fs.readFile(path.join(sourceRoot, "source-marker.txt"), "utf8"), "source data remains intact\n");
     assert.deepEqual((await fs.readFile(npmCallsPath, "utf8")).trim().split("\n"), [
-      "ci --include=dev", "run build", "run codex:schema:check", "run verify:normalizers",
-      "prune --omit=dev --ignore-scripts", "ls --omit=dev --depth=0",
+      "ci --include=dev", "audit --audit-level=high", "run build", "run codex:schema:check", "run verify:normalizers",
+      "prune --omit=dev --ignore-scripts --package-lock=false", "ls --omit=dev --depth=0",
     ]);
     for (const folder of ["docs/research", "test-results", "playwright-report"]) {
       await assert.rejects(fs.access(path.join(activeRelease, folder)), { code: "ENOENT" });
       await fs.access(path.join(sourceRoot, folder, "test-artifact.txt"));
     }
+
+    const auditFailed = await runCaptured("bash", installerArgs, {
+      cwd: projectRoot,
+      env: { ...installerEnv, FAKE_HEALTH_MODE: "recover", FAKE_NPM_FAIL_AUDIT: "1" },
+    });
+    assert.notEqual(auditFailed.code, 0);
+    assert.equal(await fs.realpath(currentLink), activeRelease);
+    assert.equal((await fs.readdir(releaseRoot)).length, 1);
 
     const pruneFailed = await runCaptured("bash", installerArgs, {
       cwd: projectRoot,
