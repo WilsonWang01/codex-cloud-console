@@ -38,6 +38,12 @@ test("unknown and in-flight usage fail closed when a budget is configured", () =
   assert.equal(checkKnownTokenBudget([run("completed", 100, "2026-09-25T23:00:00Z")], { limit: 100, now }).ok, true);
 });
 
+test("a task accepted yesterday but executed today belongs to today's UTC budget", () => {
+  const queuedYesterday = { ...run("completed", 100, "2026-09-25T23:59:00Z"), executionStartedAt: "2026-09-26T00:01:00Z" };
+  assert.equal(checkKnownTokenBudget([queuedYesterday], { limit: 100, now }).statusCode, 429);
+  assert.equal(checkKnownTokenBudget([queuedYesterday], { limit: 100, now: now + 86400000 }).ok, true);
+});
+
 test("retention preserves all current-day budget records beyond the history limit", () => {
   const runs = dailyRuns();
   const retained = retainAutomationRuns(runs, retention);

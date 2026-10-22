@@ -27,6 +27,8 @@ import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
+import { createExternalTaskStore, createExternalTaskOwner } from "./external-task-store.mjs";
+import { withPublicationLock } from "./publication-lock.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
 import { readConnectedApps } from "./connected-apps.mjs";
 import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
@@ -78,6 +80,13 @@ let runUsageLedger;
 function usageLedger() {
   return runUsageLedger ||= openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
 }
+let externalTasks;
+function externalTaskStore() {
+  return externalTasks ||= createExternalTaskStore(usageLedger().database);
+}
+const externalTaskOwner = createExternalTaskOwner();
+let drainingExternalTasks = false;
+const publicationLockPath = process.env.CODEX_CLOUD_RELEASE_LOCK || path.join(cloudRoot, "locks/console-release.lock");
 const auditEventsPath = path.join(stateRoot, "audit-events.json");
 const attentionStatePath = path.join(stateRoot, "attention-state.json");
 const notificationStatePath = path.join(stateRoot, "notification-state.json");
@@ -227,7 +236,6 @@ const automationTriggerRateMax = Number(process.env.CODEX_AUTOMATION_TRIGGER_RAT
 const automationTriggerIdempotencyTtlMs = Number(process.env.CODEX_AUTOMATION_IDEMPOTENCY_TTL_MS || 24 * 60 * 60 * 1000);
 const automationTriggerRateByKey = new Map();
 const automationResultRateByClient = new Map();
-const automationTriggerIdempotency = new Map();
 const runAdmission = createRunAdmission({
   maxGlobal: process.env.CODEX_AUTOMATION_MAX_CONCURRENT || 2,
   maxPerClient: process.env.CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT || 1,
@@ -5186,6 +5194,7 @@ function normalizeAutomationRun(run = {}) {
     runner: String(run.runner || "systemd"),
     status: run.status === "cancelled" ? "canceled" : String(run.status || "queued"),
     startedAt,
+    ...(run.executionStartedAt ? { executionStartedAt: String(run.executionStartedAt) } : {}),
     updatedAt: String(run.updatedAt || startedAt),
     finishedAt: run.finishedAt ? String(run.finishedAt) : null,
     threadId: run.threadId ? String(run.threadId) : null,
@@ -5208,7 +5217,10 @@ function normalizeAutomationRun(run = {}) {
 async function readAutomationRuns() {
   const parsed = await readJsonState(automationRunsPath, { version: 1, runs: [] });
   const runs = Array.isArray(parsed?.runs) ? parsed.runs.map(normalizeAutomationRun) : [];
-  return { version: 1, runs };
+  const merged = new Map(runs.map((run) => [run.id, run]));
+  if (merged.size !== runs.length) throw new Error("自动化运行 ID 重复，需要核对原状态文件");
+  for (const run of externalTaskStore().runs()) merged.set(run.id, normalizeAutomationRun(run));
+  return { version: 1, runs: [...merged.values()] };
 }
 
 async function writeAutomationRunsWithinQueue(store) {
@@ -5219,9 +5231,10 @@ async function writeAutomationRunsWithinQueue(store) {
     now: Date.now(), idempotencyTtlMs: automationTriggerIdempotencyTtlMs, recoveryMaxAgeMs: automationRecoveryMaxAgeMs,
   });
   await atomicWriteJson(automationRunsPath, { version: 1, runs });
+  externalTaskStore().retain(runs.map((run) => run.id));
 }
 
-async function upsertAutomationRun(run, event = null, { budgetLimit = null } = {}) {
+async function upsertAutomationRun(run, event = null, { budgetLimit = null, taskClaim = null } = {}) {
   return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns();
     const ledger = usageLedger();
@@ -5235,13 +5248,14 @@ async function upsertAutomationRun(run, event = null, { budgetLimit = null } = {
     const index = store.runs.findIndex((item) => item.id === run.id);
     const current = index >= 0 ? store.runs[index] : null;
     const { events, eventSeq } = mergeAutomationEvents(current, run.events || [], event ? [event] : []);
-    const normalized = normalizeAutomationRun({
+    let normalized = normalizeAutomationRun({
       ...(current || {}),
       ...run,
       updatedAt: new Date().toISOString(),
       events,
       eventSeq,
     });
+    if (externalTaskStore().read(normalized.id)) normalized = externalTaskStore().update(normalized, taskClaim);
     if (index >= 0) store.runs[index] = normalized;
     else store.runs.unshift(normalized);
     await writeAutomationRunsWithinQueue(store);
@@ -5249,20 +5263,21 @@ async function upsertAutomationRun(run, event = null, { budgetLimit = null } = {
   });
 }
 
-async function appendAutomationRunEvent(runId, patch = {}, event = null) {
+async function appendAutomationRunEvent(runId, patch = {}, event = null, { taskClaim = null } = {}) {
   return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns();
     const index = store.runs.findIndex((item) => item.id === runId);
     if (index < 0) return null;
     const current = store.runs[index];
     const { events, eventSeq } = mergeAutomationEvents(current, event ? [event] : []);
-    const next = normalizeAutomationRun({
+    let next = normalizeAutomationRun({
       ...current,
       ...patch,
       updatedAt: new Date().toISOString(),
       events,
       eventSeq,
     });
+    if (externalTaskStore().read(runId)) next = externalTaskStore().update(next, taskClaim);
     store.runs[index] = next;
     await writeAutomationRunsWithinQueue(store);
     return next;
@@ -5281,6 +5296,12 @@ async function requestAutomationRunCancellation(runId, automationId, clientId) {
       return { run: current, pending: false };
     }
     if (current.status === "canceling") return { run: current, pending: true };
+    if (externalTaskStore().read(runId)) {
+      const result = externalTaskStore().cancel(runId, { id: clientId, automationId }, { type: "cancel-requested", text: "Cancellation requested; already completed actions remain" });
+      store.runs[index] = result.run;
+      await writeAutomationRunsWithinQueue(store);
+      return result;
+    }
     if (!["queued", "running"].includes(current.status)) {
       throw Object.assign(new Error("Run cannot be canceled in its current state"), { statusCode: 409 });
     }
@@ -5299,11 +5320,11 @@ async function requestAutomationRunCancellation(runId, automationId, clientId) {
   });
 }
 
-async function appendAutomationRunEventWithRetry(runId, patch = {}, event = null, attempts = 3) {
+async function appendAutomationRunEventWithRetry(runId, patch = {}, event = null, attempts = 3, options = {}) {
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const record = await appendAutomationRunEvent(runId, patch, event);
+      const record = await appendAutomationRunEvent(runId, patch, event, options);
       if (!record) throw new Error(`找不到自动化运行记录 ${runId}`);
       return record;
     } catch (error) {
@@ -5319,7 +5340,7 @@ async function appendAutomationRunEventWithRetry(runId, patch = {}, event = null
 async function reconcileStaleAutomationRuns(reason = "控制台重启时 app-server 自动化任务仍在运行") {
   const store = await readAutomationRuns();
   const staleRuns = store.runs.filter(
-    (run) => run.runner === "app-server" && (
+    (run) => !externalTaskStore().read(run.id) && run.runner === "app-server" && (
       (["queued", "running", "canceling"].includes(run.status) && !activeAutomationRuns.has(run.id)) ||
       (run.status === "interrupted" && run.interruptionKind === "console-restart" &&
         ["webhook", "heartbeat"].includes(run.trigger) && !run.recoveryRunId)
@@ -6788,21 +6809,8 @@ function automationTriggerIdempotencyKey(req, automationId, trigger, clientId = 
   return { key: `${clientId === "legacy-shared" ? "" : `${clientId}:`}${automationId}:${trigger}:${raw}`, error: null };
 }
 
-function pruneAutomationTriggerIdempotency(now = Date.now()) {
-  for (const [key, entry] of automationTriggerIdempotency.entries()) {
-    if (entry.expiresAt <= now) automationTriggerIdempotency.delete(key);
-  }
-}
-
 function automationTriggerHash(key) {
   return key ? crypto.createHash("sha256").update(key).digest("hex") : null;
-}
-
-async function refreshAutomationTriggerPayload(payload) {
-  const runId = String(payload?.run?.id || "").trim();
-  if (!runId) return payload;
-  const stored = (await readAutomationRuns().catch(() => ({ runs: [] }))).runs.find((run) => run.id === runId);
-  return stored ? { ...payload, run: externalRunView(stored, stored.automationId) } : payload;
 }
 
 function automationTriggerRequestHash(req, automation, trigger, completionContract) {
@@ -6841,6 +6849,9 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
 }
 
 async function startAppServerAutomationRun(automation, repo, options = {}) {
+  if (!options.publicationLockHeld) return withPublicationLock(publicationLockPath, () => startAppServerAutomationRun(automation, repo, { ...options, publicationLockHeld: true }));
+  const updateRun = (id, patch, event) => appendAutomationRunEvent(id, patch, event, { taskClaim: options.taskClaim });
+  const settleRun = (id, patch, event) => appendAutomationRunEventWithRetry(id, patch, event, 3, { taskClaim: options.taskClaim });
   const runId = options.runId || automationRunId(automation.id);
   const runtime = normalizeRuntime(
     {
@@ -6889,29 +6900,31 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       completionOutcome: completionContract ? "pending" : null,
       runner: "app-server",
       status: "queued",
+      executionStartedAt: new Date().toISOString(),
       worktreePolicy: options.executionPolicy || (heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd"),
       model: runtime.model,
       reasoning: runtime.reasoning,
       prompt,
     }, { type: "queued", text: heartbeatSession ? "Heartbeat turn queued" : "Automation run queued" }, {
       budgetLimit: options.budgetLimit ?? process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
+      taskClaim: options.taskClaim,
     });
     if (heartbeatSession) {
-      runRecord = await appendAutomationRunEvent(
+      runRecord = await updateRun(
         runId,
         { worktreePath: worktreePath || repo.path, status: "running", sessionId: heartbeatSession.id, threadId: heartbeatSession.codexSessionId || null },
         { type: "heartbeat", text: `Using existing session ${heartbeatSession.id}` },
       );
     } else if (useWorktree) {
       worktreePath = await createAutomationWorktree(repo, runId);
-      runRecord = await appendAutomationRunEvent(runId, { worktreePath, status: "running" }, { type: "worktree", text: `Created worktree ${worktreePath}` });
+      runRecord = await updateRun(runId, { worktreePath, status: "running" }, { type: "worktree", text: `Created worktree ${worktreePath}` });
     } else {
-      runRecord = await appendAutomationRunEvent(runId, { worktreePath: repo.path, status: "running" }, { type: "worktree", text: `Using repository cwd ${repo.path}` });
+      runRecord = await updateRun(runId, { worktreePath: repo.path, status: "running" }, { type: "worktree", text: `Using repository cwd ${repo.path}` });
     }
     const runRepo = { ...repo, path: worktreePath || repo.path };
     const beforeStart = (await readAutomationRuns()).runs.find((item) => item.id === runId);
     if (beforeStart?.cancelRequestedAt) {
-      const canceled = await appendAutomationRunEvent(runId, {
+      const canceled = await updateRun(runId, {
         status: "canceled", finishedAt: new Date().toISOString(), error: "任务在启动模型前取消；已创建的工作目录未自动删除。",
       }, { type: "canceled", text: "Canceled before Codex turn started" });
       releaseAdmission();
@@ -6927,6 +6940,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       maxRuntimeMs: options.maxRuntimeMs,
       imageInputs: options.imageInputs,
     });
+    job.externalTaskClaim = options.taskClaim;
     activeAutomationRuns.set(runId, job);
     if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {
       job.cancelRequested = true;
@@ -6934,7 +6948,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
       }
     }
-    await appendAutomationRunEvent(runId, { threadId: job.threadId, sessionId: session.id }, { type: "thread", text: "Started Codex app-server automation thread" });
+    await updateRun(runId, { threadId: job.threadId, sessionId: session.id }, { type: "thread", text: "Started Codex app-server automation thread" });
     job.emitter.on("event", (payload) => {
       if (!["status", "tool", "error", "done", "session", "tokenUsage"].includes(payload.event)) return;
       const text =
@@ -6943,7 +6957,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
             ? `tool: ${payload.data.type}`
             : "tool event"
           : payload.data?.text || payload.data?.message || payload.event;
-      appendAutomationRunEvent(runId, { threadId: job.threadId || null }, { type: payload.event, text }).catch(() => null);
+      updateRun(runId, { threadId: job.threadId || null }, { type: payload.event, text }).catch(() => null);
     });
     job.promise.then(async (result) => {
       const markerCompletion = result.ok
@@ -6972,7 +6986,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
           : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
-      await appendAutomationRunEventWithRetry(
+      await settleRun(
         runId,
         {
           status: needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
@@ -7003,6 +7017,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     }).finally(() => {
       activeAutomationRuns.delete(runId);
       releaseAdmission();
+      setImmediate(() => void drainExternalTasks());
     });
     settlementRegistered = true;
     return { ...runRecord, threadId: job.threadId, sessionId: session.id, status: "running" };
@@ -7017,7 +7032,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         releaseAdmission();
       }
     }
-    await appendAutomationRunEvent(runId, job ? {
+    await updateRun(runId, job ? {
       status: "needs_reconciliation",
       error: `任务已启动但运行记录更新失败：${error.message}`,
     } : {
@@ -7030,6 +7045,81 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     }, { type: job ? "needs-reconciliation" : "error", text: error.message }).catch(() => null);
     throw error;
   }
+}
+
+async function enqueueExternalAutomationRun(automation, repo, options) {
+  const runtime = normalizeRuntime({ model: options.model || automation.model, reasoning: options.reasoning || automation.reasoning,
+    sandbox: options.sandbox || defaultRuntime.sandbox, approval: options.approval || defaultRuntime.approval, search: options.search !== false }, {});
+  const prompt = String(options.prompt || automation.prompt || "").trim();
+  if (!prompt) throw automationRequestError(400, "Automation prompt is required");
+  const accepted = await withPublicationLock(publicationLockPath, () => enqueueWrite("automation", async () => {
+    const store = await readAutomationRuns(), ledger = usageLedger(), now = Date.now();
+    ledger.sync(store.runs);
+    const dayStart = Date.parse(new Date(now).toISOString().slice(0, 10) + "T00:00:00Z");
+    const run = normalizeAutomationRun({ id: automationRunId(automation.id), automationId: automation.id, repoId: repo.id, name: automation.name,
+      trigger: options.trigger, clientId: options.clientId, runner: "app-server", status: "queued", prompt,
+      model: runtime.model, reasoning: runtime.reasoning, completionContract: options.completionContract,
+      triggerIdempotencyHash: options.triggerIdempotencyHash, triggerRequestHash: options.triggerRequestHash,
+      ...mergeAutomationEvents(null, [{ type: "queued", text: "任务已持久接收，等待执行" }]),
+    });
+    const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt } },
+      keyHash: options.triggerIdempotencyHash, requestHash: options.triggerRequestHash, ttlMs: automationTriggerIdempotencyTtlMs,
+      maxQueued: Number(process.env.CODEX_AUTOMATION_MAX_QUEUED || 32),
+      check() {
+        const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT, now });
+        if (!budget.ok) throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
+      },
+    });
+    const index = store.runs.findIndex((item) => item.id === result.run.id);
+    if (index < 0) store.runs.unshift(result.run); else store.runs[index] = result.run;
+    await writeAutomationRunsWithinQueue(store);
+    return { ...result.run, deduplicated: result.deduplicated };
+  }));
+  setImmediate(() => void drainExternalTasks());
+  return accepted;
+}
+
+async function drainExternalTasks() {
+  if (drainingExternalTasks) return;
+  drainingExternalTasks = true;
+  try {
+    const counts = externalTaskStore().info();
+    const localRunning = [...activeAutomationRuns.values()].filter((job) => job.externalTaskClaim?.owner === externalTaskOwner).length;
+    if (!counts.queued && (!counts.running || counts.running <= localRunning)) return;
+    await withPublicationLock(publicationLockPath, async () => {
+    const recovered = externalTaskStore().recover();
+    if (recovered.length) await enqueueWrite("automation", async () => writeAutomationRunsWithinQueue(await readAutomationRuns()));
+    const limits = runAdmission.status();
+    for (let attempt = 0; attempt < limits.maxGlobal; attempt += 1) {
+      if (runAdmission.status().active >= limits.maxGlobal) break;
+      const task = externalTaskStore().claim({ owner: externalTaskOwner, maxGlobal: limits.maxGlobal, maxPerClient: limits.maxPerClient });
+      if (!task) break;
+      let handedToRunner = false;
+      try {
+        const automation = automations.find((item) => item.id === task.execution.automationId);
+        if (!automation || automation.repoId !== task.execution.repoId || automation.personalRoutine) throw new Error("排队任务的自动化配置已变化，请核对后重试");
+        if (!["legacy-shared", "local-development"].includes(task.run.clientId)) {
+          const client = (await apiClientStore.list()).find((item) => item.id === task.run.clientId);
+          if (!client || client.revokedAt || (client.expiresAt && Date.parse(client.expiresAt) <= Date.now()) || !client.automationIds.includes(automation.id)) throw new Error("调用方已撤销、过期或不再拥有自动化权限");
+        }
+        const repo = getRepoById(task.execution.repoId);
+        handedToRunner = true;
+        await startAppServerAutomationRun(automation, repo, { ...task.execution.options, runId: task.run.id, taskClaim: task.claim, publicationLockHeld: true });
+      } catch (error) {
+        const current = externalTaskStore().read(task.run.id);
+        if (error.statusCode === 429 && ["queued", "canceling"].includes(current?.status) && !current.executionStartedAt) {
+          externalTaskStore().release(task.run.id, task.claim); break;
+        }
+        if (current?.status !== "queued" && (handedToRunner || current?.status !== "canceling")) continue;
+        if (error.statusCode === 429) { externalTaskStore().release(task.run.id, task.claim); break; }
+        await appendAutomationRunEvent(task.run.id, { status: current.cancelRequestedAt ? "canceled" : "failed", finishedAt: new Date().toISOString(), error: error.message,
+          usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+        { type: "error", text: error.message }, { taskClaim: task.claim });
+      }
+    }
+    });
+  } catch (error) { if (error.statusCode !== 503) console.error(`后台任务队列读取或写入失败：${error.message}`); }
+  finally { drainingExternalTasks = false; }
 }
 
 function automationRecoveryContinuationPrompt() {
@@ -8906,8 +8996,8 @@ app.get("/healthz", async (_req, res) => {
   const { data, cache } = await getStatusForRoute();
   const health = data?.health || fastStatusFallback("health snapshot unavailable").health;
   let ledgerHealth;
-  try { usageLedger().info(); ledgerHealth = { ok: true }; }
-  catch { ledgerHealth = { ok: false, error: "用量账本不可用" }; }
+  try { usageLedger().info(); externalTaskStore().info(); ledgerHealth = { ok: true }; }
+  catch { ledgerHealth = { ok: false, error: "任务或用量存储不可用" }; }
   const strictOk = Boolean(health.ok && ledgerHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
@@ -11533,7 +11623,7 @@ app.post("/api/automations/:id/runs/:runId/cancel", async (req, res) => {
     job.cancelRequested = true;
     if (job.threadId && job.turnId) {
       appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000)
-        .catch((error) => appendAutomationRunEvent(run.id, {}, { type: "cancel-warning", text: `Interrupt request uncertain: ${error.message}` }).catch(() => null));
+        .catch((error) => appendAutomationRunEvent(run.id, {}, { type: "cancel-warning", text: `Interrupt request uncertain: ${error.message}` }, { taskClaim: job.externalTaskClaim }).catch(() => null));
     }
   }
   return res.status(202).json({ ok: true, run: externalRunView(updated, req.params.id) });
@@ -11601,18 +11691,9 @@ async function submitAutomationTriggerRequest(req, trigger) {
   if (startupAutomationRecoveryPromise) await startupAutomationRecoveryPromise;
   const triggerIdempotencyHash = automationTriggerHash(idempotency.key);
   const triggerRequestHash = automationTriggerRequestHash(req, automation, trigger, completionContract);
-  pruneAutomationTriggerIdempotency();
-  const existing = idempotency.key ? automationTriggerIdempotency.get(idempotency.key) : null;
+  const existing = externalTaskStore().lookup(triggerIdempotencyHash, triggerRequestHash);
   if (existing) {
-    if (existing.requestHash && existing.requestHash !== triggerRequestHash) {
-      throw automationRequestError(409, "同一 Idempotency-Key 不能用于不同请求");
-    }
-    try {
-      const payload = await refreshAutomationTriggerPayload(existing.payload || await existing.promise);
-      return { ...payload, deduplicated: true };
-    } catch {
-      automationTriggerIdempotency.delete(idempotency.key);
-    }
+    return { ok: true, run: externalRunView(existing, automation.id), deduplicated: true, recovered: true, output: "已恢复原任务" };
   }
   if (triggerIdempotencyHash) {
     const cutoff = Date.now() - automationTriggerIdempotencyTtlMs;
@@ -11620,6 +11701,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
     const matched = runs.find((run) =>
       run.automationId === automation.id &&
       run.trigger === trigger &&
+      !externalTaskStore().read(run.id) &&
       run.triggerIdempotencyHash === triggerIdempotencyHash &&
       new Date(run.startedAt).getTime() >= cutoff
     );
@@ -11632,12 +11714,6 @@ async function submitAutomationTriggerRequest(req, trigger) {
         throw automationRequestError(409, "历史运行缺少请求摘要，无法验证幂等重放；请先核对原任务");
       }
       const payload = { ok: true, run: externalRunView(stored, automation.id), output: `${automation.name}: ${trigger} app-server run already accepted` };
-      automationTriggerIdempotency.set(idempotency.key, {
-        promise: Promise.resolve(payload),
-        payload,
-        requestHash: triggerRequestHash,
-        expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
-      });
       return { ...payload, deduplicated: true, recovered: true };
     }
   }
@@ -11673,7 +11749,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
   if (!rate.ok) {
     throw automationRequestError(429, "Automation trigger rate limit exceeded", rate.retryAfterMs);
   }
-  const runPromise = startAppServerAutomationRun(
+  const runPromise = enqueueExternalAutomationRun(
     automation,
     repo,
     automationTriggerOptions(req, trigger, req.apiClient.id, triggerIdempotencyHash, triggerRequestHash, completionContract, heartbeatSource),
@@ -11690,31 +11766,14 @@ async function submitAutomationTriggerRequest(req, trigger) {
     return {
       ok: true,
       run: externalRunView(runRecord, automation.id),
-      output: `${automation.name}: ${trigger} app-server run started`,
+      output: `${automation.name}: 任务已接收，后台排队执行`,
+      ...(runRecord.deduplicated ? { deduplicated: true } : {}),
     };
   });
-  if (idempotency.key) {
-    automationTriggerIdempotency.set(idempotency.key, {
-      promise: runPromise,
-      payload: null,
-      requestHash: triggerRequestHash,
-      expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
-    });
-  }
   try {
-    const payload = await runPromise;
-    if (idempotency.key) {
-      automationTriggerIdempotency.set(idempotency.key, {
-        promise: Promise.resolve(payload),
-        payload,
-        requestHash: triggerRequestHash,
-        expiresAt: Date.now() + automationTriggerIdempotencyTtlMs,
-      });
-    }
-    return payload;
+    return await runPromise;
   } catch (error) {
-    if (idempotency.key) automationTriggerIdempotency.delete(idempotency.key);
-    throw automationRequestError([409, 429].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs);
+    throw automationRequestError([400, 409, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs);
   }
 }
 
@@ -12044,4 +12103,6 @@ scheduleStartupAutomationRecovery();
 startPersonalRoutineScheduler();
 server.listen(port, host, () => {
   console.log(`Codex Cloud Console listening on http://${host}:${port}`);
+  void drainExternalTasks();
+  setInterval(() => void drainExternalTasks(), 1000).unref();
 });

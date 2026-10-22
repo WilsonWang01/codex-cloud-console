@@ -28,6 +28,7 @@ export function externalRunView(run, automationId) {
     clientId: run.clientId,
     status: run.status,
     startedAt: run.startedAt,
+    executionStartedAt: run.executionStartedAt || null,
     updatedAt: run.updatedAt,
     finishedAt: run.finishedAt,
     model: run.model,

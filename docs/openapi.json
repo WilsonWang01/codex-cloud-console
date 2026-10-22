@@ -145,7 +145,7 @@
         "sessionId": {"type": "string", "minLength": 1, "maxLength": 160, "description": "仅 heartbeat 可用；webhook 拒绝"}, "completionContract": {"type": "object", "description": "详见 backend-integration.md，不能替代外部写入确认"}
       }},
       "RunResponse": {"type": "object", "required": ["ok", "run"], "properties": {
-        "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {"id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]}, "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0}}},
+        "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {"id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]}, "startedAt": {"type": "string", "format": "date-time", "description": "任务接收时间"}, "executionStartedAt": {"type": ["string", "null"], "format": "date-time", "description": "实际开始执行时间；排队中可为空，用于 UTC 用量归属"}, "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0}}},
         "eventCursor": {"type": "integer", "minimum": 0}, "eventGap": {"type": "boolean"}, "events": {"type": "array", "items": {"type": "object"}}
       }}
     }

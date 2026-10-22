@@ -26,6 +26,7 @@ function snapshot(run) {
     threadId: run.threadId || null, turnId: run.turnId || null,
     status: run.status === "cancelled" ? "canceled" : run.status,
     startedAt: new Date(run.startedAt).toISOString(), finishedAt: run.finishedAt || null,
+    ...(run.executionStartedAt ? { executionStartedAt: run.executionStartedAt } : {}),
     updatedAt: run.updatedAt || run.finishedAt || run.startedAt,
     model: run.model || null, reasoning: run.reasoning || null, usage: usageSnapshot(run),
   };
@@ -66,10 +67,11 @@ export function openRunUsageLedger(filePath, { now = () => Date.now() } = {}) {
       PRAGMA user_version=1;`);
   } catch (error) { db.close(); throw error; }
   const read = db.prepare("SELECT snapshot FROM usage_runs WHERE id=?");
-  const put = db.prepare("INSERT INTO usage_runs VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET turn_key=excluded.turn_key, snapshot=excluded.snapshot");
+  const put = db.prepare("INSERT INTO usage_runs VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET started_ms=excluded.started_ms, turn_key=excluded.turn_key, snapshot=excluded.snapshot");
   const meta = db.prepare("INSERT INTO usage_meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
   const cutoff = () => Math.floor(now() / dayMs) * dayMs - retentionDays * dayMs;
   return {
+    database: db,
     sync(runs) {
       const time = now(), floor = cutoff();
       db.exec("BEGIN IMMEDIATE");
@@ -78,7 +80,8 @@ export function openRunUsageLedger(filePath, { now = () => Date.now() } = {}) {
         for (const run of runs) {
           if (!terminal.has(run.status)) continue;
           const next = snapshot(run);
-          if (Date.parse(next.startedAt) < floor) continue;
+          const accountedAt = Date.parse(next.executionStartedAt || next.startedAt);
+          if (accountedAt < floor) continue;
           const existing = read.get(next.id);
           if (existing) {
             const previous = JSON.parse(existing.snapshot);
@@ -94,7 +97,7 @@ export function openRunUsageLedger(filePath, { now = () => Date.now() } = {}) {
           }
           const turnKey = next.threadId && next.turnId ? JSON.stringify([next.threadId, next.turnId]) : null;
           const value = JSON.stringify(next);
-          if (existing?.snapshot !== value) put.run(next.id, Date.parse(next.startedAt), turnKey, value);
+          if (existing?.snapshot !== value) put.run(next.id, accountedAt, turnKey, value);
         }
         const day = new Date(time).toISOString().slice(0, 10);
         if (db.prepare("SELECT value FROM usage_meta WHERE key='pruned_day'").get()?.value !== day) {

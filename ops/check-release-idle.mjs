@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { parseEnv } from "node:util";
+import { DatabaseSync } from "node:sqlite";
 
 const backupPath = process.argv[2] || process.env.CODEX_CLOUD_PRE_SWITCH_BACKUP;
 if (!backupPath) throw new Error("需要发布前备份的 before.json 路径");
@@ -18,6 +19,18 @@ for (const [name, expected] of Object.entries(before.hashes)) {
 }
 const runs = JSON.parse(await fs.readFile(path.join(root, "state/automation-runs.json"), "utf8"));
 if (runs.runs.some((run) => ["queued", "running", "canceling"].includes(run.status))) throw new Error("存在运行任务，停止发布");
+const database = path.join(root, "state/run-usage.sqlite");
+try {
+  await fs.access(database);
+  const db = new DatabaseSync(database, { readOnly: true });
+  try {
+    if (db.prepare("SELECT name FROM sqlite_master WHERE name='external_tasks'").get()) {
+      if (db.prepare("SELECT count(*) AS n FROM external_tasks WHERE state IN ('queued','running')").get().n) throw new Error("存在持久排队或执行中任务，停止发布");
+      const revision = db.prepare("SELECT value FROM external_tasks_meta WHERE key='revision'").get()?.value;
+      if (before.taskStoreRevision !== undefined && before.taskStoreRevision !== revision) throw new Error("持久任务已变化，停止发布");
+    }
+  } finally { db.close(); }
+} catch (error) { if (error.code !== "ENOENT") throw error; }
 const units = execFileSync("systemctl", ["list-units", "--state=running", "--no-legend", "--plain"], { encoding: "utf8" });
 if (units.split("\n").some((line) => line.trim().split(/\s+/)[0]?.startsWith("codex-auto-"))) throw new Error("存在运行定时服务，停止发布");
 // Read deployment authentication only into memory; never print the configuration or token.

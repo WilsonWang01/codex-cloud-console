@@ -10,6 +10,8 @@ HEALTH_URL="${CODEX_CLOUD_HEALTH_URL:-http://127.0.0.1:8787/healthz}"
 HEALTH_ATTEMPTS="${CODEX_CLOUD_HEALTH_ATTEMPTS:-90}"
 HEALTH_INTERVAL_SECONDS="${CODEX_CLOUD_HEALTH_INTERVAL_SECONDS:-2}"
 KEEP_RELEASES="${CODEX_CLOUD_KEEP_RELEASES:-1}"
+RELEASE_LOCK="${CODEX_CLOUD_RELEASE_LOCK:-}"
+STATE_ROOT="${CODEX_STATE_ROOT:-}"
 PRE_SWITCH_CHECK="${CODEX_CLOUD_PRE_SWITCH_CHECK:-}"
 SERVICE_USER="${CODEX_CLOUD_SERVICE_USER:-ubuntu}"
 RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -24,6 +26,10 @@ rollback_on_error() {
   trap - EXIT
   if [[ "$status" -ne 0 ]]; then
     if [[ "$SWITCHED" == "1" && -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
+      if ! node "${SOURCE_ROOT}/ops/check-task-rollback.mjs" "$STATE_ROOT" "$PREVIOUS_TARGET"; then
+        echo "Rollback stopped to preserve persistent task data; current release remains in place." >&2
+        exit "$status"
+      fi
       echo "Deployment failed after release switch; rolling back to $PREVIOUS_TARGET." >&2
       rm -f "${CURRENT_LINK}.rollback"
       ln -s "$PREVIOUS_TARGET" "${CURRENT_LINK}.rollback"
@@ -81,7 +87,14 @@ if ! sudo awk -F= '$1 == "CODEX_CLOUD_WEBHOOK_TOKEN" && length($2) >= 16 && $2 !
   exit 1
 fi
 
-mkdir -p "$RELEASE_ROOT" "$(dirname "$CURRENT_LINK")"
+read_runtime_path() {
+  sudo node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; import {parseEnv} from "node:util"; const env=parseEnv(fs.readFileSync(process.argv[1],"utf8")); const key=process.argv[2],root=env.CODEX_CLOUD_ROOT||process.argv[3]; process.stdout.write(env[key]||path.join(root,key==="CODEX_STATE_ROOT"?"state":"locks/console-release.lock"));' "$ENV_FILE" "$1" "$(dirname "$CURRENT_LINK")"
+}
+STATE_ROOT="${STATE_ROOT:-$(read_runtime_path CODEX_STATE_ROOT)}"
+RELEASE_LOCK="${RELEASE_LOCK:-$(read_runtime_path CODEX_CLOUD_RELEASE_LOCK)}"
+mkdir -p "$RELEASE_ROOT" "$(dirname "$CURRENT_LINK")" "$(dirname "$RELEASE_LOCK")"
+exec 8>"$RELEASE_LOCK"
+flock -n 8
 
 if [[ -L "$CURRENT_LINK" ]]; then
   PREVIOUS_TARGET="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"

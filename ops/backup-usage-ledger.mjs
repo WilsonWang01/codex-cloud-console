@@ -15,7 +15,11 @@ try {
   const restored = new DatabaseSync(destination, { readOnly: true });
   try {
     if (restored.prepare("PRAGMA quick_check").get().quick_check !== "ok") throw new Error("Backup integrity check failed");
-    console.log(JSON.stringify({ destination, rows: restored.prepare("SELECT count(*) AS count FROM usage_runs").get().count, verified: true }));
+    const hasTasks = Boolean(restored.prepare("SELECT name FROM sqlite_master WHERE name='external_tasks'").get());
+    console.log(JSON.stringify({ destination, rows: restored.prepare("SELECT count(*) AS count FROM usage_runs").get().count,
+      externalTaskRows: hasTasks ? restored.prepare("SELECT count(*) AS n FROM external_tasks").get().n : 0,
+      externalTaskRevision: hasTasks ? restored.prepare("SELECT value FROM external_tasks_meta WHERE key='revision'").get()?.value : null,
+      verified: true }));
   } finally { restored.close(); }
 } catch (error) {
   if (created) fs.rmSync(destination, { force: true });

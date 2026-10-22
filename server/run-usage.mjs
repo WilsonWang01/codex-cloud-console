@@ -28,7 +28,7 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
   const terminalStatuses = new Set(["completed", "failed", "interrupted", "needs_reconciliation", "canceled", "cancelled"]);
   for (const run of runs) {
     if (!run.clientId || (clientId && run.clientId !== clientId)) continue;
-    const time = Date.parse(run.startedAt || "");
+    const time = Date.parse(run.executionStartedAt || run.startedAt || "");
     if (!Number.isFinite(time) || time < from || time >= to) continue;
     const hour = new Date(time).toISOString().slice(0, 13) + ":00:00Z";
     const key = `${hour}:${run.clientId}`;
@@ -61,7 +61,7 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
 
 export function runUsageDetails(runs, { from, to, clientId = "", limit = 200 }) {
   return runs.filter((run) => {
-    const started = Date.parse(run.startedAt || "");
+    const started = Date.parse(run.executionStartedAt || run.startedAt || "");
     return run.clientId && (!clientId || run.clientId === clientId) && Number.isFinite(started) && started >= from && started < to;
   }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map((run) => ({
     id: run.id,
@@ -69,6 +69,7 @@ export function runUsageDetails(runs, { from, to, clientId = "", limit = 200 }) 
     automationId: run.automationId,
     status: run.status,
     startedAt: run.startedAt,
+    executionStartedAt: run.executionStartedAt || null,
     finishedAt: run.finishedAt || null,
     model: run.model || null,
     reasoning: run.reasoning || null,

@@ -408,6 +408,87 @@ input.on("line", (line) => {
   return fakePath;
 }
 
+await check("durable API queue survives lost responses and restart without repeating claimed work", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-durable-api-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const directory of [repo, stateRoot, bin]) await fs.mkdir(directory, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "durable-fixture-token-123456" };
+  const start = () => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot,
+    CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0",
+    CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"], CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1",
+    CODEX_AUTOMATION_MAX_QUEUED: "2", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const submit = (key, prompt, auth = headers) => jsonRequest(base, "/api/automations/sample-research/webhook", {
+    method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}) }),
+  });
+  const wait = async (callback) => {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 40)); }
+    throw new Error("Durable API fixture did not reach expected state");
+  };
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse).filter((row) => row.method === "turn/start");
+  let server;
+  try {
+    server = start(); await waitForOutput(server, /listening on/);
+    const lock = path.join(cloudRoot, "locks/console-release.lock");
+    await fs.mkdir(path.dirname(lock), { recursive: true });
+    await fs.writeFile(path.join(bin, "flock"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    await fs.writeFile(lock, "");
+    const maintenance = await submit("durable-maintenance-0000", "must-not-start during publication");
+    assert.equal(maintenance.response.status, 503);
+    assert.equal(Number(maintenance.response.headers.get("retry-after")), 5);
+    assert.equal((await rpc()).length, 0);
+    await fs.rm(lock);
+    const firstBody = JSON.stringify({ prompt: "progress regression queue first durable-one", worktree: false });
+    const lost = await fetch(base + "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "durable-lost-response-0001" }, body: firstBody });
+    assert.equal(lost.status, 200); await lost.body.cancel();
+    const first = await submit("durable-lost-response-0001", "progress regression queue first durable-one");
+    assert.equal(first.data.deduplicated, true);
+    await wait(async () => (await rpc()).length === 1);
+    const second = await submit("durable-cancel-0002", "queue regression next must-not-start");
+    assert.equal(second.data.run.status, "queued");
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "queued-to-revoke", automationIds: ["sample-research"] }) });
+    const scoped = { "content-type": "application/json", "x-codex-cloud-token": client.data.token };
+    const third = await submit("durable-revoke-0003", "queue regression next revoked-must-not-start", scoped);
+    assert.equal(third.data.run.status, "queued");
+    const full = await submit("durable-queue-0004", "queue regression next durable-fourth");
+    assert.equal(full.response.status, 429);
+    assert.ok(Number(full.response.headers.get("retry-after")) > 0);
+    const canceled = await jsonRequest(base, second.data.run.resultPath + "/cancel", { method: "POST", headers });
+    assert.equal(canceled.response.status, 200);
+    assert.equal(canceled.data.run.status, "canceled");
+    assert.equal(canceled.data.run.usage.totalTokens, 0);
+    const fourth = await submit("durable-queue-0004", "queue regression next durable-fourth");
+    assert.equal(fourth.response.status, 200);
+    await jsonRequest(base, `/api/clients/${client.data.client.id}/revoke`, { method: "POST", headers });
+    await stopProcess(server);
+    server = start(); await waitForOutput(server, /listening on/);
+    const completed = await wait(async () => {
+      const result = await jsonRequest(base, fourth.data.run.resultPath, { headers });
+      return result.data.run?.status === "completed" ? result.data.run : null;
+    });
+    assert.equal(completed.id, fourth.data.run.id);
+    const replay = await submit("durable-lost-response-0001", "progress regression queue first durable-one");
+    assert.equal(replay.data.run.id, first.data.run.id);
+    assert.equal(replay.data.run.status, "needs_reconciliation");
+    const conflicts = await submit("durable-lost-response-0001", "changed input");
+    assert.equal(conflicts.response.status, 409);
+    const requests = await rpc();
+    assert.equal(requests.filter((row) => JSON.stringify(row.params).includes("durable-one")).length, 1);
+    assert.equal(requests.filter((row) => JSON.stringify(row.params).includes("durable-fourth")).length, 1);
+    assert.equal(requests.some((row) => JSON.stringify(row.params).includes("must-not-start")), false);
+    const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
+    assert.equal(stored.find((run) => run.id === third.data.run.id).status, "failed");
+    assert.equal(stored.find((run) => run.id === third.data.run.id).usage.totalTokens, 0);
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
 await check("usage API retains accounting across history pruning and restart; corrupt ledgers block execution", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-ledger-api-"));
   const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), binDir = path.join(root, "bin");
@@ -2497,7 +2578,13 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "POST", headers: { ...scopedHeaders, "idempotency-key": "scoped-heartbeat-0001" }, body: scopedBody,
     });
     assert.equal(heartbeat.response.status, 200, JSON.stringify(heartbeat.data));
-    const heartbeatRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === heartbeat.data.run.id);
+    let heartbeatRun;
+    const heartbeatStartedDeadline = Date.now() + 5000;
+    while (Date.now() < heartbeatStartedDeadline) {
+      heartbeatRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find((run) => run.id === heartbeat.data.run.id);
+      if (heartbeatRun?.sessionId) break;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
     assert.equal(heartbeatRun.sessionId, originalClientRun.sessionId);
     assert.equal(await fs.realpath(heartbeatRun.worktreePath), await fs.realpath(originalClientRun.worktreePath));
     for (let attempt = 0; attempt < 25; attempt += 1) {
@@ -2725,6 +2812,12 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
     });
     assert.equal(cancelAgain.response.status, 200);
+    const legacyIdleDeadline = Date.now() + 5000;
+    while (Date.now() < legacyIdleDeadline) {
+      const remaining = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
+      if (!remaining.some((run) => ["queued", "running", "canceling"].includes(run.status))) break;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
     const legacyRunPath = path.join(stateRoot, "automation-runs.json");
     const legacyRunStore = JSON.parse(await fs.readFile(legacyRunPath, "utf8"));
     const legacyCanceled = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
@@ -2978,9 +3071,11 @@ await check("atomic installer gates on strict health, prunes, and rolls back", a
   await fs.mkdir(path.join(sourceRoot, "ops"), { recursive: true });
   await fs.mkdir(path.join(sourceRoot, "server"), { recursive: true });
   await fs.copyFile(path.join(projectRoot, "ops/write-release-manifest.mjs"), path.join(sourceRoot, "ops/write-release-manifest.mjs"));
+  await fs.copyFile(path.join(projectRoot, "ops/check-task-rollback.mjs"), path.join(sourceRoot, "ops/check-task-rollback.mjs"));
   await fs.copyFile(path.join(projectRoot, "server/release-info.mjs"), path.join(sourceRoot, "server/release-info.mjs"));
   await fs.mkdir(previousRelease, { recursive: true });
   await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(binDir, "flock"), '#!/bin/sh\n[ "${FAKE_DEPLOY_LOCK_BUSY:-0}" != 1 ]\n', { mode: 0o755 });
   if (process.platform === "darwin") {
     await fs.writeFile(path.join(binDir, "tar"), '#!/bin/sh\nexec /usr/bin/tar -b 1 "$@"\n', { mode: 0o755 });
   }
@@ -3096,6 +3191,12 @@ exec /usr/bin/readlink "$@"
       await assert.rejects(fs.access(path.join(activeRelease, folder)), { code: "ENOENT" });
       await fs.access(path.join(sourceRoot, folder, "test-artifact.txt"));
     }
+
+    const lockBusy = await runCaptured("bash", installerArgs, {
+      cwd: projectRoot, env: { ...installerEnv, FAKE_DEPLOY_LOCK_BUSY: "1", FAKE_HEALTH_MODE: "recover" },
+    });
+    assert.notEqual(lockBusy.code, 0);
+    assert.equal(await fs.realpath(currentLink), activeRelease);
 
     const auditFailed = await runCaptured("bash", installerArgs, {
       cwd: projectRoot,

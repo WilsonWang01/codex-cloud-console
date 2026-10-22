@@ -101,6 +101,14 @@ test("retention follows UTC start time and reports historical coverage instead o
   assert.equal(f.ledger.info().timezone, "UTC");
 }));
 
+test("late execution is accounted on execution time even when accepted before the retention window", () => fixture(({ ledger }) => {
+  const row = run("long-queued", { startedAt: new Date(start - 40 * day).toISOString(), executionStartedAt: new Date(start).toISOString() });
+  ledger.sync([row]);
+  const rows = ledger.rows({ from: start, to: start + 1 });
+  assert.equal(rows.length, 1);
+  assert.equal(aggregateRunUsage(rows, { from: start, to: start + 1 })[0].totalTokens, 120);
+}));
+
 test("consistent backup includes WAL writes, verifies restore and refuses an existing destination", () => fixture(({ ledger, file, root }) => {
   ledger.sync([run("backed-up")]);
   const destination = path.join(root, "backup.sqlite");

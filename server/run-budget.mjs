@@ -3,7 +3,7 @@ const activeStatuses = new Set(["queued", "running", "canceling"]);
 export function dailyTokenBudgetRuns(runs, now) {
   const dayStart = Date.parse(new Date(now).toISOString().slice(0, 10) + "T00:00:00Z");
   return runs.filter((run) => {
-    const startedAt = Date.parse(run.startedAt || "");
+    const startedAt = Date.parse(run.executionStartedAt || run.startedAt || "");
     return run.runner === "app-server" && startedAt >= dayStart && startedAt <= now;
   });
 }
