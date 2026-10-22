@@ -23,6 +23,18 @@ function storage() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) };
 }
 
+test("代理故障显示中文原因和错误编号，不把上游原始错误或凭据带入页面", () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(ts.transpileModule(section(frontend, "function apiErrorMessage(", "function nonJsonResponseError("), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  const issue = { layer: "local-proxy", requestId: "proxy-test-1234", cause: "header-timeout", error: "connect https://user:SECRET@example.test/?token=PRIVATE" };
+  assert.equal(context.apiErrorMessage(issue, "fallback"), "云端连接超时（错误编号：proxy-test-1234）");
+  assert.equal(context.apiErrorMessage({ ...issue, cause: "ECONNRESET" }, "fallback"), "云端连接中断（错误编号：proxy-test-1234）");
+  assert.equal(context.apiErrorMessage({ ...issue, cause: "unknown SECRET" }, "fallback"), "云端连接失败（错误编号：proxy-test-1234）");
+  assert.equal(context.apiErrorMessage({ ...issue, cause: "__proto__", requestId: "INVALID SECRET" }, "fallback"), "云端连接失败");
+  assert.equal(context.apiErrorMessage({ error: "普通接口错误" }, "fallback"), "普通接口错误");
+});
+
 test("只读运行时同步保留活跃时间与草稿，无变化不写盘，主动修改仍更新时间", async () => {
   const previous = "2026-09-01T00:00:00.000Z";
   let writes = 0;

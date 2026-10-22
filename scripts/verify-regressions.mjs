@@ -2558,9 +2558,41 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
   const cachePath = path.join(tempRoot, "cache.json");
   const secretPath = path.join(tempRoot, "outside-secret.txt");
   const symlinkPath = path.join(projectRoot, "dist", "regression-outside.txt");
+  let proxyStderr = "";
+  let healthMode = "hang", notificationOffline = false, getAttempts = 0, postAttempts = 0, bodyAttempts = 0;
   const upstream = http.createServer((req, res) => {
-    if (req.url === "/healthz") return;
+    const url = new URL(req.url, "http://upstream.test");
+    if (url.pathname === "/healthz") {
+      if (healthMode === "hang") return;
+      res.writeHead(503, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, partial: true }));
+    }
+    if (url.pathname === "/api/chat/private-project-private-session") {
+      getAttempts += 1;
+      if (getAttempts === 1) return req.socket.destroy();
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (url.pathname === "/api/codex/private-write") {
+      postAttempts += 1;
+      req.resume();
+      req.on("end", () => req.socket.destroy());
+      return;
+    }
+    if (url.pathname === "/api/files/private-body") {
+      bodyAttempts += 1;
+      res.writeHead(200, { "content-type": "application/json", "content-length": 100 });
+      res.write("BODY-SECRET");
+      return;
+    }
+    if (url.pathname === "/api/chat/job-events") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("event: delta\ndata: SSE-SECRET\n\n");
+      setTimeout(() => res.destroy(), 20);
+      return;
+    }
     if (req.url === "/api/notifications/push/status") {
+      if (notificationOffline) return req.socket.destroy();
       const body = JSON.stringify({ ok: true, pushNotifications: { supported: true } });
       res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
       res.end(body);
@@ -2588,9 +2620,12 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
       CODEX_CLOUD_CONSOLE_CREDENTIALS: credentialsPath,
       CODEX_CLOUD_CONSOLE_CACHE: cachePath,
       CODEX_CLOUD_CONSOLE_HEALTH_TIMEOUT_MS: "150",
+      CODEX_CLOUD_CONSOLE_FRESH_CACHE_TTL_MS: "0",
+      CODEX_CLOUD_CONSOLE_BUFFER_IDLE_TIMEOUT_MS: "1000",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  child.stderr.on("data", (chunk) => { proxyStderr += chunk.toString(); });
   try {
     await waitForOutput(child, /local http proxy ready/i);
     const malformedStatus = await new Promise((resolve, reject) => {
@@ -2606,6 +2641,33 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     const unavailableHealth = await fetch(`http://127.0.0.1:${proxyPort}/healthz`);
     assert.equal(unavailableHealth.status, 502);
     assert.ok(Date.now() - healthStartedAt < 1_500, "proxy health failure did not respect its response deadline");
+    const failure = await unavailableHealth.json();
+    assert.equal(failure.requestId, unavailableHealth.headers.get("x-codex-cloud-request-id"));
+    assert.equal(failure.cause, "header-timeout");
+    const event = proxyStderr.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)).find((event) => event.requestId === failure.requestId);
+    assert.ok(event, "代理错误必须留下可通过页面错误编号查找的脱敏记录");
+    assert.equal(event.route, "/healthz");
+    assert.equal(event.cause, "header-timeout");
+    assert.equal(event.attempts, 1);
+    assert.ok(event.durationMs >= 0);
+    healthMode = "unhealthy";
+    const unhealthy = await fetch(`http://127.0.0.1:${proxyPort}/healthz`);
+    assert.equal(unhealthy.status, 503, "真实服务器的 503 不冒充代理故障或健康");
+    await unhealthy.arrayBuffer();
+    const recovered = await fetch(`http://127.0.0.1:${proxyPort}/api/chat/private-project-private-session?token=QUERY-SECRET`, { headers: { authorization: "Bearer HEADER-SECRET" } });
+    assert.equal(recovered.status, 200);
+    await recovered.arrayBuffer();
+    assert.equal(getAttempts, 2, "只读请求可按原策略重试");
+    const write = await fetch(`http://127.0.0.1:${proxyPort}/api/codex/private-write?token=QUERY-SECRET`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer HEADER-SECRET" }, body: JSON.stringify({ message: "BODY-SECRET" }) });
+    assert.equal(write.status, 502);
+    const writeFailure = await write.json();
+    assert.equal(postAttempts, 1, "诊断不能导致写请求重放");
+    const bodyTimeout = await fetch(`http://127.0.0.1:${proxyPort}/api/files/private-body`);
+    assert.equal(bodyTimeout.status, 502);
+    const bodyFailure = await bodyTimeout.json();
+    assert.equal(bodyFailure.cause, "body-timeout");
+    const interruptedStream = await fetch(`http://127.0.0.1:${proxyPort}/api/chat/job-events`, { headers: { accept: "text/event-stream" } });
+    await interruptedStream.text();
     assert.equal(child.exitCode, null);
     const symlinkResponse = await fetch(`http://127.0.0.1:${proxyPort}/regression-outside.txt`);
     const symlinkBody = await symlinkResponse.text();
@@ -2616,6 +2678,24 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     const cachedStatus = await fetch(`http://127.0.0.1:${proxyPort}/api/notifications/push/status`);
     assert.equal(cachedStatus.status, 200);
     await cachedStatus.arrayBuffer();
+    notificationOffline = true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const stale = await fetch(`http://127.0.0.1:${proxyPort}/api/notifications/push/status`);
+    assert.equal(stale.status, 200);
+    assert.equal(stale.headers.get("x-codex-cloud-proxy-fallback"), "stale-cache");
+    await stale.arrayBuffer();
+    if (!proxyStderr.includes('"outcome":"stale-cache"')) await waitForOutput(child, /"outcome":"stale-cache"/);
+    const events = proxyStderr.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+    assert.ok(events.some((event) => event.cause === "upstream-http" && event.status === 503 && event.outcome === "forwarded"));
+    assert.ok(events.some((event) => event.route === "/api/chat" && event.attempts === 2 && event.outcome === "recovered"));
+    assert.ok(events.some((event) => event.requestId === writeFailure.requestId && event.attempts === 1 && event.outcome === "error"));
+    assert.ok(events.some((event) => event.requestId === bodyFailure.requestId && event.attempts === bodyAttempts && event.cause === "body-timeout"));
+    assert.ok(events.some((event) => event.route === "/api/chat" && event.outcome === "stream-closed"));
+    assert.ok(events.some((event) => event.route === "/api/notifications" && event.attempts === 2 && event.outcome === "stale-cache"));
+    for (const secret of ["QUERY-SECRET", "HEADER-SECRET", "BODY-SECRET", "SSE-SECRET", "private-project", "private-session", "private-write", "private-body", "ambient-proxy-token"]) {
+      assert.equal(proxyStderr.includes(secret), false, "代理诊断不能保存秘密或私人路径");
+    }
+    assert.equal(new Set(events.map((event) => event.requestId)).size, events.length, "同一请求只记录一次结果");
     for (const route of ["chat/completions", "messages", "responses", "images/generations"]) {
       const modelProxy = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/v1/${route}`, {
         method: "POST", headers: { authorization: "Bearer isolated-client-token", "content-type": "application/json" }, body: "{}",

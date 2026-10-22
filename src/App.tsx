@@ -1020,6 +1020,18 @@ function urlBase64ToUint8Array(value: string) {
 function apiErrorMessage(data: unknown, fallback: string) {
   if (data && typeof data === "object") {
     const record = data as Record<string, unknown>;
+    if (record.layer === "local-proxy") {
+      const reasons: Record<string, string> = {
+        "header-timeout": "连接超时", "body-timeout": "响应超时", ETIMEDOUT: "连接超时",
+        ECONNRESET: "连接中断", EPIPE: "连接中断", "interrupted-response": "连接中断",
+        ECONNREFUSED: "服务暂不可达", ENOTFOUND: "地址解析失败", EAI_AGAIN: "地址解析失败",
+        "truncated-response": "响应不完整",
+      };
+      const reason = typeof record.cause === "string" && Object.hasOwn(reasons, record.cause) ? reasons[record.cause] : "连接失败";
+      const id = typeof record.requestId === "string" && /^proxy-[a-z0-9]{1,16}-[a-f0-9]{1,8}$/i.test(record.requestId)
+        ? `（错误编号：${record.requestId}）` : "";
+      return `云端${reason}${id}`;
+    }
     for (const key of ["error", "message", "output"]) {
       if (typeof record[key] === "string" && record[key]) return String(record[key]);
     }

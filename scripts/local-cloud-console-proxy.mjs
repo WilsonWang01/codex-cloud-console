@@ -300,6 +300,13 @@ function proxyRequestId() {
   return `proxy-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
+function proxyFailureCause(error) {
+  if (error?.message === "upstream did not send headers in time") return "header-timeout";
+  if (error?.message === "upstream response body timed out") return "body-timeout";
+  return ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EPIPE", "ENOTFOUND", "EAI_AGAIN"].includes(error?.code)
+    ? error.code : "upstream-error";
+}
+
 function wantsJsonProxyError(targetUrl) {
   return targetUrl.pathname === "/healthz" || targetUrl.pathname.startsWith("/api/");
 }
@@ -525,6 +532,18 @@ function createHttpProxy() {
       return;
     }
     const requestId = proxyRequestId();
+    const startedAt = Date.now();
+    let reported = false;
+    const report = (attempt, cause, status, outcome) => {
+      if (reported) return;
+      reported = true;
+      // Only fixed route groups and failure codes belong in logs, never URLs or error messages.
+      const route = ["/healthz", "/api/status", "/api/chat", "/api/codex", "/api/automations", "/api/personal", "/api/notifications", "/api/files", "/api/uploads"]
+        .find((prefix) => targetUrl.pathname === prefix || targetUrl.pathname.startsWith(`${prefix}/`)) || "other";
+      console.error(JSON.stringify({ event: "proxy_request", time: new Date().toISOString(), requestId,
+        method: ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"].includes(req.method) ? req.method : "OTHER",
+        route, cause, status, outcome, attempts: attempt + 1, durationMs: Date.now() - startedAt }));
+    };
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
     const isModelApiRequest = req.method === "POST" && Boolean(modelApiProtocol(targetUrl.pathname));
@@ -604,22 +623,28 @@ function createHttpProxy() {
               if (expected > 0 && bytes !== expected) {
                 if (retryBuffered()) return;
                 completed = true;
-                if (sendCachedResponse(targetUrl, res)) return;
+                if (sendCachedResponse(targetUrl, res)) { report(attempt, "truncated-response", 502, "stale-cache"); return; }
+                report(attempt, "truncated-response", 502, "error");
                 sendProxyError(res, 502, "upstream response was truncated", targetUrl, requestId, { cause: "truncated-response" });
                 return;
               }
               completed = true;
+              const status = upstreamRes.statusCode || 502;
+              if (status >= 500) report(attempt, "upstream-http", status, "forwarded");
+              else if (attempt > 0 && status >= 200 && status < 300) report(attempt, "retry-succeeded", status, "recovered");
               const body = req.method === "HEAD" ? Buffer.alloc(0) : Buffer.concat(chunks, bytes);
               cacheResponse(targetUrl, upstreamRes.statusCode || 502, upstreamRes.headers, body);
               if (!safeWriteHead(res, upstreamRes.statusCode || 502, upstreamRes.headers)) return;
               safeEnd(res, req.method === "HEAD" ? undefined : body);
             });
-            upstreamRes.on("error", () => {
+            upstreamRes.on("error", (error) => {
               if (completed || res.destroyed) return;
               if (retryBuffered()) return;
               completed = true;
-              if (sendCachedResponse(targetUrl, res)) return;
-              sendProxyError(res, 502, "upstream response was interrupted", targetUrl, requestId, { cause: "interrupted-response" });
+              const cause = proxyFailureCause(error) === "body-timeout" ? "body-timeout" : "interrupted-response";
+              if (sendCachedResponse(targetUrl, res)) { report(attempt, cause, 502, "stale-cache"); return; }
+              report(attempt, cause, 502, "error");
+              sendProxyError(res, 502, "upstream response was interrupted", targetUrl, requestId, { cause });
             });
             return;
           }
@@ -627,7 +652,9 @@ function createHttpProxy() {
             upstreamRes.resume();
             return;
           }
+          if (upstreamRes.statusCode >= 500) report(attempt, "upstream-http", upstreamRes.statusCode, "forwarded");
           upstreamRes.on("error", () => {
+            report(attempt, "interrupted-response", upstreamRes.statusCode || 200, "stream-closed");
             safeEnd(res);
           });
           upstreamRes.pipe(res);
@@ -642,12 +669,15 @@ function createHttpProxy() {
           return;
         }
         completed = true;
+        const cause = proxyFailureCause(error);
         if (res.headersSent) {
+          report(attempt, cause, res.statusCode, "stream-closed");
           safeEnd(res);
           return;
         }
-        if (canRetry && sendCachedResponse(targetUrl, res)) return;
-        sendProxyError(res, 502, error.message || "upstream request failed", targetUrl, requestId, { cause: String(error.code || "upstream-error") });
+        if (canRetry && sendCachedResponse(targetUrl, res)) { report(attempt, cause, 502, "stale-cache"); return; }
+        report(attempt, cause, 502, "error");
+        sendProxyError(res, 502, "upstream request failed", targetUrl, requestId, { cause });
       });
       if (isModelApiRequest) {
         const closeUpstream = () => upstream.destroy();
