@@ -8905,6 +8905,10 @@ app.get("/api/release", (_req, res) => {
 app.get("/healthz", async (_req, res) => {
   const { data, cache } = await getStatusForRoute();
   const health = data?.health || fastStatusFallback("health snapshot unavailable").health;
+  let ledgerHealth;
+  try { usageLedger().info(); ledgerHealth = { ok: true }; }
+  catch { ledgerHealth = { ok: false, error: "用量账本不可用" }; }
+  const strictOk = Boolean(health.ok && ledgerHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
   const reachable =
@@ -8913,9 +8917,10 @@ app.get("/healthz", async (_req, res) => {
   const responseHealth =
     {
       ...health,
-      ok: Boolean(health.ok),
-      strictOk: Boolean(health.ok),
-      partial: !health.ok && reachable,
+      layers: { ...health.layers, usageLedger: ledgerHealth },
+      ok: strictOk,
+      strictOk,
+      partial: !strictOk && reachable,
     };
   res.status(responseHealth.strictOk ? 200 : 503).json(responseHealth);
 });

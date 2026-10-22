@@ -459,6 +459,9 @@ await check("usage API retains accounting across history pruning and restart; co
     await fs.writeFile(path.join(stateRoot, "run-usage.sqlite"), "corrupt fixture");
     server = startServer(); await waitForOutput(server, /listening on/);
     assert.equal((await jsonRequest(base, "/api/clients/usage", { headers })).response.status, 500);
+    const health = await jsonRequest(base, "/healthz", { headers });
+    assert.equal(health.response.status, 503);
+    assert.equal(health.data.layers.usageLedger.ok, false);
     const rejected = await jsonRequest(base, "/api/automations/sample-research/webhook", {
       method: "POST", headers: { ...headers, "content-type": "application/json", "idempotency-key": "ledger-unreadable-0001" },
       body: JSON.stringify({ prompt: "must not run", worktree: false }),
