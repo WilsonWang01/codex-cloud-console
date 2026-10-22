@@ -1,5 +1,7 @@
 # Personal Agent 统一产品与技术方案
 
+2026-10-22 M1/F02 增量：[首屏加载与断线恢复](acceptance/2026-10-22-status-recovery.md)。健康与状态并行、有界等待、保留已有内容、重试及旧请求保护已通过本地和 UI 验收；真实内置浏览器读取通过，尚未发布 EC2 或更新本机生产代理。
+
 2026-10-22 已确认规划：[现状与差距分析](reviews/2026-10-22-next-stage-assessment.md)、[下一阶段开发方案](development-plan-2026-10-22.md)、[持续推进 goal](goals/codex-cloud-reliable-agent-v1.md)。用户已确认完整 M1-M5 方案，原生 goal 已启用，既有每天 10:00 续做已通过应用工具更新并保持 `ACTIVE`，从 F01 日用量裁剪保护开始。下方早前“暂停”的记录是当时状态；历史验收保留。
 
 状态：已整合的开发基线，阶段状态见第九节；逐项证据见[个人/API/移动验收](acceptance/2026-09-26-personal-api-mobile.md)、[个人引导与连接验收](acceptance/2026-09-26-personal-onboarding-connections.md)、[第二轮本地实现验收](acceptance/2026-09-26-personal-second-iteration.md)、[外部操作可靠性迭代](acceptance/2026-09-27-personal-agent-reliability-iteration.md)、[个人流程试运行与线上验收](acceptance/2026-09-28-personal-trial-gate.md)、[无人值守审批验收](acceptance/2026-09-28-personal-unattended-approval.md)、[未声明只读连接器动作验收](acceptance/2026-09-29-personal-unverified-mcp.md)、[提醒断线补发验收](acceptance/2026-09-30-personal-reminder-catchup.md)、[提醒补发顺序验收](acceptance/2026-10-01-personal-reminder-priority.md)、[事项关联刷新恢复验收](acceptance/2026-10-02-personal-commitment-link-recovery.md)和[事项失效草稿恢复验收](acceptance/2026-10-03-personal-stale-draft-recovery.md)。更新日期：2026-10-04。原调研代码基线：`7988422ed78567b2f2cbced4e233ed795fbae292`；[第二轮对标与体验审查](competitor-benchmark-2026-09-26.md)基于 `5d07e80`，补充当前差距、复现问题及下一轮优先级。

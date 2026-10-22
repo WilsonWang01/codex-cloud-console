@@ -532,6 +532,8 @@ function createHttpProxy() {
       return;
     }
     const requestId = proxyRequestId();
+    const syncId = /^sync-[a-f0-9-]{36}$/.test(String(req.headers["x-codex-cloud-sync-id"] || ""))
+      ? req.headers["x-codex-cloud-sync-id"] : null;
     const startedAt = Date.now();
     let reported = false;
     const report = (attempt, cause, status, outcome) => {
@@ -540,7 +542,7 @@ function createHttpProxy() {
       // Only fixed route groups and failure codes belong in logs, never URLs or error messages.
       const route = ["/healthz", "/api/status", "/api/chat", "/api/codex", "/api/automations", "/api/personal", "/api/notifications", "/api/files", "/api/uploads"]
         .find((prefix) => targetUrl.pathname === prefix || targetUrl.pathname.startsWith(`${prefix}/`)) || "other";
-      console.error(JSON.stringify({ event: "proxy_request", time: new Date().toISOString(), requestId,
+      console.error(JSON.stringify({ event: "proxy_request", time: new Date().toISOString(), requestId, syncId,
         method: ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"].includes(req.method) ? req.method : "OTHER",
         route, cause, status, outcome, attempts: attempt + 1, durationMs: Date.now() - startedAt }));
     };
@@ -679,7 +681,15 @@ function createHttpProxy() {
         report(attempt, cause, 502, "error");
         sendProxyError(res, 502, "upstream request failed", targetUrl, requestId, { cause });
       });
-      if (isModelApiRequest) {
+      if (isHealthRequest && canRetry) {
+        res.once("close", () => {
+          if (completed || res.writableEnded) return;
+          completed = true;
+          clearTimeout(responseTimer);
+          report(attempt, "client-aborted", 499, "client-closed");
+          upstream.destroy();
+        });
+      } else if (isModelApiRequest) {
         const closeUpstream = () => upstream.destroy();
         res.once("close", closeUpstream);
         upstream.once("close", () => res.off("close", closeUpstream));

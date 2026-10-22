@@ -1658,7 +1658,6 @@ function statusWithHealth(status: ConsoleStatus, health: HealthCheckResponse): C
   const repoHealth = new Map(health.layers.repos.map((repo) => [repo.id, repo]));
   return {
     ...status,
-    generatedAt: new Date().toISOString(),
     localMode: false,
     health,
     codex: {
@@ -3371,6 +3370,9 @@ export function App() {
   const [fullLog, setFullLog] = useState<{ name: string; content: string; mocked?: boolean } | null>(null);
   const [statusReady, setStatusReady] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [statusError, setStatusError] = useState("");
+  const [lastStatusSuccessAt, setLastStatusSuccessAt] = useState<string | null>(null);
+  const statusRefreshController = useRef<AbortController | null>(null);
   const [pendingAction, setBusyAction] = useState<string | null>(null);
   const [streamAction, setStreamAction] = useState<"chat" | "compact" | null>(null);
   const [queueRestoreBusy, setQueueRestoreBusy] = useState(false);
@@ -3592,23 +3594,37 @@ export function App() {
   };
 
   const refresh = useCallback(async () => {
+    statusRefreshController.current?.abort();
+    const controller = new AbortController();
+    statusRefreshController.current = controller;
+    const current = () => statusRefreshController.current === controller && !controller.signal.aborted;
+    const headers = { "x-codex-cloud-sync-id": `sync-${crypto.randomUUID()}` };
+    let receivedStatus = false;
+    let receivedHealth = false;
     setIsRefreshing(true);
-    try {
-      try {
-        const healthResponse = await fetch("/healthz", { cache: "no-store" });
-        const quick = (await parseJsonResponse(healthResponse)) as HealthCheckResponse;
+    setStatusError("");
+    // Health and page data are independent; a slow probe must not hold the page.
+    void fetch("/healthz", { cache: "no-store", headers, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5_000)]) })
+      .then(async (response) => {
+        return await parseJsonResponse(response) as HealthCheckResponse;
+      })
+      .then((quick) => {
+        if (!current() || receivedStatus) return;
         const quickStatus = statusWithHealth(statusRef.current, quick);
+        receivedHealth = true;
         statusRef.current = quickStatus;
         setStatus(quickStatus);
         setCloudConnection(connectionFromStatus(quickStatus));
-      } catch {
-        // A failed quick check must not prevent the authoritative status request.
-      }
-
-      const next = await api<ConsoleStatus>("/api/status", { cache: "no-store" });
+      })
+      .catch(() => { /* The status request can still establish connectivity. */ });
+    try {
+      const next = await apiWithDeadline<ConsoleStatus>("/api/status", { cache: "no-store", headers, signal: controller.signal });
+      if (!current()) return;
+      receivedStatus = true;
       statusRef.current = next;
       setStatus(next);
       setStatusReady(true);
+      setLastStatusSuccessAt(next.generatedAt);
       setCloudConnection(connectionFromStatus(next));
       pushEvent({
         tone: connectionFromStatus(next) === "cloud" ? "ok" : "warn",
@@ -3616,21 +3632,33 @@ export function App() {
         body: connectionState(next, connectionFromStatus(next)).detail,
       });
     } catch (error) {
-      setCloudConnection("offline");
+      if (!current()) return;
+      const detail = error instanceof Error ? error.message : "暂时无法读取状态";
+      setStatusError(`${detail}（同步编号：${headers["x-codex-cloud-sync-id"]}）`);
+      setCloudConnection(receivedHealth ? connectionFromStatus(statusRef.current) : "offline");
       pushEvent({
         tone: "warn",
         title: "状态刷新",
-        body: error instanceof Error ? error.message : "API 暂不可用，正在等待隧道恢复",
+        body: detail,
       });
     } finally {
-      setIsRefreshing(false);
+      if (current()) setIsRefreshing(false);
     }
   }, [pushEvent]);
 
   useEffect(() => {
-    refresh();
+    void refresh();
     const interval = window.setInterval(refresh, 45_000);
-    return () => window.clearInterval(interval);
+    const online = () => { void refresh(); };
+    const visible = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("online", online);
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("online", online);
+      document.removeEventListener("visibilitychange", visible);
+      statusRefreshController.current?.abort();
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -6100,6 +6128,16 @@ export function App() {
           onSearchSelect={openGlobalSearchResult}
           />
           <PendingApprovals personalSpace={selectedRepo.kind === "personal"} repoId={selectedRepo.id} onPersonalCount={setPersonalApprovalCount} />
+
+        {(statusError || !statusReady) && <section className="console-sync-state" role="status" aria-live="polite">
+          {statusError ? <TriangleAlert size={18} /> : <Loader2 size={18} className="spin" />}
+          <div><strong>{statusError ? statusReady ? "状态暂未更新" : "暂时无法读取页面数据" : "正在同步云端状态"}</strong>
+            <p>{statusError ? "暂未读取到最新状态，可以重新读取。" : "正在读取项目与任务，请稍候。"}</p>
+            {statusError && <details><summary>错误详情</summary><p>{statusError}</p></details>}
+            {lastStatusSuccessAt && <p>上次成功同步：<time dateTime={lastStatusSuccessAt}>{new Date(lastStatusSuccessAt).toLocaleString()}</time>，当前保留上次读取的内容。</p>}
+          </div>
+          <button type="button" className="command-button" onClick={() => { void refresh(); }}><RefreshCw size={16} className={isRefreshing ? "spin" : undefined} />重新读取状态</button>
+        </section>}
         </div>
 
         {activeView === "inbox" && (
@@ -6128,7 +6166,6 @@ export function App() {
           </div>
         )}
 
-        {activeView === "today" && selectedRepo.kind === "personal" && !repoSelectionReady && <div className="personal-page" role="status">正在读取个人空间…</div>}
         {activeView === "today" && selectedRepo.kind === "personal" && repoSelectionReady && <PersonalToday
           status={status}
           repo={selectedRepo}
@@ -6160,7 +6197,6 @@ export function App() {
 
         {activeView === "issues" && selectedRepo.kind !== "personal" && <Suspense fallback={<div className="github-page">正在加载 GitHub…</div>}><LazyGitHubIssues repoId={selectedRepo.id} onPrepare={prepareGitHubIssue} /></Suspense>}
 
-        {activeView === "automations" && !repoSelectionReady && <div className="personal-page" role="status">正在读取计划任务…</div>}
         {activeView === "automations" && repoSelectionReady && (
           <div className={cx("content-grid", selectedRepo.kind === "personal" && "personal-automations", selectedRepo.kind === "personal" && !hasPersonalAutomations && "personal-automations-empty")}>
             <section className="panel automation-panel" aria-label="自动化任务">

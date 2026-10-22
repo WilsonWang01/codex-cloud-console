@@ -7534,3 +7534,23 @@ pre {
     padding: 4px 0 20px;
   }
 }
+/* Keep recovery visible without covering the current page or composer. */
+.console-sync-state {
+  display: flex;
+  align-content: flex-start;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+.console-sync-state > svg { flex: 0 0 18px; margin-top: 2px; }
+.console-sync-state > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.console-sync-state strong { font-size: 14px; }
+.console-sync-state p { margin: 5px 0 0; }
+.console-sync-state .command-button { flex-shrink: 0; }
+@media (max-width: 600px) {
+  .console-sync-state { flex-wrap: wrap; padding: 14px 16px; }
+  .console-sync-state > div { flex-basis: calc(100% - 30px); }
+  .console-sync-state .command-button { margin-left: 30px; }
+}

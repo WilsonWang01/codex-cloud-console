@@ -50,6 +50,7 @@
     "verify:github:ui": "node scripts/verify-github-ui.mjs",
     "verify:safety:ui": "node scripts/verify-safety-ui.mjs",
     "verify:runtime:ui": "node scripts/verify-runtime-ui.mjs",
+    "verify:status:ui": "node scripts/verify-status-ui.mjs",
     "verify:proxy:ui": "node scripts/verify-proxy-ui.mjs",
     "verify:personal:ui": "node scripts/verify-personal-usage-ui.mjs",
     "verify:runtime": "node scripts/verify-runtime-package.mjs",

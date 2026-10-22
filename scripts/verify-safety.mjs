@@ -23,6 +23,60 @@ function storage() {
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) };
 }
 
+test("状态刷新并行读取、保留局部连接，旧响应不能覆盖重试结果", async () => {
+  const statuses = [];
+  const health = [];
+  const state = { status: { generatedAt: "old" }, connection: "checking", error: "", ready: false, busy: false, last: null };
+  const context = {
+    AbortController, AbortSignal, Error, crypto,
+    useCallback: (callback) => callback,
+    statusRefreshController: { current: null }, statusRef: { current: state.status },
+    setIsRefreshing: (value) => { state.busy = value; },
+    setStatusError: (value) => { state.error = value; },
+    setStatus: (value) => { state.status = value; },
+    setStatusReady: (value) => { state.ready = value; },
+    setLastStatusSuccessAt: (value) => { state.last = value; },
+    setCloudConnection: (value) => { state.connection = value; },
+    pushEvent: () => {}, connectionState: () => ({ detail: "fixture" }),
+    connectionFromStatus: (value) => value.health ? "cloud" : "degraded",
+    statusWithHealth: (value, next) => ({ ...value, health: next }),
+    parseJsonResponse: async (response) => response,
+    fetch: () => { const gate = deferred(); health.push(gate); return gate.promise; },
+    apiWithDeadline: () => {
+      let resolve, reject;
+      const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+      statuses.push({ resolve, reject });
+      return promise;
+    },
+  };
+  vm.createContext(context);
+  const callback = section(frontend, "  const refresh = useCallback(async () => {", "\n  useEffect(() => {\n    void refresh();");
+  vm.runInContext(ts.transpileModule(callback + "\nglobalThis.refresh = refresh;", { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  const first = context.refresh();
+  assert.equal(statuses.length, 1, "主请求不能等待健康检查完成才启动");
+  const second = context.refresh();
+  statuses[1].resolve({ generatedAt: "new" });
+  await second;
+  statuses[0].resolve({ generatedAt: "stale" });
+  health[0].resolve({}); health[1].resolve({});
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.status.generatedAt, "new");
+  assert.equal(state.status.health, undefined, "迟到的快速检查不能覆盖完整状态");
+  assert.equal(state.last, "new");
+  assert.equal(state.busy, false);
+  const failure = context.refresh();
+  health[2].resolve({});
+  await new Promise((resolve) => setImmediate(resolve));
+  statuses[2].reject(new Error("请求超时"));
+  await failure;
+  assert.equal(state.connection, "cloud", "页面状态失败不等于健康检查也失败");
+  assert.equal(state.status.generatedAt, "new");
+  assert.equal(state.ready, true);
+  assert.match(state.error, /请求超时.*同步编号：sync-/);
+  assert.equal(state.busy, false);
+});
+
 test("代理故障显示中文原因和错误编号，不把上游原始错误或凭据带入页面", () => {
   const context = {};
   vm.createContext(context);

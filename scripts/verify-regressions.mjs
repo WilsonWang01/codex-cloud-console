@@ -2562,7 +2562,7 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
   let healthMode = "hang", notificationOffline = false, getAttempts = 0, postAttempts = 0, bodyAttempts = 0;
   const upstream = http.createServer((req, res) => {
     const url = new URL(req.url, "http://upstream.test");
-    if (url.pathname === "/healthz") {
+    if (url.pathname === "/healthz" || url.pathname === "/api/status") {
       if (healthMode === "hang") return;
       res.writeHead(503, { "content-type": "application/json" });
       return res.end(JSON.stringify({ ok: false, partial: true }));
@@ -2638,7 +2638,8 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     assert.equal(malformedStatus, 400);
     assert.equal(child.exitCode, null);
     const healthStartedAt = Date.now();
-    const unavailableHealth = await fetch(`http://127.0.0.1:${proxyPort}/healthz`);
+    const syncId = "sync-00000000-0000-4000-8000-000000000001";
+    const unavailableHealth = await fetch(`http://127.0.0.1:${proxyPort}/healthz`, { headers: { "x-codex-cloud-sync-id": syncId } });
     assert.equal(unavailableHealth.status, 502);
     assert.ok(Date.now() - healthStartedAt < 1_500, "proxy health failure did not respect its response deadline");
     const failure = await unavailableHealth.json();
@@ -2647,9 +2648,20 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     const event = proxyStderr.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)).find((event) => event.requestId === failure.requestId);
     assert.ok(event, "代理错误必须留下可通过页面错误编号查找的脱敏记录");
     assert.equal(event.route, "/healthz");
+    assert.equal(event.syncId, syncId, "浏览器同步编号必须能关联代理故障记录");
     assert.equal(event.cause, "header-timeout");
     assert.equal(event.attempts, 1);
     assert.ok(event.durationMs >= 0);
+    const abandoned = new AbortController();
+    const abandonedResponse = fetch(`http://127.0.0.1:${proxyPort}/api/status`, { signal: abandoned.signal, headers: { "x-codex-cloud-sync-id": syncId } });
+    setTimeout(() => abandoned.abort(), 50);
+    await assert.rejects(abandonedResponse, /abort/i);
+    for (let attempt = 0; attempt < 20 && !proxyStderr.includes('"cause":"client-aborted"'); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const abandonedEvent = proxyStderr.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)).find((item) => item.cause === "client-aborted");
+    assert.equal(abandonedEvent?.syncId, syncId);
+    assert.equal(abandonedEvent?.route, "/api/status");
     healthMode = "unhealthy";
     const unhealthy = await fetch(`http://127.0.0.1:${proxyPort}/healthz`);
     assert.equal(unhealthy.status, 503, "真实服务器的 503 不冒充代理故障或健康");
@@ -2658,7 +2670,7 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     assert.equal(recovered.status, 200);
     await recovered.arrayBuffer();
     assert.equal(getAttempts, 2, "只读请求可按原策略重试");
-    const write = await fetch(`http://127.0.0.1:${proxyPort}/api/codex/private-write?token=QUERY-SECRET`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer HEADER-SECRET" }, body: JSON.stringify({ message: "BODY-SECRET" }) });
+    const write = await fetch(`http://127.0.0.1:${proxyPort}/api/codex/private-write?token=QUERY-SECRET`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer HEADER-SECRET", "x-codex-cloud-sync-id": "PRIVATE-SYNC-SECRET" }, body: JSON.stringify({ message: "BODY-SECRET" }) });
     assert.equal(write.status, 502);
     const writeFailure = await write.json();
     assert.equal(postAttempts, 1, "诊断不能导致写请求重放");
@@ -2692,7 +2704,7 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     assert.ok(events.some((event) => event.requestId === bodyFailure.requestId && event.attempts === bodyAttempts && event.cause === "body-timeout"));
     assert.ok(events.some((event) => event.route === "/api/chat" && event.outcome === "stream-closed"));
     assert.ok(events.some((event) => event.route === "/api/notifications" && event.attempts === 2 && event.outcome === "stale-cache"));
-    for (const secret of ["QUERY-SECRET", "HEADER-SECRET", "BODY-SECRET", "SSE-SECRET", "private-project", "private-session", "private-write", "private-body", "ambient-proxy-token"]) {
+    for (const secret of ["QUERY-SECRET", "HEADER-SECRET", "BODY-SECRET", "SSE-SECRET", "PRIVATE-SYNC-SECRET", "private-project", "private-session", "private-write", "private-body", "ambient-proxy-token"]) {
       assert.equal(proxyStderr.includes(secret), false, "代理诊断不能保存秘密或私人路径");
     }
     assert.equal(new Set(events.map((event) => event.requestId)).size, events.length, "同一请求只记录一次结果");
