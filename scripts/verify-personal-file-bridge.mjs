@@ -35,6 +35,16 @@ test("dedicated file bridge keeps uploads and outputs inside the personal worksp
   const chunks = [];
   for await (const chunk of content) chunks.push(chunk);
   assert.equal(Buffer.concat(chunks).toString(), "user supplied");
+  const head = await personalFileBridgeStream(socketPath, "HEAD", `/files/content?path=${encodeURIComponent(uploaded.file.path)}&preview=1`);
+  assert.equal(head.statusCode, 200);
+  assert.equal(head.headers["content-length"], String(Buffer.byteLength("user supplied")));
+  assert.equal(head.headers["x-content-type-options"], "nosniff");
+  assert.equal(head.headers["content-security-policy"], "sandbox");
+  const headChunks = [];
+  for await (const chunk of head) headChunks.push(chunk);
+  assert.equal(Buffer.concat(headChunks).length, 0);
+  await fs.link(path.join(root, "results", "summary.md"), path.join(root, "results", "hardlink.md"));
+  await assert.rejects(personalFileBridgeJson(socketPath, "GET", "/files/content?path=results%2Fhardlink.md"), { statusCode: 403 });
   assert.deepEqual(await personalFileBridgeJson(socketPath, "POST", "/validate", { path: uploaded.file.path }), { ok: true });
   await assert.rejects(personalFileBridgeJson(socketPath, "POST", "/validate", { path: "results/linked.txt" }), { statusCode: 403 });
   await assert.rejects(personalFileBridgeJson(socketPath, "GET", `/files/content?path=${encodeURIComponent("results/linked.txt")}`), { statusCode: 403 });

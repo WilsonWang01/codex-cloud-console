@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { readRootedFile } from "./safe-file-read.mjs";
 
 const previewMime = new Map([
   [".avif", "image/avif"], [".gif", "image/gif"], [".jpeg", "image/jpeg"],
@@ -8,6 +9,7 @@ const previewMime = new Map([
   [".md", "text/plain; charset=utf-8"], [".csv", "text/plain; charset=utf-8"],
   [".json", "text/plain; charset=utf-8"],
 ]);
+let pendingFileResponses = 0;
 
 function fileError(message, statusCode = 400) {
   return Object.assign(new Error(message), { statusCode });
@@ -38,6 +40,45 @@ export async function resolvePersonalFile(root, relativePath, maxBytes = 20 * 10
   if (stat.size > maxBytes) throw fileError("Personal file is too large to preview or download", 413);
   const mimeType = previewMime.get(path.extname(target).toLowerCase()) || "application/octet-stream";
   return { target, relativePath: parts.join("/"), input, stat, mimeType };
+}
+
+export async function readPersonalFile(root, relativePath, maxBytes = 20 * 1024 * 1024) {
+  const { parts, input } = allowedParts(relativePath);
+  const file = await readRootedFile(root, parts.join("/"), maxBytes);
+  return { ...file, input, mimeType: previewMime.get(path.extname(parts.at(-1)).toLowerCase()) || "application/octet-stream" };
+}
+
+export async function sendPersonalFile(res, root, relativePath, { preview = false, head = false, maxBytes = 20 * 1024 * 1024 } = {}) {
+  // Keep at most two buffered personal downloads per process, including slow/disconnected clients.
+  if (pendingFileResponses >= 2) {
+    res.setHeader("Retry-After", "1");
+    throw fileError("当前文件下载较多，请稍后重试", 503);
+  }
+  pendingFileResponses++;
+  let finished;
+  const done = new Promise(resolve => { finished = resolve; });
+  res.once("finish", finished);
+  res.once("close", finished);
+  const timer = setTimeout(() => { res.destroy(); finished(); }, 120_000);
+  timer.unref();
+  try {
+    const file = await readPersonalFile(root, relativePath, maxBytes);
+    if (res.destroyed) return;
+    const inline = preview && file.mimeType !== "application/octet-stream";
+    res.setHeader("Content-Type", inline ? file.mimeType : "application/octet-stream");
+    res.setHeader("Content-Length", String(file.stat.size));
+    res.setHeader("Content-Disposition", `${inline ? "inline" : "attachment"}; filename="file"; filename*=UTF-8''${encodeURIComponent(path.basename(file.relativePath))}`);
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "sandbox");
+    res.end(head ? undefined : file.buffer);
+    await done;
+  } finally {
+    clearTimeout(timer);
+    res.off("finish", finished);
+    res.off("close", finished);
+    pendingFileResponses--;
+  }
 }
 
 export async function listPersonalFiles(root, limit = 100) {

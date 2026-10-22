@@ -1,6 +1,5 @@
-import fs from "node:fs/promises";
-import { constants } from "node:fs";
 import path from "node:path";
+import { readRootedFile } from "./safe-file-read.mjs";
 
 const maxBytes = 8 * 1024 * 1024;
 const fail = (message, code = "image_result_unavailable") => {
@@ -19,24 +18,12 @@ function imageBytes(data) {
 
 async function savedImage(target, root) {
   if (!root || !path.isAbsolute(target) || !within(path.resolve(root), path.resolve(target))) fail("生成图片路径不在允许目录");
-  const realRoot = await fs.realpath(root);
-  const realTarget = await fs.realpath(target);
-  if (!within(realRoot, realTarget)) fail("生成图片符号链接指向允许目录之外");
-  const file = await fs.open(realTarget, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const stat = await file.stat();
-    if (!stat.isFile() || stat.size > maxBytes) fail("生成图片不是普通文件或超过 8 MiB", "image_output_too_large");
-    const bytes = Buffer.alloc(stat.size);
-    let offset = 0;
-    while (offset < bytes.length) {
-      const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
-      if (!bytesRead) fail("生成图片在读取期间发生变化");
-      offset += bytesRead;
-    }
-    const after = await file.stat();
-    if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) fail("生成图片在读取期间发生变化");
-    return bytes;
-  } finally { await file.close(); }
+    return (await readRootedFile(root, path.relative(path.resolve(root), path.resolve(target)), maxBytes)).buffer;
+  } catch (error) {
+    if (error.code === "file_too_large") fail("生成图片超过 8 MiB", "image_output_too_large");
+    fail("生成图片文件不可安全读取，请查询原任务结果");
+  }
 }
 
 function imageMime(bytes) {

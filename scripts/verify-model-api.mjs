@@ -215,7 +215,12 @@ test("image outputs are exact-turn, bounded native artifacts, not paths in text"
     await fs.writeFile(outside, Buffer.from(png, "base64"));
     const link = path.join(generatedImagesRoot, "linked.png");
     await fs.symlink(outside, link);
+    const internalLink = path.join(generatedImagesRoot, "internal-link.png");
+    await fs.symlink(savedPath, internalLink);
+    const hardlink = path.join(generatedImagesRoot, "hardlink.png");
+    await fs.link(outside, hardlink);
     for (const bad of [{ ...image, result: "https://example.com/image.png" }, { ...image, savedPath: outside }, { ...image, savedPath: link },
+      { ...image, savedPath: internalLink }, { ...image, savedPath: hardlink },
       { ...image, failure: { type: "usageLimitExceeded" } }, { ...image, status: "inProgress" }, { ...image, result: Buffer.from("<svg/>").toString("base64") },
       { ...image, result: Buffer.alloc(8 * 1024 * 1024 + 1).toString("base64") }]) {
       await assert.rejects(modelApiTurnResult(thread([bad]), "wanted", { generatedImagesRoot }), { statusCode: 502 });

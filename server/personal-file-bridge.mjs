@@ -1,9 +1,8 @@
 import crypto from "node:crypto";
-import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
-import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
+import { listPersonalFiles, resolvePersonalFile, sendPersonalFile } from "./personal-files.mjs";
 
 const defaultMaxBytes = 20 * 1024 * 1024;
 
@@ -93,28 +92,9 @@ export function createPersonalFileBridgeServer({ root, socketPath, maxBytes = de
         return sendJson(res, 200, { ok: true });
       }
       if (["GET", "HEAD"].includes(req.method) && url.pathname === "/files/content") {
-        const file = await resolvePersonalFile(root, url.searchParams.get("path"), maxBytes);
-        const inline = url.searchParams.get("preview") === "1" && file.mimeType !== "application/octet-stream";
-        const headers = {
-          "Content-Type": inline ? file.mimeType : "application/octet-stream",
-          "Content-Length": String(file.stat.size),
-          "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="file"; filename*=UTF-8''${encodeURIComponent(path.basename(file.target))}`,
-          "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
-          "Content-Security-Policy": "sandbox",
-        };
-        if (req.method === "HEAD") { res.writeHead(200, headers); return res.end(); }
-        const handle = await fs.open(file.target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-        const opened = await handle.stat().catch(async (error) => { await handle.close(); throw error; });
-        if (!opened.isFile() || opened.dev !== file.stat.dev || opened.ino !== file.stat.ino || opened.size !== file.stat.size) {
-          await handle.close();
-          throw bridgeError("Personal file changed before read", 409);
-        }
-        res.writeHead(200, headers);
-        const stream = handle.createReadStream();
-        stream.on("error", (error) => res.destroy(error));
-        res.on("close", () => stream.destroy());
-        return stream.pipe(res);
+        return await sendPersonalFile(res, root, url.searchParams.get("path"), {
+          preview: url.searchParams.get("preview") === "1", head: req.method === "HEAD", maxBytes,
+        });
       }
       if (req.method === "POST" && url.pathname === "/uploads") {
         const body = await readJsonRequest(req, Math.ceil(maxBytes * 4 / 3) + 4096);

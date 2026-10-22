@@ -1,6 +1,6 @@
 import express from "express";
 import { EventEmitter } from "node:events";
-import { constants as fsConstants, createReadStream } from "node:fs";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -32,7 +32,8 @@ import { withPublicationLock } from "./publication-lock.mjs";
 import { normalizeOutputSchema, validateStructuredOutput, structuredTurnText } from "./structured-output.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
 import { readConnectedApps } from "./connected-apps.mjs";
-import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
+import { listPersonalFiles, resolvePersonalFile, sendPersonalFile } from "./personal-files.mjs";
+import { readRootedFile } from "./safe-file-read.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore } from "./personal-facts.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
@@ -10982,27 +10983,11 @@ app.get("/api/personal/files/content", async (req, res) => {
   try {
     if (!repos.some((repo) => repo.id === personalRepoId)) return res.status(404).json({ ok: false, error: "个人空间不可用" });
     if (personalRuntime.enabled) {
-      return pipePersonalFileFromWorker(res, String(req.query?.path || ""), req.query?.preview === "1");
+      return await pipePersonalFileFromWorker(res, String(req.query?.path || ""), req.query?.preview === "1");
     }
-    const file = await resolvePersonalFile(personalRoot, req.query?.path, maxUploadBytes);
-    const handle = await fs.open(file.target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const opened = await handle.stat().catch(async (error) => { await handle.close(); throw error; });
-    if (!opened.isFile() || opened.dev !== file.stat.dev || opened.ino !== file.stat.ino || opened.size !== file.stat.size) {
-      await handle.close();
-      return res.status(409).json({ ok: false, error: "个人文件在读取前已改变，请刷新列表后重试" });
-    }
-    const inline = req.query?.preview === "1" && file.mimeType !== "application/octet-stream";
-    const name = path.basename(file.target);
-    res.setHeader("Content-Type", inline ? file.mimeType : "application/octet-stream");
-    res.setHeader("Content-Length", String(file.stat.size));
-    res.setHeader("Content-Disposition", `${inline ? "inline" : "attachment"}; filename="file"; filename*=UTF-8''${encodeURIComponent(name)}`);
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Content-Security-Policy", "sandbox");
-    const stream = handle.createReadStream();
-    stream.on("error", (error) => { console.error(`Personal file stream failed: ${error.message}`); res.destroy(error); });
-    res.on("close", () => stream.destroy());
-    stream.pipe(res);
+    await sendPersonalFile(res, personalRoot, req.query?.path, {
+      preview: req.query?.preview === "1", head: req.method === "HEAD", maxBytes: maxUploadBytes,
+    });
   } catch (error) { sendRouteError(res, error); }
 });
 
@@ -11179,10 +11164,7 @@ app.get("/api/files/read", async (req, res) => {
       });
     }
 
-    const stat = await fs.stat(filePath);
-    if (!stat.isFile()) return res.status(400).json({ ok: false, error: "Path is not a file" });
-    if (stat.size > 512_000) return res.status(400).json({ ok: false, error: "File is larger than 512 KB" });
-    const buffer = await fs.readFile(filePath);
+    const { buffer, stat } = await readRootedFile(repo.path, path.relative(repo.path, filePath), 512_000);
     const content = buffer.toString("utf8");
     res.json({
       ok: true,
@@ -11210,7 +11192,7 @@ app.get("/api/files/blob", async (req, res) => {
       return res.status(415).json({ ok: false, error: "Only raster image previews or uploaded attachments are supported" });
     }
     if (repo.kind === "personal" && personalRuntime.enabled) {
-      return pipePersonalFileFromWorker(res, path.relative(repo.path, filePath).replaceAll("\\", "/"), Boolean(imageMimeType));
+      return await pipePersonalFileFromWorker(res, path.relative(repo.path, filePath).replaceAll("\\", "/"), Boolean(imageMimeType));
     }
     const mimeType = imageMimeType || attachmentMimeForPath(filePath);
     const disposition = imageMimeType ? "inline" : "attachment";
@@ -11234,15 +11216,13 @@ app.get("/api/files/blob", async (req, res) => {
         source: "app-server-unavailable",
       });
     }
-    const stat = await fs.stat(filePath);
-    if (!stat.isFile()) return res.status(400).json({ ok: false, error: "Path is not a file" });
-    if (stat.size > maxUploadBytes) return res.status(400).json({ ok: false, error: `Attachment exceeds ${Math.round(maxUploadBytes / 1024 / 1024)} MB` });
+    const { buffer, stat } = await readRootedFile(repo.path, path.relative(repo.path, filePath), maxUploadBytes);
     res.setHeader("Content-Type", mimeType);
     res.setHeader("Content-Length", String(stat.size));
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Content-Disposition", `${disposition}; filename="${safeUploadName(path.basename(filePath))}"`);
     res.setHeader("X-Codex-Source", "local-fallback");
-    res.end(await fs.readFile(filePath));
+    res.end(buffer);
   } catch (error) {
     sendRouteError(res, error);
   }
@@ -11272,15 +11252,13 @@ app.get("/api/codex/generated-image", async (req, res) => {
         source: "app-server-unavailable",
       });
     }
-    const stat = await fs.stat(filePath);
-    if (!stat.isFile()) return res.status(400).json({ ok: false, error: "Path is not a file" });
-    if (stat.size > maxUploadBytes) return res.status(400).json({ ok: false, error: `Generated image exceeds ${Math.round(maxUploadBytes / 1024 / 1024)} MB` });
+    const { buffer, stat } = await readRootedFile(generatedImagesRoot, path.relative(generatedImagesRoot, filePath), maxUploadBytes);
     res.setHeader("Content-Type", mimeType);
     res.setHeader("Content-Length", String(stat.size));
     res.setHeader("Cache-Control", "private, max-age=300");
     res.setHeader("Content-Disposition", `inline; filename="${safeUploadName(path.basename(filePath))}"`);
     res.setHeader("X-Codex-Source", "local-fallback");
-    return res.end(await fs.readFile(filePath));
+    return res.end(buffer);
   } catch (error) {
     sendRouteError(res, error);
   }
