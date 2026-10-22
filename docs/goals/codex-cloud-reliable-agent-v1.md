@@ -1,6 +1,6 @@
 # Codex Cloud 可依赖后台与日常助理 Goal
 
-状态：用户已确认，原生 goal 为 active，正在执行 M1；F01-F03 已推 main，F04 本地和 UI 通过，四项尚未上线；下一项 F05 版本、能力及安全发布基线。版本：2026-10-22。
+状态：用户已确认，原生 goal 为 active，正在执行 M1；F01-F04 已推 main、通过本地/CI 及相关 UI 验收，四项尚未上线；下一项 F05 版本、能力及安全发布基线。版本：2026-10-22。
 
 范围与验收以[开发方案](../development-plan-2026-10-22.md)为准，证据基线见[现状分析](../reviews/2026-10-22-next-stage-assessment.md)。
 
@@ -55,7 +55,7 @@ goal 描述“做成什么”，heartbeat 负责“何时继续”。本机既�
 | 1 | F01 日用量裁剪保护 | main `2642307`、本地/CI 通过，待发布 | M1 安全发布时验收线上；不重复开发此项 | [F01 验收](../acceptance/2026-10-22-daily-budget-retention.md) |
 | 2 | F02 首屏与断线恢复 | main `ca17893`、本地/UI/CI 通过，待发布 | M1 发布时验收真实代理关联；不重复开发此项 | [F02 验收](../acceptance/2026-10-22-status-recovery.md) |
 | 3 | F03 运行设置竞争 | main `8029269`、本地/相关 UI/CI 通过，待发布 | 同一会话序列化、旧任务写回保护；M1 发布时验证生产 | [F03 验收](../acceptance/2026-10-22-runtime-transitions.md) |
-| 4 | F04 取消状态统一 | 本地/UI 通过，待推送与 CI | 新旧取消记录兼容；取消中保持活动；M1 发布时验收生产 | [F04 验收](../acceptance/2026-10-22-cancellation-consistency.md) |
+| 4 | F04 取消状态统一 | main `737f6d0`、本地/相关 UI/CI 通过，待发布 | 新旧取消记录兼容；取消中保持活动；M1 发布时验收生产 | [F04 验收](../acceptance/2026-10-22-cancellation-consistency.md) |
 | 5 | F05 版本与能力基线 | 待开始 | 整理主线/本机/EC2与接口能力矩阵 | 现状分析 R8 |
 | 6 | A01 能力发现与接入契约 | 等待 M1 | 核对运行时模型和协议能力，确定契约 | 开发方案 A01 |
 

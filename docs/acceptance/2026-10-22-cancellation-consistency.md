@@ -2,6 +2,8 @@
 
 日期：2026-10-22。关联：[开发方案](../development-plan-2026-10-22.md) M1/F04、[活动目标](../goals/codex-cloud-reliable-agent-v1.md)。
 
+已推送 main：[代码 `737f6d0`](https://github.com/WilsonWang01/codex-cloud-console/commit/737f6d0949b4a5a25331d9a46220a629a0f25644)。[GitHub CI 39760046243](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39760046243) 已成功，Linux / Node 22 下 `npm ci` 与 `npm run verify:local` 均通过。EC2 尚未更新。
+
 ## 修复结果
 
 运行记录在服务端读取时，把旧 `cancelled` 规范为 `canceled`；保留任务 ID、时间、事件、调用方归属和用量。没有批量迁移旧文件。只读查询或对已取消任务重复请求取消均不重写运行文件；后续正常持久化时可能把旧状态拼写规范化。
@@ -35,4 +37,4 @@ UI 通过既有本机 Vite 服务与隔离模拟 API 运行，简报数据使用
 
 没有新增依赖、通用状态引擎、数据库或迁移程序；规范化放在现有运行记录入口，UI 继续复用现有标签函数。保留未来未知状态的原有兼容行为。
 
-EC2 尚未更新，F01-F04 仍待 M1 的空闲检查、备份、严格健康与真实流程验收。下一项是 F05 版本、能力和发布基线。提交与 GitHub CI 结果在本报告补充后才作为已推送证据。
+EC2 尚未更新，F01-F04 仍待 M1 的空闲检查、备份、严格健康与真实流程验收。下一项是 F05 版本、能力和发布基线。主线提交与 CI 成功不代表生产部署或真实手机验收已完成。

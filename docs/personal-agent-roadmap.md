@@ -1,6 +1,6 @@
 # Personal Agent 统一产品与技术方案
 
-2026-10-22 M1/F04 增量：[取消状态一致性](acceptance/2026-10-22-cancellation-consistency.md)。旧拼写兼容、个人取消简报、统一状态文案、外部客户端终态及取消中活动分类已通过本地与相关 UI 验收；尚未部署 EC2。
+2026-10-22 M1/F04 增量：[取消状态一致性](acceptance/2026-10-22-cancellation-consistency.md)。main `737f6d0` 通过本地/相关 UI/GitHub CI；旧拼写兼容、个人取消简报、统一状态文案、外部客户端终态及取消中活动分类已完成，尚未部署 EC2。
 
 2026-10-22 M1/F03 增量：[设置竞争与任务回写保护](acceptance/2026-10-22-runtime-transitions.md)。main `8029269` 通过本地/相关 UI/GitHub CI，同一会话的设置和启动检查按序执行，旧任务不能覆盖较新选择，尚未部署 EC2。
 
