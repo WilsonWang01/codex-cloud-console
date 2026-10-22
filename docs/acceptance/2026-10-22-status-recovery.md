@@ -4,6 +4,8 @@
 
 ## 本轮交付
 
+已推送主线：[代码 ca17893](https://github.com/WilsonWang01/codex-cloud-console/commit/ca17893eb01f28bd7f6e9c486df7c1077b3abd2f)、[GitHub CI 39755603600](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39755603600)。Linux / Node 22 的完整 `verify:local` 及全部步骤成功；EC2 和本机生产代理仍未更新。
+
 健康检查与页面状态并行读取；健康检查等待上限为 5 秒，主状态请求沿用现有 15 秒超时工具。首次失败提供重试及可展开的错误详情，后续失败保留已经加载的页面并显示上次成功读取时间。网络恢复和返回页面时重新读取状态，新的刷新取消旧请求，迟到结果不能覆盖新状态。
 
 快速健康结果不再刷新整份业务数据的生成时间。主状态失败但健康结果可读时，保留已知的在线/降级状态，避免把局部接口错误直接写成断线。健康结果为有效 JSON 时，即使 HTTP 为 503 也保留其中的分层信息。
