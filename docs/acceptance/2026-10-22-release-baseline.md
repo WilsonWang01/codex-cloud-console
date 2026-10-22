@@ -2,6 +2,8 @@
 
 日期：2026-10-22。关联：[开发方案](../development-plan-2026-10-22.md)、[版本与能力基线](../release-baseline-2026-10-22.md)。本报告为代码、本地验收与只读生产核对；本轮尚未部署 EC2 或重启原本机代理。
 
+已推送 main：[代码 `02bf1a3`](https://github.com/WilsonWang01/codex-cloud-console/commit/02bf1a3bc9d9f4083d19b3d2b0dca37186ff59c9)。[CI 39762287486](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39762287486) 成功；Linux / Node 22 下 `npm ci`、完整 `npm run verify:local` 通过，覆盖最终代码。
+
 ## 交付与 Review
 
 - 后端 `GET /api/release` 与本机代理 `GET /api/local/release` 分别报告启动时版本。包含提交、分支、未提交改动标记、Node、来源清单时间及固定入口摘要，不返回磁盘目录、凭据、Git 变更文件列表或业务数据。不访问模型和云管理 API。
@@ -32,4 +34,4 @@ F01-F05 必须完成一次 M1 整体安全发布与数据对账后，才算生�
 
 未发送邮件、改日历、运行真实模型、创建 AWS 资源、读取登录凭据、删除现有数据或重置额度。另一工作树的未提交本型门禁与 pnpm 文件保持不变。
 
-主线提交与 CI 结果将在实际推送、检查完成后补充，不把本地通过当作已推送或已上线。
+代码与 CI 已交付，不等于版本接口已在生产生效；生产上线与核对将单独记录。
