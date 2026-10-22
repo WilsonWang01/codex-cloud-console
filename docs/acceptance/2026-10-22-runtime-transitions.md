@@ -2,6 +2,8 @@
 
 日期：2026-10-22。关联：[开发方案](../development-plan-2026-10-22.md) M1/F03、[活动目标](../goals/codex-cloud-reliable-agent-v1.md)。
 
+已推 main：[代码 8029269](https://github.com/WilsonWang01/codex-cloud-console/commit/8029269b2d28bd95caa2fe71d55286ed42c6aa2e)、[GitHub CI 39758225096](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39758225096)。最终提交的 Linux / Node 22 完整检查成功；36 项安全测试和 9 组后端回归通过。尚未更新 EC2。
+
 ## 已复现的问题
 
 在隔离本机 HTTP 服务中，将旧的 GPT-6 Sol 设置请求停在模拟 Codex 的 `thread/resume`，再发 GPT-6 Astra / ultra / 关闭搜索请求。原代码先保存新选择，随后旧请求返回又把模型写回 Sol；新增回归在修复前明确失败。
@@ -41,4 +43,4 @@ HTTP 竞争测试使用真实 Express 服务、临时磁盘状态和模拟 Codex
 
 当前目标仍为单机、单后端进程；会话队列不协调多个后端进程。后续请求可能等待前一次设置的协议超时，不代表模型运行队列已经具备持久化。后台任务的明确模型和未来对话的界面选择是两种用途，不把一种静默批量改成另一种。
 
-EC2 尚未更新，发布前仍需空闲、备份、严格健康及真实流程检查。F04 取消状态和 F05 发布基线仍未完成。本轮提交、完整回归及 CI 结果将在发布记录中补充。
+EC2 尚未更新，发布前仍需空闲、备份、严格健康及真实流程检查。F04 取消状态和 F05 发布基线仍未完成。本项不作为整个 M1 或持续目标已经完成的证据。
