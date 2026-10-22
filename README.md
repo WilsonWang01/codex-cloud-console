@@ -29,7 +29,7 @@
 
 ### 1. 准备运行环境
 
-- Node.js **22+**、npm、Git。
+- Node.js **22.16+**、npm、Git；建议使用较新的 Node.js 22 维护版。
 - 主机上已安装可运行 `app-server` 的 Codex CLI，安装方法见 [Codex CLI 官方文档](https://learn.chatgpt.com/docs/codex/cli)。
 - 在**运行控制台的同一个系统用户**下完成 Codex 登录。登录你的笔记本，不等于服务器上的 Codex 也已登录。
 

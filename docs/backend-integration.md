@@ -13,6 +13,8 @@ Codex Cloud 的核心是**既有自动化任务的异步执行接口**。适合 
 
 参考客户端仅依赖 Node.js 内置模块，可从仓库导入 [`runExternalClient`](../scripts/external-client-example.mjs)，或用任意语言按以下 HTTP 契约接入。推荐使用项目已有的 Node.js 22 或更新运行环境。
 
+调用方统计的任务用量由独立账本保留，历史结果明细裁剪后不会立即丢掉近期 token 统计；未知用量不按零计算。管理接口 `/api/clients/usage` 的 `usageLedger` 返回起始/同步时间、UTC 保留边界、精简记录数和数据库占用。账本保留最近 32 个完整 UTC 日及当天；首次接入前已删除的历史无法回填，不能用它推算完整账户账单。任务结果的保留边界仍以能力接口为准。
+
 另有不依赖第三方包的 [Python 客户端](../scripts/external-client-example.py)（Python 3.9+）和 [OpenAPI 3.1 契约](openapi.json)。该 OpenAPI 覆盖发现与异步任务；推理适配的字段边界另见模型协议文档，不宣称全协议覆盖。
 
 ## 先查询能力

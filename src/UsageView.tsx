@@ -7,7 +7,7 @@ type RequestBucket = { hour: string; clientId: string; requests: number; accepte
 type RunBucket = { hour: string; clientId: string; runs: number; completed: number; failed: number; knownRuns: number; unknownRuns: number; inputTokens: number; outputTokens: number; totalTokens: number };
 type RequestRow = { id: string; clientId: string; automationId: string; trigger: string; status: number; runId: string | null; deduplicated: boolean; durationMs: number; time: string };
 type RunRow = { id: string; clientId: string; automationId: string; status: string; startedAt: string; finishedAt: string | null; model: string | null; reasoning: string | null; usage: { status: "complete" | "unknown"; inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number | null } };
-type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; runs?: RunRow[]; droppedRequests: number };
+type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; runs?: RunRow[]; droppedRequests: number; usageLedger?: { seededAt: string | null; retentionDays: number; timezone: string } };
 const emptyUsage: Usage = { buckets: [], runBuckets: [], requests: [], runs: [], droppedRequests: 0 };
 
 function localDay(date: Date) {
@@ -166,6 +166,7 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
       {error && <p className="usage-error" role="alert">{error}</p>}
       {loading && <p className="usage-note" role="status">正在更新调用数据…</p>}
       {hasCurrentData && <p className="usage-note">{error ? "当前显示上次成功数据；" : ""}更新于 {new Date(loadedAt).toLocaleString()}；按本机时区 {Intl.DateTimeFormat().resolvedOptions().timeZone} 显示。Token 仅覆盖已计量的外部任务。</p>}
+      {visibleUsage.usageLedger?.seededAt && <p className="usage-note">用量账本始于 {new Date(visibleUsage.usageLedger.seededAt).toLocaleString()}，保留 {visibleUsage.usageLedger.retentionDays} 天；此前历史仅覆盖仍保留的记录，统计可能不完整。每日预算按 UTC 日期计算。</p>}
       <div className="usage-filters">
         <div className="usage-segmented" role="group" aria-label="时间范围">
           {[1, 7, 30].map((days) => <button type="button" key={days} className={rangeDays === days ? "selected" : ""} onClick={() => setRangeDays(days)}>{days === 1 ? "24 小时" : `${days} 天`}</button>)}

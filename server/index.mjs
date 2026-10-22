@@ -26,6 +26,7 @@ import { notificationAttempt, pendingNotificationChannels } from "./notification
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
+import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
 import { readConnectedApps } from "./connected-apps.mjs";
 import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
@@ -73,6 +74,10 @@ const personalRoutinesStore = createPersonalRoutinesStore(path.join(stateRoot, "
 const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
+let runUsageLedger;
+function usageLedger() {
+  return runUsageLedger ||= openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+}
 const auditEventsPath = path.join(stateRoot, "audit-events.json");
 const attentionStatePath = path.join(stateRoot, "attention-state.json");
 const notificationStatePath = path.join(stateRoot, "notification-state.json");
@@ -5207,7 +5212,10 @@ async function readAutomationRuns() {
 }
 
 async function writeAutomationRunsWithinQueue(store) {
-  const runs = retainAutomationRuns((store.runs || []).map(normalizeAutomationRun), {
+  const normalized = (store.runs || []).map(normalizeAutomationRun);
+  // Persist terminal accounting before result history can discard its evidence.
+  usageLedger().sync(normalized);
+  const runs = retainAutomationRuns(normalized, {
     now: Date.now(), idempotencyTtlMs: automationTriggerIdempotencyTtlMs, recoveryMaxAgeMs: automationRecoveryMaxAgeMs,
   });
   await atomicWriteJson(automationRunsPath, { version: 1, runs });
@@ -5216,7 +5224,11 @@ async function writeAutomationRunsWithinQueue(store) {
 async function upsertAutomationRun(run, event = null, { budgetLimit = null } = {}) {
   return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns();
-    const budget = checkKnownTokenBudget(store.runs, { limit: budgetLimit });
+    const ledger = usageLedger();
+    ledger.sync(store.runs);
+    const now = Date.now();
+    const dayStart = Date.parse(new Date(now).toISOString().slice(0, 10) + "T00:00:00Z");
+    const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: budgetLimit, now });
     if (!budget.ok) {
       throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
     }
@@ -8957,11 +8969,16 @@ app.get("/api/clients/usage", async (req, res) => {
   }
   try {
     const clientId = String(req.query.clientId || "");
-    const [requests, runStore] = await Promise.all([
+    const [requests, usage] = await Promise.all([
       apiClientStore.usage({ from, to, clientId }),
-      readAutomationRuns(),
+      enqueueWrite("automation", async () => {
+        const store = await readAutomationRuns();
+        const ledger = usageLedger();
+        ledger.sync(store.runs);
+        return { runs: mergeUsageRuns(store.runs, ledger.rows({ from, to })), info: ledger.info() };
+      }),
     ]);
-    res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(runStore.runs, { from, to, clientId }), runs: runUsageDetails(runStore.runs, { from, to, clientId }) });
+    res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(usage.runs, { from, to, clientId }), runs: runUsageDetails(usage.runs, { from, to, clientId }), usageLedger: usage.info });
   } catch (error) { res.status(500).json({ ok: false, error: error.message }); }
 });
 

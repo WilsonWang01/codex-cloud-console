@@ -262,6 +262,7 @@ await context.route("**/api/**", async (route) => {
     if (usageRace && requestedDays > 4 && requestedDays < 10) await new Promise((resolve) => setTimeout(resolve, 300));
     const requests = usageRace && requestedDays > 20 ? 30 : usageRace && requestedDays > 4 ? 7 : 2;
     return send({ ok: true, droppedRequests: 0,
+    usageLedger: { seededAt: "2026-10-23T00:00:00Z", retentionDays: 32, timezone: "UTC" },
     buckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", requests, accepted: 1, errors: 0, replayed: 1, polls: 3, controls: 1 }],
     runBuckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", runs: 2, completed: 1, failed: 0, knownRuns: 1, unknownRuns: 1, inputTokens: 100, outputTokens: 20, totalTokens: 120 }],
     requests: [{ id: "request-1", clientId: "client-a", automationId: status.automations[0].id, trigger: "webhook", status: 200, runId: "run-1", deduplicated: false, durationMs: 5, time: new Date().toISOString() }],
@@ -490,6 +491,8 @@ try {
   await page.getByRole("heading", { name: "调用与用量" }).waitFor();
   assert.match(await page.locator(".usage-summary").innerText(), /120/);
   assert.match(await page.locator(".usage-view").innerText(), /1 次运行用量未知/);
+  assert.match(await page.locator(".usage-view").innerText(), /此前历史仅覆盖仍保留的记录/);
+  assert.match(await page.locator(".usage-view").innerText(), /每日预算按 UTC/);
   assert.match(await page.locator(".usage-summary").innerText(), /结果查询\s*3/);
   await page.locator(".usage-request summary").first().click();
   assert.match(await page.locator(".usage-request-expanded").innerText(), /Token 120/);

@@ -60,7 +60,7 @@ async function stopProcess(child) {
   const closed = new Promise((resolve) => child.once("close", resolve));
   child.kill("SIGTERM");
   await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-  if (child.exitCode === null) child.kill("SIGKILL");
+  if (child.exitCode === null) { child.kill("SIGKILL"); await closed; }
 }
 
 async function runCaptured(command, args, options = {}) {
@@ -119,6 +119,8 @@ const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
 const threads = [];
 let modelApiText = null;
 let modelApiImages = [];
+let modelApiTurnId = null;
+let turnSequence = 0;
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
@@ -214,7 +216,7 @@ input.on("line", (line) => {
     return send({ method: "thread/archived", params: { threadId: message.params.threadId } }, 20);
   }
   if (message.method === "thread/read" && message.params?.includeTurns && modelApiText) {
-    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: "turn-model-api", items: [{ type: "agentMessage", text: modelApiText }, ...modelApiImages] }] } } });
+    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: modelApiTurnId, items: [{ type: "agentMessage", text: modelApiText }, ...modelApiImages] }] } } });
   }
   if (message.method === "thread/archive" && message.params?.threadId === "thread-archive-race") {
     return send({ id: message.id, result: {} }, 250);
@@ -257,17 +259,19 @@ input.on("line", (line) => {
   }
   if (message.method === "turn/start") {
     const requestText = JSON.stringify(message.params || {});
+    const uniqueTurn = process.pid + "-" + (++turnSequence);
     if (requestText.includes("model api regression")) {
+      modelApiTurnId = "turn-model-api-" + uniqueTurn;
       modelApiText = requestText.includes("long output") ? "验收".repeat(2500) : "接口验收通过";
       modelApiImages = requestText.includes("generated output") ? [{ id: "ig-fixture", type: "imageGeneration", status: "completed", failure: null, result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", revisedPrompt: "图片输出验收" }] : [];
-      send({ id: message.id, result: { turn: { id: "turn-model-api" } } });
-      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: "turn-model-api", delta: modelApiText.slice(0, 2) } }, 40);
-      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: "turn-model-api", delta: modelApiText.slice(2) } }, 150);
+      send({ id: message.id, result: { turn: { id: modelApiTurnId } } });
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(0, 2) } }, 40);
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(2) } }, 150);
       send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
-      send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: "turn-model-api", status: "completed" } } }, 300);
+      send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: modelApiTurnId, status: "completed" } } }, 300);
       return;
     }
-    const turnId = requestText.includes("cancel regression") ? "turn-cancel-regression" : "turn-regression";
+    const turnId = (requestText.includes("cancel regression") ? "turn-cancel-regression-" : "turn-regression-") + uniqueTurn;
     const progressRegression = requestText.includes("progress regression");
     const queuedFirstRegression = requestText.includes("progress regression queue first");
     const queueRegressionNext = requestText.includes("queue regression next");
@@ -387,7 +391,7 @@ input.on("line", (line) => {
   }
   if (message.method === "turn/interrupt") {
     send({ id: message.id, result: {} });
-    if (message.params?.turnId === "turn-cancel-regression") {
+    if (String(message.params?.turnId).startsWith("turn-cancel-regression-")) {
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
         turn: { id: message.params?.turnId, status: "interrupted" },
@@ -403,6 +407,68 @@ input.on("line", (line) => {
   );
   return fakePath;
 }
+
+await check("usage API retains accounting across history pruning and restart; corrupt ledgers block execution", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-ledger-api-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), binDir = path.join(root, "bin");
+  for (const directory of [stateRoot, binDir, path.join(cloudRoot, "workspace", "sample-app")]) await fs.mkdir(directory, { recursive: true });
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(binDir, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const startedAt = new Date(Date.now() - 86400000).toISOString();
+  const runs = Array.from({ length: 450 }, (_, i) => ({
+    id: `accounting-${i}`, automationId: "sample-research", repoId: "sample-app", runner: "app-server", clientId: "ledger-client",
+    status: "completed", startedAt, updatedAt: startedAt, finishedAt: startedAt, threadId: "ledger-thread", turnId: `turn-${i}`,
+    usage: { status: "complete", inputTokens: 100, outputTokens: 20, totalTokens: 120 }, prompt: "private accounting fixture",
+  }));
+  const source = path.join(stateRoot, "automation-runs.json");
+  await fs.writeFile(source, JSON.stringify({ version: 1, runs }));
+  const capturePath = path.join(root, "requests.ndjson");
+  const startServer = () => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], {
+    cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+      ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port),
+      CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"),
+      CODEX_CLOUD_WEBHOOK_TOKEN: "ledger-test-token-123456", CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0",
+      FAKE_CAPTURE_PATH: capturePath, PATH: `${binDir}:${process.env.PATH}`,
+    },
+  });
+  const headers = { "x-codex-cloud-token": "ledger-test-token-123456" };
+  let server;
+  try {
+    server = startServer(); await waitForOutput(server, /listening on/);
+    const first = await jsonRequest(base, "/api/clients/usage", { headers });
+    assert.equal(first.response.status, 200);
+    assert.equal(first.data.runBuckets.reduce((sum, row) => sum + row.totalTokens, 0), 54000);
+    assert.equal(JSON.stringify(first.data).includes("private accounting fixture"), false);
+    assert.equal(first.data.usageLedger.rows, 450);
+    await stopProcess(server);
+    await fs.writeFile(source, JSON.stringify({ version: 1, runs: runs.slice(0, 200) }));
+    server = startServer(); await waitForOutput(server, /listening on/);
+    const after = await jsonRequest(base, "/api/clients/usage", { headers });
+    assert.equal(after.response.status, 200);
+    assert.deepEqual(after.data.runBuckets, first.data.runBuckets);
+    const other = await jsonRequest(base, "/api/clients/usage?clientId=other", { headers });
+    assert.deepEqual(other.data.runBuckets, []);
+    assert.deepEqual(other.data.runs, []);
+    await stopProcess(server);
+    for (const suffix of ["", "-wal", "-shm"]) {
+      await fs.rename(path.join(stateRoot, `run-usage.sqlite${suffix}`), path.join(stateRoot, `saved.sqlite${suffix}`)).catch((error) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+    await fs.writeFile(path.join(stateRoot, "run-usage.sqlite"), "corrupt fixture");
+    server = startServer(); await waitForOutput(server, /listening on/);
+    assert.equal((await jsonRequest(base, "/api/clients/usage", { headers })).response.status, 500);
+    const rejected = await jsonRequest(base, "/api/automations/sample-research/webhook", {
+      method: "POST", headers: { ...headers, "content-type": "application/json", "idempotency-key": "ledger-unreadable-0001" },
+      body: JSON.stringify({ prompt: "must not run", worktree: false }),
+    });
+    assert.equal(rejected.response.status, 500);
+    const requests = await fs.readFile(capturePath, "utf8").catch(() => "");
+    assert.equal(requests.includes('"method":"turn/start"'), false);
+    assert.equal(JSON.parse(await fs.readFile(source, "utf8")).runs.length, 200);
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
 
 await check("app-server generations ignore stale exits", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-client-generation-"));
@@ -2484,6 +2550,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(JSON.stringify(clientsAfter.data).includes(newClient.data.token), false);
     const usageAfter = await jsonRequest(baseUrl, `/api/clients/usage?to=${encodeURIComponent(new Date(Date.now() + 5_000).toISOString())}`);
     assert.equal(usageAfter.response.status, 200);
+    assert.equal(usageAfter.data.usageLedger.source, "sqlite-terminal-runs");
+    assert.equal(usageAfter.data.usageLedger.timezone, "UTC");
     assert.ok(usageAfter.data.buckets.some((bucket) => bucket.clientId === newClient.data.client.id && bucket.requests >= 3));
     assert.ok(usageAfter.data.buckets.some((bucket) => bucket.clientId === newClient.data.client.id && bucket.polls >= 1));
     assert.equal(usageAfter.data.buckets.some((bucket) => bucket.clientId === "unknown"), false);
@@ -2567,6 +2635,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       ...progressRun,
       id: "run-sample-research-interrupted-regression",
       automationId: "sample-hourly",
+      turnId: "interrupted-fixture-turn",
       status: "interrupted",
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -2613,7 +2682,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ runner: "app-server", prompt: "progress regression admission first", worktree: false }),
     });
-    assert.equal(admissionFirst.response.status, 200);
+    assert.equal(admissionFirst.response.status, 200, JSON.stringify(admissionFirst.data));
     const admissionBlocked = await jsonRequest(baseUrl, "/api/automations/sample-hourly/run", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ runner: "app-server", prompt: "admission second", worktree: false }),
