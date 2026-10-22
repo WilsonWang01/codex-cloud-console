@@ -37,7 +37,9 @@ EC2 备份目录：`/home/ubuntu/codex-cloud/backups/pre-m1-20261022`，目录 0
 
 安装器 `npm prune` 原先会移除锁文件的部分 peer 标记，未改变依赖版本，但使运行锁文件哈希不同。增加 `--package-lock=false` 保留来源锁文件，仍裁剪实际开发依赖。
 
-测试补充：Express 实际使用的 `proxy-addr` 回环、非信任来源、伪造转发头和异常 IPv6 子网；安装器审计失败不切换、不删除原版本。`npm run verify:local` 全部通过；`verify:status:ui` 通过首屏、局部错误、超时、恢复及 30 次重载，84 次状态请求、0 次写入。CI 和最终生产复查结果待补。
+测试补充：Express 实际使用的 `proxy-addr` 回环、非信任来源、伪造转发头和异常 IPv6 子网；安装器审计失败不切换、不删除原版本。`npm run verify:local` 全部通过；`verify:status:ui` 通过首屏、局部错误、超时、恢复及 30 次重载，84 次状态请求、0 次写入。
+
+首次 CI [39769628624](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39769628624) 审计通过，但回归失败：测试只等待模型任务结束，没有等待自动化结果持久化与并发名额释放，下一提交得到 429。补充等待已有 `activeRunIds` 为空且模型任务为空，不修改生产并发上限，不跳过断言，不以无条件重试掩盖。修复后的 CI 和最终生产复查结果待补。
 
 公告来源：[proxy-addr](https://github.com/advisories/GHSA-jqcg-44mw-7w3h)、[shell-quote](https://github.com/advisories/GHSA-pqg4-j6r4-53mv)、[source-map-js](https://github.com/advisories/GHSA-68fv-2mgg-jv7q)、[Vite/launch-editor](https://github.com/advisories/GHSA-587h-7wmj-h5pm)。
 

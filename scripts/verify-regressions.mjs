@@ -2509,11 +2509,16 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(rateLimitedTrigger.response.status, 429);
     assert.ok(Number(rateLimitedTrigger.response.headers.get("retry-after")) >= 1);
     await new Promise((resolve) => setTimeout(resolve, 400));
-    // The preceding timed-out task may still be releasing admission under load.
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    // Model completion precedes automation settlement and admission release.
+    for (let attempt = 0; attempt < 50; attempt += 1) {
       const status = await jsonRequest(baseUrl, "/api/codex/app-host/status");
-      if (!status.data.activeJobs?.length) break;
-      assert.ok(attempt < 29, "preceding regression task did not release admission");
+      const runs = await jsonRequest(baseUrl, "/api/automations/runs?verifyLimit=0");
+      assert.equal(status.response.status, 200);
+      assert.equal(runs.response.status, 200);
+      assert.ok(Array.isArray(status.data.activeJobs));
+      assert.ok(Array.isArray(runs.data.activeRunIds));
+      if (!status.data.activeJobs.length && !runs.data.activeRunIds.length) break;
+      assert.ok(attempt < 49, `preceding regression task did not settle: ${JSON.stringify(runs.data.activeRunIds)}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     const progressTriggerKey = "regression-idempotency-progress";
