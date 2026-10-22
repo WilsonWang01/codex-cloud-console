@@ -3,7 +3,7 @@
   "info": {
     "title": "Codex Cloud 能力发现与异步任务",
     "version": "2026-10-23",
-    "description": "覆盖能力发现、异步任务、受限结构化结果及新任务的私有产物清单/下载。推理适配字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 或 Files API 兼容。部署能力以 capabilities 为准。"
+    "description": "覆盖能力发现、异步任务、受限内联 txt/md/图片材料、结构化结果及新任务的私有产物清单/下载。推理适配字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 或 Files API 兼容。部署能力以 capabilities 为准。"
   },
   "servers": [{"url": "https://your-codex-cloud.example"}],
   "paths": {
@@ -52,6 +52,8 @@
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"$ref": "#/components/responses/NotFound"},
           "409": {"$ref": "#/components/responses/Conflict"},
+          "413": {"$ref": "#/components/responses/InputTooLarge"},
+          "415": {"$ref": "#/components/responses/UnsupportedInput"},
           "429": {"$ref": "#/components/responses/RateLimited"},
           "500": {"$ref": "#/components/responses/UnknownOutcome"}
         }
@@ -70,6 +72,8 @@
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"$ref": "#/components/responses/NotFound"},
           "409": {"$ref": "#/components/responses/Conflict"},
+          "413": {"$ref": "#/components/responses/InputTooLarge"},
+          "415": {"$ref": "#/components/responses/UnsupportedInput"},
           "429": {"$ref": "#/components/responses/RateLimited"},
           "500": {"$ref": "#/components/responses/UnknownOutcome"}
         }
@@ -143,6 +147,8 @@
     },
     "responses": {
       "BadRequest": {"description": "未知字段或参数不支持"},
+      "InputTooLarge": {"description": "JSON、文本/图片材料或执行载荷超过限制，未接收新任务；不截断输入"},
+      "UnsupportedInput": {"description": "只接受未压缩的 application/json；附件类型、后缀/MIME 或来源不支持"},
       "Unauthorized": {"description": "令牌缺失、过期、撤销或自动化范围不符"},
       "NotFound": {"description": "不存在或不属于本调用方，不泄漏他人的目标"},
       "RateLimited": {"description": "限流，遵循 Retry-After 秒数", "headers": {"Retry-After": {"schema": {"type": "integer", "minimum": 1}}}},
@@ -171,13 +177,24 @@
         "reasoning": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]}, "search": {"type": "boolean"}, "worktree": {"const": true},
         "sessionId": {"type": "string", "minLength": 1, "maxLength": 160, "description": "仅 heartbeat 可用；webhook 拒绝"}, "completionContract": {"type": "object", "description": "详见 backend-integration.md，不能替代外部写入确认"},
         "outputSchema": {"type": ["object", "null"], "description": "受限 JSON Schema：16 KiB、8 层、128 节点，根为 object；省略或 null 不要求结构化；详见 structured-output.md"},
-        "artifactPaths": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "隔离工作树内待生成的相对路径；只收本轮新增/内容变化的 txt/md/json/csv/html/pdf/png/jpg/jpeg/webp 文件。拒绝隐藏目录、链接与旧内容；单份 8 MiB，清单和所有产物总计 20 MiB"}
+        "artifactPaths": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "隔离工作树内待生成的相对路径；只收本轮新增/内容变化的 txt/md/json/csv/html/pdf/png/jpg/jpeg/webp 文件。拒绝隐藏目录、链接与旧内容；单份 8 MiB，清单和所有产物总计 20 MiB"},
+        "attachments": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/InputAttachment"}, "description": "内联材料，不是服务器文件路径。txt/md 最多四份、单份 64 KiB、合计 128 KiB；图片单份 4 MiB、合计 8 MiB；总正文 12 MiB。不支持 PDF、远程 URL 或文件 ID"}
+      }},
+      "InputAttachment": {"type": "object", "additionalProperties": false, "required": ["name", "mimeType", "dataBase64"], "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 255, "description": "普通非隐藏文件名，UTF-8 最多 255 字节，不含路径或控制字符"},
+        "mimeType": {"enum": ["text/plain", "text/markdown", "image/png", "image/jpeg", "image/webp"], "description": "必须与 txt/md/png/jpg/jpeg/webp 后缀匹配"},
+        "dataBase64": {"type": "string", "maxLength": 5592408, "description": "文件字节的标准 Base64，不能带 data URL 前缀或换行；解码大小另按类型限制"}
+      }},
+      "InputFileMetadata": {"type": "object", "additionalProperties": false, "required": ["index", "name", "mimeType", "bytes", "sha256"], "properties": {
+        "index": {"type": "integer", "minimum": 1, "maximum": 8}, "name": {"type": "string"}, "mimeType": {"type": "string"},
+        "bytes": {"type": "integer", "minimum": 0, "maximum": 4194304}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
       }},
       "RunResponse": {"type": "object", "required": ["ok", "run"], "properties": {
         "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {
           "id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]},
           "startedAt": {"type": "string", "format": "date-time", "description": "任务接收时间"}, "executionStartedAt": {"type": ["string", "null"], "format": "date-time", "description": "实际开始执行时间；排队中可为空，用于 UTC 用量归属"},
           "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0},
+          "inputFiles": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/InputFileMetadata"}, "description": "只含材料描述，不含内容/Base64；参与同事件键校验"},
           "structuredOutput": {"type": "object", "description": "验证成功为 validated/schemaSha256/data，失败为 invalid/error；data 是完整业务对象", "required": ["status"], "properties": {"status": {"enum": ["validated", "invalid"]}, "schemaSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "data": {"type": "object"}, "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}},
           "outputPath": {"type": "string", "description": "受限清单相对路径，仍需同一调用方认证"},
           "delivery": {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "ready", "failed", "expired"]}, "id": {"type": "string", "format": "uuid"}, "expiresAt": {"type": "string", "format": "date-time"}, "artifactCount": {"type": "integer", "minimum": 0, "maximum": 8}, "error": {"type": "object"}}}

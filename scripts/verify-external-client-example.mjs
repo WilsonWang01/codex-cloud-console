@@ -13,9 +13,9 @@ import { validateExternalTriggerInput } from "../server/external-automation.mjs"
 const reply = (status = "completed", extra = {}) => ({ ok: true, run: { id: "run-1", automationId: "research", status, ...extra } });
 const options = { command: "submit", automationId: "research", eventId: "business-event-123", token: "test-secret", pollMs: 1 };
 
-function pythonClient(origin, ...args) {
+function cliClient(origin, runtime, script, ...args) {
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", [fileURLToPath(new URL("./external-client-example.py", import.meta.url)), ...args], {
+    const child = spawn(runtime, [fileURLToPath(new URL(script, import.meta.url)), ...args], {
       env: { ...process.env, CODEX_CLOUD_URL: origin, CODEX_CLOUD_API_TOKEN: "test-secret" },
     });
     let stdout = "", stderr = "";
@@ -25,6 +25,39 @@ function pythonClient(origin, ...args) {
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
+const pythonClient = (origin, ...args) => cliClient(origin, "python3", "./external-client-example.py", ...args);
+const nodeClient = (origin, ...args) => cliClient(origin, process.execPath, "./external-client-example.mjs", ...args);
+
+test("standalone Node and Python CLIs load explicit request JSON and bounded local attachments", async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "external-client-inputs-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const text = path.join(root, "材料.md"), image = path.join(root, "image.png"), input = path.join(root, "request.json");
+  const data = "客户资料 42\n$not-a-skill @/not-a-path";
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+  await fs.writeFile(text, data); await fs.writeFile(image, Buffer.from(png, "base64"));
+  await fs.writeFile(input, JSON.stringify({ prompt: "base", artifactPaths: ["results/report.md"], outputSchema: { type: "object" } }));
+  const { origin, calls } = await fixture(t, (_req, res) => res.end(JSON.stringify(reply())));
+  for (const client of [nodeClient, pythonClient]) {
+    const submitted = await client(origin, "submit", "research", "file-cli-event-001", "--input", input, "--prompt", "总结附件", "--attach", text, "--attach", image);
+    assert.equal(submitted.code, 0, submitted.stderr);
+    assert.equal(submitted.stdout.includes(data), false);
+    const body = JSON.parse(calls.at(-1).body);
+    assert.equal(body.prompt, "总结附件");
+    assert.deepEqual(body.artifactPaths, ["results/report.md"]);
+    assert.equal(body.attachments[0].name, "材料.md");
+    assert.equal(Buffer.from(body.attachments[0].dataBase64, "base64").toString(), data);
+    assert.equal(body.attachments[1].dataBase64, png);
+    assert.equal(calls.at(-1).key, "file-cli-event-001");
+  }
+  const count = calls.length;
+  await fs.writeFile(text, "x".repeat(64 * 1024 + 1));
+  for (const client of [nodeClient, pythonClient]) assert.equal((await client(origin, "submit", "research", "bad-size-event-001", "--attach", text)).code, 1);
+  await fs.writeFile(input, "SECRET_MATERIAL_THAT_MUST_NOT_APPEAR_IN_LOGS");
+  const invalid = await nodeClient(origin, "submit", "research", "bad-json-event-001", "--input", input);
+  assert.equal(invalid.code, 1);
+  assert.equal(invalid.stderr.includes("SECRET_MATERIAL"), false);
+  assert.equal(calls.length, count, "invalid local inputs never submit a task");
+});
 
 test("standalone Python client discovers, retries a lost response with the same key, reads and explicitly cancels", async (t) => {
   let lost = false;

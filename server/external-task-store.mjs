@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 
 const terminal = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
-export const externalTaskSchemaVersion = 3;
+export const externalTaskSchemaVersion = 4;
+export const executionPayloadLimits = Object.freeze({ perRun: 12 * 1024 * 1024, global: 128 * 1024 * 1024, client: 32 * 1024 * 1024 });
 const decode = (row) => row ? JSON.parse(row.record) : null;
 function processIdentity(pid) {
   if (process.platform !== "linux") return null;
@@ -23,11 +24,12 @@ const alive = (pid, owner) => {
   return !identity || !owner.startsWith("linux:") || owner.startsWith(identity + ":");
 };
 
-export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive = alive } = {}) {
+export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive = alive, payloadLimits = executionPayloadLimits } = {}) {
+  if (![payloadLimits.perRun, payloadLimits.global, payloadLimits.client].every(n => Number.isSafeInteger(n) && n > 0)) throw new Error("Invalid execution payload limits");
   db.exec("CREATE TABLE IF NOT EXISTS external_tasks_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('schema_version', ?)").run(externalTaskSchemaVersion);
   const version = db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value;
-  if (![1, 2, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
+  if (![1, 2, 3, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('revision', 0)").run();
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS external_tasks (
@@ -45,7 +47,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       key_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
       run_id TEXT NOT NULL REFERENCES external_tasks(id), expires_ms INTEGER NOT NULL
     ) STRICT;`);
-  // V3 adds result delivery fields and reservations; preserve old rows and execution claims.
+  // V4 adds inline materials; old executors cannot silently omit their payload.
   if (version !== externalTaskSchemaVersion) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
   const get = db.prepare("SELECT id, record, state, owner, owner_pid, epoch FROM external_tasks WHERE id=?");
   const save = db.prepare("UPDATE external_tasks SET record=?, state=?, execution=CASE WHEN ?='terminal' THEN '{}' ELSE execution END WHERE id=?");
@@ -61,6 +63,9 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
   };
   const write = (row, record) => {
     const state = terminal.has(record.status) ? "terminal" : row.state;
+    if (state === "terminal" && record.status !== "completed" && record.delivery?.status === "pending") {
+      record = { ...record, delivery: { status: "failed", error: { code: "run_not_completed", message: "任务未成功完成，未交付结果；请核对原任务，不会自动重复执行" } } };
+    }
     if (state === "terminal" && db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get()) {
       const result = db.prepare("SELECT expires_ms, record FROM external_results WHERE run_id=?").get(row.id);
       if (result) {
@@ -119,10 +124,15 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         if (db.prepare("SELECT count(*) AS n FROM external_tasks WHERE state='queued'").get().n >= maxQueued) {
           throw Object.assign(failure(429, "后台任务队列已满，请稍后使用原事件键重试"), { retryAfterMs: 30000 });
         }
+        const encoded = JSON.stringify(execution), bytes = Buffer.byteLength(encoded);
+        if (bytes > payloadLimits.perRun) throw Object.assign(failure(413, "任务执行材料超过允许大小，未接收任务"), { code: "execution_input_too_large" });
+        const global = db.prepare("SELECT coalesce(sum(length(CAST(execution AS BLOB))),0) AS n FROM external_tasks WHERE state!='terminal'").get().n;
+        const client = db.prepare("SELECT coalesce(sum(length(CAST(execution AS BLOB))),0) AS n FROM external_tasks WHERE state!='terminal' AND json_extract(record,'$.clientId')=?").get(run.clientId).n;
+        if (global + bytes > payloadLimits.global || client + bytes > payloadLimits.client) throw Object.assign(failure(429, "待执行材料容量已满，未启动模型；请稍后使用原事件键重试"), { code: "execution_input_capacity", retryAfterMs: 30000 });
         check();
         db.prepare("DELETE FROM external_task_keys WHERE expires_ms<=? AND run_id IN (SELECT id FROM external_tasks WHERE state='terminal' AND json_extract(record,'$.status')!='needs_reconciliation')").run(now());
         db.prepare("INSERT INTO external_tasks VALUES (?, ?, ?, ?, 'queued', NULL, NULL, 0)").run(
-          run.id, JSON.stringify(run), JSON.stringify(execution), now(),
+          run.id, JSON.stringify(run), encoded, now(),
         );
         onAccepted(run);
         if (keyHash) db.prepare("INSERT INTO external_task_keys VALUES (?, ?, ?, ?)").run(keyHash, requestHash, run.id, now() + ttlMs);
@@ -154,6 +164,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         }
         if (JSON.stringify(current.outputSchema || null) !== JSON.stringify(record.outputSchema || null)) throw failure(409, "已接收任务的输出格式不能更改");
         if (JSON.stringify(current.artifactPaths || []) !== JSON.stringify(record.artifactPaths || [])) throw failure(409, "已接收任务的产物路径不能更改");
+        if (JSON.stringify(current.inputFiles || []) !== JSON.stringify(record.inputFiles || [])) throw failure(409, "已接收任务的输入材料摘要不能更改");
         if (row.state === "terminal") return current;
         if (current.cancelRequestedAt) {
           record = { ...record, cancelRequestedAt: current.cancelRequestedAt };

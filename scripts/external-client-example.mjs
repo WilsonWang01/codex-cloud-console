@@ -184,25 +184,71 @@ export async function runExternalClient({ command, automationId, eventId = "", r
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const [command, automationId, value, option, destination] = process.argv.slice(2);
+  const [command, automationId, value, ...args] = process.argv.slice(2);
   const controller = new AbortController();
   process.once("SIGINT", () => controller.abort());
   process.once("SIGTERM", () => controller.abort());
-  runExternalClient({
-    command, automationId, eventId: ["submit", "heartbeat"].includes(command) ? value : "", runId: ["submit", "heartbeat"].includes(command) ? "" : value,
-    fileId: command === "download" ? option : "",
-    origin: process.env.CODEX_CLOUD_URL, token: process.env.CODEX_CLOUD_API_TOKEN, wait: option === "--wait", signal: controller.signal,
-    onStatus: (run) => process.stderr.write(`${run.id}: ${run.status}\n`),
-  }).then(async (result) => {
+  const cli = async () => {
+    const fs = await import("node:fs/promises"), { constants } = await import("node:fs"), path = await import("node:path");
+    const read = async (name, limit) => {
+      const handle = await fs.open(name, constants.O_RDONLY | constants.O_NONBLOCK);
+      try {
+        const stat = await handle.stat();
+        if (!stat.isFile() || stat.size > limit) throw new Error("Input must be a regular file within the documented size limit");
+        const buffer = Buffer.alloc(limit + 1);
+        let size = 0;
+        while (size < buffer.length) { controller.signal.throwIfAborted(); const { bytesRead } = await handle.read(buffer, size, buffer.length - size); if (!bytesRead) break; size += bytesRead; }
+        if (size > limit) throw new Error("Input file exceeds the documented size limit");
+        return buffer.subarray(0, size);
+      } finally { await handle.close(); }
+    };
+    let input = {}, prompt, wait = false, fileId = "", destination;
+    const attachments = [];
     if (command === "download") {
-      if (!destination) throw new Error("download requires a destination path; existing files are never overwritten");
-      const fs = await import("node:fs/promises");
+      if (args.length !== 2) throw new Error("download requires file-id and destination; existing files are never overwritten");
+      [fileId, destination] = args;
+    } else for (let i = 0; i < args.length; i++) {
+      const flag = args[i];
+      if (flag === "--wait") { wait = true; continue; }
+      if (!["--input", "--prompt", "--attach"].includes(flag) || !args[i + 1]) throw new Error("Supported options: --wait, --input request.json, --prompt text, --attach file");
+      if (!["submit", "heartbeat"].includes(command)) throw new Error("Input options are only for submit or heartbeat");
+      const item = args[++i];
+      if (flag === "--input") {
+        const bytes = await read(item, 12 * 1024 * 1024);
+        try { input = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+        catch { throw new Error("--input must contain valid UTF-8 JSON; file contents are not logged"); }
+      }
+      else if (flag === "--prompt") prompt = item;
+      else attachments.push(item);
+    }
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("--input must contain a JSON object");
+    if (prompt !== undefined) input.prompt = prompt;
+    const mimes = { ".txt": "text/plain", ".md": "text/markdown", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
+    if (attachments.length) {
+      if (input.attachments !== undefined && !Array.isArray(input.attachments)) throw new Error("attachments must be an array");
+      input.attachments ||= [];
+      if (input.attachments.length + attachments.length > 8) throw new Error("At most eight attachments are allowed");
+      for (const name of attachments) {
+        const mimeType = mimes[path.extname(name).toLowerCase()];
+        if (!mimeType) throw new Error("Attachments must be txt/md/png/jpeg/webp files");
+        const bytes = await read(name, mimeType.startsWith("image/") ? 4 * 1024 * 1024 : 64 * 1024);
+        input.attachments.push({ name: path.basename(name), mimeType, dataBase64: bytes.toString("base64") });
+      }
+    }
+    const result = await runExternalClient({
+      command, automationId, eventId: ["submit", "heartbeat"].includes(command) ? value : "", runId: ["submit", "heartbeat"].includes(command) ? "" : value,
+      fileId, input,
+      origin: process.env.CODEX_CLOUD_URL, token: process.env.CODEX_CLOUD_API_TOKEN, wait, signal: controller.signal,
+      onStatus: (run) => process.stderr.write(`${run.id}: ${run.status}\n`),
+    });
+    if (command === "download") {
       await fs.writeFile(destination, result.buffer, { flag: "wx", mode: 0o600 });
       return process.stdout.write(`${JSON.stringify({ artifact: result.artifact, destination }, null, 2)}\n`);
     }
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (terminalStatuses.has(result.status) && result.status !== "completed") process.exitCode = 1;
-  }).catch((error) => {
+  };
+  cli().catch((error) => {
     process.stderr.write(`${error.message}${error.runId ? ` (run-id: ${error.runId})` : ""}${error.eventId ? ` (event-id: ${error.eventId})` : ""}\n`);
     process.exitCode = 1;
   });

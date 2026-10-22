@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Standalone stdlib client. Discovery is read-only; submit/heartbeat can incur model costs."""
 import argparse
+import base64
 import http.client
 import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -85,7 +87,7 @@ class Client:
                     raise RuntimeError("Network outcome unknown; query the known run or retry the SAME event ID") from None
             self.sleep(delay)
 
-    def execute(self, command, value=None, wait=False, prompt=None, file_id=None):
+    def execute(self, command, value=None, wait=False, prompt=None, file_id=None, input_body=None):
         if command in ("models", "capabilities"):
             data = self.request("/v1/" + command, discovery=True)
             if (command == "models" and (data.get("object") != "list" or not isinstance(data.get("data"), list))
@@ -122,6 +124,10 @@ class Client:
             raise ValueError("A stable event ID (submit/heartbeat) or run ID (status/cancel) is required")
         if command in ("submit", "heartbeat"):
             body = {"runner": "app-server", "worktree": True}
+            if input_body is not None:
+                if not isinstance(input_body, dict):
+                    raise ValueError("input must be a JSON object")
+                body.update(input_body)
             if prompt is not None:
                 body["prompt"] = prompt
             data = self.request("/" + ("webhook" if command == "submit" else "heartbeat"), body, value)
@@ -144,6 +150,18 @@ class Client:
             data = self.request("/runs/" + urllib.parse.quote(known_id, safe=""))
 
 
+def read_input_file(filename, limit):
+    descriptor = os.open(filename, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise ValueError("Input must be a regular file within the documented size limit")
+        data = source.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("Input exceeds the documented size limit")
+        return data
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("models", "capabilities", "submit", "heartbeat", "status", "cancel", "output", "download"))
@@ -151,15 +169,34 @@ if __name__ == "__main__":
     parser.add_argument("value", nargs="?")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--prompt")
+    parser.add_argument("--input")
+    parser.add_argument("--attach", action="append", default=[])
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--file-id")
     parser.add_argument("--output")
     args = parser.parse_args()
     try:
+        if (args.input or args.attach or args.prompt is not None) and args.command not in ("submit", "heartbeat"):
+            raise ValueError("Input options are only for submit or heartbeat")
+        body = json.loads(read_input_file(args.input, 12 * 1024 * 1024).decode("utf-8")) if args.input else {}
+        if not isinstance(body, dict):
+            raise ValueError("--input must contain a JSON object")
+        mimes = {".txt": "text/plain", ".md": "text/markdown", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+        if args.attach:
+            if "attachments" not in body:
+                body["attachments"] = []
+            if not isinstance(body["attachments"], list) or len(body["attachments"]) + len(args.attach) > 8:
+                raise ValueError("At most eight attachments are allowed")
+            for filename in args.attach:
+                mime = mimes.get(os.path.splitext(filename)[1].lower())
+                if not mime:
+                    raise ValueError("Attachments must be txt/md/png/jpeg/webp files")
+                data = read_input_file(filename, 4 * 1024 * 1024 if mime.startswith("image/") else 64 * 1024)
+                body["attachments"].append({"name": os.path.basename(filename), "mimeType": mime, "dataBase64": base64.b64encode(data).decode("ascii")})
         client = Client(os.environ.get("CODEX_CLOUD_URL", ""), os.environ.get("CODEX_CLOUD_API_TOKEN", ""), args.automation_id, args.timeout)
         if args.command == "download" and not args.output:
             raise ValueError("download requires --output; existing files are never overwritten")
-        result = client.execute(args.command, args.value, args.wait, args.prompt, args.file_id)
+        result = client.execute(args.command, args.value, args.wait, args.prompt, args.file_id, body)
         if args.command == "download":
             with open(args.output, "xb") as destination:
                 destination.write(result.pop("buffer"))

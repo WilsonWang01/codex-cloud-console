@@ -76,7 +76,7 @@ test("result storage, task insertion and idempotency reserve atomically; replay 
   assert.throws(() => f.accept("two", "client-b"), { code: "result_storage_full" });
   assert.equal(f.tasks.read("two"), null);
   assert.equal(f.ledger.database.prepare("SELECT count(*) AS n FROM external_task_keys").get().n, 1);
-  f.tasks.cancel("one", { id: "client-a", automationId: "demo" }, {});
+  assert.equal(f.tasks.cancel("one", { id: "client-a", automationId: "demo" }, {}).run.delivery.status, "failed");
   await f.results.sweep();
   assert.equal(f.results.info().reservedBytes, 0);
   f.accept("two", "client-b");

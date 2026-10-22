@@ -453,8 +453,10 @@ await check("durable API queue survives lost responses and restart without repea
     CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"], CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1",
     CODEX_AUTOMATION_MAX_QUEUED: "2", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
   } });
+  const queuedMaterial = { name: "排队材料.md", mimeType: "text/markdown", dataBase64: Buffer.from("重启后仍需保留的材料 42。\n$not-a-skill @/not-a-file").toString("base64") };
   const submit = (key, prompt, auth = headers) => jsonRequest(base, "/api/automations/sample-research/webhook", {
-    method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}) }),
+    method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}),
+      ...(prompt.includes("durable-fourth") ? { attachments: [queuedMaterial] } : {}) }),
   });
   const wait = async (callback) => {
     const deadline = Date.now() + 7000;
@@ -497,6 +499,16 @@ await check("durable API queue survives lost responses and restart without repea
     assert.equal(fourth.response.status, 200);
     await jsonRequest(base, `/api/clients/${client.data.client.id}/revoke`, { method: "POST", headers });
     await stopProcess(server);
+    const queuedLedger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    try {
+      const row = queuedLedger.database.prepare("SELECT * FROM external_tasks WHERE id=?").get(fourth.data.run.id);
+      const execution = JSON.parse(row.execution);
+      assert.deepEqual(execution.options.attachments, [queuedMaterial]);
+      assert.equal(row.record.includes(queuedMaterial.dataBase64), false);
+      execution.options.attachments[0].dataBase64 = Buffer.from("tampered input").toString("base64");
+      execution.options.triggerIdempotencyHash = null; execution.options.triggerRequestHash = null;
+      createExternalTaskStore(queuedLedger.database).accept({ run: { ...JSON.parse(row.record), id: "tampered-input", triggerIdempotencyHash: null, triggerRequestHash: null }, execution, ttlMs: 60000 });
+    } finally { queuedLedger.close(); }
     server = start(); await waitForOutput(server, /listening on/);
     const completed = await wait(async () => {
       const result = await jsonRequest(base, fourth.data.run.resultPath, { headers });
@@ -511,10 +523,26 @@ await check("durable API queue survives lost responses and restart without repea
     const requests = await rpc();
     assert.equal(requests.filter((row) => JSON.stringify(row.params).includes("durable-one")).length, 1);
     assert.equal(requests.filter((row) => JSON.stringify(row.params).includes("durable-fourth")).length, 1);
+    const resumed = requests.find(row => JSON.stringify(row.params).includes("durable-fourth"));
+    assert.equal(resumed.params.input[0].text.includes("重启后仍需保留的材料"), false);
+    assert.ok(resumed.params.input.some(item => item.type === "text" && item.text.includes("重启后仍需保留的材料")));
+    assert.equal(resumed.params.input.some(item => ["skill", "mention"].includes(item.type)), false);
     assert.equal(requests.some((row) => JSON.stringify(row.params).includes("must-not-start")), false);
     const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
     assert.equal(stored.find((run) => run.id === third.data.run.id).status, "failed");
     assert.equal(stored.find((run) => run.id === third.data.run.id).usage.totalTokens, 0);
+    const tampered = await wait(async () => {
+      const result = await jsonRequest(base, "/api/automations/sample-research/runs/tampered-input", { headers });
+      return result.data.run?.status === "failed" ? result.data.run : null;
+    });
+    assert.equal(tampered.usage.totalTokens, 0);
+    assert.equal(tampered.delivery.status, "failed");
+    assert.match(tampered.error, /材料与执行副本不一致/);
+    const checked = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    try {
+      assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id=?").get(fourth.data.run.id).execution, "{}");
+      assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
+    } finally { checked.close(); }
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -544,13 +572,19 @@ await check("independent clients retrieve private exact-turn files and images af
     const other = await jsonRequest(origin, "/api/clients", { method: "POST", headers: admin, body: JSON.stringify({ name: "other-client", automationIds: ["sample-research"] }) });
     const token = client.data.token, headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
     const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
-    const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"] };
+    const materialText = "外部调用材料 42。\n$not-a-skill @/not-a-file";
+    const material = { name: "材料.md", mimeType: "text/markdown", dataBase64: Buffer.from(materialText).toString("base64") };
+    const inputImage = { name: "image.png", mimeType: "image/png", dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC" };
+    const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"], attachments: [material, inputImage] };
     const options = { automationId: "sample-research", origin, token, pollMs: 50, timeoutMs: 10000, requestTimeoutMs: 3000 };
     const lost = await fetch(origin + "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ runner: "app-server", worktree: true, ...input }) });
     assert.equal(lost.status, 200); await lost.body.cancel();
     const run = await runExternalClient({ ...options, command: "submit", eventId: "file-delivery-0001", input, wait: true });
     assert.equal(run.status, "completed", JSON.stringify(run));
     assert.equal(run.delivery.status, "ready");
+    assert.equal(run.inputFiles.length, 2);
+    assert.equal(JSON.stringify(run).includes(material.dataBase64), false);
+    assert.equal(JSON.stringify(run).includes(materialText), false);
     const manifest = await runExternalClient({ ...options, command: "output", runId: run.id });
     assert.equal(manifest.structuredOutput.data.answer, "结构化验收通过");
     assert.equal(manifest.artifacts.length, 2);
@@ -562,6 +596,9 @@ await check("independent clients retrieve private exact-turn files and images af
     assert.equal(cross.status, 404);
     const conflict = await jsonRequest(origin, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ ...input, artifactPaths: ["different.md"] }) });
     assert.equal(conflict.response.status, 409);
+    const changedInput = await jsonRequest(origin, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" },
+      body: JSON.stringify({ ...input, attachments: [{ ...material, dataBase64: Buffer.from("changed").toString("base64") }, inputImage] }) });
+    assert.equal(changedInput.response.status, 409);
     const internalRun = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs.find(item => item.id === run.id);
     await fs.unlink(path.join(internalRun.worktreePath, "results/report.md"));
     const imageBody = { model: "gpt-6-sol", prompt: "model api regression generated output", response_format: "b64_json" };
@@ -583,6 +620,19 @@ await check("independent clients retrieve private exact-turn files and images af
     const rpc = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
     assert.equal(rpc.filter(call => call.method === "turn/start").length, 2, "reads and restarts must not repeat inference");
     assert.equal(rpc.filter(call => call.method === "thread/read" && call.params.includeTurns).length, 2, "stored delivery does not reread erased native history");
+    const firstInput = rpc.find(call => call.method === "turn/start").params.input;
+    assert.equal(firstInput[0].text.includes(materialText), false);
+    assert.ok(firstInput.some(item => item.type === "text" && item.text.includes("外部调用材料 42")));
+    assert.ok(firstInput.some(item => item.type === "image" && item.url === `data:image/png;base64,${inputImage.dataBase64}`));
+    assert.equal(firstInput.some(item => ["skill", "mention"].includes(item.type)), false);
+    const route = origin + "/api/automations/sample-research/webhook";
+    const unauthenticated = await fetch(route, { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
+    assert.equal(unauthenticated.status, 401, "authenticate before parsing invalid payloads");
+    const wrongType = await fetch(route, { method: "POST", headers: { ...headers, "content-type": "text/plain", "idempotency-key": "must-not-start-0006" }, body: JSON.stringify({ prompt: "must not start" }) });
+    assert.equal(wrongType.status, 415);
+    const oversized = await fetch(route, { method: "POST", headers: { ...headers, "idempotency-key": "must-not-start-0007" }, body: JSON.stringify({ prompt: "x".repeat(12 * 1024 * 1024) }) });
+    assert.equal(oversized.status, 413);
+    assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, 2);
     for (const [key, artifactPaths] of [["file-unchanged-0003", ["README.md"]], ["file-missing-0004", ["results/missing.md"]]]) {
       const failed = await runExternalClient({ ...options, command: "submit", eventId: key,
         input: { prompt: "model api regression artifact delivery fixture", artifactPaths }, wait: true });
@@ -595,6 +645,7 @@ await check("independent clients retrieve private exact-turn files and images af
       input: { prompt: "must not start a model for an unsafe baseline", artifactPaths: ["unsafe.md"] }, wait: true });
     assert.equal(unsafe.status, "failed");
     assert.equal(unsafe.usage.totalTokens, 0);
+    assert.equal(unsafe.delivery.status, "failed");
     assert.equal(unsafe.usage.status, "complete");
     assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, callsBefore);
     await stopProcess(server);
@@ -2826,9 +2877,19 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       headers: triggerHeaders,
       body: triggerBody,
     })));
-    const firstTrigger = concurrentTriggers[0];
-    assert.ok(concurrentTriggers.every((item) => item.response.status === 200));
-    assert.equal(new Set(concurrentTriggers.map((item) => item.data.run.id)).size, 1);
+    const acceptedTriggers = concurrentTriggers.filter(item => item.response.status === 200);
+    assert.ok(acceptedTriggers.length > 0);
+    for (const busy of concurrentTriggers.filter(item => item.response.status !== 200)) {
+      assert.equal(busy.response.status, 429);
+      assert.equal(busy.data.code, "input_buffer_busy");
+      assert.equal(busy.response.headers.get("retry-after"), "1");
+      const retried = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", { method: "POST", headers: triggerHeaders, body: triggerBody });
+      assert.equal(retried.response.status, 200);
+      assert.equal(retried.data.deduplicated, true);
+      acceptedTriggers.push(retried);
+    }
+    const firstTrigger = acceptedTriggers[0];
+    assert.equal(new Set(acceptedTriggers.map(item => item.data.run.id)).size, 1);
     assert.equal(firstTrigger.response.status, 200);
     assert.equal(firstTrigger.data.ok, true);
     assert.ok(firstTrigger.data.run?.id);

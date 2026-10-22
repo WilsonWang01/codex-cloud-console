@@ -17,7 +17,7 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
-import { authenticateModelApiRequest, createModelApiHandler, modelApiJsonLimit, modelApiProtocol, sendModelApiError } from "./model-api.mjs";
+import { authenticateModelApiRequest, createModelApiHandler, modelApiProtocol, sendModelApiError } from "./model-api.mjs";
 import { createDiscoveryHandler } from "./api-discovery.mjs";
 import { modelApiTurnResult } from "./model-api-output.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
@@ -27,7 +27,9 @@ import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
-import { createExternalTaskStore, createExternalTaskOwner } from "./external-task-store.mjs";
+import { createExternalTaskStore, createExternalTaskOwner, executionPayloadLimits } from "./external-task-store.mjs";
+import { normalizeInlineAttachments, inlineAttachmentInputs } from "./inline-inputs.mjs";
+import { createExternalBodyParser } from "./external-input-body.mjs";
 import { createExternalResultStore, normalizeArtifactPaths, artifactBaseline, requestedArtifacts, nativeSources } from "./external-results.mjs";
 import { createExternalResultHandler } from "./external-result-api.mjs";
 import { externalApiToken } from "./external-auth.mjs";
@@ -138,17 +140,22 @@ app.use((req, res, next) => {
   }
   return next();
 });
-app.use("/api/automations/:id/v1", async (req, res, next) => {
+const parseExternalBody = createExternalBodyParser({ record: metric => apiClientStore.record(metric) });
+app.use("/api/automations/:id", async (req, res, next) => {
   const protocol = modelApiProtocol(`${req.baseUrl}${req.path}`);
-  if (req.method !== "POST" || !protocol) return next();
+  const trigger = /^\/(webhook|heartbeat)$/.test(req.path);
+  if (req.method !== "POST" || (!protocol && !trigger)) return next();
+  let client;
   try {
     // Authenticate before buffering the larger image payload; recheck when accepting the task.
-    await authenticateModelApiRequest(req, protocol, (request, token) => authenticateAutomationTrigger(request, { token, allowLocalDevelopment: false }));
-  } catch (error) { return sendModelApiError(res, protocol, error); }
-  express.json({ limit: modelApiJsonLimit })(req, res, (error) => {
-    if (error) return sendModelApiError(res, protocol, Object.assign(new Error("请求正文不是有效 JSON 或超过 12 MiB"), { statusCode: error.status || 400 }));
-    return next();
-  });
+    if (protocol) ({ client } = await authenticateModelApiRequest(req, protocol, (request, token) => authenticateAutomationTrigger(request, { token, allowLocalDevelopment: false })));
+    else if (!(client = await authenticateAutomationTrigger(req))) throw automationRequestError(401, "调用方令牌无效或没有此自动化权限");
+  } catch (error) {
+    if (protocol) return sendModelApiError(res, protocol, error);
+    const unauthorized = error.statusCode === 401;
+    return res.status(unauthorized ? 401 : 503).json({ ok: false, error: unauthorized ? error.message : "调用方认证暂不可用，未接收任务", code: unauthorized ? "authentication_required" : "authentication_unavailable" });
+  }
+  return parseExternalBody(req, res, next, { protocol, clientId: client.id });
 });
 app.use(express.json({ limit: process.env.CODEX_UPLOAD_JSON_LIMIT || "32mb" }));
 const maxStoredChatMessages = 80;
@@ -5216,6 +5223,7 @@ function normalizeAutomationRun(run = {}) {
     ...(run.structuredOutput ? { structuredOutput: run.structuredOutput } : {}),
     ...(run.artifactPaths?.length ? { artifactPaths: run.artifactPaths } : {}),
     ...(run.delivery ? { delivery: run.delivery } : {}),
+    ...(Array.isArray(run.inputFiles) && run.inputFiles.length ? { inputFiles: run.inputFiles } : {}),
     runner: String(run.runner || "systemd"),
     status: run.status === "cancelled" ? "canceled" : String(run.status || "queued"),
     startedAt,
@@ -6876,6 +6884,7 @@ function automationTriggerRequestHash(req, automation, trigger, completionContra
     completionContract,
     ...(body.outputSchema ? { outputSchema: normalizeOutputSchema(body.outputSchema) } : {}),
     ...(normalizeArtifactPaths(body.artifactPaths).length ? { artifactPaths: normalizeArtifactPaths(body.artifactPaths) } : {}),
+    ...(req.inlineAttachments?.metadata.length ? { inputFiles: req.inlineAttachments.metadata } : {}),
   })).digest("hex");
 }
 
@@ -6896,6 +6905,7 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
     imageInputs: req.modelApiImageInputs,
     outputSchema: normalizeOutputSchema(req.body?.outputSchema),
     artifactPaths: normalizeArtifactPaths(req.body?.artifactPaths),
+    ...(req.inlineAttachments?.metadata.length ? { attachments: req.body.attachments, inputFiles: req.inlineAttachments.metadata } : {}),
   };
 }
 
@@ -6920,6 +6930,8 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     ? options.completionContract
     : automation.completionContract;
   const completionContract = normalizeAutomationCompletionContract(completionContractSource, { strict: true });
+  const inline = normalizeInlineAttachments(options.attachments);
+  if (JSON.stringify(inline.metadata) !== JSON.stringify(options.inputFiles || [])) throw Object.assign(automationRequestError(503, "已接收材料与执行副本不一致，未启动模型"), { code: "input_integrity_failed" });
   const executionPrompt = promptWithAutomationCompletionContract(prompt, completionContract) + (options.artifactPaths?.length
     ? `\n\n本轮文件交付：请在隔离工作目录中生成这些相对路径的新内容：${JSON.stringify(options.artifactPaths)}。旧文件内容不作为本轮交付。` : "");
   const heartbeatSessionId = options.sessionId ? String(options.sessionId) : "";
@@ -6953,6 +6965,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       completionOutcome: completionContract ? "pending" : null,
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       ...(options.artifactPaths?.length ? { artifactPaths: options.artifactPaths } : {}),
+      ...(options.inputFiles?.length ? { inputFiles: options.inputFiles } : {}),
       runner: "app-server",
       status: "queued",
       executionStartedAt: new Date().toISOString(),
@@ -6997,7 +7010,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       unattendedPersonalSchedule: options.trigger === "personal-schedule",
       reviewUnverifiedMcpCalls: ["personal-test", "personal-schedule"].includes(options.trigger),
       maxRuntimeMs: options.maxRuntimeMs,
-      imageInputs: options.imageInputs,
+      imageInputs: [...(options.imageInputs || []), ...inlineAttachmentInputs(inline)],
       outputSchema: options.outputSchema,
     });
     job.externalTaskClaim = options.taskClaim;
@@ -7159,6 +7172,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
       model: runtime.model, reasoning: runtime.reasoning, completionContract: options.completionContract,
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       ...(options.artifactPaths?.length ? { artifactPaths: options.artifactPaths } : {}),
+      ...(options.inputFiles?.length ? { inputFiles: options.inputFiles } : {}),
       delivery: { status: "pending" },
       triggerIdempotencyHash: options.triggerIdempotencyHash, triggerRequestHash: options.triggerRequestHash,
       ...mergeAutomationEvents(null, [{ type: "queued", text: "任务已持久接收，等待执行" }]),
@@ -11756,7 +11770,7 @@ async function processAutomationTriggerRequest(req, res, trigger) {
   } catch (error) {
     if (error.retryAfterMs) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
     return res.status(error.statusCode || 500).json({ ok: false, error: error.message, output: error.message, ...(error.code ? { code: error.code } : {}) });
-  }
+  } finally { req.releaseInputBody?.(); }
 }
 
 function automationRequestError(statusCode, message, retryAfterMs = 0) {
@@ -11774,10 +11788,10 @@ async function submitAutomationTriggerRequest(req, trigger) {
   }
   let completionContract;
   try {
-    validateExternalTriggerInput(req.body, { trigger, scoped: scopedClient });
+    req.inlineAttachments = validateExternalTriggerInput(req.body, { trigger, scoped: scopedClient });
     completionContract = automationCompletionContractForRequest(req, automation);
   } catch (error) {
-    throw automationRequestError(400, error.message);
+    throw Object.assign(automationRequestError([400, 413, 415].includes(error.statusCode) ? error.statusCode : 400, error.message), error.code ? { code: error.code } : {});
   }
   const idempotency = automationTriggerIdempotencyKey(req, automation.id, trigger, req.apiClient.id);
   if (idempotency.error) throw automationRequestError(400, idempotency.error);
@@ -11867,7 +11881,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
   try {
     return await runPromise;
   } catch (error) {
-    throw Object.assign(automationRequestError([400, 409, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs), error.code ? { code: error.code } : {});
+    throw Object.assign(automationRequestError([400, 409, 413, 415, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs), error.code ? { code: error.code } : {});
   }
 }
 
@@ -11942,7 +11956,8 @@ const handleDiscovery = createDiscoveryHandler({
   record: (metric) => apiClientStore.record(metric),
   idempotencyTtlMs: automationTriggerIdempotencyTtlMs,
   modelWaitMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
-  queueLimits: () => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: runAdmission.status().maxPerClient }),
+  queueLimits: () => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: runAdmission.status().maxPerClient,
+    max_execution_payload_bytes: executionPayloadLimits.perRun, max_global_execution_payload_bytes: executionPayloadLimits.global, max_client_execution_payload_bytes: executionPayloadLimits.client }),
   resultStorage: () => {
     const info = externalResultStore().info();
     return { max_global_bytes: info.globalBytes, max_client_bytes: info.clientBytes, reservation_bytes_per_run: info.packageBytes,

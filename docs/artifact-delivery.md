@@ -18,7 +18,7 @@ curl --fail-with-body "$CODEX_CLOUD_URL/api/automations/$AUTOMATION_ID/webhook" 
 
 `artifactPaths` 最多四个普通相对文件路径，单项最多 500 字符、32 段。允许 txt/md/json/csv/html/pdf/png/jpg/jpeg/webp；拒绝绝对路径、越界、隐藏/系统目录、链接、管道等特殊文件。模型须在隔离工作树里新增文件或改变其内容；不能把未改变的旧文件当作本回合生成。类型按扩展名标记，不保证报告的业务质量或文件语法正确。
 
-首批文件输入仍未提供：本接口允许交付 PDF 文件，不等于接受 PDF 输入。图片输入继续使用模型协议的内联 Base64；音视频、远程 URL 抓取及客户端工具协议仍不支持。
+首批[内联文件输入](file-inputs.md)已提供 txt/md 和静态图片，先查部署能力。本接口允许交付 PDF 文件，不等于接受 PDF 输入；音视频、远程 URL 抓取及客户端工具协议仍不支持。
 
 ## 取回清单与副本
 

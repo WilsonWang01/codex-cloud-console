@@ -1,6 +1,6 @@
 # OpenAI / Anthropic 协议接入
 
-本项目提供 **OpenAI Chat Completions、Responses、Images Generations 和 Anthropic Messages 的子集适配**，支持文本、内嵌图片输入和生成图片结果，可接入官方 SDK。底层始终是已有自动化中的 Codex Agent，不是 OpenAI 模型 API 的透明代理，也不会调用 Claude。长任务、恢复与取消仍推荐[异步任务 API](backend-integration.md)。
+本项目提供 **OpenAI Chat Completions、Responses、Images Generations 和 Anthropic Messages 的子集适配**，支持文本、内嵌图片、受限文本文件输入和生成图片结果，可接入官方 SDK。Responses 的 txt/md `input_file` 与 Messages 的纯文本 `document` 见[文件输入](file-inputs.md)，不提供 PDF、Files API 或原生引用服务。底层始终是已有自动化中的 Codex Agent，不是 OpenAI 模型 API 的透明代理，也不会调用 Claude。长任务、恢复与取消仍推荐[异步任务 API](backend-integration.md)。
 
 ## 先明确边界
 
@@ -9,6 +9,7 @@
 | 请求和响应 | Chat `messages → choices[0].message.content`；Messages `messages/system → content[text]`；Responses `input → output`；Images `prompt → data[b64_json]` |
 | 文本历史 | 保留角色和内容边界，转换成 Codex 单轮的 JSON 对话记录；不是原生模型消息通道 |
 | 图片输入 | user 消息中的 PNG/JPEG/WebP Base64；作为原生 Codex `image` 输入，不当作文本或仅做 OCR |
+| 文本文件输入 | Responses 的 txt/md `input_file` data URL；Messages 的 text/plain `document`。作为编号数据块传入，不提供 PDF、文件 ID、远程文件、缓存或原生引用功能，详见[内联文件](file-inputs.md) |
 | 图片输出 | 精确原回合的原生 `imageGeneration` 结果；Responses `image_generation_call.result`、Images `data[].b64_json`，或 Chat/Messages 的 `codex_cloud.images` 扩展 |
 | 流式输出 | 普通文本为 Agent 增量；结构化 JSON 在完整验证后发送。OpenAI SSE chunks / `[DONE]`，Anthropic具名 SSE 事件 |
 | 结构化输出 | 受限 JSON Schema，经原生 `outputSchema` 和服务端校验；先查询 capabilities，详见[结构化结果](structured-output.md) |

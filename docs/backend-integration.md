@@ -53,9 +53,11 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 
 新任务支持受限产物清单和鉴权下载，须先查询部署能力；Node/Python 的 `output`、`download` 用法、20 MiB 结果包限额和保留策略见[文件交付](artifact-delivery.md)。异步任务的 `summary` 仍可能截断，不等于完整结果；旧任务不会补造副本。
 
+支持首批[受限内联文件输入](file-inputs.md)：异步正文 `attachments` 或 Node/Python 的 `--attach`、`--input`，用于 txt/md 和静态图片材料。先查 `features.file_input`，不把文件名当服务器路径；同事件键的材料变化会冲突，正文、队列材料和接收缓冲均有上限。
+
 ## HTTP 契约
 
-以下异步任务接口使用 `x-codex-cloud-token`，不同于上面的发现接口。提交接口另需 `Idempotency-Key` 和 JSON 正文。
+以下异步任务接口支持 `x-codex-cloud-token`、Bearer 或 `x-api-key`；多个头必须一致。提交另需 `Idempotency-Key` 和未压缩的 application/json 正文（最多 12 MiB），不是上传任意服务器路径。
 
 | 接口 | 用途 |
 | --- | --- |
