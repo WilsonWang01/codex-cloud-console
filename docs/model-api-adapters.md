@@ -14,7 +14,8 @@
 | 执行隔离 | 每个新事件使用独立会话和 Git 工作树；完整历史由调用方逐次传入 |
 | 幂等、撤销与统计 | 复用独立调用方令牌、运行记录、并发及请求限制；两类调用进入“调用与用量” |
 | 模型与推理 | `model` 使用实际 Codex 模型 ID；OpenAI `reasoning_effort` / Anthropic `output_config.effort` |
-| 不支持 | Responses 的保存/查询/previous_response_id、模型列表、Images Edits/multipart、远程图片 URL/Files API/GIF、音频/视频/PDF、音频生成、客户端 `tools/tool_calls/tool_use/tool_result`、JSON Schema、采样参数、assistant 预填充、Anthropic beta/缓存控制 |
+| 能力发现 | 同一自动化范围的 `GET v1/models`（OpenAI 列表子集）及 `GET v1/capabilities`；目录不是账号执行权限证明 |
+| 不支持 | Responses 的保存/查询/previous_response_id、Anthropic Models 原生响应、Images Edits/multipart、远程图片 URL/Files API/GIF、音频/视频/PDF、音频生成、客户端 `tools/tool_calls/tool_use/tool_result`、JSON Schema、采样参数、assistant 预填充、Anthropic beta/缓存控制 |
 
 **重要：Codex 无法原生兑现请求级 `max_tokens/max_completion_tokens`。** 默认返回 400，而不是假装预算生效。Anthropic 的 SDK 必须提供 `max_tokens`，因此只有在调用方明确接受“不应用该输出上限”后，才可加 `x-codex-cloud-allow-unbounded-output: true`。这不限制推理或总 token 消耗，也不会截断输出。需要严格逐请求 token 预算的业务不能使用本适配器。
 
@@ -30,6 +31,8 @@ Codex 自身的仓库工具、联网和连接服务仍由服务器策略决定�
 | Anthropic | `https://你的域名/api/automations/自动化ID` | `x-api-key: <调用方令牌>`，SDK 自动追加 `/v1/messages` |
 
 接口均为 `POST /api/automations/:id/v1/` 下的 `chat/completions`、`messages`、`responses`、`images/generations`，不提供域名根目录的 `/v1`。Anthropic 也接受 Bearer，但两个认证头冲突时拒绝。支持 `anthropic-version: 2023-06-01`。
+
+新增两个只读 GET 发现接口见[后端接入](backend-integration.md#先查询能力)。OpenAI `client.models.list()` 可直接使用；SDK 分页对象可能不保留顶层扩展，完整目录状态以原始 HTTP JSON 或 capabilities 为准。`created: 0` 是未知日期的占位，不是模型发布日期。Anthropic 可用 `client.get('/v1/capabilities')` 读取自定义能力，但不承诺 `client.models.list()` 的原生格式。
 
 每次调用必须设置稳定的 `Idempotency-Key`：8–160 位 ASCII 字母、数字或 `._:-`。业务事件创建时保存该键，重试不能换键，同键变更文本/模型/推理强度返回 409。同键可以改用流式读取最终结果，不会重新执行模型。不要把示例中的事件 ID 作为所有用户请求的固定值。
 

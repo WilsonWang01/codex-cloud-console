@@ -1,0 +1,153 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Codex Cloud 能力发现与异步任务",
+    "version": "2026-10-22",
+    "description": "覆盖能力发现及异步任务。推理适配字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 兼容。结构化结果和文件下载尚未实现。"
+  },
+  "servers": [{"url": "https://your-codex-cloud.example"}],
+  "paths": {
+    "/api/automations/{automationId}/v1/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "列出目录，不验证模型权限；不接受查询参数",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}],
+        "security": [{"BearerToken": []}, {"AnthropicKey": []}],
+        "responses": {
+          "200": {"description": "模型目录，created=0 表示创建日期未知", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Models"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "429": {"$ref": "#/components/responses/RateLimited"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/v1/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "summary": "协议、默认设置、运行时探测及保留边界；不接受查询参数",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}],
+        "security": [{"BearerToken": []}, {"AnthropicKey": []}],
+        "responses": {
+          "200": {"description": "能力快照，不执行模型", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Capabilities"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "429": {"$ref": "#/components/responses/RateLimited"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/webhook": {
+      "post": {
+        "operationId": "submitRun",
+        "summary": "创建任务，可能消耗模型额度；webhook 禁止 sessionId",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/IdempotencyKey"}],
+        "security": [{"ClientToken": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Trigger"}}}},
+        "responses": {
+          "200": {"$ref": "#/components/responses/Run"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "429": {"$ref": "#/components/responses/RateLimited"},
+          "500": {"$ref": "#/components/responses/UnknownOutcome"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/heartbeat": {
+      "post": {
+        "operationId": "continueRun",
+        "summary": "续接本调用方最近会话，可能消耗模型额度",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/IdempotencyKey"}],
+        "security": [{"ClientToken": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Trigger"}}}},
+        "responses": {
+          "200": {"$ref": "#/components/responses/Run"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"$ref": "#/components/responses/Conflict"},
+          "429": {"$ref": "#/components/responses/RateLimited"},
+          "500": {"$ref": "#/components/responses/UnknownOutcome"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/runs/{runId}": {
+      "get": {
+        "operationId": "getRun",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}, {"name": "after", "in": "query", "schema": {"type": "integer", "minimum": 0}}],
+        "security": [{"ClientToken": []}],
+        "responses": {
+          "200": {"$ref": "#/components/responses/Run"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "429": {"$ref": "#/components/responses/RateLimited"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/runs/{runId}/cancel": {
+      "post": {
+        "operationId": "cancelRun",
+        "summary": "明确请求取消，不能撤回已经发生的外部动作",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}],
+        "security": [{"ClientToken": []}],
+        "responses": {
+          "200": {"$ref": "#/components/responses/Run"},
+          "202": {"$ref": "#/components/responses/Run"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerToken": {"type": "http", "scheme": "bearer"},
+      "AnthropicKey": {"type": "apiKey", "in": "header", "name": "x-api-key"},
+      "ClientToken": {"type": "apiKey", "in": "header", "name": "x-codex-cloud-token"}
+    },
+    "parameters": {
+      "AutomationId": {"name": "automationId", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1}},
+      "RunId": {"name": "runId", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1}},
+      "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": true, "description": "业务持久键，重试必须同键同输入", "schema": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,160}$"}}
+    },
+    "responses": {
+      "BadRequest": {"description": "未知字段或参数不支持"},
+      "Unauthorized": {"description": "令牌缺失、过期、撤销或自动化范围不符"},
+      "NotFound": {"description": "不存在或不属于本调用方，不泄漏他人的目标"},
+      "RateLimited": {"description": "限流，遵循 Retry-After 秒数", "headers": {"Retry-After": {"schema": {"type": "integer", "minimum": 1}}}},
+      "Conflict": {"description": "同键不同输入或任务仍运行"},
+      "Unavailable": {"description": "暂不可用；可按退避策略重试只读查询"},
+      "UnknownOutcome": {"description": "提交结果可能未知，查询已知 run ID 或保持同键同输入重试"},
+      "Run": {"description": "运行快照，HTTP 成功不等于业务完成；202 表示取消处理中", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunResponse"}}}}
+    },
+    "schemas": {
+      "Models": {"type": "object", "required": ["object", "data", "codex_cloud"], "properties": {
+        "object": {"const": "list"},
+        "data": {"type": "array", "items": {"type": "object", "required": ["id", "object", "created", "owned_by", "codex_cloud"], "properties": {"id": {"type": "string"}, "object": {"const": "model"}, "created": {"const": 0}, "owned_by": {"const": "unknown"}, "codex_cloud": {"type": "object", "description": "display_name、reasoning_efforts、input_modalities、inference。inference 仅使用本调用方和自动化的保留记录，不代表当前账号权限；创建日期和所有者未由上游提供。"}}}},
+        "codex_cloud": {"type": "object", "properties": {"catalog_status": {"enum": ["available", "stale"]}, "observed_at": {"type": ["string", "null"], "format": "date-time"}, "inference_verified": {"const": false}}}
+      }},
+      "Capabilities": {"type": "object", "required": ["object", "version", "automation_id", "defaults", "runtime", "catalog", "protocols", "features", "limits", "retention", "unsupported", "notes"], "properties": {
+        "object": {"const": "codex_cloud.capabilities"}, "version": {"type": "string"}, "automation_id": {"type": "string"},
+        "defaults": {"type": "object", "properties": {"model": {"type": "string"}, "reasoning": {"type": "string"}}},
+        "runtime": {"type": "object", "properties": {"cli_version": {"type": ["string", "null"]}, "probed_at": {"type": "string", "format": "date-time"}, "protocol": {"const": "codex-app-server-v2"}}},
+        "catalog": {"type": "object", "properties": {"status": {"enum": ["available", "stale", "unavailable"]}, "observed_at": {"type": ["string", "null"], "format": "date-time"}, "inference_verified": {"const": false}}},
+        "protocols": {"type": "object"}, "features": {"type": "object", "properties": {"structured_output": {"const": false}, "artifact_download": {"const": false}, "callback": {"const": false}, "request_output_token_limit": {"const": false}}},
+        "limits": {"type": "object"}, "retention": {"type": "object"}, "unsupported": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "array", "items": {"type": "string"}}
+      }},
+      "Trigger": {"type": "object", "additionalProperties": false, "properties": {
+        "runner": {"const": "app-server"}, "prompt": {"type": "string", "minLength": 1, "description": "UTF-8 不超过 65536 字节"}, "model": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{2,64}$"},
+        "reasoning": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]}, "search": {"type": "boolean"}, "worktree": {"const": true},
+        "sessionId": {"type": "string", "minLength": 1, "maxLength": 160, "description": "仅 heartbeat 可用；webhook 拒绝"}, "completionContract": {"type": "object", "description": "详见 backend-integration.md，不能替代外部写入确认"}
+      }},
+      "RunResponse": {"type": "object", "required": ["ok", "run"], "properties": {
+        "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {"id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]}, "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0}}},
+        "eventCursor": {"type": "integer", "minimum": 0}, "eventGap": {"type": "boolean"}, "events": {"type": "array", "items": {"type": "object"}}
+      }}
+    }
+  }
+}

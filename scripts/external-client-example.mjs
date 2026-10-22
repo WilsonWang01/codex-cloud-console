@@ -46,9 +46,10 @@ export async function runExternalClient({ command, automationId, eventId = "", r
   if (!origin || !token || !automationId) throw new Error("CODEX_CLOUD_URL, CODEX_CLOUD_API_TOKEN and automation-id are required");
   origin = serviceOrigin(origin);
   const submitting = ["submit", "heartbeat"].includes(command);
-  if (!submitting && !["status", "cancel"].includes(command)) throw new Error("command must be submit, heartbeat, status or cancel");
+  const discovery = ["models", "capabilities"].includes(command);
+  if (!submitting && !discovery && !["status", "cancel"].includes(command)) throw new Error("command must be submit, heartbeat, status, cancel, models or capabilities");
   if (submitting && !/^[A-Za-z0-9._:-]{8,160}$/.test(eventId)) throw new Error("event-id must be 8-160 letters, numbers, dots, underscores, colons or dashes and stable across retries");
-  if (!submitting && !runId) throw new Error("run-id is required");
+  if (!submitting && !discovery && !runId) throw new Error("run-id is required");
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("input must be a JSON object");
   for (const [name, value] of Object.entries({ pollMs, timeoutMs, requestTimeoutMs })) positiveMilliseconds(value, name);
   if (!Number.isSafeInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) throw new Error("maxRetries must be between 0 and 5");
@@ -106,7 +107,7 @@ export async function runExternalClient({ command, automationId, eventId = "", r
           if (!payload) throw new ExternalClientError("Server returned a non-JSON response", { code: "INVALID_RESPONSE" });
           return payload;
         }
-        error = new ExternalClientError(payload?.error || payload?.output || `HTTP ${response.status}`, {
+        error = new ExternalClientError(payload?.error?.message || payload?.error || payload?.output || `HTTP ${response.status}`, {
           code: "HTTP_ERROR", statusCode: response.status, retryAfterMs: retryAfterMs(response.headers.get("retry-after")),
         });
       } catch (caught) {
@@ -119,6 +120,13 @@ export async function runExternalClient({ command, automationId, eventId = "", r
     }
   };
   try {
+    if (discovery) {
+      const payload = await request(`/api/automations/${encodeURIComponent(automationId)}/v1/${command}`, { headers: { authorization: `Bearer ${token}` } });
+      if (command === "models" ? payload.object !== "list" || !Array.isArray(payload.data) : payload.object !== "codex_cloud.capabilities" || payload.automation_id !== automationId) {
+        throw new ExternalClientError("Server returned invalid discovery information", { code: "INVALID_RESPONSE" });
+      }
+      return payload;
+    }
     const payload = submitting
       ? await request(`/api/automations/${encodeURIComponent(automationId)}/${command === "heartbeat" ? "heartbeat" : "webhook"}`, {
           method: "POST", headers: { "idempotency-key": eventId }, body: JSON.stringify({ runner: "app-server", worktree: true, ...input }),

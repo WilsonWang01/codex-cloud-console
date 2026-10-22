@@ -29,6 +29,24 @@ const modelRoutes = `\t@automation_model_api {
 \t\t}
 \t}
 `;
+const discoveryRoutes = `\t@automation_discovery {
+\t\tmethod GET
+\t\tpath_regexp automation_discovery ^/api/automations/[^/]+/v1/(models|capabilities)$
+\t}
+\thandle @automation_discovery {
+\t\treverse_proxy 127.0.0.1:8787
+\t}
+`;
+
+export function extendDiscoveryRoutes(source) {
+  if (source.includes("@automation_discovery")) {
+    if (source.includes(discoveryRoutes) && source.indexOf(discoveryRoutes) === source.lastIndexOf(discoveryRoutes)) return source;
+    throw new Error("Existing discovery routes differ from the expected configuration");
+  }
+  const first = source.indexOf(triggerBlock);
+  if (first < 0 || source.indexOf(triggerBlock, first + triggerBlock.length) >= 0) throw new Error("Expected exactly one existing automation trigger block");
+  return source.slice(0, first + triggerBlock.length) + discoveryRoutes + source.slice(first + triggerBlock.length);
+}
 
 export function extendModelApiRoutes(source) {
   if (source.includes("@automation_model_api")) {
@@ -103,11 +121,11 @@ export function assertCaddyRouteExtension(before, after, names = ["automation_re
 if (process.argv[1] && await fs.realpath(process.argv[1]).catch(() => null) === fileURLToPath(import.meta.url)) {
   const [sourcePath, candidatePath, mode] = process.argv.slice(2);
   if (!sourcePath || !candidatePath) throw new Error("Usage: node extend-caddy-automation-routes.mjs SOURCE CANDIDATE");
-  if (mode && mode !== "--model-api") throw new Error("Unknown extension mode");
+  if (mode && !["--model-api", "--discovery"].includes(mode)) throw new Error("Unknown extension mode");
   const source = await fs.readFile(sourcePath, "utf8");
-  const candidate = mode ? extendModelApiRoutes(source) : extendAutomationRoutes(source);
+  const candidate = mode === "--discovery" ? extendDiscoveryRoutes(source) : mode ? extendModelApiRoutes(source) : extendAutomationRoutes(source);
   await fs.writeFile(candidatePath, candidate, { mode: 0o600, flag: "wx" });
-  assertCaddyRouteExtension(adapt(sourcePath), adapt(candidatePath), mode ? ["automation_model_api"] : undefined);
+  assertCaddyRouteExtension(adapt(sourcePath), adapt(candidatePath), mode === "--discovery" ? ["automation_discovery"] : mode ? ["automation_model_api"] : undefined);
   execFileSync("caddy", ["validate", "--config", candidatePath, "--adapter", "caddyfile"], { stdio: "ignore" });
   process.stdout.write("Caddy candidate validated; all pre-existing routes remain unchanged.\n");
 }

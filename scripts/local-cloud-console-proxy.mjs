@@ -562,8 +562,10 @@ function createHttpProxy() {
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
     const isModelApiRequest = req.method === "POST" && Boolean(modelApiProtocol(targetUrl.pathname));
-    if (credentials.token && !isModelApiRequest) headers["x-codex-cloud-token"] = credentials.token;
-    if (targetUrl.protocol === "https:" && credentials.password && !isModelApiRequest) headers.authorization = authHeader;
+    const isClientApiRequest = isModelApiRequest
+      || (req.method === "GET" && /^\/api\/automations\/[^/]+\/v1\/(models|capabilities)$/.test(targetUrl.pathname));
+    if (credentials.token && !isClientApiRequest) headers["x-codex-cloud-token"] = credentials.token;
+    if (targetUrl.protocol === "https:" && credentials.password && !isClientApiRequest) headers.authorization = authHeader;
     delete headers["proxy-connection"];
     delete headers["connection"];
     delete headers["accept-encoding"];

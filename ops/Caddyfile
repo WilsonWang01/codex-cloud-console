@@ -25,6 +25,13 @@ http://{$CODEX_CLOUD_PUBLIC_IP} {
 	handle @automation_trigger {
 		reverse_proxy 127.0.0.1:8787
 	}
+	@automation_discovery {
+		method GET
+		path_regexp automation_discovery ^/api/automations/[^/]+/v1/(models|capabilities)$
+	}
+	handle @automation_discovery {
+		reverse_proxy 127.0.0.1:8787
+	}
 	@automation_result {
 		method GET
 		path_regexp automation_result ^/api/automations/[^/]+/runs/[^/]+$

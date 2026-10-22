@@ -18,6 +18,7 @@ import { createApprovalBroker, approvalDigest, declineAppServerRequest } from ".
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
 import { authenticateModelApiRequest, createModelApiHandler, modelApiJsonLimit, modelApiProtocol, sendModelApiError } from "./model-api.mjs";
+import { createDiscoveryHandler } from "./api-discovery.mjs";
 import { modelApiTurnResult } from "./model-api-output.mjs";
 import { externalWriteAttempt, unresolvedExternalAction } from "./external-action-review.mjs";
 import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents } from "./automation-events.mjs";
@@ -9253,7 +9254,7 @@ app.get("/api/codex/apps", async (req, res) => {
   try {
     const repo = getRepoById(req.query?.repoId);
     const data = await readConnectedApps(
-      (method, params) => codexAppServerRequest(method, params, 20_000, repo),
+      (method, params, timeoutMs) => codexAppServerRequest(method, params, timeoutMs, repo),
       { refresh: req.query?.refresh === "1" },
     );
     res.setHeader("Cache-Control", "no-store");
@@ -11718,6 +11719,33 @@ async function modelApiRunSnapshot(id) {
   const summary = job?.output || run.summary || "";
   return { ...externalRunView(run, run.automationId), summary };
 }
+
+let discoveryRuntimeCache;
+async function readDiscoveryRuntime() {
+  if (!discoveryRuntimeCache || Date.now() - discoveryRuntimeCache.at > 60_000) {
+    discoveryRuntimeCache = { at: Date.now(), value: run("codex", ["--version"], { timeout: 8_000 }).then((result) => ({
+      version: result.ok ? /\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/.exec(result.stdout)?.[0] || null : null,
+      probedAt: new Date().toISOString(),
+    })) };
+  }
+  return discoveryRuntimeCache.value;
+}
+const handleDiscovery = createDiscoveryHandler({
+  authenticate: (req, token) => apiClientStore.authenticate(token, req.params.id),
+  automation: (id) => {
+    const item = automations.find((automation) => automation.id === id);
+    return item ? { model: item.model || defaultRuntime.model, reasoning: item.reasoning || defaultRuntime.reasoning } : null;
+  },
+  catalog: async () => (await getModelListForRoute()).data,
+  runtime: readDiscoveryRuntime,
+  runs: async () => (await readAutomationRuns()).runs,
+  rateLimit: consumeAutomationResultRate,
+  record: (metric) => apiClientStore.record(metric),
+  idempotencyTtlMs: automationTriggerIdempotencyTtlMs,
+  modelWaitMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
+});
+app.get("/api/automations/:id/v1/models", (req, res) => handleDiscovery(req, res, "models"));
+app.get("/api/automations/:id/v1/capabilities", (req, res) => handleDiscovery(req, res, "capabilities"));
 
 const handleModelApi = createModelApiHandler({
   authenticate: (req, token) => authenticateAutomationTrigger(req, { token, allowLocalDevelopment: false }),

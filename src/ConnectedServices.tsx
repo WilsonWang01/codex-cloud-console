@@ -65,7 +65,7 @@ export default function ConnectedServices({ repoId, onPrepare }: { repoId: strin
     </div>
     <label className="plugin-search"><Search size={15} /><input aria-label="搜索服务" placeholder="搜索 Gmail、Outlook、日历、文档…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     {error && <p className="detail-error" role="alert">{error}</p>}
-    {catalog?.directoryError && <details className="connected-directory-warning"><summary>服务目录暂不可用，已连接服务仍可查看</summary><p>{catalog.directoryError}</p></details>}
+    {catalog?.directoryError && <details className="connected-directory-warning"><summary>{catalog.runtimeVerified ? "目录信息不完整，已安装状态已核对" : "目录信息不完整，工具状态待确认"}</summary><p>{catalog.directoryError}</p></details>}
     {loading && <p role="status">正在核对账号服务…</p>}
     {catalog && !catalog.runtimeVerified && <p className="warn-text">工具状态暂未确认，不能据此判断服务已可调用。</p>}
     <div className="connected-service-list">

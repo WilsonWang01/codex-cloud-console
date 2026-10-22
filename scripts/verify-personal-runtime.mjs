@@ -40,8 +40,9 @@ test("服务目录分页、实际可调用状态和授权链接边界", async ()
   assert.equal(catalog.apps[1].callable, false);
   assert.equal(catalog.apps[1].installUrl, null);
   assert.equal(catalog.apps[2].callable, false);
-  assert.equal(calls[0].params.forceRefetch, true);
-  assert.equal(calls[1].params.forceRefetch, false);
+  assert.equal(calls[0].method, "app/installed");
+  assert.equal(calls[1].params.forceRefetch, true);
+  assert.equal(calls[2].params.forceRefetch, false);
   for (const url of ["javascript:alert(1)", "http://chatgpt.com/apps/mail", "https://chatgpt.com.evil.test/apps/mail", "https://user@chatgpt.com/apps/mail", "https://chatgpt.com:444/apps/mail", "https://chatgpt.com/other"]) assert.equal(appAuthorizationUrl(url), null);
 });
 
@@ -49,7 +50,15 @@ test("服务调用状态不可读取时保留未知，分页异常不返回伪�
   const catalog = await readConnectedApps(async (method) => method === "app/installed" ? { ok: false, error: "unsupported" } : { ok: true, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true }], nextCursor: null } });
   assert.equal(catalog.runtimeVerified, false);
   assert.equal(catalog.apps[0].callable, null);
-  await assert.rejects(readConnectedApps(async () => ({ ok: true, result: { data: [], nextCursor: "repeat" } })), /分页未完成/);
+  let pages = 0;
+  const repeated = await readConnectedApps(async (method) => {
+    if (method === "app/installed") return { ok: true, result: { apps: [{ id: "mail", enabled: true, callable: true }] } };
+    pages += 1;
+    return { ok: true, result: { data: [], nextCursor: "repeat" } };
+  });
+  assert.equal(pages, 2);
+  assert.match(repeated.directoryError, /分页未完成/);
+  assert.equal(repeated.apps[0].callable, true);
   const denied = await readConnectedApps(async (method) => method === "app/list" ? { ok: false, error: "403 Forbidden <html>upstream error</html>" } : { ok: true, result: { apps: [{ id: "installed-mail", runtimeName: "Mail", enabled: true, callable: true }] } });
   assert.match(denied.directoryError, /403/);
   assert.doesNotMatch(denied.directoryError, /<html>/);
@@ -58,6 +67,28 @@ test("服务调用状态不可读取时保留未知，分页异常不返回伪�
   const unavailable = await readConnectedApps(async () => ({ ok: false, error: "offline" }));
   assert.equal(unavailable.runtimeVerified, false);
   assert.ok(unavailable.directoryError);
+});
+
+test("目录异常、超时和无效工具快照不冒充完整或已连接", async () => {
+  for (const result of [{}, { apps: {} }, { apps: [null] }, { apps: [{ id: "mail", enabled: true }] }]) {
+    const data = await readConnectedApps(async (method) => ({ ok: true, result: method === "app/installed" ? result : { data: [{ id: "mail", name: "Mail" }] } }));
+    assert.equal(data.runtimeVerified, false);
+    assert.equal(data.apps[0].callable, null);
+  }
+  for (const directory of [null, {}, { data: {} }, { data: [], nextCursor: 3 }]) {
+    const data = await readConnectedApps(async (method) => ({ ok: true, result: method === "app/installed" ? { apps: [] } : directory }));
+    assert.ok(data.directoryError);
+  }
+  let pages = 0;
+  const bounded = await readConnectedApps(async (method) => ({ ok: true, result: method === "app/installed" ? { apps: [] } : { data: [], nextCursor: `page-${++pages}` } }));
+  assert.equal(pages, 20);
+  assert.ok(bounded.directoryError);
+  const slow = await readConnectedApps(async (method) => method === "app/installed" ? { ok: true, result: { apps: [{ id: "mail", enabled: true, callable: true }] } } : new Promise(() => {}), { directoryTimeoutMs: 5 });
+  assert.equal(slow.apps[0].callable, true);
+  assert.ok(slow.directoryError);
+  const thrown = await readConnectedApps(async () => { throw new Error("private path/token"); });
+  assert.equal(thrown.runtimeVerified, false);
+  assert.doesNotMatch(JSON.stringify(thrown), /private/);
 });
 
 test("personal runtime shares the existing account by default and supports explicit modes", () => {

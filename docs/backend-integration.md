@@ -13,9 +13,47 @@ Codex Cloud 的核心是**既有自动化任务的异步执行接口**。适合 
 
 参考客户端仅依赖 Node.js 内置模块，可从仓库导入 [`runExternalClient`](../scripts/external-client-example.mjs)，或用任意语言按以下 HTTP 契约接入。推荐使用项目已有的 Node.js 22 或更新运行环境。
 
+另有不依赖第三方包的 [Python 客户端](../scripts/external-client-example.py)（Python 3.9+）和 [OpenAPI 3.1 契约](openapi.json)。该 OpenAPI 覆盖发现与异步任务；推理适配的字段边界另见模型协议文档，不宣称全协议覆盖。
+
+## 先查询能力
+
+使用同一个独立调用方令牌，通过 `Authorization: Bearer` 或 `x-api-key` 查询下列接口。发现接口不运行模型，不接受 `refresh` 等查询参数；与结果轮询共用每调用方每分钟 60 次限流。过期、撤销、范围不符均拒绝，不接受旧全局共享令牌，也不回退到本机默认登录。
+
+```sh
+node scripts/external-client-example.mjs capabilities my-app-review
+node scripts/external-client-example.mjs models my-app-review
+python3 scripts/external-client-example.py capabilities my-app-review
+python3 scripts/external-client-example.py models my-app-review
+```
+
+两种客户端均从环境读取 `CODEX_CLOUD_URL` 和 `CODEX_CLOUD_API_TOKEN`。不要把令牌直接写在命令行、Git 或浏览器代码中。
+
+| 接口/字段 | 解释 |
+| --- | --- |
+| `GET /api/automations/:id/v1/models` | OpenAI 列表子集；返回可见模型及推理/输入类型元信息 |
+| `GET /api/automations/:id/v1/capabilities` | 协议能力、自动化默认模型、CLI/协议版本、探测时间和保留边界 |
+| `catalog.status` / `catalog_status` | `available` 有目录；`stale` 刷新失败或使用旧缓存；`unavailable` 当前无法取得目录 |
+| `inference.status` | 只看此调用方、此自动化保留的记录：`not_verified`、`succeeded`、`failed`；失败不一定是模型权限问题，历史成功也不保证以后可用 |
+| `structured_output` / `artifact_download` | 目前均 `false`；不要用提示词“请输出 JSON”冒充结构化保证，也不要把日志中的路径当下载地址 |
+| `image_output` | 支持取回精确原回合的原生生成图片，仍依赖账号/工具及该回合真正成功，不代表所有模型一定能生成 |
+
+目录缺失时 models 返回 503；capabilities 仍可返回 200 并显式标记 unavailable。上游没有提供创建日期和所有者，模型返回 `created: 0`、`owned_by: "unknown"`，不伪造元数据。运行记录为有界历史，没有承诺固定天数；调用方应及时持久保存结果。能力查询记入请求明细的 `discovery`，不计作模型任务受理或 token 使用。
+
+Python 生命周期示例（提交会消耗模型额度；先审核输入和自动化权限）：
+
+```sh
+python3 scripts/external-client-example.py submit my-app-review business-event-20261022-001 --prompt '整理已审核资料' --wait --timeout 300
+python3 scripts/external-client-example.py status my-app-review 已保存的运行ID
+python3 scripts/external-client-example.py cancel my-app-review 已保存的运行ID
+```
+
+业务事件 ID 必须先在调用方保存。提交响应丢失时保持相同事件 ID 和输入重试；已拿到运行 ID 就查询它。示例有限重试，拒绝跳转转发令牌，本地等候超时不会自动取消。Python 使用网络超时和整体等待期限；不适合作为硬实时截止控制。更完整的事件游标、异步持久化进度回调可用 Node 参考客户端。
+
+文件下载暂未开放，所以本轮没有伪造“下载完成”的示例；A03 实现受限产物接口后，再接入下载、权限检查和校验。当前图片可用模型适配的 Base64 结果；异步任务的 `summary` 可能截断，不等于文件或完整结果。
+
 ## HTTP 契约
 
-所有接口使用 `x-codex-cloud-token`。提交接口另需 `Idempotency-Key` 和 JSON 正文。
+以下异步任务接口使用 `x-codex-cloud-token`，不同于上面的发现接口。提交接口另需 `Idempotency-Key` 和 JSON 正文。
 
 | 接口 | 用途 |
 | --- | --- |

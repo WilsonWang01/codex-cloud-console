@@ -37,6 +37,7 @@ let selectedRuntime = null;
 let runtimeReadGate = null;
 let appsFailure = false;
 let appsDirectoryDenied = false;
+let appsDirectoryPartial = false;
 let submittedMessages = 0;
 let queueFlow = false;
 let releaseJobEvents = null;
@@ -244,7 +245,7 @@ await context.route("**/api/**", async (route) => {
     return send({ ok: true });
   }
   if (url.pathname === "/api/codex/turn-steer" && queueFlow) { steeredMessages.push(body.message); return send({ ok: true }); }
-  if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", directoryError: appsDirectoryDenied ? "上游拒绝了云端服务目录请求（403）。" : "", apps: [
+  if (url.pathname === "/api/codex/apps") return appsFailure ? send({ ok: false, error: "服务暂不可用" }, 502) : send({ ok: true, runtimeVerified: true, runtimeScope: "shared", directoryError: appsDirectoryPartial ? "服务目录分页未完成，仅展示已取得的目录和已安装工具状态。" : appsDirectoryDenied ? "上游拒绝了云端服务目录请求（403）。" : "", apps: [
     { id: "mail", name: "Gmail", description: "整理邮件", installUrl: "https://chatgpt.com/apps/gmail/mail", accessible: false, enabled: true, callable: false },
     { id: "calendar", name: "Calendar", description: "查看日程", installUrl: "https://chatgpt.com/apps/calendar/cal", accessible: true, enabled: true, callable: true },
     { id: "invalid", name: "Untrusted", description: "不可信授权链接", installUrl: "javascript:alert(1)", accessible: false, enabled: false, callable: null },
@@ -452,6 +453,15 @@ try {
   await page.getByText("上游拒绝了云端服务目录请求（403）。", { exact: true }).waitFor();
   assert.equal(await page.getByRole("link", { name: "管理全部服务" }).getAttribute("href"), "https://chatgpt.com/apps");
   appsDirectoryDenied = false;
+  appsDirectoryPartial = true;
+  await page.getByRole("button", { name: "刷新连接" }).click();
+  await page.getByText("服务目录分页未完成，仅展示已取得的目录和已安装工具状态。", { exact: true }).waitFor();
+  const availableCalendar = page.locator(".connected-service-row").filter({ hasText: "Calendar" });
+  assert.match(await availableCalendar.innerText(), /可调用/);
+  assert.equal(await availableCalendar.getByRole("link", { name: "管理Calendar" }).getAttribute("href"), "https://chatgpt.com/apps/calendar/cal");
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+  await page.screenshot({ path: new URL("connections-partial-390.png", out).pathname });
+  appsDirectoryPartial = false;
   await page.locator(".command-panel").getByRole("button", { name: "关闭面板" }).click();
   await page.setViewportSize({ width: 1280, height: 900 });
   await composer.fill("独立个人草稿");

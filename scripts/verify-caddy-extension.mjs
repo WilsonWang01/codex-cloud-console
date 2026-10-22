@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { assertCaddyRouteExtension, extendAutomationRoutes, extendModelApiRoutes } from "../ops/extend-caddy-automation-routes.mjs";
+import { assertCaddyRouteExtension, extendAutomationRoutes, extendModelApiRoutes, extendDiscoveryRoutes } from "../ops/extend-caddy-automation-routes.mjs";
 
 const source = `example.com {
 \t@automation_trigger path_regexp automation_trigger ^/api/automations/[^/]+/(webhook|heartbeat)$
@@ -77,4 +77,16 @@ test("model API exposure is limited to four POST routes and preserves existing r
   const previous = updated.replace("chat/completions|messages|responses|images/generations", "chat/completions|messages");
   assert.equal(extendModelApiRoutes(previous), updated);
   assert.throws(() => extendModelApiRoutes(updated.replace("flush_interval -1", "flush_interval 10s")), /differ/);
+});
+
+test("discovery exposes only two exact GET paths without changing admin authentication", () => {
+  const current = extendModelApiRoutes(extendAutomationRoutes(source));
+  const updated = extendDiscoveryRoutes(current);
+  const pattern = updated.match(/method GET\n\t\tpath_regexp automation_discovery (.+)/)[1];
+  const matcher = new RegExp(pattern);
+  for (const route of ["models", "capabilities"]) assert.ok(matcher.test(`/api/automations/demo/v1/${route}`));
+  for (const route of ["/api/clients", "/api/codex/models", "/api/automations/demo/v1/models/other", "/api/automations/demo/v1/capabilities/", "/v1/models"]) assert.equal(matcher.test(route), false);
+  assert.equal(updated.replace(/\t@automation_discovery \{[\s\S]*?\n\t\}\n\thandle @automation_discovery \{[\s\S]*?\n\t\}\n/, ""), current);
+  assert.equal(extendDiscoveryRoutes(updated), updated);
+  assert.throws(() => extendDiscoveryRoutes(updated.replace("method GET\n\t\tpath_regexp automation_discovery", "method POST\n\t\tpath_regexp automation_discovery")), /differ/);
 });

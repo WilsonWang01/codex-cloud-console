@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { runExternalClient } from "./external-client-example.mjs";
 import { validateExternalTriggerInput } from "../server/external-automation.mjs";
@@ -7,12 +9,70 @@ import { validateExternalTriggerInput } from "../server/external-automation.mjs"
 const reply = (status = "completed", extra = {}) => ({ ok: true, run: { id: "run-1", automationId: "research", status, ...extra } });
 const options = { command: "submit", automationId: "research", eventId: "business-event-123", token: "test-secret", pollMs: 1 };
 
+function pythonClient(origin, ...args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", [fileURLToPath(new URL("./external-client-example.py", import.meta.url)), ...args], {
+      env: { ...process.env, CODEX_CLOUD_URL: origin, CODEX_CLOUD_API_TOKEN: "test-secret" },
+    });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+test("standalone Python client discovers, retries a lost response with the same key, reads and explicitly cancels", async (t) => {
+  let lost = false;
+  const { origin, calls } = await fixture(t, (req, res) => {
+    if (req.url.endsWith("/capabilities")) {
+      assert.equal(req.headers.authorization, "Bearer test-secret");
+      return res.end(JSON.stringify({ object: "codex_cloud.capabilities", automation_id: "research" }));
+    }
+    if (req.url.endsWith("/webhook") && !lost) { lost = true; return req.socket.destroy(); }
+    res.end(JSON.stringify(reply(req.url.endsWith("/cancel") ? "canceling" : "completed")));
+  });
+  const caps = await pythonClient(origin, "capabilities", "research");
+  assert.equal(caps.code, 0, caps.stderr);
+  const submitted = await pythonClient(origin, "submit", "research", "python-event-123", "--prompt", "只读");
+  assert.equal(submitted.code, 0, submitted.stderr);
+  const posts = calls.filter((call) => call.url.endsWith("/webhook"));
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].body, posts[1].body);
+  assert.equal(posts[0].key, posts[1].key);
+  const status = await pythonClient(origin, "status", "research", "run-1");
+  assert.equal(JSON.parse(status.stdout).status, "completed");
+  const canceled = await pythonClient(origin, "cancel", "research", "run-1");
+  assert.equal(JSON.parse(canceled.stdout).status, "canceling");
+  assert.equal(calls.filter((call) => call.url.endsWith("/cancel")).length, 1);
+});
+
+test("Python rejects redirects and unsafe origins without forwarding credentials", async (t) => {
+  const sink = await fixture(t, (_req, res) => res.end("{}"));
+  const { origin, calls } = await fixture(t, (_req, res) => { res.statusCode = 307; res.setHeader("Location", sink.origin); res.end(); });
+  const redirected = await pythonClient(origin, "capabilities", "research");
+  assert.equal(redirected.code, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(sink.calls.length, 0);
+  assert.equal((await pythonClient("http://example.com", "capabilities", "research")).code, 1);
+});
+
 test("reference client accepts both cancellation spellings as terminal without resubmitting or polling", async (t) => {
   for (const status of ["canceled", "cancelled"]) {
     const { origin, calls } = await fixture(t, (_req, res) => res.end(JSON.stringify(reply(status))));
     assert.equal((await runExternalClient({ ...options, origin, wait: true })).status, status);
     assert.equal(calls.length, 1);
   }
+});
+
+test("independent client queries capabilities and models without running a task", async (t) => {
+  const { origin, calls } = await fixture(t, (req, res) => {
+    assert.equal(req.headers.authorization, "Bearer test-secret");
+    res.end(JSON.stringify(req.url.endsWith("/models") ? { object: "list", data: [] } : { object: "codex_cloud.capabilities", automation_id: "research", features: { artifact_download: false } }));
+  });
+  assert.equal((await runExternalClient({ ...options, command: "capabilities", origin })).features.artifact_download, false);
+  assert.deepEqual((await runExternalClient({ ...options, command: "models", origin })).data, []);
+  assert.ok(calls.every((call) => call.method === "GET" && !call.key));
 });
 
 async function fixture(t, handler) {

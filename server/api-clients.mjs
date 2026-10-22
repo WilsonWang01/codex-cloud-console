@@ -142,7 +142,9 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
         const hour = row.time.slice(0, 13) + ":00:00Z";
         const key = `${hour}:${row.clientId}`;
         const bucket = buckets.get(key) || { hour, clientId: row.clientId, requests: 0, accepted: 0, errors: 0, replayed: 0, polls: 0, pollErrors: 0, controls: 0 };
-        if (row.trigger === "cancel") {
+        if (row.trigger === "discovery") {
+          bucket.discovery = (bucket.discovery || 0) + 1;
+        } else if (row.trigger === "cancel") {
           bucket.controls += 1;
         } else if (row.trigger === "result") {
           bucket.polls += 1;

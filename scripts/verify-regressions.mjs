@@ -2284,6 +2284,17 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     const modelPath = "/api/automations/sample-on-demand/v1/chat/completions";
     const modelBody = { model: "gpt-6-sol", reasoning_effort: "high", messages: [{ role: "system", content: "只用中文" }, { role: "user", content: "model api regression" }] };
     const modelHeaders = { authorization: `Bearer ${modelClient.data.token}`, "content-type": "application/json", "idempotency-key": "model-api-regression-0001", origin: "https://external-service.example" };
+    const discoveryBase = "/api/automations/sample-on-demand/v1";
+    assert.equal((await jsonRequest(baseUrl, `${discoveryBase}/models`)).response.status, 401);
+    assert.equal((await jsonRequest(baseUrl, `${discoveryBase}/models`, { headers: { authorization: "Bearer regression-token-123456" } })).response.status, 401);
+    assert.equal((await jsonRequest(baseUrl, "/api/automations/sample-hourly/v1/models", { headers: modelHeaders })).response.status, 401);
+    const discovered = await jsonRequest(baseUrl, `${discoveryBase}/models`, { headers: modelHeaders });
+    assert.equal(discovered.response.status, 200);
+    assert.ok(discovered.data.data.some((model) => model.id === "gpt-6-sol"));
+    const capabilities = await jsonRequest(baseUrl, `${discoveryBase}/capabilities`, { headers: modelHeaders });
+    assert.equal(capabilities.response.status, 200);
+    assert.equal(capabilities.data.features.structured_output, false);
+    assert.equal(capabilities.data.features.artifact_download, false);
     const missingModelToken = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(modelBody) });
     assert.equal(missingModelToken.response.status, 401);
     assert.equal(missingModelToken.data.error.type, "authentication_error");
@@ -2534,10 +2545,12 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(progressTrigger.response.status, 200, JSON.stringify(progressTrigger.data));
     let progressRun = null;
-    for (let attempt = 0; attempt < 12; attempt += 1) {
+    const progressDeadline = Date.now() + 5_000;
+    while (Date.now() < progressDeadline) {
       const runs = await jsonRequest(baseUrl, "/api/automations/runs?automationId=sample-research");
+      assert.equal(runs.response.status, 200);
       progressRun = runs.data.runs.find((run) => run.id === progressTrigger.data.run.id) || null;
-      if (progressRun?.status === "completed") break;
+      if (progressRun && !["queued", "running", "canceling"].includes(progressRun.status)) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.equal(progressRun?.status, "completed");
@@ -2729,7 +2742,7 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
       res.end(body);
       return;
     }
-    if (["chat/completions", "messages", "responses", "images/generations"].some((route) => req.url === `/api/automations/demo/v1/${route}`)) {
+    if (["chat/completions", "messages", "responses", "images/generations", "models", "capabilities"].some((route) => req.url === `/api/automations/demo/v1/${route}`)) {
       req.resume();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ authorization: req.headers.authorization, cloudToken: req.headers["x-codex-cloud-token"] || null }));
@@ -2851,6 +2864,10 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
         method: "POST", headers: { authorization: "Bearer isolated-client-token", "content-type": "application/json" }, body: "{}",
       });
       assert.deepEqual(await modelProxy.json(), { authorization: "Bearer isolated-client-token", cloudToken: null });
+    }
+    for (const route of ["models", "capabilities"]) {
+      const discoveryProxy = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/v1/${route}`, { headers: { authorization: "Bearer scoped-discovery-token" } });
+      assert.deepEqual(await discoveryProxy.json(), { authorization: "Bearer scoped-discovery-token", cloudToken: null });
     }
     const cacheMode = (await fs.stat(cachePath)).mode & 0o777;
     assert.equal(cacheMode, 0o600);
