@@ -136,16 +136,22 @@
         "defaults": {"type": "object", "properties": {"model": {"type": "string"}, "reasoning": {"type": "string"}}},
         "runtime": {"type": "object", "properties": {"cli_version": {"type": ["string", "null"]}, "probed_at": {"type": "string", "format": "date-time"}, "protocol": {"const": "codex-app-server-v2"}}},
         "catalog": {"type": "object", "properties": {"status": {"enum": ["available", "stale", "unavailable"]}, "observed_at": {"type": ["string", "null"], "format": "date-time"}, "inference_verified": {"const": false}}},
-        "protocols": {"type": "object"}, "features": {"type": "object", "properties": {"structured_output": {"const": false}, "artifact_download": {"const": false}, "callback": {"const": false}, "request_output_token_limit": {"const": false}}},
+        "protocols": {"type": "object"}, "features": {"type": "object", "properties": {"structured_output": {"type": "boolean", "description": "先查询部署版本；true 时支持 structured-output.md 的受限格式"}, "artifact_download": {"const": false}, "callback": {"const": false}, "request_output_token_limit": {"const": false}}},
         "limits": {"type": "object"}, "retention": {"type": "object"}, "unsupported": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "array", "items": {"type": "string"}}
       }},
       "Trigger": {"type": "object", "additionalProperties": false, "properties": {
         "runner": {"const": "app-server"}, "prompt": {"type": "string", "minLength": 1, "description": "UTF-8 不超过 65536 字节"}, "model": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{2,64}$"},
         "reasoning": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]}, "search": {"type": "boolean"}, "worktree": {"const": true},
-        "sessionId": {"type": "string", "minLength": 1, "maxLength": 160, "description": "仅 heartbeat 可用；webhook 拒绝"}, "completionContract": {"type": "object", "description": "详见 backend-integration.md，不能替代外部写入确认"}
+        "sessionId": {"type": "string", "minLength": 1, "maxLength": 160, "description": "仅 heartbeat 可用；webhook 拒绝"}, "completionContract": {"type": "object", "description": "详见 backend-integration.md，不能替代外部写入确认"},
+        "outputSchema": {"type": ["object", "null"], "description": "受限 JSON Schema：16 KiB、8 层、128 节点，根为 object；省略或 null 不要求结构化；详见 structured-output.md"}
       }},
       "RunResponse": {"type": "object", "required": ["ok", "run"], "properties": {
-        "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {"id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]}, "startedAt": {"type": "string", "format": "date-time", "description": "任务接收时间"}, "executionStartedAt": {"type": ["string", "null"], "format": "date-time", "description": "实际开始执行时间；排队中可为空，用于 UTC 用量归属"}, "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0}}},
+        "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {
+          "id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]},
+          "startedAt": {"type": "string", "format": "date-time", "description": "任务接收时间"}, "executionStartedAt": {"type": ["string", "null"], "format": "date-time", "description": "实际开始执行时间；排队中可为空，用于 UTC 用量归属"},
+          "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0},
+          "structuredOutput": {"type": "object", "description": "验证成功为 validated/schemaSha256/data，失败为 invalid/error；data 是完整业务对象", "required": ["status"], "properties": {"status": {"enum": ["validated", "invalid"]}, "schemaSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "data": {"type": "object"}, "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}}
+        }},
         "eventCursor": {"type": "integer", "minimum": 0}, "eventGap": {"type": "boolean"}, "events": {"type": "array", "items": {"type": "object"}}
       }}
     }

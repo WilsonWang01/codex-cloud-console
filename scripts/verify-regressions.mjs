@@ -120,6 +120,7 @@ const threads = [];
 let modelApiText = null;
 let modelApiImages = [];
 let modelApiTurnId = null;
+let modelApiStructured = false;
 let turnSequence = 0;
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
@@ -216,7 +217,7 @@ input.on("line", (line) => {
     return send({ method: "thread/archived", params: { threadId: message.params.threadId } }, 20);
   }
   if (message.method === "thread/read" && message.params?.includeTurns && modelApiText) {
-    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: modelApiTurnId, items: [{ type: "agentMessage", text: modelApiText }, ...modelApiImages] }] } } });
+    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: modelApiTurnId, items: [...(modelApiStructured ? [{ type: "agentMessage", phase: "commentary", text: "private non-JSON progress" }] : []), { type: "agentMessage", text: modelApiText, ...(modelApiStructured ? { phase: "final_answer" } : {}) }, ...modelApiImages] }] } } });
   }
   if (message.method === "thread/archive" && message.params?.threadId === "thread-archive-race") {
     return send({ id: message.id, result: {} }, 250);
@@ -262,7 +263,8 @@ input.on("line", (line) => {
     const uniqueTurn = process.pid + "-" + (++turnSequence);
     if (requestText.includes("model api regression")) {
       modelApiTurnId = "turn-model-api-" + uniqueTurn;
-      modelApiText = requestText.includes("long output") ? "验收".repeat(2500) : "接口验收通过";
+      modelApiStructured = Boolean(message.params.outputSchema);
+      modelApiText = modelApiStructured ? JSON.stringify({ answer: requestText.includes("invalid schema result") ? 7 : requestText.includes("large structured output") ? "验收".repeat(2500) : "结构化验收通过" }) : requestText.includes("long output") ? "验收".repeat(2500) : "接口验收通过";
       modelApiImages = requestText.includes("generated output") ? [{ id: "ig-fixture", type: "imageGeneration", status: "completed", failure: null, result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", revisedPrompt: "图片输出验收" }] : [];
       send({ id: message.id, result: { turn: { id: modelApiTurnId } } });
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(0, 2) } }, 40);
@@ -2443,7 +2445,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.ok(discovered.data.data.some((model) => model.id === "gpt-6-sol"));
     const capabilities = await jsonRequest(baseUrl, `${discoveryBase}/capabilities`, { headers: modelHeaders });
     assert.equal(capabilities.response.status, 200);
-    assert.equal(capabilities.data.features.structured_output, false);
+    assert.equal(capabilities.data.features.structured_output, true);
+    assert.equal(capabilities.data.limits.task_queue.max_queued, 32);
     assert.equal(capabilities.data.features.artifact_download, false);
     const missingModelToken = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(modelBody) });
     assert.equal(missingModelToken.response.status, 401);
@@ -2475,6 +2478,36 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(longFirst.data.choices[0].message.content, "验收".repeat(2500));
     const longReplay = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: longHeaders, body: JSON.stringify(longBody) });
     assert.equal(longReplay.data.choices[0].message.content, longFirst.data.choices[0].message.content);
+    const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
+    const structuredBody = { ...modelBody, response_format: { type: "json_schema", json_schema: { name: "answer", schema, strict: true } } };
+    const structuredHeaders = { ...modelHeaders, "idempotency-key": "model-api-structured-0001" };
+    const structured = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: structuredHeaders, body: JSON.stringify(structuredBody) });
+    assert.equal(structured.response.status, 200, JSON.stringify(structured.data));
+    assert.deepEqual(JSON.parse(structured.data.choices[0].message.content), { answer: "结构化验收通过" });
+    const structuredId = structured.response.headers.get("x-codex-cloud-run-id");
+    const structuredRun = (JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8"))).runs.find(run => run.id === structuredId);
+    assert.equal(structuredRun.structuredOutput.status, "validated");
+    const structuredRpc = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).find(request => request.method === "turn/start" && request.params.outputSchema);
+    assert.deepEqual(structuredRpc.params.outputSchema, schema);
+    const structuredReplay = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: structuredHeaders, body: JSON.stringify(structuredBody) });
+    assert.deepEqual(structuredReplay.data, structured.data);
+    const largeStructured = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { ...structuredHeaders, "idempotency-key": "model-api-structured-large-0001" }, body: JSON.stringify({ ...structuredBody, messages: [{ role: "user", content: "model api regression large structured output" }] }) });
+    assert.equal(largeStructured.response.status, 200);
+    assert.equal(JSON.parse(largeStructured.data.choices[0].message.content).answer, "验收".repeat(2500));
+    const changedSchema = structuredClone(structuredBody); changedSchema.response_format.json_schema.schema.description = "different request";
+    assert.equal((await jsonRequest(baseUrl, modelPath, { method: "POST", headers: structuredHeaders, body: JSON.stringify(changedSchema) })).response.status, 409);
+    const invalidBody = { ...structuredBody, messages: [{ role: "user", content: "model api regression invalid schema result" }] };
+    const invalidStructured = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { ...structuredHeaders, "idempotency-key": "model-api-structured-invalid-0001" }, body: JSON.stringify(invalidBody) });
+    assert.equal(invalidStructured.response.status, 502);
+    assert.equal(invalidStructured.data.error.code, "invalid_structured_output");
+    const invalidStream = await fetch(new URL(modelPath, baseUrl), { method: "POST", headers: { ...structuredHeaders, "idempotency-key": "model-api-structured-invalid-0002" }, body: JSON.stringify({ ...invalidBody, stream: true }) });
+    const invalidRaw = await invalidStream.text();
+    assert.match(invalidRaw, /invalid_structured_output/); assert.doesNotMatch(invalidRaw, /private non-JSON|\[DONE\]/);
+    const asyncStructured = await jsonRequest(baseUrl, "/api/automations/sample-on-demand/webhook", { method: "POST", headers: { "x-codex-cloud-token": modelClient.data.token, "content-type": "application/json", "idempotency-key": "async-structured-0001" }, body: JSON.stringify({ prompt: "model api regression", model: "gpt-6-sol", outputSchema: schema }) });
+    assert.equal(asyncStructured.response.status, 200);
+    const asyncResult = await runExternalClient({ command: "status", origin: baseUrl, token: modelClient.data.token, automationId: "sample-on-demand", runId: asyncStructured.data.run.id, wait: true, pollMs: 100, timeoutMs: 10000 });
+    assert.equal(asyncResult.structuredOutput.status, "validated");
+    assert.equal(asyncResult.structuredOutput.data.answer, "结构化验收通过");
     const anthropicHeaders = { "x-api-key": modelClient.data.token, "content-type": "application/json", "idempotency-key": "model-api-anthropic-0001", "anthropic-version": "2023-06-01", "x-codex-cloud-allow-unbounded-output": "true" };
     const anthropicPath = "/api/automations/sample-on-demand/v1/messages";
     const anthropicBody = { model: "gpt-6-sol", messages: [{ role: "user", content: "model api regression" }], max_tokens: 1024 };

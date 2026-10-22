@@ -99,7 +99,17 @@ test("unsupported features and malformed input fail closed before execution", ()
   assert.throws(() => normalize({ ...input, max_tokens: 1024 }), { code: "unsupported_output_limit" });
   assert.throws(() => normalize({ ...input, max_tokens: 1024, max_completion_tokens: 1024 }, "openai", { allowUnboundedOutput: true }), /同时/);
   assert.throws(() => normalize({ ...input, max_tokens: -1 }, "anthropic", { allowUnboundedOutput: true }), /正整数/);
-  assert.throws(() => normalize({ ...input, max_tokens: 1, output_config: { format: {} } }, "anthropic", { allowUnboundedOutput: true }), /effort/);
+  assert.throws(() => normalize({ ...input, max_tokens: 1, output_config: { format: {} } }, "anthropic", { allowUnboundedOutput: true }), /format/);
+});
+
+const outputSchema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
+const outputFormat = { name: "answer", strict: true, schema: outputSchema };
+test("all three protocol formats normalize into the same native output schema", () => {
+  assert.deepEqual(normalize({ ...input, response_format: { type: "json_schema", json_schema: outputFormat } }).body.outputSchema, outputSchema);
+  assert.deepEqual(normalize({ model: input.model, input: "JSON", text: { format: { type: "json_schema", ...outputFormat } } }, "responses").body.outputSchema, outputSchema);
+  assert.deepEqual(normalize({ ...input, max_tokens: 1, output_config: { format: { type: "json_schema", schema: outputSchema } } }, "anthropic", { allowUnboundedOutput: true }).body.outputSchema, outputSchema);
+  assert.throws(() => normalize({ ...input, response_format: { type: "json_schema", json_schema: { ...outputFormat, strict: false } } }), { statusCode: 400 });
+  assert.throws(() => normalize({ model: input.model, input: "JSON", text: { format: { type: "json_schema", ...outputFormat }, verbosity: "low" } }, "responses"), { statusCode: 400 });
 });
 
 test("routing and token usage do not invent models or unknown counts", () => {
@@ -138,7 +148,7 @@ async function fixture(task, options = {}) {
     submit: async (req, body, imageInputs) => {
       const key = req.get("idempotency-key");
       const saved = keys.get(key);
-      if (saved && saved.body.prompt !== body.prompt) throw Object.assign(new Error("幂等键冲突"), { statusCode: 409 });
+      if (saved && JSON.stringify(saved.body) !== JSON.stringify(body)) throw Object.assign(new Error("幂等键冲突"), { statusCode: 409 });
       if (saved) return { run: saved.run, deduplicated: true };
       submits += 1;
       const run = { id: `run-${submits}`, model: body.model, startedAt: new Date().toISOString(), status: "running", summary: "", resultPath: `/api/automations/demo/runs/run-${submits}` };
@@ -216,6 +226,34 @@ test("image outputs are exact-turn, bounded native artifacts, not paths in text"
 });
 
 const outputImages = [{ id: "ig-1", b64_json: png, media_type: "image/png", revised_prompt: "实际提示" }];
+test("official SDKs return validated JSON and structured streams never leak invalid progress", async () => {
+  await fixture(async f => {
+    const openai = new OpenAI({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo/v1`, maxRetries: 0 });
+    const body = { ...input, response_format: { type: "json_schema", json_schema: outputFormat } };
+    const json = await openai.chat.completions.create(body, { headers: { "Idempotency-Key": "structured-sdk-chat-0001" } });
+    assert.deepEqual(JSON.parse(json.choices[0].message.content), { answer: "validated" });
+    const parsed = await openai.chat.completions.parse(body, { headers: { "Idempotency-Key": "structured-sdk-chat-parse-0001" } });
+    assert.deepEqual(parsed.choices[0].message.parsed, { answer: "validated" });
+    const chunks = [];
+    for await (const chunk of await openai.chat.completions.create({ ...body, stream: true }, { headers: { "Idempotency-Key": "structured-sdk-chat-0002" } })) chunks.push(chunk);
+    assert.equal(chunks.map(chunk => chunk.choices[0]?.delta.content || "").join(""), '{"answer":"validated"}');
+    const response = await openai.responses.create({ model: input.model, input: "JSON", text: { format: { type: "json_schema", ...outputFormat } } }, { headers: { "Idempotency-Key": "structured-sdk-response-0001" } });
+    assert.equal(JSON.parse(response.output_text).answer, "validated");
+    const parsedResponse = await openai.responses.parse({ model: input.model, input: "JSON", text: { format: { type: "json_schema", ...outputFormat } } }, { headers: { "Idempotency-Key": "structured-sdk-response-parse-0001" } });
+    assert.deepEqual(parsedResponse.output_parsed, { answer: "validated" });
+    const anthropic = new Anthropic({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo`, maxRetries: 0, defaultHeaders: { "x-codex-cloud-allow-unbounded-output": "true" } });
+    const message = await anthropic.messages.create({ ...input, max_tokens: 1, output_config: { format: { type: "json_schema", schema: outputSchema } } }, { headers: { "Idempotency-Key": "structured-sdk-message-0001" } });
+    assert.equal(JSON.parse(message.content[0].text).answer, "validated");
+    const parsedMessage = await anthropic.messages.parse({ ...input, max_tokens: 1, output_config: { format: { type: "json_schema", schema: outputSchema } } }, { headers: { "Idempotency-Key": "structured-sdk-message-parse-0001" } });
+    assert.deepEqual(parsedMessage.parsed_output, { answer: "validated" });
+    for (const submitted of f.submissions) assert.deepEqual(submitted.body.outputSchema, outputSchema);
+  }, { result: async () => ({ summary: '{"answer":"validated"}', images: [] }) });
+  await fixture(async f => {
+    const response = await post(f.origin, { ...input, stream: true, response_format: { type: "json_schema", json_schema: outputFormat } });
+    const raw = await response.text();
+    assert.match(raw, /invalid_structured_json/); assert.doesNotMatch(raw, /你好|\[DONE\]/);
+  }, { result: async () => ({ summary: "not JSON", images: [] }) });
+});
 test("official OpenAI SDK gets image bytes from Images and Responses, including streaming and replay", async () => {
   await fixture(async (f) => {
     const client = new OpenAI({ apiKey: "fixture-token", baseURL: `${f.origin}/api/automations/demo/v1`, maxRetries: 0 });

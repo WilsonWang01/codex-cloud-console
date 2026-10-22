@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 
 const terminal = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
-export const externalTaskSchemaVersion = 1;
+export const externalTaskSchemaVersion = 2;
 const decode = (row) => row ? JSON.parse(row.record) : null;
 function processIdentity(pid) {
   if (process.platform !== "linux") return null;
@@ -26,7 +26,8 @@ const alive = (pid, owner) => {
 export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive = alive } = {}) {
   db.exec("CREATE TABLE IF NOT EXISTS external_tasks_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('schema_version', ?)").run(externalTaskSchemaVersion);
-  if (db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value !== externalTaskSchemaVersion) throw new Error("Unsupported persistent task schema");
+  const version = db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value;
+  if (![1, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('revision', 0)").run();
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS external_tasks (
@@ -41,6 +42,8 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       key_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
       run_id TEXT NOT NULL REFERENCES external_tasks(id), expires_ms INTEGER NOT NULL
     ) STRICT;`);
+  // Version 2 adds structured-result fields inside existing JSON; preserve every row and claim.
+  if (version === 1) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
   const get = db.prepare("SELECT id, record, state, owner, owner_pid, epoch FROM external_tasks WHERE id=?");
   const save = db.prepare("UPDATE external_tasks SET record=?, state=?, execution=CASE WHEN ?='terminal' THEN '{}' ELSE execution END WHERE id=?");
   const transaction = (callback) => {
@@ -118,6 +121,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         for (const field of ["id", "clientId", "automationId", "repoId", "startedAt", "triggerIdempotencyHash", "triggerRequestHash"]) {
           if ((current[field] || null) !== (record[field] || null)) throw failure(409, "任务归属或请求摘要不能更改");
         }
+        if (JSON.stringify(current.outputSchema || null) !== JSON.stringify(record.outputSchema || null)) throw failure(409, "已接收任务的输出格式不能更改");
         if (row.state === "terminal") return current;
         if (current.cancelRequestedAt) {
           record = { ...record, cancelRequestedAt: current.cancelRequestedAt };

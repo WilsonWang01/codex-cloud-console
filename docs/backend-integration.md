@@ -36,7 +36,7 @@ python3 scripts/external-client-example.py models my-app-review
 | `GET /api/automations/:id/v1/capabilities` | 协议能力、自动化默认模型、CLI/协议版本、探测时间和保留边界 |
 | `catalog.status` / `catalog_status` | `available` 有目录；`stale` 刷新失败或使用旧缓存；`unavailable` 当前无法取得目录 |
 | `inference.status` | 只看此调用方、此自动化保留的记录：`not_verified`、`succeeded`、`failed`；失败不一定是模型权限问题，历史成功也不保证以后可用 |
-| `structured_output` / `artifact_download` | 目前均 `false`；不要用提示词“请输出 JSON”冒充结构化保证，也不要把日志中的路径当下载地址 |
+| `structured_output` / `artifact_download` | 结构化输出见[受限 JSON Schema](structured-output.md)，上线版本应返回前者 `true`；文件下载仍为 `false`。不要用提示词冒充结构化保证，也不要把日志路径当下载地址 |
 | `image_output` | 支持取回精确原回合的原生生成图片，仍依赖账号/工具及该回合真正成功，不代表所有模型一定能生成 |
 
 目录缺失时 models 返回 503；capabilities 仍可返回 200 并显式标记 unavailable。上游没有提供创建日期和所有者，模型返回 `created: 0`、`owned_by: "unknown"`，不伪造元数据。运行记录为有界历史，没有承诺固定天数；调用方应及时持久保存结果。能力查询记入请求明细的 `discovery`，不计作模型任务受理或 token 使用。
@@ -111,6 +111,7 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 | `reasoning` | `none/minimal/low/medium/high/xhigh/max/ultra`；具体模型不一定支持所有值 |
 | `search` | 布尔值，默认 `true`；设置该线程的网页搜索配置，不是网络访问隔离 |
 | `completionContract` | 声明式完成条件，可检查最终标记、工作区文件和可选哈希；见[配置说明](setup.md#自动化接入) |
+| `outputSchema` | 受限 JSON Schema，原生传入 CLI 并校验精确原回合；成功从 `run.structuredOutput.data` 取完整对象，见[说明](structured-output.md) |
 | `sessionId` | 仅 Heartbeat 可用，必须能验证为本调用方、同一自动化的历史会话 |
 | `runner` | 仅支持 `app-server`，无需显式设置 |
 | `worktree` | 独立调用方只能省略或设为 `true` |

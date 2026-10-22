@@ -30,7 +30,7 @@
     "verify:approvals": "node --test scripts/verify-approvals.mjs",
     "verify:clients": "node --test scripts/verify-api-clients.mjs",
     "verify:external-client": "node --test scripts/verify-external-client-example.mjs",
-    "verify:model-api": "node --test scripts/verify-model-api.mjs scripts/verify-api-discovery.mjs",
+    "verify:model-api": "node --test scripts/verify-model-api.mjs scripts/verify-api-discovery.mjs scripts/verify-structured-output.mjs",
     "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
     "verify:automation-events": "node --test scripts/verify-automation-events.mjs",
     "verify:usage": "node --test scripts/verify-run-usage.mjs scripts/verify-run-usage-ledger.mjs",
@@ -65,6 +65,7 @@
     "cloud:console:install": "bash scripts/install-cloud-console-agent.sh"
   },
   "dependencies": {
+    "ajv": "8.20.0",
     "cron-parser": "5.10.1",
     "express": "^5.2.1",
     "playwright": "^1.60.0",

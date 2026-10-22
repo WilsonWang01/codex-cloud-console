@@ -10,12 +10,13 @@
 | 文本历史 | 保留角色和内容边界，转换成 Codex 单轮的 JSON 对话记录；不是原生模型消息通道 |
 | 图片输入 | user 消息中的 PNG/JPEG/WebP Base64；作为原生 Codex `image` 输入，不当作文本或仅做 OCR |
 | 图片输出 | 精确原回合的原生 `imageGeneration` 结果；Responses `image_generation_call.result`、Images `data[].b64_json`，或 Chat/Messages 的 `codex_cloud.images` 扩展 |
-| 流式输出 | 真实 Agent 文本增量；OpenAI SSE chunks / `[DONE]`，Anthropic具名 SSE 事件 |
+| 流式输出 | 普通文本为 Agent 增量；结构化 JSON 在完整验证后发送。OpenAI SSE chunks / `[DONE]`，Anthropic具名 SSE 事件 |
+| 结构化输出 | 受限 JSON Schema，经原生 `outputSchema` 和服务端校验；先查询 capabilities，详见[结构化结果](structured-output.md) |
 | 执行隔离 | 每个新事件使用独立会话和 Git 工作树；完整历史由调用方逐次传入 |
 | 幂等、撤销与统计 | 复用独立调用方令牌、运行记录、并发及请求限制；两类调用进入“调用与用量” |
 | 模型与推理 | `model` 使用实际 Codex 模型 ID；OpenAI `reasoning_effort` / Anthropic `output_config.effort` |
 | 能力发现 | 同一自动化范围的 `GET v1/models`（OpenAI 列表子集）及 `GET v1/capabilities`；目录不是账号执行权限证明 |
-| 不支持 | Responses 的保存/查询/previous_response_id、Anthropic Models 原生响应、Images Edits/multipart、远程图片 URL/Files API/GIF、音频/视频/PDF、音频生成、客户端 `tools/tool_calls/tool_use/tool_result`、JSON Schema、采样参数、assistant 预填充、Anthropic beta/缓存控制 |
+| 不支持 | Responses 的保存/查询/previous_response_id、Anthropic Models 原生响应、Images Edits/multipart、远程图片 URL/Files API/GIF、音频/视频/PDF、音频生成、客户端 `tools/tool_calls/tool_use/tool_result`、Schema 引用/组合/正则等子集外约束、采样参数、assistant 预填充、Anthropic beta/缓存控制 |
 
 **重要：Codex 无法原生兑现请求级 `max_tokens/max_completion_tokens`。** 默认返回 400，而不是假装预算生效。Anthropic 的 SDK 必须提供 `max_tokens`，因此只有在调用方明确接受“不应用该输出上限”后，才可加 `x-codex-cloud-allow-unbounded-output: true`。这不限制推理或总 token 消耗，也不会截断输出。需要严格逐请求 token 预算的业务不能使用本适配器。
 

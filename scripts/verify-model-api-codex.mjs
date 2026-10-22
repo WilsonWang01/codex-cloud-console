@@ -37,7 +37,8 @@ try {
     initializeTimeoutMs: 15_000,
   });
   const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-  const normalized = normalizeModelApiRequest({ model: "gpt-6-sol", messages: [{ role: "user", content: [
+  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
+  const normalized = normalizeModelApiRequest({ model: "gpt-6-sol", response_format: { type: "json_schema", json_schema: { name: "answer", strict: true, schema } }, messages: [{ role: "user", content: [
     { type: "image_url", image_url: { url: `data:image/png;base64,${png}`, detail: "auto" } },
     { type: "text", text: "Describe this test image without tools." },
   ] }] }, "openai");
@@ -52,6 +53,7 @@ try {
   });
   await client.request("turn/start", { threadId: thread.thread.id, model: "gpt-6-sol", effort: "medium",
     input: [{ type: "text", text: normalized.body.prompt, text_elements: [] }, ...normalized.imageInputs],
+    outputSchema: normalized.body.outputSchema,
   }, 15_000);
   let timer;
   const turn = await Promise.race([terminal, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Mock provider turn did not finish")), 15_000); })])
@@ -64,8 +66,11 @@ try {
     assert.equal(images.length, 1);
     assert.equal(images[0].image_url, `data:image/png;base64,${png}`);
     assert.ok(images[0].detail === undefined || images[0].detail === "auto");
+    assert.equal(request.body.text.format.type, "json_schema");
+    assert.equal(request.body.text.format.strict, true);
+    assert.deepEqual(request.body.text.format.schema, schema);
   }
-  console.log("真实 Codex CLI 图片序列化通过；仅访问本机模拟 provider，未调用付费模型。");
+  console.log("真实 Codex CLI 图片及结构化格式序列化通过；仅访问本机模拟 provider，未调用付费模型。");
 } finally {
   if (client) await client.stop({ waitForExit: true });
   await new Promise((resolve) => mock.close(resolve));

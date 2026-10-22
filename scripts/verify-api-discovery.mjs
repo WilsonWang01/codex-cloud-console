@@ -45,7 +45,7 @@ test("OpenAI pinned SDK discovers models without leaking other clients or claimi
 test("Anthropic pinned SDK headers can read capabilities, without pretending models.list compatibility", () => fixture(async ({ origin }) => {
   const sdk = new Anthropic({ baseURL: `${origin}/api/automations/demo`, apiKey: "allowed", maxRetries: 0 });
   const data = await sdk.get("/v1/capabilities");
-  assert.equal(data.features.structured_output, false);
+  assert.equal(data.features.structured_output, true);
   assert.equal(data.features.artifact_download, false);
   assert.equal(data.features.request_output_token_limit, false);
   assert.equal(data.runtime.cli_version, "0.157.1");

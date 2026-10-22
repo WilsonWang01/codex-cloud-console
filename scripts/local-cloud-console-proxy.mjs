@@ -4,7 +4,7 @@ import http from "node:http";
 import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { modelApiProtocol } from "../server/model-api.mjs";
+import { modelApiProtocol } from "../server/model-api-protocol.mjs";
 import { readReleaseInfo } from "../server/release-info.mjs";
 
 const port = Number(process.env.CODEX_CLOUD_CONSOLE_PORT || 18787);

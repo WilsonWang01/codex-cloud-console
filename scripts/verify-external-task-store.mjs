@@ -138,10 +138,29 @@ test("pending and uncertain work keeps its original key beyond the nominal TTL",
 }));
 
 test("unknown task schema is not rewritten", () => fixture(({ ledger }) => {
-  ledger.database.exec("UPDATE external_tasks_meta SET value=2 WHERE key='schema_version'; DELETE FROM external_tasks_meta WHERE key='revision'");
+  ledger.database.exec("UPDATE external_tasks_meta SET value=3 WHERE key='schema_version'; DELETE FROM external_tasks_meta WHERE key='revision'");
   const before = ledger.database.prepare("SELECT * FROM external_tasks_meta").all();
   assert.throws(() => createExternalTaskStore(ledger.database), /Unsupported/);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks_meta").all(), before);
+}));
+
+test("version-one tasks migrate without changing identity, execution or claims", () => fixture(({ ledger, store }) => {
+  store.accept(options("1")); store.claim({ owner: "running" });
+  const before = ledger.database.prepare("SELECT * FROM external_tasks").all();
+  ledger.database.exec("UPDATE external_tasks_meta SET value=1 WHERE key='schema_version'");
+  createExternalTaskStore(ledger.database);
+  assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 2);
+}));
+
+test("accepted output schema is immutable and structured results survive reopening", () => fixture(({ store, ledger }) => {
+  const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
+  store.accept({ ...options("1"), run: { ...task("1"), outputSchema: schema } });
+  const claim = store.claim({ owner: "structured" });
+  assert.throws(() => store.update({ ...claim.run, outputSchema: { ...schema, description: "changed" } }, claim.claim), { statusCode: 409 });
+  const structuredOutput = { status: "validated", schemaSha256: "a".repeat(64), data: { answer: "x".repeat(5000) } };
+  store.update({ ...claim.run, status: "completed", structuredOutput }, claim.claim);
+  assert.deepEqual(createExternalTaskStore(ledger.database).read("1").structuredOutput, structuredOutput);
 }));
 
 test("separate processes accept one run for the same key and recover an exited execution without replay", () => fixture(async ({ ledger, root }) => {
@@ -167,17 +186,23 @@ test("separate processes accept one run for the same key and recover an exited e
   assert.throws(() => current.update({ ...claim.run, status: "completed" }, claim.claim), { statusCode: 409 });
 }));
 
-test("rollback rejects incompatible releases without altering task data", () => fixture(async ({ store, root }) => {
+test("rollback rejects incompatible releases without altering task data", () => fixture(async ({ store, ledger, root }) => {
   const previous = path.join(root, "previous"); fs.mkdirSync(path.join(previous, "server"), { recursive: true });
   const script = new URL("../ops/check-task-rollback.mjs", import.meta.url).pathname;
   const execute = () => promisify(execFile)(process.execPath, [script, root, previous], { timeout: 10000 });
   await execute();
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 1;");
+  await execute();
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 1);
+  createExternalTaskStore(ledger.database);
   store.accept(options("1"));
   await assert.rejects(execute, /不能自动退回/);
   assert.equal(store.runs().length, 1);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 1;");
-  await execute();
+  await assert.rejects(execute, /不能自动退回/);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 2;");
+  await execute();
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 3;");
   await assert.rejects(execute, /不能自动退回/);
   assert.equal(store.runs().length, 1);
 }));

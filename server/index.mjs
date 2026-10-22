@@ -29,6 +29,7 @@ import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner } from "./external-task-store.mjs";
 import { withPublicationLock } from "./publication-lock.mjs";
+import { normalizeOutputSchema, validateStructuredOutput, structuredTurnText } from "./structured-output.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
 import { readConnectedApps } from "./connected-apps.mjs";
 import { listPersonalFiles, resolvePersonalFile } from "./personal-files.mjs";
@@ -234,6 +235,8 @@ const automationThreadVerificationDefaultLimit = Math.min(
 const automationTriggerRateWindowMs = Number(process.env.CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS || 60_000);
 const automationTriggerRateMax = Number(process.env.CODEX_AUTOMATION_TRIGGER_RATE_MAX || 12);
 const automationTriggerIdempotencyTtlMs = Number(process.env.CODEX_AUTOMATION_IDEMPOTENCY_TTL_MS || 24 * 60 * 60 * 1000);
+const automationMaxQueued = Number(process.env.CODEX_AUTOMATION_MAX_QUEUED || 32);
+if (!Number.isSafeInteger(automationMaxQueued) || automationMaxQueued < 1) throw new Error("CODEX_AUTOMATION_MAX_QUEUED must be a positive integer");
 const automationTriggerRateByKey = new Map();
 const automationResultRateByClient = new Map();
 const runAdmission = createRunAdmission({
@@ -3141,7 +3144,9 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
           await finishTurnJob(job, false, 130, "Turn cancelled before start");
           return;
         }
-        const result = await appServerClientForJob(job).request("turn/start", await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs), 30_000);
+        const params = await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs);
+        if (options.outputSchema) params.outputSchema = options.outputSchema;
+        const result = await appServerClientForJob(job).request("turn/start", params, 30_000);
         job.turnId = result?.turn?.id || null;
         if (job.completed) {
           if (job.threadId && job.turnId) {
@@ -5191,6 +5196,8 @@ function normalizeAutomationRun(run = {}) {
     completionContract,
     completionOutcome,
     completionCheckedAt: run.completionCheckedAt ? String(run.completionCheckedAt) : null,
+    ...(run.outputSchema ? { outputSchema: run.outputSchema } : {}),
+    ...(run.structuredOutput ? { structuredOutput: run.structuredOutput } : {}),
     runner: String(run.runner || "systemd"),
     status: run.status === "cancelled" ? "canceled" : String(run.status || "queued"),
     startedAt,
@@ -6827,6 +6834,7 @@ function automationTriggerRequestHash(req, automation, trigger, completionContra
     approval: String(body.approval || defaultRuntime.approval),
     search: body.search !== false,
     completionContract,
+    ...(body.outputSchema ? { outputSchema: normalizeOutputSchema(body.outputSchema) } : {}),
   })).digest("hex");
 }
 
@@ -6845,6 +6853,7 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
     heartbeatWorktreePath: heartbeatSource?.worktreePath || null,
     worktree: req.body?.worktree !== false,
     imageInputs: req.modelApiImageInputs,
+    outputSchema: normalizeOutputSchema(req.body?.outputSchema),
   };
 }
 
@@ -6898,6 +6907,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       recoveryAttempt: options.recoveryAttempt || 0,
       completionContract,
       completionOutcome: completionContract ? "pending" : null,
+      ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       runner: "app-server",
       status: "queued",
       executionStartedAt: new Date().toISOString(),
@@ -6939,6 +6949,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       reviewUnverifiedMcpCalls: ["personal-test", "personal-schedule"].includes(options.trigger),
       maxRuntimeMs: options.maxRuntimeMs,
       imageInputs: options.imageInputs,
+      outputSchema: options.outputSchema,
     });
     job.externalTaskClaim = options.taskClaim;
     activeAutomationRuns.set(runId, job);
@@ -6972,7 +6983,16 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         : null;
       const completion = artifact && !artifact.satisfied ? artifact : markerCompletion;
       const unattendedApprovalDenied = Boolean(job.unattendedApprovalDenied);
-      const completed = result.ok && completion.satisfied && !unattendedApprovalDenied;
+      let structuredOutput = null;
+      if (options.outputSchema && result.ok) {
+        try {
+          const read = await appServerClientForJob(job).request("thread/read", { threadId: job.threadId, includeTurns: true }, 10000);
+          structuredOutput = validateStructuredOutput(options.outputSchema, structuredTurnText(read?.thread, job.turnId));
+        } catch (failure) {
+          structuredOutput = { status: "invalid", error: { code: typeof failure.code === "string" ? failure.code : "structured_result_unavailable", message: failure.statusCode ? failure.message : "原始回合读取失败，未验证结构化结果" } };
+        }
+      }
+      const completed = result.ok && completion.satisfied && !unattendedApprovalDenied && structuredOutput?.status !== "invalid";
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const personalKnownWriteObserved = [...job.externalWriteItems.values()].some((item) => !item.unverifiedReadOnly);
@@ -6984,7 +7004,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       const error = needsExternalReview ? result.externalActionReview.reason
         : personalWriteObserved ? personalExternalActionError
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
-          : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : completion.error || result.error || job.error || "自动化任务失败";
+          : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : structuredOutput?.error?.message || completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await settleRun(
         runId,
@@ -6995,6 +7015,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           turnId: job.turnId,
           summary: job.output || "",
           usage: runUsageFromProtocol(job.rawTurnUsage),
+          ...(structuredOutput ? { structuredOutput } : {}),
           error,
           completionOutcome: completion.outcome,
           completionCheckedAt: completionContract ? new Date().toISOString() : null,
@@ -7059,12 +7080,13 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
     const run = normalizeAutomationRun({ id: automationRunId(automation.id), automationId: automation.id, repoId: repo.id, name: automation.name,
       trigger: options.trigger, clientId: options.clientId, runner: "app-server", status: "queued", prompt,
       model: runtime.model, reasoning: runtime.reasoning, completionContract: options.completionContract,
+      ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       triggerIdempotencyHash: options.triggerIdempotencyHash, triggerRequestHash: options.triggerRequestHash,
       ...mergeAutomationEvents(null, [{ type: "queued", text: "任务已持久接收，等待执行" }]),
     });
     const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt } },
       keyHash: options.triggerIdempotencyHash, requestHash: options.triggerRequestHash, ttlMs: automationTriggerIdempotencyTtlMs,
-      maxQueued: Number(process.env.CODEX_AUTOMATION_MAX_QUEUED || 32),
+      maxQueued: automationMaxQueued,
       check() {
         const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT, now });
         if (!budget.ok) throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
@@ -11783,6 +11805,12 @@ async function modelApiRunResult(id) {
   if (!reading) {
     reading = (async () => {
       const run = (await readAutomationRuns()).runs.find((item) => item.id === id);
+      if (run?.outputSchema) {
+        if (run.structuredOutput?.status !== "validated") throw automationRequestError(502, "结构化结果尚未通过验证");
+        const checked = validateStructuredOutput(run.outputSchema, JSON.stringify(run.structuredOutput.data));
+        if (checked.schemaSha256 !== run.structuredOutput.schemaSha256) throw automationRequestError(502, "结构化结果与请求格式不一致");
+        return { summary: JSON.stringify(checked.data), images: [] };
+      }
       if (!run?.turnId || !run.threadId) throw automationRequestError(502, "完整回合定位不可用；不能用摘要冒充完整结果");
       const response = await codexAppServerRequest("thread/read", { threadId: run.threadId, includeTurns: true }, 10_000);
       if (!response.ok) throw automationRequestError(502, "完整回合读取失败；请稍后使用原键重试");
@@ -11824,6 +11852,7 @@ const handleDiscovery = createDiscoveryHandler({
   record: (metric) => apiClientStore.record(metric),
   idempotencyTtlMs: automationTriggerIdempotencyTtlMs,
   modelWaitMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
+  queueLimits: () => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: runAdmission.status().maxPerClient }),
 });
 app.get("/api/automations/:id/v1/models", (req, res) => handleDiscovery(req, res, "models"));
 app.get("/api/automations/:id/v1/capabilities", (req, res) => handleDiscovery(req, res, "capabilities"));

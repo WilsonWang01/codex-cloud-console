@@ -1,4 +1,5 @@
-const triggerFields = new Set(["runner", "prompt", "model", "reasoning", "search", "worktree", "sessionId", "completionContract"]);
+import { normalizeOutputSchema } from "./structured-output.mjs";
+const triggerFields = new Set(["runner", "prompt", "model", "reasoning", "search", "worktree", "sessionId", "completionContract", "outputSchema"]);
 const reasoningLevels = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 export function validateExternalTriggerInput(body = {}, { trigger, scoped }) {
@@ -19,6 +20,7 @@ export function validateExternalTriggerInput(body = {}, { trigger, scoped }) {
   if (body.model !== undefined && (typeof body.model !== "string" || !/^[A-Za-z0-9._:-]{2,64}$/.test(body.model.trim()))) invalid("model 必须是有效的模型 ID");
   if (body.reasoning !== undefined && (typeof body.reasoning !== "string" || !reasoningLevels.has(body.reasoning.trim()))) invalid("reasoning 必须是有效的 thinking level");
   if (body.sessionId !== undefined && (typeof body.sessionId !== "string" || !body.sessionId.trim() || body.sessionId.length > 160)) invalid("sessionId 必须是有效的会话 ID");
+  normalizeOutputSchema(body.outputSchema);
 }
 
 export function externalRunView(run, automationId) {
@@ -39,6 +41,7 @@ export function externalRunView(run, automationId) {
     summary: run.summary,
     error: run.error,
     usage: run.usage,
+    ...(run.structuredOutput ? { structuredOutput: run.structuredOutput } : {}),
     eventCursor: run.eventSeq || 0,
     resultPath: `/api/automations/${encodeURIComponent(automationId)}/runs/${encodeURIComponent(run.id)}`,
   };

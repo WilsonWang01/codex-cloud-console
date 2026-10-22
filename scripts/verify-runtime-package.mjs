@@ -24,7 +24,7 @@ try {
   execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
     cwd: root, stdio: "pipe", timeout: 120_000,
   });
-  const dependencies = ["express", "ws", "web-push", "playwright"];
+  const dependencies = ["ajv", "cron-parser", "express", "ws", "web-push", "playwright"];
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
     for (const name of ${JSON.stringify(dependencies)}) {
