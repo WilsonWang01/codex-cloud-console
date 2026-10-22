@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 
 const terminal = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
-export const externalTaskSchemaVersion = 2;
+export const externalTaskSchemaVersion = 3;
 const decode = (row) => row ? JSON.parse(row.record) : null;
 function processIdentity(pid) {
   if (process.platform !== "linux") return null;
@@ -27,7 +27,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
   db.exec("CREATE TABLE IF NOT EXISTS external_tasks_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('schema_version', ?)").run(externalTaskSchemaVersion);
   const version = db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value;
-  if (![1, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
+  if (![1, 2, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('revision', 0)").run();
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS external_tasks (
@@ -38,12 +38,15 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       CHECK(state!='running' OR (owner IS NOT NULL AND owner_pid>0))
     ) STRICT;
     CREATE INDEX IF NOT EXISTS external_queue ON external_tasks(state, created_ms);
+    CREATE INDEX IF NOT EXISTS external_client_latest ON external_tasks(json_extract(record,'$.clientId'), json_extract(record,'$.automationId'), created_ms DESC, id DESC)
+      WHERE json_extract(record,'$.sessionId') IS NOT NULL AND json_extract(record,'$.sessionId')!='';
+    CREATE INDEX IF NOT EXISTS external_run_status ON external_tasks(json_extract(record,'$.status'));
     CREATE TABLE IF NOT EXISTS external_task_keys (
       key_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
       run_id TEXT NOT NULL REFERENCES external_tasks(id), expires_ms INTEGER NOT NULL
     ) STRICT;`);
-  // Version 2 adds structured-result fields inside existing JSON; preserve every row and claim.
-  if (version === 1) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
+  // V3 adds result delivery fields and reservations; preserve old rows and execution claims.
+  if (version !== externalTaskSchemaVersion) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
   const get = db.prepare("SELECT id, record, state, owner, owner_pid, epoch FROM external_tasks WHERE id=?");
   const save = db.prepare("UPDATE external_tasks SET record=?, state=?, execution=CASE WHEN ?='terminal' THEN '{}' ELSE execution END WHERE id=?");
   const transaction = (callback) => {
@@ -58,6 +61,16 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
   };
   const write = (row, record) => {
     const state = terminal.has(record.status) ? "terminal" : row.state;
+    if (state === "terminal" && db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get()) {
+      const result = db.prepare("SELECT expires_ms, record FROM external_results WHERE run_id=?").get(row.id);
+      if (result) {
+        const ttl = JSON.parse(result.record).retentionMs;
+        if (!Number.isSafeInteger(ttl) || ttl < 1) throw failure(503, "结果保留策略无效，未改变任务终态");
+        const expires = result.expires_ms ?? now() + ttl;
+        db.prepare("UPDATE external_results SET expires_ms=? WHERE run_id=?").run(expires, row.id);
+        db.prepare("UPDATE external_task_keys SET expires_ms=max(expires_ms,?) WHERE run_id=?").run(expires, row.id);
+      }
+    }
     save.run(JSON.stringify(record), state, state, row.id);
     return record;
   };
@@ -75,11 +88,28 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
     if (!row) throw failure(503, "已接收任务的记录缺失，需要核对后恢复");
     return decode(row);
   };
+  const latestIds = () => db.prepare(`SELECT id FROM (SELECT id,
+    row_number() OVER (PARTITION BY json_extract(record,'$.clientId'), json_extract(record,'$.automationId') ORDER BY created_ms DESC, id DESC) AS n
+    FROM external_tasks WHERE json_extract(record,'$.clientId') IS NOT NULL AND json_extract(record,'$.sessionId') IS NOT NULL AND json_extract(record,'$.sessionId')!='') WHERE n=1`).all().map(row => row.id);
   return {
     read(id) { return decode(get.get(id)); },
     runs() { return db.prepare("SELECT record FROM external_tasks ORDER BY created_ms DESC, id").all().map(decode); },
+    ids() { return db.prepare("SELECT id FROM external_tasks").all().map(row => row.id); },
+    recentRuns(limit = 200) {
+      const ids = new Set(db.prepare("SELECT id FROM external_tasks WHERE state IN ('queued','running') UNION SELECT id FROM external_tasks WHERE json_extract(record,'$.status')='needs_reconciliation'").all().map(row => row.id));
+      for (const row of db.prepare("SELECT id FROM external_tasks WHERE state='terminal' ORDER BY created_ms DESC, id DESC LIMIT ?").all(limit)) ids.add(row.id);
+      return [...ids].map(id => decode(get.get(id)));
+    },
+    latest(clientId, automationId, { repoId, sessionId } = {}) {
+      return decode(db.prepare("SELECT record FROM external_tasks WHERE json_extract(record,'$.clientId')=? AND json_extract(record,'$.automationId')=? AND json_extract(record,'$.sessionId') IS NOT NULL AND json_extract(record,'$.sessionId')!=''" +
+        (repoId ? " AND json_extract(record,'$.repoId')=?" : "") + (sessionId ? " AND json_extract(record,'$.sessionId')=?" : "") + " ORDER BY created_ms DESC, id DESC LIMIT 1")
+        .get(clientId, automationId, ...(repoId ? [repoId] : []), ...(sessionId ? [sessionId] : [])));
+    },
+    unaccountedIds() {
+      return db.prepare("SELECT t.id FROM external_tasks t LEFT JOIN usage_runs u ON u.id=t.id WHERE t.state='terminal' AND u.id IS NULL").all().map(row => row.id);
+    },
     lookup,
-    accept({ run, execution, keyHash, requestHash, ttlMs, maxQueued = 32, check = () => {} }) {
+    accept({ run, execution, keyHash, requestHash, ttlMs, maxQueued = 32, check = () => {}, onAccepted = () => {} }) {
       return transaction(() => {
         const existing = lookup(keyHash, requestHash);
         if (existing) return { run: existing, deduplicated: true };
@@ -94,6 +124,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         db.prepare("INSERT INTO external_tasks VALUES (?, ?, ?, ?, 'queued', NULL, NULL, 0)").run(
           run.id, JSON.stringify(run), JSON.stringify(execution), now(),
         );
+        onAccepted(run);
         if (keyHash) db.prepare("INSERT INTO external_task_keys VALUES (?, ?, ?, ?)").run(keyHash, requestHash, run.id, now() + ttlMs);
         return { run, deduplicated: false };
       });
@@ -122,6 +153,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
           if ((current[field] || null) !== (record[field] || null)) throw failure(409, "任务归属或请求摘要不能更改");
         }
         if (JSON.stringify(current.outputSchema || null) !== JSON.stringify(record.outputSchema || null)) throw failure(409, "已接收任务的输出格式不能更改");
+        if (JSON.stringify(current.artifactPaths || []) !== JSON.stringify(record.artifactPaths || [])) throw failure(409, "已接收任务的产物路径不能更改");
         if (row.state === "terminal") return current;
         if (current.cancelRequestedAt) {
           record = { ...record, cancelRequestedAt: current.cancelRequestedAt };
@@ -177,9 +209,12 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
     },
     retain(ids) {
       const kept = new Set(ids);
+      for (const id of latestIds()) kept.add(id);
       transaction(() => {
         db.prepare("DELETE FROM external_task_keys WHERE expires_ms<=? AND run_id IN (SELECT id FROM external_tasks WHERE state='terminal' AND json_extract(record,'$.status')!='needs_reconciliation')").run(now());
-        for (const row of db.prepare("SELECT id FROM external_tasks WHERE state='terminal' AND json_extract(record,'$.status')!='needs_reconciliation' AND id NOT IN (SELECT run_id FROM external_task_keys)").all()) {
+        const results = db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get();
+        for (const row of db.prepare("SELECT id FROM external_tasks WHERE state='terminal' AND json_extract(record,'$.status')!='needs_reconciliation' AND id NOT IN (SELECT run_id FROM external_task_keys)" +
+          (results ? " AND id NOT IN (SELECT run_id FROM external_results)" : "")).all()) {
           if (!kept.has(row.id)) db.prepare("DELETE FROM external_tasks WHERE id=?").run(row.id);
         }
       });

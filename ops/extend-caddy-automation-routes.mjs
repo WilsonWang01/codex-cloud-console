@@ -48,6 +48,16 @@ export function extendDiscoveryRoutes(source) {
   return source.slice(0, first + triggerBlock.length) + discoveryRoutes + source.slice(first + triggerBlock.length);
 }
 
+export function extendArtifactRoutes(source) {
+  const previous = "path_regexp automation_result ^/api/automations/[^/]+/runs/[^/]+$";
+  const updated = "path_regexp automation_result ^/api/automations/[^/]+/runs/[^/]+(/output(/files/[^/]+)?)?$";
+  if (source.split("path_regexp automation_result ").length !== 2) throw new Error("Expected one canonical result matcher");
+  if (!source.includes("\t@automation_result {\n\t\tmethod GET\n\t\t") || !source.includes("\thandle @automation_result {\n\t\treverse_proxy 127.0.0.1:8787\n\t}")) throw new Error("Existing result route differs from expected GET proxy");
+  const expected = source.includes(updated) ? updated : previous;
+  if (!source.includes(expected) || source.indexOf(expected) !== source.lastIndexOf(expected)) throw new Error("Expected one canonical result matcher");
+  return source.replace(previous, updated);
+}
+
 export function extendModelApiRoutes(source) {
   if (source.includes("@automation_model_api")) {
     if (source.includes(modelRoutes)) return source;
@@ -121,11 +131,11 @@ export function assertCaddyRouteExtension(before, after, names = ["automation_re
 if (process.argv[1] && await fs.realpath(process.argv[1]).catch(() => null) === fileURLToPath(import.meta.url)) {
   const [sourcePath, candidatePath, mode] = process.argv.slice(2);
   if (!sourcePath || !candidatePath) throw new Error("Usage: node extend-caddy-automation-routes.mjs SOURCE CANDIDATE");
-  if (mode && !["--model-api", "--discovery"].includes(mode)) throw new Error("Unknown extension mode");
+  if (mode && !["--model-api", "--discovery", "--artifacts"].includes(mode)) throw new Error("Unknown extension mode");
   const source = await fs.readFile(sourcePath, "utf8");
-  const candidate = mode === "--discovery" ? extendDiscoveryRoutes(source) : mode ? extendModelApiRoutes(source) : extendAutomationRoutes(source);
+  const candidate = mode === "--artifacts" ? extendArtifactRoutes(source) : mode === "--discovery" ? extendDiscoveryRoutes(source) : mode ? extendModelApiRoutes(source) : extendAutomationRoutes(source);
   await fs.writeFile(candidatePath, candidate, { mode: 0o600, flag: "wx" });
-  assertCaddyRouteExtension(adapt(sourcePath), adapt(candidatePath), mode === "--discovery" ? ["automation_discovery"] : mode ? ["automation_model_api"] : undefined);
+  assertCaddyRouteExtension(adapt(sourcePath), adapt(candidatePath), mode === "--artifacts" ? ["automation_result"] : mode === "--discovery" ? ["automation_discovery"] : mode ? ["automation_model_api"] : undefined);
   execFileSync("caddy", ["validate", "--config", candidatePath, "--adapter", "caddyfile"], { stdio: "ignore" });
   process.stdout.write("Caddy candidate validated; all pre-existing routes remain unchanged.\n");
 }

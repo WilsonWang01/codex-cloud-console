@@ -2,6 +2,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { createHash } from "node:crypto";
 import { responsesBody } from "./model-api-output.mjs";
 import { normalizeOutputSchema, validateStructuredOutput } from "./structured-output.mjs";
+import { externalApiToken } from "./external-auth.mjs";
 export { modelApiProtocol } from "./model-api-protocol.mjs";
 
 export const modelApiJsonLimit = 12 * 1024 * 1024;
@@ -224,12 +225,8 @@ export function normalizeModelApiRequest(body, protocol, { allowUnboundedOutput 
   };
 }
 
-export async function authenticateModelApiRequest(req, protocol, authenticate) {
-  const authorization = String(req.get("authorization") || "");
-  const bearer = /^Bearer ([^\s]+)$/i.exec(authorization)?.[1];
-  const apiKey = protocol === "anthropic" ? String(req.get("x-api-key") || "").trim() : "";
-  if ((authorization && !bearer) || (bearer && apiKey && bearer !== apiKey)) fail("无效或冲突的认证信息", null, 401);
-  const token = bearer || apiKey;
+export async function authenticateModelApiRequest(req, _protocol, authenticate) {
+  const token = externalApiToken(req);
   const client = token ? await authenticate(req, token) : null;
   if (!client) fail("需要有效且有此自动化权限的调用方令牌", null, 401);
   return { token, client };

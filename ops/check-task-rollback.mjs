@@ -21,11 +21,12 @@ try {
       db.exec("BEGIN IMMEDIATE");
       try {
         const empty = db.prepare("SELECT count(*) AS n FROM external_tasks").get().n === 0 && db.prepare("SELECT count(*) AS n FROM external_task_keys").get().n === 0;
-        // V2 only adds JSON fields. With no tasks or keys, its marker can return to V1.
-        if (empty && version === 2 && previous === 1) {
-          db.prepare("UPDATE external_tasks_meta SET value=1 WHERE key='schema_version'").run();
+        const resultsEmpty = !db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get() || db.prepare("SELECT count(*) AS n FROM external_results").get().n === 0;
+        // Only known, empty format changes are reversible without understanding new records.
+        if (empty && resultsEmpty && ((version === 3 && previous === 2) || (version === 2 && previous === 1))) {
+          db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(previous);
           compatible = true;
-        } else if (empty && previous === null) compatible = true;
+        } else if (empty && resultsEmpty && [1, 2, 3].includes(version) && previous === null) compatible = true;
         db.exec("COMMIT");
       } catch (error) { db.exec("ROLLBACK"); throw error; }
     }

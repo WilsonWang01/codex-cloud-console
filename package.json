@@ -34,7 +34,7 @@
     "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
     "verify:automation-events": "node --test scripts/verify-automation-events.mjs",
     "verify:usage": "node --test scripts/verify-run-usage.mjs scripts/verify-run-usage-ledger.mjs",
-    "verify:admission": "node --test scripts/verify-run-admission.mjs scripts/verify-run-budget.mjs scripts/verify-external-task-store.mjs",
+    "verify:admission": "node --test scripts/verify-run-admission.mjs scripts/verify-run-budget.mjs scripts/verify-external-task-store.mjs scripts/verify-external-results.mjs scripts/verify-external-result-api.mjs",
     "verify:notifications": "node --test scripts/verify-notifications.mjs",
     "verify:personal-runtime": "node --test scripts/verify-personal-runtime.mjs",
     "verify:personal-files": "node --test scripts/verify-personal-files.mjs scripts/verify-safe-file-read.mjs",

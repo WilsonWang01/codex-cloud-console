@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const activeStatuses = new Set(["queued", "running", "canceling"]);
 const terminalStatuses = new Set(["completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]);
@@ -40,14 +41,16 @@ function retryAfterMs(value) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
 }
 
-export async function runExternalClient({ command, automationId, eventId = "", runId = "", origin, token, input = {}, wait = false,
+export async function runExternalClient({ command, automationId, eventId = "", runId = "", fileId = "", origin, token, input = {}, wait = false,
   pollMs = 5000, timeoutMs = 60 * 60_000, requestTimeoutMs = 30_000, maxRetries = 2, signal,
   onStatus = () => {}, onProgress = () => {} }) {
   if (!origin || !token || !automationId) throw new Error("CODEX_CLOUD_URL, CODEX_CLOUD_API_TOKEN and automation-id are required");
   origin = serviceOrigin(origin);
   const submitting = ["submit", "heartbeat"].includes(command);
   const discovery = ["models", "capabilities"].includes(command);
-  if (!submitting && !discovery && !["status", "cancel"].includes(command)) throw new Error("command must be submit, heartbeat, status, cancel, models or capabilities");
+  const output = ["output", "download"].includes(command);
+  if (!submitting && !discovery && !output && !["status", "cancel"].includes(command)) throw new Error("command must be submit, heartbeat, status, cancel, models, capabilities, output or download");
+  if (command === "download" && !/^[a-f0-9-]{36}$/.test(fileId)) throw new Error("a valid artifact file-id is required");
   if (submitting && !/^[A-Za-z0-9._:-]{8,160}$/.test(eventId)) throw new Error("event-id must be 8-160 letters, numbers, dots, underscores, colons or dashes and stable across retries");
   if (!submitting && !discovery && !runId) throw new Error("run-id is required");
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("input must be a JSON object");
@@ -86,7 +89,7 @@ export async function runExternalClient({ command, automationId, eventId = "", r
     } finally { operationSignal.removeEventListener("abort", abort); }
     return run;
   };
-  const request = async (pathname, options = {}) => {
+  const request = async (pathname, options = {}, binary = false) => {
     for (let attempt = 0; ; attempt += 1) {
       operationSignal.throwIfAborted();
       let error;
@@ -100,15 +103,24 @@ export async function runExternalClient({ command, automationId, eventId = "", r
           await response.body?.cancel();
           throw new ExternalClientError("API redirects are not followed; use the final HTTPS origin", { code: "INVALID_RESPONSE", statusCode: response.status });
         }
+        const chunks = [];
+        let size = 0;
+        for await (const chunk of response.body || []) {
+          size += chunk.length;
+          if (size > (binary && response.ok ? 8 : 20) * 1024 * 1024) throw new ExternalClientError("Response exceeds the delivery limit", { code: "INVALID_RESPONSE" });
+          chunks.push(chunk);
+        }
+        const buffer = Buffer.concat(chunks);
+        if (binary && response.ok) return { buffer, sha256: response.headers.get("x-content-sha256") };
         let payload;
-        try { payload = await response.json(); }
+        try { payload = JSON.parse(buffer.toString("utf8")); }
         catch (caught) { if (!(caught instanceof SyntaxError)) throw caught; }
         if (response.ok) {
           if (!payload) throw new ExternalClientError("Server returned a non-JSON response", { code: "INVALID_RESPONSE" });
           return payload;
         }
         error = new ExternalClientError(payload?.error?.message || payload?.error || payload?.output || `HTTP ${response.status}`, {
-          code: "HTTP_ERROR", statusCode: response.status, retryAfterMs: retryAfterMs(response.headers.get("retry-after")),
+          code: "HTTP_ERROR", serverCode: payload?.code || payload?.error?.code || null, statusCode: response.status, retryAfterMs: retryAfterMs(response.headers.get("retry-after")),
         });
       } catch (caught) {
         operationSignal.throwIfAborted();
@@ -126,6 +138,27 @@ export async function runExternalClient({ command, automationId, eventId = "", r
         throw new ExternalClientError("Server returned invalid discovery information", { code: "INVALID_RESPONSE" });
       }
       return payload;
+    }
+    if (output) {
+      const base = `${resultPath(automationId, runId)}/output`;
+      const payload = await request(base);
+      const manifest = payload?.result;
+      if (!payload?.ok || manifest?.version !== 1 || manifest.runId !== runId || manifest.automationId !== automationId || manifest.status !== "completed" ||
+          typeof manifest.text !== "string" || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > 8) {
+        throw new ExternalClientError("Server returned an invalid result manifest", { code: "INVALID_RESPONSE" });
+      }
+      if (command === "output") return manifest;
+      const artifact = manifest.artifacts.find(file => file.id === fileId);
+      if (!artifact || !Number.isSafeInteger(artifact.size) || artifact.size < 0 || artifact.size > 8 * 1024 * 1024 || !/^[a-f0-9]{64}$/.test(artifact.sha256)) {
+        throw new ExternalClientError("Artifact is missing or has invalid integrity metadata", { code: "INVALID_RESPONSE" });
+      }
+      // Construct the path locally; never follow a server-supplied URL with credentials.
+      const downloaded = await request(`${base}/files/${encodeURIComponent(fileId)}`, {}, true);
+      const sha256 = createHash("sha256").update(downloaded.buffer).digest("hex");
+      if (sha256 !== artifact.sha256 || downloaded.sha256 !== sha256 || downloaded.buffer.length !== artifact.size) {
+        throw new ExternalClientError("Artifact integrity check failed", { code: "INVALID_RESPONSE" });
+      }
+      return { artifact, buffer: downloaded.buffer };
     }
     const payload = submitting
       ? await request(`/api/automations/${encodeURIComponent(automationId)}/${command === "heartbeat" ? "heartbeat" : "webhook"}`, {
@@ -151,15 +184,22 @@ export async function runExternalClient({ command, automationId, eventId = "", r
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const [command, automationId, value, option] = process.argv.slice(2);
+  const [command, automationId, value, option, destination] = process.argv.slice(2);
   const controller = new AbortController();
   process.once("SIGINT", () => controller.abort());
   process.once("SIGTERM", () => controller.abort());
   runExternalClient({
     command, automationId, eventId: ["submit", "heartbeat"].includes(command) ? value : "", runId: ["submit", "heartbeat"].includes(command) ? "" : value,
+    fileId: command === "download" ? option : "",
     origin: process.env.CODEX_CLOUD_URL, token: process.env.CODEX_CLOUD_API_TOKEN, wait: option === "--wait", signal: controller.signal,
     onStatus: (run) => process.stderr.write(`${run.id}: ${run.status}\n`),
-  }).then((result) => {
+  }).then(async (result) => {
+    if (command === "download") {
+      if (!destination) throw new Error("download requires a destination path; existing files are never overwritten");
+      const fs = await import("node:fs/promises");
+      await fs.writeFile(destination, result.buffer, { flag: "wx", mode: 0o600 });
+      return process.stdout.write(`${JSON.stringify({ artifact: result.artifact, destination }, null, 2)}\n`);
+    }
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (terminalStatuses.has(result.status) && result.status !== "completed") process.exitCode = 1;
   }).catch((error) => {

@@ -12,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
 import { runExternalClient } from "./external-client-example.mjs";
 import { modelApiJsonLimit } from "../server/model-api.mjs";
+import { openRunUsageLedger } from "../server/run-usage-ledger.mjs";
+import { createExternalTaskStore } from "../server/external-task-store.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -122,6 +124,8 @@ let modelApiImages = [];
 let modelApiTurnId = null;
 let modelApiStructured = false;
 let turnSequence = 0;
+const fixtureTurns = new Map();
+const fixtureCwds = new Map();
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
@@ -129,7 +133,17 @@ input.on("line", (line) => {
   const message = JSON.parse(line);
   if (process.env.FAKE_CAPTURE_PATH) fsSync.appendFileSync(process.env.FAKE_CAPTURE_PATH, JSON.stringify(message) + "\\n");
   if (!message.id) return;
-  const send = (payload, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(payload) + "\\n"), delay);
+  const send = (payload, delay = 0) => setTimeout(() => {
+    if (payload.method === "item/agentMessage/delta") {
+      const turn = fixtureTurns.get(payload.params.threadId)?.find(turn => turn.id === payload.params.turnId);
+      if (turn && !turn.nativeKnown) {
+        let message = turn.items.find(item => item.type === "agentMessage");
+        if (!message) { message = { type: "agentMessage", phase: "final_answer", text: "" }; turn.items.push(message); }
+        message.text += payload.params.delta;
+      }
+    }
+    process.stdout.write(JSON.stringify(payload) + "\\n");
+  }, delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
   if (message.method === "app/list") return send({ id: message.id, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true, installUrl: "https://chatgpt.com/apps/mail/mail" }], nextCursor: null } });
   if (message.method === "app/installed") return send({ id: message.id, result: { apps: [{ id: "mail", enabled: true, callable: true }] } });
@@ -216,8 +230,8 @@ input.on("line", (line) => {
     send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [] } } });
     return send({ method: "thread/archived", params: { threadId: message.params.threadId } }, 20);
   }
-  if (message.method === "thread/read" && message.params?.includeTurns && modelApiText) {
-    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [{ id: modelApiTurnId, items: [...(modelApiStructured ? [{ type: "agentMessage", phase: "commentary", text: "private non-JSON progress" }] : []), { type: "agentMessage", text: modelApiText, ...(modelApiStructured ? { phase: "final_answer" } : {}) }, ...modelApiImages] }] } } });
+  if (message.method === "thread/read" && message.params?.includeTurns && fixtureTurns.has(message.params.threadId)) {
+    return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: fixtureTurns.get(message.params.threadId) } } });
   }
   if (message.method === "thread/archive" && message.params?.threadId === "thread-archive-race") {
     return send({ id: message.id, result: {} }, 250);
@@ -227,7 +241,10 @@ input.on("line", (line) => {
     if (cwd.includes("sample-service")) return send({ id: message.id, result: { data: [], nextCursor: null } });
     return send({ id: message.id, error: { code: -32000, message: "injected thread/list failure" } });
   }
-  if (message.method === "thread/start") return send({ id: message.id, result: { thread: { id: "thread-regression" } } });
+  if (message.method === "thread/start") {
+    fixtureCwds.set("thread-regression", message.params.cwd);
+    return send({ id: message.id, result: { thread: { id: "thread-regression" } } });
+  }
   if (message.method === "thread/read" && message.params?.threadId === "thread-runtime-regression") {
     return send({ id: message.id, result: { thread: { id: message.params.threadId, model: "gpt-5.4-mini", reasoningEffort: "low",
       recencyAt: Date.parse("2026-09-01T00:00:00.000Z") / 1000, updatedAt: Date.now() / 1000, turns: [] } } });
@@ -261,11 +278,20 @@ input.on("line", (line) => {
   if (message.method === "turn/start") {
     const requestText = JSON.stringify(message.params || {});
     const uniqueTurn = process.pid + "-" + (++turnSequence);
+    const turns = fixtureTurns.get(message.params.threadId) || [];
+    fixtureTurns.set(message.params.threadId, turns);
+    if (requestText.includes("artifact delivery fixture")) {
+      const cwd = fixtureCwds.get(message.params.threadId);
+      fsSync.mkdirSync(cwd + "/results", { recursive: true });
+      fsSync.writeFileSync(cwd + "/results/report.md", "verified artifact delivery\\n");
+    }
     if (requestText.includes("model api regression")) {
       modelApiTurnId = "turn-model-api-" + uniqueTurn;
       modelApiStructured = Boolean(message.params.outputSchema);
       modelApiText = modelApiStructured ? JSON.stringify({ answer: requestText.includes("invalid schema result") ? 7 : requestText.includes("large structured output") ? "验收".repeat(2500) : "结构化验收通过" }) : requestText.includes("long output") ? "验收".repeat(2500) : "接口验收通过";
       modelApiImages = requestText.includes("generated output") ? [{ id: "ig-fixture", type: "imageGeneration", status: "completed", failure: null, result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", revisedPrompt: "图片输出验收" }] : [];
+      turns.push({ id: modelApiTurnId, nativeKnown: true, items: [...(modelApiStructured ? [{ type: "agentMessage", phase: "commentary", text: "private non-JSON progress" }] : []),
+        { type: "agentMessage", text: modelApiText, ...(modelApiStructured ? { phase: "final_answer" } : {}) }, ...modelApiImages] });
       send({ id: message.id, result: { turn: { id: modelApiTurnId } } });
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(0, 2) } }, 40);
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(2) } }, 150);
@@ -274,6 +300,7 @@ input.on("line", (line) => {
       return;
     }
     const turnId = (requestText.includes("cancel regression") ? "turn-cancel-regression-" : "turn-regression-") + uniqueTurn;
+    turns.push({ id: turnId, items: [] });
     const progressRegression = requestText.includes("progress regression");
     const queuedFirstRegression = requestText.includes("progress regression queue first");
     const queueRegressionNext = requestText.includes("queue regression next");
@@ -488,6 +515,115 @@ await check("durable API queue survives lost responses and restart without repea
     const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
     assert.equal(stored.find((run) => run.id === third.data.run.id).status, "failed");
     assert.equal(stored.find((run) => run.id === third.data.run.id).usage.totalTokens, 0);
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("independent clients retrieve private exact-turn files and images after native history and process restart", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-result-delivery-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  await fs.symlink("README.md", path.join(repo, "unsafe.md"));
+  for (const args of [["-C", repo, "add", "unsafe.md"], ["-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Unsafe file fixture"]]) {
+    const result = await runCaptured("git", args); assert.equal(result.code, 0, result.stderr);
+  }
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), origin = `http://127.0.0.1:${port}`;
+  const admin = { "content-type": "application/json", "x-codex-cloud-token": "result-fixture-admin-123456" };
+  const start = () => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100",
+    CODEX_CLOUD_WEBHOOK_TOKEN: admin["x-codex-cloud-token"], FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
+  } });
+  let server;
+  try {
+    server = start(); await waitForOutput(server, /listening on/);
+    const client = await jsonRequest(origin, "/api/clients", { method: "POST", headers: admin, body: JSON.stringify({ name: "file-client", automationIds: ["sample-research"] }) });
+    const other = await jsonRequest(origin, "/api/clients", { method: "POST", headers: admin, body: JSON.stringify({ name: "other-client", automationIds: ["sample-research"] }) });
+    const token = client.data.token, headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
+    const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
+    const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"] };
+    const options = { automationId: "sample-research", origin, token, pollMs: 50, timeoutMs: 10000, requestTimeoutMs: 3000 };
+    const lost = await fetch(origin + "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ runner: "app-server", worktree: true, ...input }) });
+    assert.equal(lost.status, 200); await lost.body.cancel();
+    const run = await runExternalClient({ ...options, command: "submit", eventId: "file-delivery-0001", input, wait: true });
+    assert.equal(run.status, "completed", JSON.stringify(run));
+    assert.equal(run.delivery.status, "ready");
+    const manifest = await runExternalClient({ ...options, command: "output", runId: run.id });
+    assert.equal(manifest.structuredOutput.data.answer, "结构化验收通过");
+    assert.equal(manifest.artifacts.length, 2);
+    assert.equal(manifest.text, JSON.stringify(manifest.structuredOutput.data));
+    const report = manifest.artifacts.find(file => file.name === "report.md");
+    const file = await runExternalClient({ ...options, command: "download", runId: run.id, fileId: report.id });
+    assert.equal(file.buffer.toString(), "verified artifact delivery\n");
+    const cross = await fetch(origin + report.downloadPath, { headers: { authorization: `Bearer ${other.data.token}` } });
+    assert.equal(cross.status, 404);
+    const conflict = await jsonRequest(origin, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ ...input, artifactPaths: ["different.md"] }) });
+    assert.equal(conflict.response.status, 409);
+    const internalRun = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs.find(item => item.id === run.id);
+    await fs.unlink(path.join(internalRun.worktreePath, "results/report.md"));
+    const imageBody = { model: "gpt-6-sol", prompt: "model api regression generated output", response_format: "b64_json" };
+    const imageOptions = { method: "POST", headers: { ...headers, "idempotency-key": "file-images-0002" }, body: JSON.stringify(imageBody) };
+    const image = await jsonRequest(origin, "/api/automations/sample-research/v1/images/generations", imageOptions);
+    assert.equal(image.response.status, 200, JSON.stringify(image.data));
+    assert.equal(image.data.data[0].revised_prompt, "图片输出验收");
+    await stopProcess(server);
+    server = start(); await waitForOutput(server, /listening on/);
+    const restored = await runExternalClient({ ...options, command: "download", runId: run.id, fileId: report.id });
+    assert.deepEqual(restored.buffer, file.buffer);
+    const python = await runCaptured("python3", [path.join(projectRoot, "scripts/external-client-example.py"), "download", "sample-research", run.id,
+      "--file-id", report.id, "--output", path.join(root, "downloaded.md")], { env: { ...process.env, CODEX_CLOUD_URL: origin, CODEX_CLOUD_API_TOKEN: token } });
+    assert.equal(python.code, 0, python.stderr);
+    assert.equal(await fs.readFile(path.join(root, "downloaded.md"), "utf8"), file.buffer.toString());
+    const replay = await jsonRequest(origin, "/api/automations/sample-research/v1/images/generations", imageOptions);
+    assert.equal(replay.response.status, 200, JSON.stringify(replay.data));
+    assert.equal(replay.data.data[0].b64_json, image.data.data[0].b64_json);
+    const rpc = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(rpc.filter(call => call.method === "turn/start").length, 2, "reads and restarts must not repeat inference");
+    assert.equal(rpc.filter(call => call.method === "thread/read" && call.params.includeTurns).length, 2, "stored delivery does not reread erased native history");
+    for (const [key, artifactPaths] of [["file-unchanged-0003", ["README.md"]], ["file-missing-0004", ["results/missing.md"]]]) {
+      const failed = await runExternalClient({ ...options, command: "submit", eventId: key,
+        input: { prompt: "model api regression artifact delivery fixture", artifactPaths }, wait: true });
+      assert.equal(failed.status, "failed");
+      assert.equal(failed.delivery.status, "failed");
+      assert.ok(["artifact_not_generated", "file_not_found"].includes(failed.delivery.error.code));
+    }
+    const callsBefore = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length;
+    const unsafe = await runExternalClient({ ...options, command: "submit", eventId: "file-unsafe-0005",
+      input: { prompt: "must not start a model for an unsafe baseline", artifactPaths: ["unsafe.md"] }, wait: true });
+    assert.equal(unsafe.status, "failed");
+    assert.equal(unsafe.usage.totalTokens, 0);
+    assert.equal(unsafe.usage.status, "complete");
+    assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, callsBefore);
+    await stopProcess(server);
+    const ledger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    let seedClock = Date.now() - 500;
+    const tasks = createExternalTaskStore(ledger.database, { now: () => seedClock++ });
+    try {
+      for (let index = 0; index < 250; index++) {
+        tasks.accept({ run: { id: `seed-${index}`, clientId: "synthetic-list-client", automationId: "sample-research", repoId: "sample-app", status: "queued",
+          startedAt: new Date(seedClock).toISOString(), prompt: "private seed context".repeat(200) }, execution: {}, ttlMs: 60000 });
+        const owned = tasks.claim({ owner: "seed" });
+        tasks.update({ ...owned.run, sessionId: "seed-session", status: "completed", model: "gpt-6-sol",
+          usage: { status: "complete", source: "synthetic", inputTokens: 2, outputTokens: 1, totalTokens: 3 } }, owned.claim);
+      }
+      assert.equal(ledger.database.prepare("SELECT count(*) AS n FROM usage_runs WHERE id LIKE 'seed-%'").get().n, 0);
+    } finally { ledger.close(); }
+    server = start(); await waitForOutput(server, /listening on/);
+    const list = await jsonRequest(origin, "/api/automations/runs", { headers: admin });
+    assert.equal(list.response.status, 200);
+    assert.ok(list.data.runs.length <= 200, "global list is a bounded projection, not all retained full records");
+    assert.equal(list.data.runs.some(item => item.id === run.id), false);
+    const old = await runExternalClient({ ...options, command: "status", runId: run.id });
+    assert.equal(old.status, "completed");
+    assert.deepEqual((await runExternalClient({ ...options, command: "download", runId: run.id, fileId: report.id })).buffer, file.buffer);
+    const checked = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    try {
+      assert.equal(checked.database.prepare("SELECT count(*) AS n FROM usage_runs WHERE id LIKE 'seed-%'").get().n, 250);
+      assert.equal(checked.rows({ from: 0, to: Date.now() + 1000 }).filter(item => item.id.startsWith("seed-")).reduce((sum, item) => sum + item.usage.totalTokens, 0), 750);
+    } finally { checked.close(); }
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -2347,7 +2483,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       headers: { authorization: "Bearer regression-token-123456", "content-type": "application/json" },
       body: "{}",
     });
-    assert.equal(bearer.response.status, 401);
+    assert.equal(bearer.response.status, 404, "Bearer now authenticates the same scoped token; unknown automation remains unavailable");
     const tokenHeader = await jsonRequest(baseUrl, "/api/automations/not-real/webhook", {
       method: "POST",
       headers: { "x-codex-cloud-token": "regression-token-123456", "content-type": "application/json" },
@@ -2447,7 +2583,8 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(capabilities.response.status, 200);
     assert.equal(capabilities.data.features.structured_output, true);
     assert.equal(capabilities.data.limits.task_queue.max_queued, 32);
-    assert.equal(capabilities.data.features.artifact_download, false);
+    assert.equal(capabilities.data.features.artifact_download, true);
+    assert.equal(capabilities.data.limits.result_storage.reservation_bytes_per_run, 20 * 1024 * 1024);
     const missingModelToken = await jsonRequest(baseUrl, modelPath, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(modelBody) });
     assert.equal(missingModelToken.response.status, 401);
     assert.equal(missingModelToken.data.error.type, "authentication_error");
@@ -2940,7 +3077,8 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
       res.end(body);
       return;
     }
-    if (["chat/completions", "messages", "responses", "images/generations", "models", "capabilities"].some((route) => req.url === `/api/automations/demo/v1/${route}`)) {
+    if (["chat/completions", "messages", "responses", "images/generations", "models", "capabilities"].some((route) => req.url === `/api/automations/demo/v1/${route}`) ||
+        /^\/api\/automations\/demo\/(webhook|heartbeat|runs\/one(?:\/cancel|\/output(?:\/files\/file)?)?)$/.test(url.pathname)) {
       req.resume();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ authorization: req.headers.authorization, cloudToken: req.headers["x-codex-cloud-token"] || null }));
@@ -3066,6 +3204,12 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
     for (const route of ["models", "capabilities"]) {
       const discoveryProxy = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/v1/${route}`, { headers: { authorization: "Bearer scoped-discovery-token" } });
       assert.deepEqual(await discoveryProxy.json(), { authorization: "Bearer scoped-discovery-token", cloudToken: null });
+    }
+    for (const [method, route] of [["POST", "webhook"], ["POST", "heartbeat"], ["GET", "runs/one"], ["POST", "runs/one/cancel"], ["GET", "runs/one/output"], ["GET", "runs/one/output/files/file"]]) {
+      const preserved = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/${route}`, { method, headers: { "x-codex-cloud-token": "scoped-external-token" } });
+      assert.deepEqual(await preserved.json(), { cloudToken: "scoped-external-token" });
+      const anonymous = await fetch(`http://127.0.0.1:${proxyPort}/api/automations/demo/${route}`, { method });
+      assert.deepEqual(await anonymous.json(), { cloudToken: null }, "proxy must not lend its admin token to an anonymous API request");
     }
     const cacheMode = (await fs.stat(cachePath)).mode & 0o777;
     assert.equal(cacheMode, 0o600);

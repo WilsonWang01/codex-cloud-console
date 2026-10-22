@@ -2,6 +2,7 @@
 """Standalone stdlib client. Discovery is read-only; submit/heartbeat can incur model costs."""
 import argparse
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -41,7 +42,7 @@ class Client:
         time.sleep(min(seconds, self.remaining()))
         self.remaining()
 
-    def request(self, suffix, body=None, event_id=None, discovery=False):
+    def request(self, suffix, body=None, event_id=None, discovery=False, binary=False):
         headers = {"Authorization": "Bearer " + self.token} if discovery else {"x-codex-cloud-token": self.token}
         payload = None if body is None else json.dumps(body).encode()
         if body is not None:
@@ -59,12 +60,15 @@ class Client:
                     while True:
                         self.remaining()
                         chunk = response.read1(65536)
+                        self.remaining()
                         if not chunk:
                             break
                         size += len(chunk)
-                        if size > 4 * 1024 * 1024:
-                            raise ValueError("Response exceeds the example client's 4 MiB limit")
+                        if size > (8 if binary else 20) * 1024 * 1024:
+                            raise ValueError("Response exceeds the delivery size limit")
                         chunks.append(chunk)
+                    if binary:
+                        return {"buffer": b"".join(chunks), "sha256": response.headers.get("X-Content-SHA256")}
                     data = json.loads(b"".join(chunks))
                 if not isinstance(data, dict):
                     raise ValueError("Invalid JSON object response")
@@ -81,7 +85,7 @@ class Client:
                     raise RuntimeError("Network outcome unknown; query the known run or retry the SAME event ID") from None
             self.sleep(delay)
 
-    def execute(self, command, value=None, wait=False, prompt=None):
+    def execute(self, command, value=None, wait=False, prompt=None, file_id=None):
         if command in ("models", "capabilities"):
             data = self.request("/v1/" + command, discovery=True)
             if (command == "models" and (data.get("object") != "list" or not isinstance(data.get("data"), list))
@@ -89,6 +93,31 @@ class Client:
                     or data.get("automation_id") != self.automation_id)):
                 raise ValueError("Invalid discovery response")
             return data
+        if command in ("output", "download"):
+            if not value:
+                raise ValueError("run ID is required")
+            prefix = "/runs/" + urllib.parse.quote(value, safe="") + "/output"
+            data = self.request(prefix)
+            result = data.get("result", {})
+            if (data.get("ok") is not True or result.get("version") != 1 or result.get("runId") != value
+                    or result.get("automationId") != self.automation_id or result.get("status") != "completed"
+                    or not isinstance(result.get("text"), str) or not isinstance(result.get("artifacts"), list)
+                    or len(result["artifacts"]) > 8):
+                raise ValueError("Invalid result manifest")
+            if command == "output":
+                return result
+            if not isinstance(file_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", file_id):
+                raise ValueError("Valid artifact file ID is required")
+            artifact = next((item for item in result["artifacts"] if item.get("id") == file_id), None)
+            if (not artifact or type(artifact.get("size")) is not int or not 0 <= artifact["size"] <= 8 * 1024 * 1024
+                    or not isinstance(artifact.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", artifact["sha256"])):
+                raise ValueError("Artifact integrity metadata is invalid")
+            # Ignore server-provided download URLs; build an authenticated same-origin path.
+            downloaded = self.request(prefix + "/files/" + urllib.parse.quote(file_id, safe=""), binary=True)
+            digest = hashlib.sha256(downloaded["buffer"]).hexdigest()
+            if digest != artifact["sha256"] or downloaded["sha256"] != digest or len(downloaded["buffer"]) != artifact["size"]:
+                raise ValueError("Artifact integrity check failed")
+            return {"artifact": artifact, "buffer": downloaded["buffer"]}
         if not value:
             raise ValueError("A stable event ID (submit/heartbeat) or run ID (status/cancel) is required")
         if command in ("submit", "heartbeat"):
@@ -117,18 +146,26 @@ class Client:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("models", "capabilities", "submit", "heartbeat", "status", "cancel"))
+    parser.add_argument("command", choices=("models", "capabilities", "submit", "heartbeat", "status", "cancel", "output", "download"))
     parser.add_argument("automation_id")
     parser.add_argument("value", nargs="?")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--prompt")
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--file-id")
+    parser.add_argument("--output")
     args = parser.parse_args()
     try:
         client = Client(os.environ.get("CODEX_CLOUD_URL", ""), os.environ.get("CODEX_CLOUD_API_TOKEN", ""), args.automation_id, args.timeout)
-        result = client.execute(args.command, args.value, args.wait, args.prompt)
+        if args.command == "download" and not args.output:
+            raise ValueError("download requires --output; existing files are never overwritten")
+        result = client.execute(args.command, args.value, args.wait, args.prompt, args.file_id)
+        if args.command == "download":
+            with open(args.output, "xb") as destination:
+                destination.write(result.pop("buffer"))
+            result["destination"] = args.output
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(1 if result.get("status") in ("failed", "canceled", "cancelled", "interrupted", "needs_reconciliation") else 0)
-    except (ValueError, RuntimeError, TimeoutError, KeyboardInterrupt) as error:
+    except (ValueError, RuntimeError, TimeoutError, KeyboardInterrupt, OSError) as error:
         print(str(error) or "Local wait interrupted; no cancellation sent", file=sys.stderr)
         sys.exit(1)

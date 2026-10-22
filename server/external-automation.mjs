@@ -1,5 +1,6 @@
 import { normalizeOutputSchema } from "./structured-output.mjs";
-const triggerFields = new Set(["runner", "prompt", "model", "reasoning", "search", "worktree", "sessionId", "completionContract", "outputSchema"]);
+import { normalizeArtifactPaths, resultPath } from "./external-results.mjs";
+const triggerFields = new Set(["runner", "prompt", "model", "reasoning", "search", "worktree", "sessionId", "completionContract", "outputSchema", "artifactPaths"]);
 const reasoningLevels = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 export function validateExternalTriggerInput(body = {}, { trigger, scoped }) {
@@ -21,6 +22,7 @@ export function validateExternalTriggerInput(body = {}, { trigger, scoped }) {
   if (body.reasoning !== undefined && (typeof body.reasoning !== "string" || !reasoningLevels.has(body.reasoning.trim()))) invalid("reasoning 必须是有效的 thinking level");
   if (body.sessionId !== undefined && (typeof body.sessionId !== "string" || !body.sessionId.trim() || body.sessionId.length > 160)) invalid("sessionId 必须是有效的会话 ID");
   normalizeOutputSchema(body.outputSchema);
+  if (normalizeArtifactPaths(body.artifactPaths).length && body.worktree === false) invalid("产物交付必须使用隔离工作树");
 }
 
 export function externalRunView(run, automationId) {
@@ -42,6 +44,8 @@ export function externalRunView(run, automationId) {
     error: run.error,
     usage: run.usage,
     ...(run.structuredOutput ? { structuredOutput: run.structuredOutput } : {}),
+    ...(run.delivery ? { delivery: run.delivery.status === "ready" && Date.parse(run.delivery.expiresAt) <= Date.now()
+      ? { ...run.delivery, status: "expired" } : run.delivery, outputPath: resultPath(run) } : {}),
     eventCursor: run.eventSeq || 0,
     resultPath: `/api/automations/${encodeURIComponent(automationId)}/runs/${encodeURIComponent(run.id)}`,
   };

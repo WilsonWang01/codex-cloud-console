@@ -46,6 +46,7 @@ export async function modelApiTurnResult(thread, turnId, { generatedImagesRoot }
       summary += item.text;
     }
     if (item.type !== "imageGeneration") continue;
+    if (typeof item.id !== "string" || !item.id || item.id.length > 160) fail("生成图片缺少有效的原生标识");
     if (item.failure || item.status !== "completed") fail("图片生成未成功完成，请查询后台任务", "image_generation_failed");
     if (images.length >= 4) fail("图片输出最多 4 张、总计 8 MiB", "image_output_too_large");
     let bytes;

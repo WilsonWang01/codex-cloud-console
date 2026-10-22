@@ -138,7 +138,7 @@ test("pending and uncertain work keeps its original key beyond the nominal TTL",
 }));
 
 test("unknown task schema is not rewritten", () => fixture(({ ledger }) => {
-  ledger.database.exec("UPDATE external_tasks_meta SET value=3 WHERE key='schema_version'; DELETE FROM external_tasks_meta WHERE key='revision'");
+  ledger.database.exec("UPDATE external_tasks_meta SET value=99 WHERE key='schema_version'; DELETE FROM external_tasks_meta WHERE key='revision'");
   const before = ledger.database.prepare("SELECT * FROM external_tasks_meta").all();
   assert.throws(() => createExternalTaskStore(ledger.database), /Unsupported/);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks_meta").all(), before);
@@ -150,7 +150,7 @@ test("version-one tasks migrate without changing identity, execution or claims",
   ledger.database.exec("UPDATE external_tasks_meta SET value=1 WHERE key='schema_version'");
   createExternalTaskStore(ledger.database);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
-  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 2);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 3);
 }));
 
 test("accepted output schema is immutable and structured results survive reopening", () => fixture(({ store, ledger }) => {
@@ -191,6 +191,7 @@ test("rollback rejects incompatible releases without altering task data", () => 
   const script = new URL("../ops/check-task-rollback.mjs", import.meta.url).pathname;
   const execute = () => promisify(execFile)(process.execPath, [script, root, previous], { timeout: 10000 });
   await execute();
+  ledger.database.exec("UPDATE external_tasks_meta SET value=2 WHERE key='schema_version'");
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 1;");
   await execute();
   assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 1);
@@ -201,8 +202,10 @@ test("rollback rejects incompatible releases without altering task data", () => 
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 1;");
   await assert.rejects(execute, /不能自动退回/);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 2;");
-  await execute();
+  await assert.rejects(execute, /不能自动退回/);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 3;");
+  await execute();
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 99;");
   await assert.rejects(execute, /不能自动退回/);
   assert.equal(store.runs().length, 1);
 }));

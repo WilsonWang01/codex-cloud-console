@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { readRootedFile } from "./safe-file-read.mjs";
+import { withFileResponse } from "./file-response.mjs";
 
 const previewMime = new Map([
   [".avif", "image/avif"], [".gif", "image/gif"], [".jpeg", "image/jpeg"],
@@ -9,7 +10,6 @@ const previewMime = new Map([
   [".md", "text/plain; charset=utf-8"], [".csv", "text/plain; charset=utf-8"],
   [".json", "text/plain; charset=utf-8"],
 ]);
-let pendingFileResponses = 0;
 
 function fileError(message, statusCode = 400) {
   return Object.assign(new Error(message), { statusCode });
@@ -49,19 +49,7 @@ export async function readPersonalFile(root, relativePath, maxBytes = 20 * 1024 
 }
 
 export async function sendPersonalFile(res, root, relativePath, { preview = false, head = false, maxBytes = 20 * 1024 * 1024 } = {}) {
-  // Keep at most two buffered personal downloads per process, including slow/disconnected clients.
-  if (pendingFileResponses >= 2) {
-    res.setHeader("Retry-After", "1");
-    throw fileError("当前文件下载较多，请稍后重试", 503);
-  }
-  pendingFileResponses++;
-  let finished;
-  const done = new Promise(resolve => { finished = resolve; });
-  res.once("finish", finished);
-  res.once("close", finished);
-  const timer = setTimeout(() => { res.destroy(); finished(); }, 120_000);
-  timer.unref();
-  try {
+  return withFileResponse(res, async () => {
     const file = await readPersonalFile(root, relativePath, maxBytes);
     if (res.destroyed) return;
     const inline = preview && file.mimeType !== "application/octet-stream";
@@ -72,13 +60,7 @@ export async function sendPersonalFile(res, root, relativePath, { preview = fals
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Content-Security-Policy", "sandbox");
     res.end(head ? undefined : file.buffer);
-    await done;
-  } finally {
-    clearTimeout(timer);
-    res.off("finish", finished);
-    res.off("close", finished);
-    pendingFileResponses--;
-  }
+  });
 }
 
 export async function listPersonalFiles(root, limit = 100) {

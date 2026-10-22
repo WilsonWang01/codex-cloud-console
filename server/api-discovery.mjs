@@ -25,7 +25,7 @@ export function discoveryModels(catalog, runs, client, automationId) {
   }));
 }
 
-export function discoveryCapabilities({ automationId, defaults, catalog, cli, idempotencyTtlMs, modelWaitMs, queueLimits }) {
+export function discoveryCapabilities({ automationId, defaults, catalog, cli, idempotencyTtlMs, modelWaitMs, queueLimits, resultStorage }) {
   return {
     object: "codex_cloud.capabilities", version: "2026-10-23", automation_id: automationId,
     defaults: { model: defaults.model, reasoning: defaults.reasoning },
@@ -36,18 +36,20 @@ export function discoveryCapabilities({ automationId, defaults, catalog, cli, id
     features: {
       text: true, image_input: { supported: true, encoding: "inline_base64", mime_types: ["image/png", "image/jpeg", "image/webp"], max_images: 8, max_bytes_each: 4 * 1024 * 1024, max_bytes_total: 8 * 1024 * 1024 },
       image_output: { supported: true, conditional: "Requires a successful native imageGeneration item in the exact turn", encoding: "base64", max_images: 4, max_bytes_total: 8 * 1024 * 1024 },
-      structured_output: true, artifact_download: false, sse: true, async_runs: true, durable_async_queue: true, cancellation: true,
+      structured_output: true, artifact_download: Boolean(resultStorage), result_manifest: Boolean(resultStorage), sse: true, async_runs: true, durable_async_queue: true, cancellation: true,
       request_output_token_limit: false, callback: false,
     },
     limits: { json_bytes: 12 * 1024 * 1024, messages: 100, normalized_text_bytes: 64 * 1024, model_wait_ms: modelWaitMs, discovery_and_poll_requests_per_minute: 60,
-      structured_output: structuredOutputLimits, ...(queueLimits ? { task_queue: queueLimits } : {}) },
-    retention: { idempotency_ttl_ms: idempotencyTtlMs, pending_task_keys: "retained_until_resolved", run_results: "bounded_history_no_fixed_duration_guarantee", request_metrics_days: 30, model_results: "original_turn_must_remain_readable", structured_results: "retained_with_run" },
-    unsupported: ["remote_image_urls", "files_api", "audio", "video", "pdf", "client_tools", "schema_refs_composition_patterns_formats", "sampling_parameters", "responses_store", "images_edits"],
+      structured_output: structuredOutputLimits, ...(queueLimits ? { task_queue: queueLimits } : {}), ...(resultStorage ? { result_storage: resultStorage } : {}) },
+    retention: { idempotency_ttl_ms: idempotencyTtlMs, pending_task_keys: "retained_until_resolved", run_results: "bounded_history_no_fixed_duration_guarantee", request_metrics_days: 30,
+      model_results: resultStorage ? "new_runs_have_private_snapshots_until_expiresAt;_legacy_requires_original_turn" : "original_turn_must_remain_readable", structured_results: "retained_with_run",
+      ...(resultStorage ? { result_ttl_ms_from_capture: resultStorage.retention_ms, result_cleanup: "minute_sweep;_only_delivery_copies;_uncertain_executions_retained" } : {}) },
+    unsupported: ["remote_image_urls", "files_api", "audio", "video", "pdf_input", "client_tools", "schema_refs_composition_patterns_formats", "sampling_parameters", "responses_store", "images_edits"],
     notes: ["Model catalog membership does not verify account access. Inference evidence is limited to this client and automation's retained runs; a failed run does not prove model unavailability.", "Codex does not supply model creation time or owner: created=0 and owned_by=unknown are placeholders.", "Adapter support is not an end-to-end business or third-party permission guarantee."],
   };
 }
 
-export function createDiscoveryHandler({ authenticate, automation, catalog, runtime, runs, rateLimit, record, idempotencyTtlMs, modelWaitMs, queueLimits }) {
+export function createDiscoveryHandler({ authenticate, automation, catalog, runtime, runs, rateLimit, record, idempotencyTtlMs, modelWaitMs, queueLimits, resultStorage }) {
   return async (req, res, kind) => {
     const protocol = req.get("x-api-key") || req.get("anthropic-version") ? "anthropic" : "openai";
     res.setHeader("Cache-Control", "no-store");
@@ -65,10 +67,10 @@ export function createDiscoveryHandler({ authenticate, automation, catalog, runt
       const listed = await catalog();
       if (kind === "models") {
         if (listed?.ok !== true) throw failure(503, "模型目录暂不可用，请稍后重试或查询 capabilities");
-        res.json({ object: "list", data: discoveryModels(listed, await runs(), client, req.params.id),
+        res.json({ object: "list", data: discoveryModels(listed, await runs(client, req.params.id), client, req.params.id),
           codex_cloud: { catalog_status: listed.stale || listed.refreshError ? "stale" : "available", observed_at: timestamp(listed.cachedAt), inference_verified: false } });
       } else {
-        res.json(discoveryCapabilities({ automationId: req.params.id, defaults, catalog: listed, cli: await runtime(), idempotencyTtlMs, modelWaitMs, queueLimits: queueLimits?.() }));
+        res.json(discoveryCapabilities({ automationId: req.params.id, defaults, catalog: listed, cli: await runtime(), idempotencyTtlMs, modelWaitMs, queueLimits: queueLimits?.(), resultStorage: resultStorage?.() }));
       }
     } catch (error) {
       sendModelApiError(res, protocol, error.statusCode ? error : failure(503, "能力信息暂不可用，请稍后重试"));

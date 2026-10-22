@@ -34,7 +34,7 @@ http://{$CODEX_CLOUD_PUBLIC_IP} {
 	}
 	@automation_result {
 		method GET
-		path_regexp automation_result ^/api/automations/[^/]+/runs/[^/]+$
+		path_regexp automation_result ^/api/automations/[^/]+/runs/[^/]+(/output(/files/[^/]+)?)?$
 	}
 	handle @automation_result {
 		reverse_proxy 127.0.0.1:8787

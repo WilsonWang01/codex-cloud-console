@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { runExternalClient } from "./external-client-example.mjs";
 import { validateExternalTriggerInput } from "../server/external-automation.mjs";
@@ -88,6 +92,49 @@ async function fixture(t, handler) {
   t.after(() => { server.closeAllConnections(); return new Promise((resolve) => server.close(resolve)); });
   return { origin: `http://127.0.0.1:${server.address().port}`, calls };
 }
+
+test("Node and Python download verified private bytes, ignoring server-supplied foreign URLs", async t => {
+  const fileId = "00000000-0000-4000-8000-000000000001";
+  const bytes = Buffer.from("artifact bytes");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const manifest = { version: 1, runId: "run-1", automationId: "research", status: "completed", text: "complete report", artifacts: [
+    { id: fileId, size: bytes.length, sha256, downloadPath: "https://foreign.invalid/do-not-use", name: "report.md" },
+  ] };
+  const { origin, calls } = await fixture(t, (req, res) => {
+    if (req.url.endsWith("/output")) return res.end(JSON.stringify({ ok: true, result: manifest }));
+    assert.equal(req.url, `/api/automations/research/runs/run-1/output/files/${fileId}`);
+    res.setHeader("X-Content-SHA256", sha256);
+    res.end(bytes);
+  });
+  const result = await runExternalClient({ ...options, command: "download", runId: "run-1", fileId, origin });
+  assert.deepEqual(result.buffer, bytes);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "python-artifact-client-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const target = path.join(root, "report.md");
+  const python = await pythonClient(origin, "download", "research", "run-1", "--file-id", fileId, "--output", target);
+  assert.equal(python.code, 0, python.stderr);
+  assert.deepEqual(await fs.readFile(target), bytes);
+  const overwrite = await pythonClient(origin, "download", "research", "run-1", "--file-id", fileId, "--output", target);
+  assert.notEqual(overwrite.code, 0);
+  assert.deepEqual(await fs.readFile(target), bytes);
+  assert.ok(calls.every(call => call.method === "GET" && call.token === "test-secret"));
+});
+
+test("file downloads reject corrupt bytes, mismatched manifests, expiry and redirects without submitting work", async t => {
+  const fileId = "00000000-0000-4000-8000-000000000001";
+  let mode = "corrupt";
+  const { origin, calls } = await fixture(t, (req, res) => {
+    if (mode === "expired") { res.statusCode = 410; return res.end(JSON.stringify({ ok: false, error: "expired" })); }
+    if (req.url.endsWith("/output")) return res.end(JSON.stringify({ ok: true, result: { version: 1, runId: mode === "mismatch" ? "other" : "run-1",
+      automationId: "research", status: "completed", text: "report", artifacts: [{ id: fileId, size: 3, sha256: "a".repeat(64) }] } }));
+    if (mode === "redirect") { res.writeHead(302, { location: "https://foreign.invalid/" }); return res.end(); }
+    res.setHeader("X-Content-SHA256", "a".repeat(64)); res.end("bad");
+  });
+  for (mode of ["corrupt", "mismatch", "redirect", "expired"]) {
+    await assert.rejects(runExternalClient({ ...options, command: "download", runId: "run-1", fileId, origin }), err => ["INVALID_RESPONSE", "HTTP_ERROR"].includes(err.code));
+  }
+  assert.ok(calls.every(call => call.method === "GET"));
+});
 
 test("reference client submits with a stable event key, polls its result and cancels only explicitly", async (t) => {
   const { origin, calls } = await fixture(t, (req, res) => {

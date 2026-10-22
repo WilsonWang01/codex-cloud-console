@@ -28,6 +28,9 @@ import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner } from "./external-task-store.mjs";
+import { createExternalResultStore, normalizeArtifactPaths, artifactBaseline, requestedArtifacts, nativeSources } from "./external-results.mjs";
+import { createExternalResultHandler } from "./external-result-api.mjs";
+import { externalApiToken } from "./external-auth.mjs";
 import { withPublicationLock } from "./publication-lock.mjs";
 import { normalizeOutputSchema, validateStructuredOutput, structuredTurnText } from "./structured-output.mjs";
 import { appServerRequestScope, personalRuntimeConfig, personalSessionRuntime, personalDeveloperInstructions } from "./personal-runtime.mjs";
@@ -85,6 +88,18 @@ function usageLedger() {
 let externalTasks;
 function externalTaskStore() {
   return externalTasks ||= createExternalTaskStore(usageLedger().database);
+}
+let externalResults;
+function externalResultStore() {
+  externalTaskStore();
+  try {
+    return externalResults ||= createExternalResultStore(usageLedger().database, path.join(stateRoot, "external-results"), {
+      retentionMs: Math.max(automationTriggerIdempotencyTtlMs, Number(process.env.CODEX_RESULT_RETENTION_MS || 86_400_000)),
+      globalBytes: Number(process.env.CODEX_RESULT_MAX_BYTES || 256 * 1024 * 1024),
+      clientBytes: Number(process.env.CODEX_RESULT_CLIENT_MAX_BYTES || 64 * 1024 * 1024),
+      globalRuns: Number(process.env.CODEX_RESULT_MAX_RUNS || 4096), clientRuns: Number(process.env.CODEX_RESULT_CLIENT_MAX_RUNS || 1024),
+    });
+  } catch { throw automationRequestError(503, "结果存储不可用，需要管理员核对；未接收新任务"); }
 }
 const externalTaskOwner = createExternalTaskOwner();
 let drainingExternalTasks = false;
@@ -5199,6 +5214,8 @@ function normalizeAutomationRun(run = {}) {
     completionCheckedAt: run.completionCheckedAt ? String(run.completionCheckedAt) : null,
     ...(run.outputSchema ? { outputSchema: run.outputSchema } : {}),
     ...(run.structuredOutput ? { structuredOutput: run.structuredOutput } : {}),
+    ...(run.artifactPaths?.length ? { artifactPaths: run.artifactPaths } : {}),
+    ...(run.delivery ? { delivery: run.delivery } : {}),
     runner: String(run.runner || "systemd"),
     status: run.status === "cancelled" ? "canceled" : String(run.status || "queued"),
     startedAt,
@@ -5227,8 +5244,28 @@ async function readAutomationRuns() {
   const runs = Array.isArray(parsed?.runs) ? parsed.runs.map(normalizeAutomationRun) : [];
   const merged = new Map(runs.map((run) => [run.id, run]));
   if (merged.size !== runs.length) throw new Error("自动化运行 ID 重复，需要核对原状态文件");
-  for (const run of externalTaskStore().runs()) merged.set(run.id, normalizeAutomationRun(run));
+  const tasks = externalTaskStore(), ledger = usageLedger();
+  // Repair the task-commit/accounting crash window before bounding the JSON/list projection.
+  const missing = tasks.unaccountedIds();
+  if (missing.length) {
+    const cutoff = Date.parse(ledger.info().retainedFrom);
+    for (let offset = 0; offset < missing.length; offset += 32) {
+      const batch = missing.slice(offset, offset + 32).map(id => tasks.read(id)).filter(run => {
+        const time = Date.parse(run.executionStartedAt || run.startedAt);
+        if (!Number.isFinite(time)) throw new Error("持久任务缺少有效执行时间，无法安全核对用量");
+        return time >= cutoff;
+      });
+      if (batch.length) ledger.sync(batch);
+    }
+  }
+  for (const id of tasks.ids()) merged.delete(id);
+  for (const run of tasks.recentRuns()) merged.set(run.id, normalizeAutomationRun(run));
   return { version: 1, runs: [...merged.values()] };
+}
+
+async function readAutomationRun(id) {
+  const saved = externalTaskStore().read(id);
+  return saved ? normalizeAutomationRun(saved) : (await readAutomationRuns()).runs.find(run => run.id === id);
 }
 
 async function writeAutomationRunsWithinQueue(store) {
@@ -5254,7 +5291,7 @@ async function upsertAutomationRun(run, event = null, { budgetLimit = null, task
       throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
     }
     const index = store.runs.findIndex((item) => item.id === run.id);
-    const current = index >= 0 ? store.runs[index] : null;
+    const current = index >= 0 ? store.runs[index] : externalTaskStore().read(run.id);
     const { events, eventSeq } = mergeAutomationEvents(current, run.events || [], event ? [event] : []);
     let normalized = normalizeAutomationRun({
       ...(current || {}),
@@ -5296,7 +5333,7 @@ async function requestAutomationRunCancellation(runId, automationId, clientId) {
   return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns();
     const index = store.runs.findIndex((item) => item.id === runId);
-    const current = index >= 0 ? store.runs[index] : null;
+    const current = index >= 0 ? store.runs[index] : externalTaskStore().read(runId);
     if (!clientCanReadRun({ id: clientId }, automationId, current)) {
       throw Object.assign(new Error("Run not found"), { statusCode: 404 });
     }
@@ -6761,7 +6798,9 @@ async function auditTimelineMessagesForSession(repoId, session, existingIds = ne
 
 async function authenticateAutomationTrigger(req, { token, allowLocalDevelopment = true } = {}) {
   const expected = String(process.env.CODEX_CLOUD_WEBHOOK_TOKEN || process.env.AUTOMATION_WEBHOOK_TOKEN || "").trim();
-  const provided = String(token ?? req.get("x-codex-cloud-token") ?? "").trim();
+  let provided;
+  try { provided = String(token ?? externalApiToken(req, { allowLegacyBasic: true }) ?? "").trim(); }
+  catch { return null; }
   if (expected) {
     const providedBytes = Buffer.from(provided);
     const expectedBytes = Buffer.from(expected);
@@ -6836,6 +6875,7 @@ function automationTriggerRequestHash(req, automation, trigger, completionContra
     search: body.search !== false,
     completionContract,
     ...(body.outputSchema ? { outputSchema: normalizeOutputSchema(body.outputSchema) } : {}),
+    ...(normalizeArtifactPaths(body.artifactPaths).length ? { artifactPaths: normalizeArtifactPaths(body.artifactPaths) } : {}),
   })).digest("hex");
 }
 
@@ -6855,6 +6895,7 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
     worktree: req.body?.worktree !== false,
     imageInputs: req.modelApiImageInputs,
     outputSchema: normalizeOutputSchema(req.body?.outputSchema),
+    artifactPaths: normalizeArtifactPaths(req.body?.artifactPaths),
   };
 }
 
@@ -6879,7 +6920,8 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     ? options.completionContract
     : automation.completionContract;
   const completionContract = normalizeAutomationCompletionContract(completionContractSource, { strict: true });
-  const executionPrompt = promptWithAutomationCompletionContract(prompt, completionContract);
+  const executionPrompt = promptWithAutomationCompletionContract(prompt, completionContract) + (options.artifactPaths?.length
+    ? `\n\n本轮文件交付：请在隔离工作目录中生成这些相对路径的新内容：${JSON.stringify(options.artifactPaths)}。旧文件内容不作为本轮交付。` : "");
   const heartbeatSessionId = options.sessionId ? String(options.sessionId) : "";
   const store = heartbeatSessionId ? await readChatStore() : null;
   const heartbeatSession = heartbeatSessionId ? store.sessions[heartbeatSessionId] : null;
@@ -6892,6 +6934,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   let runRecord;
   let job = null;
   let settlementRegistered = false;
+  let modelStartAttempted = false;
   try {
     runRecord = await upsertAutomationRun({
       id: runId,
@@ -6909,6 +6952,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       completionContract,
       completionOutcome: completionContract ? "pending" : null,
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
+      ...(options.artifactPaths?.length ? { artifactPaths: options.artifactPaths } : {}),
       runner: "app-server",
       status: "queued",
       executionStartedAt: new Date().toISOString(),
@@ -6933,15 +6977,19 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       runRecord = await updateRun(runId, { worktreePath: repo.path, status: "running" }, { type: "worktree", text: `Using repository cwd ${repo.path}` });
     }
     const runRepo = { ...repo, path: worktreePath || repo.path };
+    if (options.artifactPaths?.length && await fs.realpath(runRepo.path) === await fs.realpath(repo.path)) throw automationRequestError(400, "产物交付必须使用隔离工作树，不能读取主仓库文件");
+    const baseline = options.artifactPaths?.length ? await artifactBaseline(runRepo.path, options.artifactPaths) : {};
     const beforeStart = (await readAutomationRuns()).runs.find((item) => item.id === runId);
     if (beforeStart?.cancelRequestedAt) {
       const canceled = await updateRun(runId, {
         status: "canceled", finishedAt: new Date().toISOString(), error: "任务在启动模型前取消；已创建的工作目录未自动删除。",
+        usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       }, { type: "canceled", text: "Canceled before Codex turn started" });
       releaseAdmission();
       return canceled;
     }
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
+    modelStartAttempted = true;
     job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
@@ -6985,18 +7033,41 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       const completion = artifact && !artifact.satisfied ? artifact : markerCompletion;
       const unattendedApprovalDenied = Boolean(job.unattendedApprovalDenied);
       let structuredOutput = null;
-      if (options.outputSchema && result.ok) {
+      const keepResult = Boolean(options.taskClaim && externalResultStore().has(runId));
+      let retainedThread;
+      let deliveryError = null;
+      let delivery = null;
+      if ((options.outputSchema || keepResult) && result.ok) {
         try {
           const read = await appServerClientForJob(job).request("thread/read", { threadId: job.threadId, includeTurns: true }, 10000);
-          structuredOutput = validateStructuredOutput(options.outputSchema, structuredTurnText(read?.thread, job.turnId));
+          retainedThread = read?.thread;
+          if (options.outputSchema) structuredOutput = validateStructuredOutput(options.outputSchema, structuredTurnText(retainedThread, job.turnId));
         } catch (failure) {
-          structuredOutput = { status: "invalid", error: { code: typeof failure.code === "string" ? failure.code : "structured_result_unavailable", message: failure.statusCode ? failure.message : "原始回合读取失败，未验证结构化结果" } };
+          if (options.outputSchema) structuredOutput = { status: "invalid", error: { code: typeof failure.code === "string" ? failure.code : "structured_result_unavailable", message: failure.statusCode ? failure.message : "原始回合读取失败，未验证结构化结果" } };
+          deliveryError = { code: "original_turn_unavailable", message: "原始回合读取失败，未保存可交付结果" };
         }
       }
-      const completed = result.ok && completion.satisfied && !unattendedApprovalDenied && structuredOutput?.status !== "invalid";
+      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && structuredOutput?.status !== "invalid" && !deliveryError;
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const personalKnownWriteObserved = [...job.externalWriteItems.values()].some((item) => !item.unverifiedReadOnly);
+      if (keepResult && completed && !needsExternalReview && !personalWriteObserved) {
+        try {
+          const output = await modelApiTurnResult(retainedThread, job.turnId, { generatedImagesRoot });
+          const files = await requestedArtifacts(runRepo.path, options.artifactPaths || [], baseline);
+          for (const image of output.images) files.push({ name: `${image.id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 100)}.${image.media_type.slice(6)}`,
+            mimeType: image.media_type, buffer: Buffer.from(image.b64_json, "base64"), nativeItemId: image.id,
+            provenance: "native-image-item", ...(image.revised_prompt ? { revisedPrompt: image.revised_prompt } : {}) });
+          const bound = await updateRun(runId, { turnId: job.turnId }, { type: "result-saving", text: "正在保存本回合交付副本" });
+          delivery = await externalResultStore().capture(bound, options.taskClaim, {
+            text: structuredOutput ? JSON.stringify(structuredOutput.data) : output.summary, structuredOutput,
+            sources: nativeSources(retainedThread, job.turnId), files,
+          });
+        } catch (failure) {
+          completed = false;
+          deliveryError = { code: failure.code || "result_capture_failed", message: failure.statusCode ? failure.message : "结果交付失败，原任务不会自动重复执行" };
+        }
+      }
       const personalActionDisposition = options.trigger === "personal-schedule" ? "个人计划已暂停" : "本次试运行不能确认通过";
       const personalExternalActionError = personalKnownWriteObserved
         ? `检测到连接服务写入；请在对应服务核对结果，${personalActionDisposition}。`
@@ -7005,7 +7076,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       const error = needsExternalReview ? result.externalActionReview.reason
         : personalWriteObserved ? personalExternalActionError
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
-          : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : structuredOutput?.error?.message || completion.error || result.error || job.error || "自动化任务失败";
+          : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : structuredOutput?.error?.message || deliveryError?.message || completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await settleRun(
         runId,
@@ -7017,6 +7088,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           summary: job.output || "",
           usage: runUsageFromProtocol(job.rawTurnUsage),
           ...(structuredOutput ? { structuredOutput } : {}),
+          ...(keepResult ? { delivery: delivery || { status: "failed", error: deliveryError || { code: "run_not_completed", message: error || "任务未成功完成，未交付结果" } } } : {}),
           error,
           completionOutcome: completion.outcome,
           completionCheckedAt: completionContract ? new Date().toISOString() : null,
@@ -7064,17 +7136,21 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       error: error.message,
       completionOutcome: completionContract ? "turn-failed" : null,
       completionCheckedAt: completionContract ? new Date().toISOString() : null,
+      ...(!modelStartAttempted ? { usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 } } : {}),
     }, { type: job ? "needs-reconciliation" : "error", text: error.message }).catch(() => null);
     throw error;
   }
 }
 
 async function enqueueExternalAutomationRun(automation, repo, options) {
+  const results = externalResultStore();
   const runtime = normalizeRuntime({ model: options.model || automation.model, reasoning: options.reasoning || automation.reasoning,
     sandbox: options.sandbox || defaultRuntime.sandbox, approval: options.approval || defaultRuntime.approval, search: options.search !== false }, {});
   const prompt = String(options.prompt || automation.prompt || "").trim();
   if (!prompt) throw automationRequestError(400, "Automation prompt is required");
-  const accepted = await withPublicationLock(publicationLockPath, () => enqueueWrite("automation", async () => {
+  const accepted = await withPublicationLock(publicationLockPath, async () => {
+    await results.sweep();
+    return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns(), ledger = usageLedger(), now = Date.now();
     ledger.sync(store.runs);
     const dayStart = Date.parse(new Date(now).toISOString().slice(0, 10) + "T00:00:00Z");
@@ -7082,12 +7158,15 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
       trigger: options.trigger, clientId: options.clientId, runner: "app-server", status: "queued", prompt,
       model: runtime.model, reasoning: runtime.reasoning, completionContract: options.completionContract,
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
+      ...(options.artifactPaths?.length ? { artifactPaths: options.artifactPaths } : {}),
+      delivery: { status: "pending" },
       triggerIdempotencyHash: options.triggerIdempotencyHash, triggerRequestHash: options.triggerRequestHash,
       ...mergeAutomationEvents(null, [{ type: "queued", text: "任务已持久接收，等待执行" }]),
     });
     const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt } },
       keyHash: options.triggerIdempotencyHash, requestHash: options.triggerRequestHash, ttlMs: automationTriggerIdempotencyTtlMs,
       maxQueued: automationMaxQueued,
+      onAccepted: run => results.reserve(run),
       check() {
         const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT, now });
         if (!budget.ok) throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
@@ -7097,15 +7176,21 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
     if (index < 0) store.runs.unshift(result.run); else store.runs[index] = result.run;
     await writeAutomationRunsWithinQueue(store);
     return { ...result.run, deduplicated: result.deduplicated };
-  }));
+    });
+  });
   setImmediate(() => void drainExternalTasks());
   return accepted;
 }
 
+let lastResultSweep = 0;
 async function drainExternalTasks() {
   if (drainingExternalTasks) return;
   drainingExternalTasks = true;
   try {
+    if (Date.now() - lastResultSweep >= 60000) {
+      await withPublicationLock(publicationLockPath, () => externalResultStore().sweep());
+      lastResultSweep = Date.now();
+    }
     const counts = externalTaskStore().info();
     const localRunning = [...activeAutomationRuns.values()].filter((job) => job.externalTaskClaim?.owner === externalTaskOwner).length;
     if (!counts.queued && (!counts.running || counts.running <= localRunning)) return;
@@ -9019,8 +9104,8 @@ app.get("/healthz", async (_req, res) => {
   const { data, cache } = await getStatusForRoute();
   const health = data?.health || fastStatusFallback("health snapshot unavailable").health;
   let ledgerHealth;
-  try { usageLedger().info(); externalTaskStore().info(); ledgerHealth = { ok: true }; }
-  catch { ledgerHealth = { ok: false, error: "任务或用量存储不可用" }; }
+  try { usageLedger().info(); externalTaskStore().info(); externalResultStore().info(); ledgerHealth = { ok: true }; }
+  catch { ledgerHealth = { ok: false, error: "任务、结果或用量存储不可用" }; }
   const strictOk = Boolean(health.ok && ledgerHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
@@ -11566,6 +11651,14 @@ app.get("/api/automations/inbox", async (_req, res) => {
   res.json({ ok: true, source: "local-run-store+app-server-thread-verification", ...automationInboxBuckets(runs, auditEvents) });
 });
 
+const handleExternalResult = createExternalResultHandler({
+  authenticate: (req, token) => authenticateAutomationTrigger(req, { token, allowLocalDevelopment: false }),
+  readRun: readAutomationRun,
+  results: externalResultStore, rateLimit: consumeAutomationResultRate, record: metric => apiClientStore.record(metric),
+});
+app.get("/api/automations/:id/runs/:runId/output", handleExternalResult);
+app.get("/api/automations/:id/runs/:runId/output/files/:fileId", handleExternalResult);
+
 app.get("/api/automations/:id/runs/:runId", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const startedAt = Date.now();
@@ -11587,7 +11680,7 @@ app.get("/api/automations/:id/runs/:runId", async (req, res) => {
     res.setHeader("Retry-After", String(retryAfter));
     return res.status(429).json({ ok: false, error: "Automation result polling limit exceeded" });
   }
-  const run = (await readAutomationRuns()).runs.find((item) => item.id === req.params.runId);
+  const run = await readAutomationRun(req.params.runId);
   if (!clientCanReadRun(req.apiClient, req.params.id, run)) {
     return res.status(404).json({ ok: false, error: "Run not found" });
   }
@@ -11611,7 +11704,7 @@ app.post("/api/automations/:id/runs/:runId/cancel", async (req, res) => {
   });
   req.apiClient = await authenticateAutomationTrigger(req);
   if (!req.apiClient) return res.status(401).json({ ok: false, error: "Automation client token is required" });
-  const run = (await readAutomationRuns()).runs.find((item) => item.id === req.params.runId);
+  const run = await readAutomationRun(req.params.runId);
   if (!clientCanReadRun(req.apiClient, req.params.id, run)) {
     return res.status(404).json({ ok: false, error: "Run not found" });
   }
@@ -11662,7 +11755,7 @@ async function processAutomationTriggerRequest(req, res, trigger) {
     return res.json(payload);
   } catch (error) {
     if (error.retryAfterMs) res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
-    return res.status(error.statusCode || 500).json({ ok: false, error: error.message, output: error.message });
+    return res.status(error.statusCode || 500).json({ ok: false, error: error.message, output: error.message, ...(error.code ? { code: error.code } : {}) });
   }
 }
 
@@ -11721,7 +11814,8 @@ async function submitAutomationTriggerRequest(req, trigger) {
   let heartbeatSource = null;
   if (scopedClient && trigger === "heartbeat") {
     const requestedSessionId = String(req.body?.sessionId || "").trim();
-    const source = scopedHeartbeatSource((await readAutomationRuns()).runs, {
+    const durableSource = externalTaskStore().latest(req.apiClient.id, automation.id, { repoId: repo.id, sessionId: requestedSessionId });
+    const source = scopedHeartbeatSource([...(await readAutomationRuns()).runs, ...(durableSource ? [durableSource] : [])], {
       clientId: req.apiClient.id, automationId: automation.id, repoId: repo.id, sessionId: requestedSessionId,
     });
     if (requestedSessionId && !source) {
@@ -11773,7 +11867,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
   try {
     return await runPromise;
   } catch (error) {
-    throw automationRequestError([400, 409, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs);
+    throw Object.assign(automationRequestError([400, 409, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs), error.code ? { code: error.code } : {});
   }
 }
 
@@ -11782,7 +11876,22 @@ async function modelApiRunResult(id) {
   let reading = modelApiResultReads.get(id);
   if (!reading) {
     reading = (async () => {
-      const run = (await readAutomationRuns()).runs.find((item) => item.id === id);
+      const run = await readAutomationRun(id);
+      if (run?.delivery) {
+        const manifest = await externalResultStore().manifest(run);
+        const images = [];
+        for (const item of manifest.artifacts.filter(file => file.provenance === "native-image-item")) {
+          const file = await externalResultStore().file(run, item.id);
+          images.push({ id: file.nativeItemId, b64_json: file.buffer.toString("base64"), media_type: file.mimeType,
+            ...(file.revisedPrompt ? { revised_prompt: file.revisedPrompt } : {}) });
+        }
+        if (run.outputSchema) {
+          const checked = validateStructuredOutput(run.outputSchema, JSON.stringify(manifest.structuredOutput?.data));
+          if (checked.schemaSha256 !== run.structuredOutput?.schemaSha256) throw automationRequestError(502, "保存的结构化结果与请求格式不一致");
+          return { summary: JSON.stringify(checked.data), images };
+        }
+        return { summary: manifest.text, images };
+      }
       if (run?.outputSchema) {
         if (run.structuredOutput?.status !== "validated") throw automationRequestError(502, "结构化结果尚未通过验证");
         const checked = validateStructuredOutput(run.outputSchema, JSON.stringify(run.structuredOutput.data));
@@ -11801,7 +11910,7 @@ async function modelApiRunResult(id) {
 async function modelApiRunSnapshot(id) {
   const job = activeAutomationRuns.get(id);
   if (job && !job.completed) return { id, status: "running", summary: job.output || "" };
-  const run = (await readAutomationRuns()).runs.find((item) => item.id === id);
+  const run = await readAutomationRun(id);
   if (!run) return null;
   const summary = job?.output || run.summary || "";
   return { ...externalRunView(run, run.automationId), summary };
@@ -11825,12 +11934,22 @@ const handleDiscovery = createDiscoveryHandler({
   },
   catalog: async () => (await getModelListForRoute()).data,
   runtime: readDiscoveryRuntime,
-  runs: async () => (await readAutomationRuns()).runs,
+  runs: async (client, id) => {
+    const latest = externalTaskStore().latest(client.id, id);
+    return [...(await readAutomationRuns()).runs, ...(latest ? [latest] : [])];
+  },
   rateLimit: consumeAutomationResultRate,
   record: (metric) => apiClientStore.record(metric),
   idempotencyTtlMs: automationTriggerIdempotencyTtlMs,
   modelWaitMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
   queueLimits: () => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: runAdmission.status().maxPerClient }),
+  resultStorage: () => {
+    const info = externalResultStore().info();
+    return { max_global_bytes: info.globalBytes, max_client_bytes: info.clientBytes, reservation_bytes_per_run: info.packageBytes,
+      max_package_bytes: info.packageBytes, max_file_bytes: info.fileBytes, max_requested_files: info.requestedFiles,
+      max_artifacts: info.totalFiles, max_text_bytes: info.textBytes, retention_ms: info.retentionMs, max_retained_runs: info.globalRuns,
+      max_client_retained_runs: info.clientRuns, min_free_disk_bytes: info.minFreeBytes, accounting: "logical_bytes_not_disk_quota" };
+  },
 });
 app.get("/api/automations/:id/v1/models", (req, res) => handleDiscovery(req, res, "models"));
 app.get("/api/automations/:id/v1/capabilities", (req, res) => handleDiscovery(req, res, "capabilities"));

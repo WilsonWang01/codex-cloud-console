@@ -36,7 +36,7 @@ python3 scripts/external-client-example.py models my-app-review
 | `GET /api/automations/:id/v1/capabilities` | 协议能力、自动化默认模型、CLI/协议版本、探测时间和保留边界 |
 | `catalog.status` / `catalog_status` | `available` 有目录；`stale` 刷新失败或使用旧缓存；`unavailable` 当前无法取得目录 |
 | `inference.status` | 只看此调用方、此自动化保留的记录：`not_verified`、`succeeded`、`failed`；失败不一定是模型权限问题，历史成功也不保证以后可用 |
-| `structured_output` / `artifact_download` | 结构化输出见[受限 JSON Schema](structured-output.md)，上线版本应返回前者 `true`；文件下载仍为 `false`。不要用提示词冒充结构化保证，也不要把日志路径当下载地址 |
+| `structured_output` / `artifact_download` | 结构化输出见[受限 JSON Schema](structured-output.md)；支持文件交付的部署会将后者设为 `true`。详见[私有结果与文件交付](artifact-delivery.md)，不要把日志路径当下载地址 |
 | `image_output` | 支持取回精确原回合的原生生成图片，仍依赖账号/工具及该回合真正成功，不代表所有模型一定能生成 |
 
 目录缺失时 models 返回 503；capabilities 仍可返回 200 并显式标记 unavailable。上游没有提供创建日期和所有者，模型返回 `created: 0`、`owned_by: "unknown"`，不伪造元数据。运行记录为有界历史，没有承诺固定天数；调用方应及时持久保存结果。能力查询记入请求明细的 `discovery`，不计作模型任务受理或 token 使用。
@@ -51,7 +51,7 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 
 业务事件 ID 必须先在调用方保存。提交响应丢失时保持相同事件 ID 和输入重试；已拿到运行 ID 就查询它。示例有限重试，拒绝跳转转发令牌，本地等候超时不会自动取消。Python 使用网络超时和整体等待期限；不适合作为硬实时截止控制。更完整的事件游标、异步持久化进度回调可用 Node 参考客户端。
 
-文件下载暂未开放，所以本轮没有伪造“下载完成”的示例；A03 实现受限产物接口后，再接入下载、权限检查和校验。当前图片可用模型适配的 Base64 结果；异步任务的 `summary` 可能截断，不等于文件或完整结果。
+新任务支持受限产物清单和鉴权下载，须先查询部署能力；Node/Python 的 `output`、`download` 用法、20 MiB 结果包限额和保留策略见[文件交付](artifact-delivery.md)。异步任务的 `summary` 仍可能截断，不等于完整结果；旧任务不会补造副本。
 
 ## HTTP 契约
 
@@ -111,6 +111,7 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 | `reasoning` | `none/minimal/low/medium/high/xhigh/max/ultra`；具体模型不一定支持所有值 |
 | `search` | 布尔值，默认 `true`；设置该线程的网页搜索配置，不是网络访问隔离 |
 | `completionContract` | 声明式完成条件，可检查最终标记、工作区文件和可选哈希；见[配置说明](setup.md#自动化接入) |
+| `artifactPaths` | 最多四个隔离工作树内的相对文件路径；本轮新增/内容变化才可交付。单份 8 MiB，清单与所有产物总计 20 MiB；见[文件交付](artifact-delivery.md) |
 | `outputSchema` | 受限 JSON Schema，原生传入 CLI 并校验精确原回合；成功从 `run.structuredOutput.data` 取完整对象，见[说明](structured-output.md) |
 | `sessionId` | 仅 Heartbeat 可用，必须能验证为本调用方、同一自动化的历史会话 |
 | `runner` | 仅支持 `app-server`，无需显式设置 |
@@ -181,6 +182,6 @@ async function waitForResearch(runId, signal) {
 
 独立令牌不能读取管理页面、其他服务的结果或批准任务；运行响应不泄漏工作目录、会话 ID 和原始工具内容。用量缺失时为“未知”，token 不是美元账单。
 
-隔离工作树和调用方范围**不是操作系统沙箱**，当前工作执行器仍共用系统用户和 Codex 账号。仅向受信任服务开放，不能作为不可信多租户执行平台。当前没有通用外部任务创建/编排 API、完成回调推送或隔离令牌文件下载接口；交付文件条件可以校验，但不能通过此结果接口直接下载文件。已有的 OpenAI/Anthropic 文本 SSE 和图文协议子集是另一组接口，见[模型协议适配](model-api-adapters.md)，不能与本页异步运行接口混为一谈。代码、运行时和生产证据的区别见[版本与能力基线](release-baseline-2026-10-22.md)。
+隔离工作树和调用方范围**不是操作系统沙箱**，当前工作执行器仍共用系统用户和 Codex 账号。仅向受信任服务开放，不能作为不可信多租户执行平台。没有通用外部任务创建/编排 API 或完成回调推送；文件下载只对同一调用方的新运行私有副本开放，既有运行状态接口不接受任意文件路径。已有的 OpenAI/Anthropic SSE 和图文协议子集是另一组接口，见[模型协议适配](model-api-adapters.md)。代码、运行时和生产证据的区别见[版本与能力基线](release-baseline-2026-10-22.md)。
 
 本轮[验收与 review](acceptance/2026-10-04-backend-integration.md)记录测试证据及未覆盖边界。

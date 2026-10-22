@@ -179,7 +179,7 @@ Images 当前支持的参数只有 `model/prompt/n/response_format`，`n` 只能
 
 既有 Chat / Messages 非流式响应会附带 **非标准扩展** `codex_cloud.images: [{id,b64_json,media_type,revised_prompt?}]`，原文本字段不变。流式时扩展出现在 Chat 最后一个 stop chunk、Messages 的 `message_delta`；Anthropic 高级流累积器可能不保留扩展，需读取原始事件或改用 Responses / Images。不能假设其存在官方的图片输出 content block。
 
-所有入口最多输出 4 张 PNG/JPEG/WebP、解码总计 8 MiB（单张也最多 8 MiB）；过大、失效、文件不可读或图片生成失败明确返回错误。只导出原 thread 中**精确 turn 的原生图片生成项**，不扫描模型文本里的路径、不从远程地址抓图、不导出其他回合图片。保存文件须在既有 generated_images 目录，拒绝越界与符号链接逃逸。运行索引不保存 Base64，没有新增结果缓存目录；原 Codex 历史及生成文件仍会保留，删除原产物可能导致幂等重放无法再取图。
+所有入口最多输出 4 张 PNG/JPEG/WebP、解码总计 8 MiB（单张也最多 8 MiB）；过大、失效、文件不可读或图片生成失败明确返回错误。只导出原 thread 中**精确 turn 的原生图片生成项**，不扫描模型文本里的路径、不从远程地址抓图、不导出其他回合图片。保存文件须在既有 generated_images 目录，拒绝子路径链接及越界。支持[私有结果交付](artifact-delivery.md)的部署会为新任务保存限额、限时的副本，重放不再依赖原历史；旧任务仍依赖原生成文件和回合可读。索引不保存 Base64，读取到期/缺失副本不会自动重跑模型。原 Codex 历史和生成文件不由副本清理策略删除。
 
 图片结果采用 [OpenAI 图片输出](https://developers.openai.com/api/docs/guides/image-generation) 的 Base64 字段，图片质量、权限、计费仍由实际工具和账号决定。当前 Codex 回合 `usage` 不保证覆盖图片工具的独立计费，不是精确图片费用账单。
 

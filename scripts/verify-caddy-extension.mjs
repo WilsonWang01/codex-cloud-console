@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { assertCaddyRouteExtension, extendAutomationRoutes, extendModelApiRoutes, extendDiscoveryRoutes } from "../ops/extend-caddy-automation-routes.mjs";
+import { assertCaddyRouteExtension, extendAutomationRoutes, extendModelApiRoutes, extendDiscoveryRoutes, extendArtifactRoutes } from "../ops/extend-caddy-automation-routes.mjs";
 
 const source = `example.com {
 \t@automation_trigger path_regexp automation_trigger ^/api/automations/[^/]+/(webhook|heartbeat)$
@@ -89,4 +89,16 @@ test("discovery exposes only two exact GET paths without changing admin authenti
   assert.equal(updated.replace(/\t@automation_discovery \{[\s\S]*?\n\t\}\n\thandle @automation_discovery \{[\s\S]*?\n\t\}\n/, ""), current);
   assert.equal(extendDiscoveryRoutes(updated), updated);
   assert.throws(() => extendDiscoveryRoutes(updated.replace("method GET\n\t\tpath_regexp automation_discovery", "method POST\n\t\tpath_regexp automation_discovery")), /differ/);
+});
+
+test("artifact extension changes only the exact GET result matcher, never admin or arbitrary file paths", () => {
+  const current = extendAutomationRoutes(source);
+  const updated = extendArtifactRoutes(current);
+  const pattern = updated.match(/path_regexp automation_result (.+)/)[1];
+  const matcher = new RegExp(pattern);
+  for (const suffix of ["", "/output", "/output/files/uuid"]) assert.equal(matcher.test(`/api/automations/demo/runs/run${suffix}`), true);
+  for (const route of ["/api/clients", "/api/files/read", "/api/automations/demo/runs/run/output/admin", "/api/automations/demo/runs/run/output/files/a/b", "/api/automations/demo/runs/run/cancel"]) assert.equal(matcher.test(route), false);
+  assert.equal(extendArtifactRoutes(updated), updated);
+  assert.equal(updated.replace(pattern, "^/api/automations/[^/]+/runs/[^/]+$"), current);
+  assert.throws(() => extendArtifactRoutes(current.replace("method GET", "method POST")), /expected GET/);
 });

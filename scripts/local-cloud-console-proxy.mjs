@@ -5,6 +5,7 @@ import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { modelApiProtocol } from "../server/model-api-protocol.mjs";
+import { isExternalApiPath } from "../server/external-api-paths.mjs";
 import { readReleaseInfo } from "../server/release-info.mjs";
 
 const port = Number(process.env.CODEX_CLOUD_CONSOLE_PORT || 18787);
@@ -562,8 +563,7 @@ function createHttpProxy() {
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
     const isModelApiRequest = req.method === "POST" && Boolean(modelApiProtocol(targetUrl.pathname));
-    const isClientApiRequest = isModelApiRequest
-      || (req.method === "GET" && /^\/api\/automations\/[^/]+\/v1\/(models|capabilities)$/.test(targetUrl.pathname));
+    const isClientApiRequest = isExternalApiPath(targetUrl.pathname);
     if (credentials.token && !isClientApiRequest) headers["x-codex-cloud-token"] = credentials.token;
     if (targetUrl.protocol === "https:" && credentials.password && !isClientApiRequest) headers.authorization = authHeader;
     delete headers["proxy-connection"];

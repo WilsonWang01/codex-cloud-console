@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Codex Cloud 能力发现与异步任务",
-    "version": "2026-10-22",
-    "description": "覆盖能力发现及异步任务。推理适配字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 兼容。结构化结果和文件下载尚未实现。"
+    "version": "2026-10-23",
+    "description": "覆盖能力发现、异步任务、受限结构化结果及新任务的私有产物清单/下载。推理适配字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 或 Files API 兼容。部署能力以 capabilities 为准。"
   },
   "servers": [{"url": "https://your-codex-cloud.example"}],
   "paths": {
@@ -12,7 +12,7 @@
         "operationId": "listModels",
         "summary": "列出目录，不验证模型权限；不接受查询参数",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}],
-        "security": [{"BearerToken": []}, {"AnthropicKey": []}],
+        "security": [{"BearerToken": []}, {"AnthropicKey": []}, {"ClientToken": []}],
         "responses": {
           "200": {"description": "模型目录，created=0 表示创建日期未知", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Models"}}}},
           "400": {"$ref": "#/components/responses/BadRequest"},
@@ -28,7 +28,7 @@
         "operationId": "getCapabilities",
         "summary": "协议、默认设置、运行时探测及保留边界；不接受查询参数",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}],
-        "security": [{"BearerToken": []}, {"AnthropicKey": []}],
+        "security": [{"BearerToken": []}, {"AnthropicKey": []}, {"ClientToken": []}],
         "responses": {
           "200": {"description": "能力快照，不执行模型", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Capabilities"}}}},
           "400": {"$ref": "#/components/responses/BadRequest"},
@@ -44,7 +44,7 @@
         "operationId": "submitRun",
         "summary": "创建任务，可能消耗模型额度；webhook 禁止 sessionId",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/IdempotencyKey"}],
-        "security": [{"ClientToken": []}],
+        "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Trigger"}}}},
         "responses": {
           "200": {"$ref": "#/components/responses/Run"},
@@ -62,7 +62,7 @@
         "operationId": "continueRun",
         "summary": "续接本调用方最近会话，可能消耗模型额度",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/IdempotencyKey"}],
-        "security": [{"ClientToken": []}],
+        "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Trigger"}}}},
         "responses": {
           "200": {"$ref": "#/components/responses/Run"},
@@ -79,7 +79,7 @@
       "get": {
         "operationId": "getRun",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}, {"name": "after", "in": "query", "schema": {"type": "integer", "minimum": 0}}],
-        "security": [{"ClientToken": []}],
+        "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
         "responses": {
           "200": {"$ref": "#/components/responses/Run"},
           "400": {"$ref": "#/components/responses/BadRequest"},
@@ -94,12 +94,38 @@
         "operationId": "cancelRun",
         "summary": "明确请求取消，不能撤回已经发生的外部动作",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}],
-        "security": [{"ClientToken": []}],
+        "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
         "responses": {
           "200": {"$ref": "#/components/responses/Run"},
           "202": {"$ref": "#/components/responses/Run"},
           "401": {"$ref": "#/components/responses/Unauthorized"},
           "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/runs/{runId}/output": {
+      "get": {
+        "operationId": "getRunOutput", "summary": "读取本调用方已完成的新运行结果；不接受查询参数，不运行模型",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}],
+        "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
+        "responses": {
+          "200": {"description": "完整结果与私有产物清单", "content": {"application/json": {"schema": {"type": "object", "required": ["ok", "result"], "properties": {"ok": {"const": true}, "result": {"$ref": "#/components/schemas/ResultManifest"}}}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"description": "运行尚未成功交付，查询原运行而非创建新事件"}, "410": {"$ref": "#/components/responses/ResultExpired"},
+          "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/api/automations/{automationId}/runs/{runId}/output/files/{fileId}": {
+      "get": {
+        "operationId": "downloadRunArtifact", "summary": "下载本调用方、本运行的私有副本；核对哈希，仅附件，不提供匿名 URL 或范围读取",
+        "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}, {"name": "fileId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
+        "responses": {
+          "200": {"description": "最多 8 MiB 的已校验文件副本，Content-Disposition:attachment", "headers": {"X-Content-SHA256": {"schema": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}}, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"$ref": "#/components/responses/Conflict"}, "410": {"$ref": "#/components/responses/ResultExpired"},
+          "429": {"$ref": "#/components/responses/RateLimited"}, "503": {"$ref": "#/components/responses/Unavailable"}
         }
       }
     }
@@ -122,6 +148,7 @@
       "RateLimited": {"description": "限流，遵循 Retry-After 秒数", "headers": {"Retry-After": {"schema": {"type": "integer", "minimum": 1}}}},
       "Conflict": {"description": "同键不同输入或任务仍运行"},
       "Unavailable": {"description": "暂不可用；可按退避策略重试只读查询"},
+      "ResultExpired": {"description": "交付副本到期，不会通过重新执行模型恢复；不要盲目更换事件键"},
       "UnknownOutcome": {"description": "提交结果可能未知，查询已知 run ID 或保持同键同输入重试"},
       "Run": {"description": "运行快照，HTTP 成功不等于业务完成；202 表示取消处理中", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunResponse"}}}}
     },
@@ -136,23 +163,36 @@
         "defaults": {"type": "object", "properties": {"model": {"type": "string"}, "reasoning": {"type": "string"}}},
         "runtime": {"type": "object", "properties": {"cli_version": {"type": ["string", "null"]}, "probed_at": {"type": "string", "format": "date-time"}, "protocol": {"const": "codex-app-server-v2"}}},
         "catalog": {"type": "object", "properties": {"status": {"enum": ["available", "stale", "unavailable"]}, "observed_at": {"type": ["string", "null"], "format": "date-time"}, "inference_verified": {"const": false}}},
-        "protocols": {"type": "object"}, "features": {"type": "object", "properties": {"structured_output": {"type": "boolean", "description": "先查询部署版本；true 时支持 structured-output.md 的受限格式"}, "artifact_download": {"const": false}, "callback": {"const": false}, "request_output_token_limit": {"const": false}}},
+        "protocols": {"type": "object"}, "features": {"type": "object", "properties": {"structured_output": {"type": "boolean", "description": "先查询部署版本；true 时支持 structured-output.md 的受限格式"}, "artifact_download": {"type": "boolean", "description": "true 时仅覆盖该版本接收的新任务，遵守 expiresAt"}, "result_manifest": {"type": "boolean"}, "callback": {"const": false}, "request_output_token_limit": {"const": false}}},
         "limits": {"type": "object"}, "retention": {"type": "object"}, "unsupported": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "array", "items": {"type": "string"}}
       }},
       "Trigger": {"type": "object", "additionalProperties": false, "properties": {
         "runner": {"const": "app-server"}, "prompt": {"type": "string", "minLength": 1, "description": "UTF-8 不超过 65536 字节"}, "model": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{2,64}$"},
         "reasoning": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]}, "search": {"type": "boolean"}, "worktree": {"const": true},
         "sessionId": {"type": "string", "minLength": 1, "maxLength": 160, "description": "仅 heartbeat 可用；webhook 拒绝"}, "completionContract": {"type": "object", "description": "详见 backend-integration.md，不能替代外部写入确认"},
-        "outputSchema": {"type": ["object", "null"], "description": "受限 JSON Schema：16 KiB、8 层、128 节点，根为 object；省略或 null 不要求结构化；详见 structured-output.md"}
+        "outputSchema": {"type": ["object", "null"], "description": "受限 JSON Schema：16 KiB、8 层、128 节点，根为 object；省略或 null 不要求结构化；详见 structured-output.md"},
+        "artifactPaths": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "隔离工作树内待生成的相对路径；只收本轮新增/内容变化的 txt/md/json/csv/html/pdf/png/jpg/jpeg/webp 文件。拒绝隐藏目录、链接与旧内容；单份 8 MiB，清单和所有产物总计 20 MiB"}
       }},
       "RunResponse": {"type": "object", "required": ["ok", "run"], "properties": {
         "ok": {"const": true}, "run": {"type": "object", "required": ["id", "automationId", "status"], "properties": {
           "id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]},
           "startedAt": {"type": "string", "format": "date-time", "description": "任务接收时间"}, "executionStartedAt": {"type": ["string", "null"], "format": "date-time", "description": "实际开始执行时间；排队中可为空，用于 UTC 用量归属"},
           "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0},
-          "structuredOutput": {"type": "object", "description": "验证成功为 validated/schemaSha256/data，失败为 invalid/error；data 是完整业务对象", "required": ["status"], "properties": {"status": {"enum": ["validated", "invalid"]}, "schemaSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "data": {"type": "object"}, "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}}
+          "structuredOutput": {"type": "object", "description": "验证成功为 validated/schemaSha256/data，失败为 invalid/error；data 是完整业务对象", "required": ["status"], "properties": {"status": {"enum": ["validated", "invalid"]}, "schemaSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "data": {"type": "object"}, "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}},
+          "outputPath": {"type": "string", "description": "受限清单相对路径，仍需同一调用方认证"},
+          "delivery": {"type": "object", "required": ["status"], "properties": {"status": {"enum": ["pending", "ready", "failed", "expired"]}, "id": {"type": "string", "format": "uuid"}, "expiresAt": {"type": "string", "format": "date-time"}, "artifactCount": {"type": "integer", "minimum": 0, "maximum": 8}, "error": {"type": "object"}}}
         }},
         "eventCursor": {"type": "integer", "minimum": 0}, "eventGap": {"type": "boolean"}, "events": {"type": "array", "items": {"type": "object"}}
+      }},
+      "ResultManifest": {"type": "object", "required": ["version", "runId", "automationId", "status", "turnId", "capturedAt", "expiresAt", "text", "structuredOutput", "sources", "artifacts"], "properties": {
+        "version": {"const": 1}, "runId": {"type": "string"}, "automationId": {"type": "string"}, "status": {"const": "completed"}, "turnId": {"type": "string"},
+        "capturedAt": {"type": "string", "format": "date-time"}, "expiresAt": {"type": "string", "format": "date-time"}, "text": {"type": "string", "description": "原回合全文，UTF-8 最多 4 MiB，不使用截断摘要"},
+        "structuredOutput": {"type": ["object", "null"]}, "sources": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["url", "itemId", "kind"], "properties": {"url": {"type": "string", "format": "uri"}, "itemId": {"type": "string"}, "kind": {"enum": ["openPage", "findInPage"]}}}},
+        "artifacts": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/Artifact"}}
+      }},
+      "Artifact": {"type": "object", "required": ["id", "name", "mimeType", "size", "sha256", "provenance", "downloadPath"], "properties": {
+        "id": {"type": "string", "format": "uuid"}, "name": {"type": "string"}, "mimeType": {"type": "string"}, "size": {"type": "integer", "minimum": 0, "maximum": 8388608}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "provenance": {"enum": ["requested-path-changed-during-run", "native-image-item"]}, "nativeItemId": {"type": "string"}, "revisedPrompt": {"type": "string"}, "downloadPath": {"type": "string", "description": "同源受限相对路径，不能作为公开链接"}
       }}
     }
   }
