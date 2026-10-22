@@ -31,11 +31,25 @@ test("queued and running work is not mislabeled as missing final usage", () => {
   const buckets = aggregateRunUsage([
     { ...base, id: "queued", status: "queued" },
     { ...base, id: "running", status: "running" },
+    { ...base, id: "canceling", status: "canceling" },
     { ...base, id: "failed", status: "failed" },
   ], { from: Date.parse("2026-09-26T00:00:00Z"), to: Date.parse("2026-09-27T00:00:00Z") });
-  assert.equal(buckets[0].runs, 3);
+  assert.equal(buckets[0].runs, 4);
   assert.equal(buckets[0].failed, 1);
   assert.equal(buckets[0].unknownRuns, 1);
+});
+
+test("canceled and legacy cancelled runs retain known or unknown usage without counting as failures", () => {
+  for (const status of ["canceled", "cancelled"]) {
+    const range = { from: Date.parse("2026-09-26T00:00:00Z"), to: Date.parse("2026-09-27T00:00:00Z") };
+    const run = { id: "canceled", clientId: "client-a", startedAt: "2026-09-26T06:00:00Z", status };
+    const known = aggregateRunUsage([{ ...run, usage: runUsageFromProtocol({ last: { inputTokens: 100, outputTokens: 20 } }) }], range)[0];
+    assert.equal(known.totalTokens, 120);
+    assert.equal(known.knownRuns, 1);
+    assert.equal(known.failed, 0);
+    assert.equal(known.completed, 0);
+    assert.equal(aggregateRunUsage([{ ...run, usage: { status: "unknown" } }], range)[0].unknownRuns, 1);
+  }
 });
 
 test("request drilldown returns scoped per-run usage without prompt content", () => {

@@ -24,12 +24,13 @@ export function buildPersonalBrief(commitments, runs, reviewedAt, now = new Date
     }
   }
   for (const run of runs) {
-    if (run.repoId !== "_personal" || !["completed", "failed", "cancelled", "needs_reconciliation"].includes(run.status)) continue;
+    const status = run.status === "cancelled" ? "canceled" : run.status;
+    if (run.repoId !== "_personal" || !["completed", "failed", "canceled", "needs_reconciliation"].includes(status)) continue;
     const time = validTime(run.finishedAt || run.updatedAt);
     if (!time || time <= since || time > now.getTime()) continue;
     items.push({
-      id: `run:${run.id}:${run.status}`, kind: run.status === "completed" ? "completed" : "attention",
-      title: run.name || "个人定时任务", detail: run.status === "completed" ? "定时任务已完成" : run.status === "failed" ? "定时任务失败" : run.status === "cancelled" ? "定时任务已取消" : "定时任务待核对",
+      id: `run:${run.id}:${status}`, kind: status === "completed" ? "completed" : "attention",
+      title: run.name || "个人定时任务", detail: status === "completed" ? "定时任务已完成" : status === "failed" ? "定时任务失败" : status === "canceled" ? "定时任务已取消" : "定时任务待核对",
       time: new Date(time).toISOString(), sessionId: run.sessionId || null,
     });
   }

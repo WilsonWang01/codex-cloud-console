@@ -5176,7 +5176,7 @@ function normalizeAutomationRun(run = {}) {
     completionOutcome,
     completionCheckedAt: run.completionCheckedAt ? String(run.completionCheckedAt) : null,
     runner: String(run.runner || "systemd"),
-    status: String(run.status || "queued"),
+    status: run.status === "cancelled" ? "canceled" : String(run.status || "queued"),
     startedAt,
     updatedAt: String(run.updatedAt || startedAt),
     finishedAt: run.finishedAt ? String(run.finishedAt) : null,
@@ -5421,7 +5421,7 @@ function automationInboxBuckets(runs, auditEvents = []) {
   }
   for (const run of runs) {
     if (run.status === "archived") archived.push(run);
-    else if (["queued", "running"].includes(run.status)) active.push(run);
+    else if (["queued", "running", "canceling"].includes(run.status)) active.push(run);
     else if (run.status === "needs_reconciliation") needsAttention.push(run);
     else if (
       automationRunInterruptedByConsoleRestart(run) ||

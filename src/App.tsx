@@ -1741,7 +1741,7 @@ function connectionState(status: ConsoleStatus, cloudConnection: CloudConnection
 
 function attentionTone(status: string) {
   if (/failed|error|interrupted|needs_reconciliation|attention/i.test(status)) return "danger";
-  if (/running|queued|active/i.test(status)) return "active";
+  if (/running|queued|canceling|active/i.test(status)) return "active";
   return "neutral";
 }
 
@@ -6570,7 +6570,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   const guideFirst = !decisionCount && dueCount === 0 && !running.length && !queuedInFlight.length && !goals.length && !upcoming.length && !repeatable.length && !recentFiles.length && !recentRuns.length && !filesLoading && !filesError;
   const summary = decisionCount ? `${decisionCount} 项需要你处理` : dueCount ? `${dueCount} 项关注事项今天或此前到期` : running.length || queuedInFlight.length ? "任务正在继续处理" : dueCount === null || filesLoading ? "正在整理今日事项…" : "目前没有需要你决定的事项";
   const guide = <PersonalAssistantGuide onChoose={onChooseTask} onConnect={onConnections} heading="可以交办" />;
-  const runDetail = (run: AutomationRun) => `${run.status === "completed" ? "运行完成" : run.status === "failed" ? "运行失败" : run.status === "needs_reconciliation" ? "外部操作待核对" : run.status === "cancelled" ? "已取消" : "运行已结束"} · ${new Date(run.finishedAt || "").toLocaleString()}`;
+  const runDetail = (run: AutomationRun) => `${run.status === "completed" ? "运行完成" : run.status === "failed" ? "运行失败" : run.status === "needs_reconciliation" ? "外部操作待核对" : ["canceled", "cancelled"].includes(run.status) ? runStatusLabel(run.status) : "运行已结束"} · ${new Date(run.finishedAt || "").toLocaleString()}`;
   return <div className="personal-page personal-today">
     <header className="personal-page-header">
       <div><p className="eyebrow">{new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "long" }).format(new Date())} · 个人助理</p><h1>今日</h1><p className="personal-daily-summary">{summary}</p></div>
@@ -8131,7 +8131,7 @@ function PersonalRoutineSchedule({ automation, onSaved, onOpenTestSession }: {
   else if (test) testLabel = `试运行${runStatusLabel(test.status)}`;
   const changed = cadence !== schedule?.cadence || time !== schedule?.time || timeZone !== schedule?.timeZone;
   const last = schedule?.lastResult;
-  const resultText = last ? ({ completed: "已完成", running: "运行中", claimed: "正在启动", skipped: "已跳过", failed: "失败，计划已暂停", needs_reconciliation: "待核对，计划已暂停", interrupted: "中断，计划已暂停", canceled: "已取消，计划已暂停" } as Record<string, string>)[last.status] || last.status : "";
+  const resultText = last ? ({ completed: "已完成", running: "运行中", claimed: "正在启动", skipped: "已跳过", failed: "失败，计划已暂停", needs_reconciliation: "待核对，计划已暂停", interrupted: "中断，计划已暂停", canceled: "已取消", cancelled: "已取消" } as Record<string, string>)[last.status] || last.status : "";
   return <form className="personal-routine-schedule" onSubmit={(event) => { event.preventDefault(); void save(true); }}>
     <div className="personal-routine-schedule-head"><strong>计划运行</strong><span className={cx("run-badge", configured ? "ok" : "warn")}>{configured ? "已启用" : "未启用"}</span></div>
     <div className="personal-routine-test">

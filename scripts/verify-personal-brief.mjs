@@ -10,6 +10,19 @@ const commitments = [
   { id: "stale", title: "过期旧事项", status: "active", dueAt: "2026-09-18T08:00:00.000Z", createdAt: "2026-09-18T08:00:00.000Z", updatedAt: "2026-09-18T08:00:00.000Z" },
 ];
 
+test("canonical and legacy cancellation produce the same brief without changing the source run", () => {
+  const run = { id: "cancel-run", repoId: "_personal", name: "已取消的整理", status: "canceled", finishedAt: "2026-09-27T09:30:00.000Z", sessionId: "personal-1" };
+  const legacy = { ...run, status: "cancelled" };
+  const canonical = buildPersonalBrief([], [run], null, now);
+  assert.equal(canonical.total, 1);
+  assert.equal(canonical.items[0].detail, "定时任务已取消");
+  assert.equal(canonical.items[0].id, "run:cancel-run:canceled");
+  assert.deepEqual(buildPersonalBrief([], [legacy], null, now), canonical);
+  assert.equal(legacy.status, "cancelled", "兼容读取不修改原始记录");
+  assert.equal(buildPersonalBrief([], [run], canonical.until, new Date(now.getTime() + 1000)).total, 0);
+  assert.equal(buildPersonalBrief([], [{ ...run, status: "canceling" }], null, now).total, 0);
+});
+
 test("brief shows bounded, sourced changes after review without clearing newer events", () => {
   const runs = [
     { id: "personal-run", repoId: "_personal", name: "每日整理", status: "completed", finishedAt: "2026-09-27T09:30:00.000Z" },

@@ -3,7 +3,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const activeStatuses = new Set(["queued", "running", "canceling"]);
-const terminalStatuses = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
+const terminalStatuses = new Set(["completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]);
 const retryStatuses = new Set([429, 502, 503, 504]);
 
 export class ExternalClientError extends Error {

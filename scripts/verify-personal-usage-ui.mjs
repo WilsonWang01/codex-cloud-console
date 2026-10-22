@@ -4,6 +4,7 @@ import vm from "node:vm";
 import ts from "typescript";
 import { chromium } from "playwright";
 import { nextPersonalOccurrence } from "../server/personal-schedule.mjs";
+import { buildPersonalBrief } from "../server/personal-brief.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -55,6 +56,7 @@ let personalFactsReadFailure = false;
 let personalCommitments = [];
 let briefReviewedAt = null;
 const briefEvent = { id: "run:recent-personal:completed", kind: "completed", title: "资料整理完成", detail: "定时任务已完成", time: new Date().toISOString(), sessionId: "_personal-session" };
+let canceledBriefItems = [];
 const personalPushEndpoint = "https://push.example.test/personal-browser";
 let personalReminderSettings = { enabled: false, timeZone: "Asia/Shanghai", quietStart: "22:00", quietEnd: "08:00" };
 let failNextCommitmentDraftResponse = false;
@@ -163,7 +165,7 @@ await context.route("**/api/**", async (route) => {
     return send({ ok: true, files: personalFiles });
   }
   if (url.pathname === "/api/personal/files/content") return route.fulfill({ status: 200, contentType: "text/plain", body: "sample result\n" });
-  if (url.pathname === "/api/personal/brief") return send({ ok: true, brief: { until: new Date().toISOString(), reviewedAt: briefReviewedAt, items: briefReviewedAt ? [] : [briefEvent], total: briefReviewedAt ? 0 : 1 } });
+  if (url.pathname === "/api/personal/brief") return send({ ok: true, brief: { until: new Date().toISOString(), reviewedAt: briefReviewedAt, items: briefReviewedAt ? [] : [briefEvent, ...canceledBriefItems], total: briefReviewedAt ? 0 : 1 + canceledBriefItems.length } });
   if (url.pathname === "/api/personal/brief/review") { briefReviewedAt = body.through; return send({ ok: true, reviewedAt: briefReviewedAt }); }
   if (url.pathname === "/api/personal/reminders/status") return body.endpoint === personalPushEndpoint ? send({ ok: true, settings: personalReminderSettings }) : send({ ok: false, error: "未订阅" }, 404);
   if (url.pathname === "/api/personal/reminders" && req.method() === "PATCH") { personalReminderSettings = body.settings; return send({ ok: true, settings: personalReminderSettings }); }
@@ -343,6 +345,37 @@ try {
   await page.getByRole("heading", { name: "关注事项" }).waitFor();
   await page.getByRole("heading", { name: "新变化" }).waitFor();
   await page.getByText("资料整理完成", { exact: true }).waitFor();
+  const priorRuns = status.automationRuns;
+  const canceledExamples = ["canceled", "cancelled"].map((runStatus, index) => ({
+    id: `canceled-example-${index}`, automationId: "personal-plan", repoId: "_personal", name: index ? "旧取消记录" : "新取消记录",
+    status: runStatus, finishedAt: new Date().toISOString(), sessionId: "_personal-session",
+  }));
+  const cancelOut = new URL("../docs/research/acceptance/cancellation-2026-10-22/", import.meta.url);
+  await fs.mkdir(cancelOut, { recursive: true });
+  const cancelPage = await context.newPage();
+  cancelPage.on("pageerror", (error) => errors.push(error.message));
+  try {
+    status.automationRuns = canceledExamples;
+    canceledBriefItems = buildPersonalBrief([], canceledExamples, null).items;
+    await cancelPage.goto(`${baseUrl}#/project/_personal/today`);
+    for (const width of [320, 390, 1280]) {
+      await cancelPage.setViewportSize({ width, height: 900 });
+      await cancelPage.locator(".personal-brief").getByText("定时任务已取消", { exact: false }).first().waitFor();
+      assert.equal(await cancelPage.locator(".personal-brief-row").filter({ hasText: "定时任务已取消" }).count(), 2);
+      for (const title of ["新取消记录", "旧取消记录"]) {
+        const row = cancelPage.locator(".personal-task-row").filter({ hasText: title });
+        assert.match(await row.innerText(), /已取消/);
+        assert.doesNotMatch(await row.innerText(), /运行已结束|已完成|待核对/);
+      }
+      assert.ok(await cancelPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+      await cancelPage.screenshot({ path: new URL(`today-canceled-${width}.png`, cancelOut).pathname, fullPage: true });
+    }
+    console.log("320/390/1280px：新旧取消记录均进入个人简报和最近结果，显示已取消。");
+  } finally {
+    status.automationRuns = priorRuns;
+    canceledBriefItems = [];
+    await cancelPage.close();
+  }
   await page.getByRole("button", { name: /整理家庭旅行计划/ }).waitFor();
   await page.getByText("每周资料整理", { exact: true }).waitFor();
   assert.equal(await page.getByText("echo approval-check", { exact: true }).count(), 0);

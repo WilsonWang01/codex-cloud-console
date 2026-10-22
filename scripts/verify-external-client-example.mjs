@@ -7,6 +7,14 @@ import { validateExternalTriggerInput } from "../server/external-automation.mjs"
 const reply = (status = "completed", extra = {}) => ({ ok: true, run: { id: "run-1", automationId: "research", status, ...extra } });
 const options = { command: "submit", automationId: "research", eventId: "business-event-123", token: "test-secret", pollMs: 1 };
 
+test("reference client accepts both cancellation spellings as terminal without resubmitting or polling", async (t) => {
+  for (const status of ["canceled", "cancelled"]) {
+    const { origin, calls } = await fixture(t, (_req, res) => res.end(JSON.stringify(reply(status))));
+    assert.equal((await runExternalClient({ ...options, origin, wait: true })).status, status);
+    assert.equal(calls.length, 1);
+  }
+});
+
 async function fixture(t, handler) {
   const calls = [];
   const server = http.createServer(async (req, res) => {

@@ -18,6 +18,26 @@ const { ConversationStreamScope } = await import(`data:text/javascript;base64,${
 const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(draftSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
+
+test("取消中仍属于活动任务，已取消与待核对各自保留含义", () => {
+  const context = {
+    successfulAutomationRun: () => false, automationRunInterruptedByConsoleRestart: () => false,
+    automationRunHasOnlyExpiredUsageLimit: () => false, supersededAutomationFailure: () => false,
+    isStaleAutomationFailure: () => false,
+  };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function automationInboxBuckets(", "function isNoisyAuditAttentionEvent("), context);
+  vm.runInContext(ts.transpileModule(section(frontend, "function attentionTone(", "function automationRunnerLabel("), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  const rows = ["canceling", "canceled", "cancelled", "needs_reconciliation"].map((status) => ({ id: status, status }));
+  const result = context.automationInboxBuckets(rows);
+  assert.deepEqual(Array.from(result.active, (run) => run.id), ["canceling"]);
+  assert.deepEqual(Array.from(result.recent, (run) => run.id), ["canceled", "cancelled"]);
+  assert.deepEqual(Array.from(result.needsAttention, (run) => run.id), ["needs_reconciliation"]);
+  assert.equal(context.attentionTone("canceling"), "active");
+  assert.equal(context.runStatusLabel("canceling"), "取消中");
+  for (const status of ["canceled", "cancelled"]) assert.equal(context.runStatusLabel(status), "已取消");
+});
+
 function storage() {
   const values = new Map();
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) };

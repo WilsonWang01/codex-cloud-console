@@ -2628,6 +2628,24 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
     });
     assert.equal(cancelAgain.response.status, 200);
+    const legacyRunPath = path.join(stateRoot, "automation-runs.json");
+    const legacyRunStore = JSON.parse(await fs.readFile(legacyRunPath, "utf8"));
+    const legacyCanceled = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
+    legacyCanceled.status = "cancelled";
+    await fs.writeFile(legacyRunPath, JSON.stringify(legacyRunStore));
+    const legacyBytes = await fs.readFile(legacyRunPath, "utf8");
+    const rpcBeforeLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
+    const legacyResult = await jsonRequest(baseUrl, cancelStart.data.run.resultPath, { headers: { "x-codex-cloud-token": competingClient.data.token } });
+    assert.equal(legacyResult.data.run.status, "canceled");
+    assert.equal(legacyResult.data.run.id, canceledRun.id);
+    const legacyCancelAgain = await jsonRequest(baseUrl, `${cancelStart.data.run.resultPath}/cancel`, {
+      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
+    });
+    assert.equal(legacyCancelAgain.response.status, 200);
+    assert.equal(legacyCancelAgain.data.run.status, "canceled");
+    assert.equal(await fs.readFile(legacyRunPath, "utf8"), legacyBytes, "查询和重复取消不触发旧数据重写");
+    const rpcAfterLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
+    assert.equal(rpcAfterLegacyRead, rpcBeforeLegacyRead, "旧取消结果不再启动或中断模型");
 
     const chatStatePath = path.join(stateRoot, "chat-history.json");
     const validChatState = await fs.readFile(chatStatePath, "utf8");
