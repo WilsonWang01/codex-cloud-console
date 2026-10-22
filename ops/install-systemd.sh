@@ -99,12 +99,15 @@ tar -C "$SOURCE_ROOT" \
   --exclude=.git \
   --exclude=node_modules \
   --exclude=dist \
+  --exclude=.codex-cloud-release.json \
   --exclude=.codex-cloud-state \
   --exclude=.codex-cloud-local \
   --exclude=./docs/research \
   --exclude=./test-results \
   --exclude=./playwright-report \
   -cf - . | tar -C "$RELEASE_DIR" -xf -
+
+node "${SOURCE_ROOT}/ops/write-release-manifest.mjs" "$SOURCE_ROOT" "$RELEASE_DIR" "$RELEASE_ID"
 
 (
   cd "$RELEASE_DIR"

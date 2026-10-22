@@ -5,11 +5,13 @@ import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { modelApiProtocol } from "../server/model-api.mjs";
+import { readReleaseInfo } from "../server/release-info.mjs";
 
 const port = Number(process.env.CODEX_CLOUD_CONSOLE_PORT || 18787);
 const host = process.env.CODEX_CLOUD_CONSOLE_HOST || "127.0.0.1";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
+const releaseInfo = readReleaseInfo(projectRoot);
 const distRoot = path.join(projectRoot, "dist");
 const credentialsPath =
   process.env.CODEX_CLOUD_CONSOLE_CREDENTIALS ||
@@ -515,6 +517,17 @@ function createHttpProxy() {
   return http.createServer((req, res) => {
     if (hasMalformedPathEncoding(req.url || "/")) {
       sendPlainError(res, 400, "Malformed URL encoding\n");
+      return;
+    }
+    if ((req.url || "").split("?")[0] === "/api/local/release") {
+      res.setHeader("Cache-Control", "no-store");
+      if (!["GET", "HEAD"].includes(req.method)) {
+        res.setHeader("Allow", "GET, HEAD");
+        sendPlainError(res, 405, "Method not allowed\n");
+      } else {
+        res.setHeader("Content-Type", "application/json");
+        res.end(req.method === "HEAD" ? undefined : JSON.stringify({ ok: true, role: "local-proxy", release: releaseInfo }));
+      }
       return;
     }
     if ((req.url || "").startsWith("/api/local/mcp-oauth-relay/start")) {

@@ -1556,6 +1556,13 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       headers: { "x-forwarded-for": "203.0.113.10" },
     });
     assert.equal(publicRelayAttempt.response.status, 403);
+    const release = await jsonRequest(baseUrl, "/api/release");
+    assert.equal(release.response.status, 200);
+    assert.equal(release.response.headers.get("cache-control"), "no-store");
+    assert.equal(release.data.role, "console-api");
+    assert.match(release.data.release.entrypoints["server/index.mjs"], /^[a-f0-9]{64}$/);
+    assert.equal(JSON.stringify(release.data).includes(projectRoot), false);
+    assert.deepEqual((await jsonRequest(baseUrl, "/api/release")).data, release.data, "version is captured at startup");
     await assert.rejects(() => fs.stat(staleManagedTemp), /ENOENT/);
     assert.equal(await fs.readFile(unmanagedTemp, "utf8"), "must remain");
     let serializedStatus = "";
@@ -2747,6 +2754,13 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
   child.stderr.on("data", (chunk) => { proxyStderr += chunk.toString(); });
   try {
     await waitForOutput(child, /local http proxy ready/i);
+    const localRelease = await jsonRequest(`http://127.0.0.1:${proxyPort}`, "/api/local/release?ignored=PRIVATE-QUERY");
+    assert.equal(localRelease.response.status, 200);
+    assert.equal(localRelease.response.headers.get("cache-control"), "no-store");
+    assert.equal(localRelease.data.role, "local-proxy");
+    assert.match(localRelease.data.release.entrypoints["scripts/local-cloud-console-proxy.mjs"], /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(JSON.stringify(localRelease.data), /PRIVATE-QUERY|ambient-proxy-token|upstream\.test/);
+    assert.equal((await fetch(`http://127.0.0.1:${proxyPort}/api/local/release`, { method: "POST" })).status, 405);
     const malformedStatus = await new Promise((resolve, reject) => {
       const request = http.get({ host: "127.0.0.1", port: proxyPort, path: "/%E0%A4%A" }, (response) => {
         response.resume();
@@ -2868,6 +2882,9 @@ await check("atomic installer gates on strict health, prunes, and rolls back", a
   const npmCallsPath = path.join(tempRoot, "npm-calls");
   const previousRelease = path.join(releaseRoot, "20260101T000000Z-previous");
   await fs.mkdir(path.join(sourceRoot, "ops"), { recursive: true });
+  await fs.mkdir(path.join(sourceRoot, "server"), { recursive: true });
+  await fs.copyFile(path.join(projectRoot, "ops/write-release-manifest.mjs"), path.join(sourceRoot, "ops/write-release-manifest.mjs"));
+  await fs.copyFile(path.join(projectRoot, "server/release-info.mjs"), path.join(sourceRoot, "server/release-info.mjs"));
   await fs.mkdir(previousRelease, { recursive: true });
   await fs.mkdir(binDir, { recursive: true });
   if (process.platform === "darwin") {
@@ -2968,6 +2985,10 @@ exec /usr/bin/readlink "$@"
     assert.match(successful.stdout, /retained releases: 1/i);
     const activeRelease = await fs.realpath(currentLink);
     assert.notEqual(activeRelease, previousRelease);
+    const releaseManifest = JSON.parse(await fs.readFile(path.join(activeRelease, ".codex-cloud-release.json"), "utf8"));
+    assert.equal(releaseManifest.schemaVersion, 1);
+    assert.equal(releaseManifest.releaseId, path.basename(activeRelease));
+    assert.equal(releaseManifest.source.revision, null, "exported sources do not invent a git revision");
     assert.equal((await fs.stat(activeRelease)).mode & 0o055, 0o055);
     assert.equal((await fs.stat(path.join(activeRelease, "package-lock.json"))).mode & 0o044, 0o044);
     assert.equal((await fs.readdir(releaseRoot)).length, 1);

@@ -35,6 +35,7 @@ import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutine
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
+import { readReleaseInfo } from "./release-info.mjs";
 
 const serializeAutomationTrigger = createKeyedQueue();
 const serializeFileWrite = createKeyedQueue();
@@ -47,6 +48,7 @@ const server = http.createServer(app);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
+const releaseInfo = readReleaseInfo(projectRoot);
 const defaultCloudRoot = process.platform === "linux" && process.env.NODE_ENV === "production"
   ? "/home/ubuntu/codex-cloud"
   : path.join(projectRoot, ".codex-cloud-local");
@@ -8880,6 +8882,11 @@ app.post("/api/notifications/push/test", async (_req, res) => {
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || "Push notification test failed" });
   }
+});
+
+app.get("/api/release", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ok: true, role: "console-api", release: releaseInfo });
 });
 
 app.get("/healthz", async (_req, res) => {

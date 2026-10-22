@@ -1,43 +1,36 @@
-# Architecture
+# 架构
 
-Codex Cloud Console is a self-hosted control plane for a Codex worker running
-near one or more development repositories.
+Codex Cloud Console 是自托管、单用户和受信任调用方使用的 Codex 控制台，不是 OpenAI 托管服务，也不是不可信多租户执行平台。
 
 ```text
-Browser
-  │ HTTPS + operator authentication
-  ▼
-Caddy on Amazon EC2
-  │ loopback reverse proxy
-  ▼
-Node.js console API ── Codex app-server
-  │                    ├─ threads and turns
-  ├─ repository state  ├─ tool events
-  ├─ automation state  └─ model/capability discovery
-  ├─ audit events
-  └─ notification adapters
+桌面/手机浏览器 -- 可选本机代理与本机页面
+        | HTTPS + 操作者认证
+      Caddy（EC2）
+        | 127.0.0.1
+    Express 控制台 -- Codex app-server -- 模型与已授权工具
+        |
+    项目/会话、运行、审批、用量、个人资料、产物与通知
+
+受信任服务 -- 自动化范围接口 + 独立令牌 -- 同一个任务执行入口
 ```
 
-## Trust boundaries
+## 现有边界
 
-- The Node service binds to `127.0.0.1` by default.
-- Caddy is the public TLS and operator-authentication boundary.
-- External automation triggers require a separate random webhook token and an
-  idempotency key.
-- Production mode fails closed when the app-server fact source is unavailable.
-- Repository paths are resolved under a configured workspace root.
-- Raw CLI and local review mutations are disabled unless explicitly enabled.
+- Node 服务默认只监听本机回环地址；公网操作者认证由 Caddy 承担。不要把 Node 端口直接暴露公网。
+- 外部触发、结果、取消及模型协议路径在 Caddy 中单独放行，应用仍验证令牌和自动化/调用方归属；管理接口不会因此一并放行。
+- 本机代理可以使用已有操作者身份转发控制台接口；模型 API 保留请求自己的令牌，不自动注入管理身份。它可以服务本机 `dist`，因此本机页面和远端后端可能不是同一版本。
+- 默认个人模式与工作模式共用 Codex 登录，以项目/会话/草稿和上下文规则区分。共享系统用户、凭据和全局工具不是文件保密隔离；专用 worker 的双向权限隔离仍未验收完成。
+- 自动化复用现有运行、幂等、审批和取消逻辑。状态以独立数据目录中的 JSON 原子写入保存；当前不是数据库事务队列，不能承诺全局“恰好一次”。不确定的第三方写入结果需要核对，不能自动重放。
+- 原始 CLI 和本地 Review 写入默认关闭；生产模式在 app-server 事实源不可用时拒绝相关操作。工作模式默认全权限，不应向不受信任客户端开放。
 
-## AWS deployment
+## 版本与发布
 
-The reference deployment uses Amazon EC2, an instance profile, Systems Manager
-Session Manager, CloudWatch, and optional S3 artifact storage. The application
-does not require long-lived AWS access keys. See
-[`aws-instance-access.md`](aws-instance-access.md) for a generic access pattern.
+安装器在新发布目录构建，写入不含秘密的来源清单；原子切换符号链接并重启后，以严格健康检查决定是否回退。状态、工作区、Codex 历史与凭据不随代码目录切换或清理。
 
-## Project direction
+`GET /api/release` 返回后端进程启动时观察到的提交、分支、未提交改动标记和关键入口摘要；本机代理的 `GET /api/local/release` 单独报告代理与本机页面摘要。导出源码缺少来源清单、旧发布或 Git 不可用时明确为未知，不能把 `package.json` 的固定版本当作当前发布版本。详情与实际环境证据见[版本与能力基线](release-baseline-2026-10-22.md)。
 
-The current implementation is deliberately small and operable by one
-developer. Roadmap work focuses on reusable configuration, automated AWS test
-matrices, artifact retention, least-privilege deployment templates, and a
-documented extension interface for community-provided automations.
+## 运行与演进
+
+参考部署使用现有 EC2、systemd、Caddy 和独立数据目录。SSM/SSH 访问见[实例访问](aws-instance-access.md)；CloudWatch、S3 或其他新增 AWS 服务不是应用必需条件，启用前单独确认费用与权限。
+
+保留 React/Vite/Express、单机部署及 Codex app-server，按实际职责复用并逐步拆分 `personal-*`、`model-api`、审批、准入和计量模块。下一阶段以[已确认的开发方案](development-plan-2026-10-22.md)和[活动 goal](goals/codex-cloud-reliable-agent-v1.md)为准：先可靠性，再可集成后端与日常个人助理，最后真机及七天观察；不引入第二套执行引擎或分布式平台。
