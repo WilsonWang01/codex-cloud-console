@@ -12,12 +12,16 @@ type RunRow = { id: string; clientId: string; automationId: string; status: stri
 type Duration = { samples: number; p50Ms: number | null; p95Ms: number | null };
 type RequestSummary = { groups: { kind: string; requests: number; errors: number; accepted: number; replayed: number; duration: Duration }[]; errorTypes: { type: string; count: number }[] };
 type RunSummary = { tasks: number; completed: number; failed: number; canceled: number; unresolved: number; active: number; unclassified: number; observedModelTurns: number; successRate: number | null; unknownUsageRate: number | null; queueWait: Duration; execution: Duration };
-type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; runs?: RunRow[]; droppedRequests: number; missingMetricFiles?: number; requestSummary?: RequestSummary; runSummary?: RunSummary; usageLedger?: { seededAt: string | null; retentionDays: number; timezone: string } };
+type DeliveryState = { status: string; artifactCount?: number; expiresAt?: string; attempts?: number; lastCode?: string | null; nextAttemptAt?: string | null; deliveredAt?: string | null };
+type DeliverySummary = { asOf: string; tasks: number; results: Record<string, number>; callbacks: Record<string, number>; artifacts: number; attempts: number; retries: number; details: { id: string; clientId: string; automationId: string; startedAt: string; result: DeliveryState; callback: DeliveryState }[] };
+type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; runs?: RunRow[]; droppedRequests: number; missingMetricFiles?: number; requestSummary?: RequestSummary; runSummary?: RunSummary; deliverySummary?: DeliverySummary; usageLedger?: { seededAt: string | null; retentionDays: number; timezone: string } };
 const emptyUsage: Usage = { buckets: [], runBuckets: [], requests: [], runs: [], droppedRequests: 0 };
 const requestLabels: Record<string, string> = { submit: "提交请求", discovery: "能力查询", poll: "结果查询", control: "取消请求" };
 const errorLabels: Record<string, string> = { authorization: "权限拒绝", rate_limited: "频率受限", wait_ended: "等待超时或断开", conflict: "状态冲突", unavailable_object: "对象不可用", input_rejected: "输入拒绝", service_error: "服务错误" };
 const runLabels: Record<string, string> = { completed: "已完成", failed: "明确失败", canceled: "已取消", cancelled: "已取消", interrupted: "中断待核对", needs_reconciliation: "待核对", queued: "排队中", running: "处理中", canceling: "取消中" };
 const triggerLabels: Record<string, string> = { discovery: "能力查询", result: "结果查询", cancel: "取消请求", webhook: "新任务", heartbeat: "续接任务", "chat-completions": "OpenAI 对话", responses: "OpenAI Responses", messages: "Anthropic 消息", "image-generations": "图片生成" };
+const resultLabels: Record<string, string> = { ready: "清单就绪", preparing: "准备中", expired: "已到期", notDelivered: "未成功交付", notRetained: "无保留结果", untracked: "历史未覆盖", unknown: "元数据待核对" };
+const callbackLabels: Record<string, string> = { awaiting: "等待任务结束", pending: "等待投递", sending: "投递中或待恢复", delivered: "接收端已确认", failed: "失败或已到期", notRetained: "无保留投递记录", untracked: "历史未覆盖", unknown: "元数据待核对" };
 const durationText = (value: number | null | undefined) => value == null ? "--" : value < 1000 ? `${value.toLocaleString()} ms` : `${(value / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} 秒`;
 const rateText = (value: number | null | undefined) => value == null ? "--" : `${(value * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
 const localDateInput = (value: string | null) => value ? new Date(Date.parse(value) - new Date(value).getTimezoneOffset() * 60_000).toISOString().slice(0, 16) : "";
@@ -215,6 +219,7 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
   const unknownRuns = visibleUsage.runBuckets.reduce((sum, row) => sum + row.unknownRuns, 0);
   const metric = (value: number | undefined) => hasCurrentData && value != null ? value.toLocaleString() : "--";
   const runSummary = visibleUsage.runSummary;
+  const delivery = visibleUsage.deliverySummary;
   const runsById = new Map((visibleUsage.runs || []).map((run) => [run.id, run]));
 
   const exportUsage = () => {
@@ -281,6 +286,23 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
         ].map(row => <tr key={row.label}><th scope="row">{row.label}</th><td>{durationText(row.duration?.p50Ms)}</td><td>{durationText(row.duration?.p95Ms)}</td><td>{row.duration?.samples.toLocaleString() ?? "--"}</td></tr>)}</tbody></table></div>
         <p className="usage-note">P50 为中位数，P95 表示 95% 样本不超过该耗时；无样本显示 --。后台处理包含准备及收尾，不等同于模型推理时间；中断待核对的结束时间不参与耗时统计。</p>
         {!!visibleUsage.requestSummary?.errorTypes.length && <dl className="usage-quality usage-error-types">{visibleUsage.requestSummary.errorTypes.map(row => <div key={row.type}><dt>{errorLabels[row.type] || "其他调用错误"}</dt><dd>{row.count.toLocaleString()}</dd></div>)}</dl>}
+      </section>
+      <section className="usage-section" aria-label="结果与投递">
+        <div className="usage-section-head"><h2>结果与投递</h2></div>
+        {delivery ? <><dl className="usage-quality">{[
+          ["清单就绪", delivery.results.ready], ["就绪文件", delivery.artifacts],
+          ["回调已确认", delivery.callbacks.delivered], ["回调失败或到期", delivery.callbacks.failed],
+          ["结果待核对", delivery.results.unknown], ["回调待核对", delivery.callbacks.unknown],
+        ].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{Number(value).toLocaleString()}</dd></div>)}</dl>
+          <p className="usage-note">截至 {new Date(delivery.asOf).toLocaleString()}，按所选任务开始时间统计当前状态。清单就绪仅核对保存记录，下载时才校验文件；回调确认只代表接收端返回成功，不代表业务已处理。</p>
+          <details className="usage-delivery-details"><summary>完整状态与最近任务</summary>
+            <h3>结果记录</h3><dl className="usage-quality">{Object.entries(resultLabels).map(([key, label]) => <div key={key}><dt>{label}</dt><dd>{delivery.results[key]?.toLocaleString() ?? "--"}</dd></div>)}</dl>
+            <h3>回调记录</h3><dl className="usage-quality">{Object.entries(callbackLabels).map(([key, label]) => <div key={key}><dt>{label}</dt><dd>{delivery.callbacks[key]?.toLocaleString() ?? "--"}</dd></div>)}<div><dt>领取尝试</dt><dd>{delivery.attempts.toLocaleString()}</dd></div><div><dt>重复尝试</dt><dd>{delivery.retries.toLocaleString()}</dd></div></dl>
+            <p className="usage-note">无保留记录不代表从未登记；历史未覆盖不按成功或失败处理。领取尝试可能未发出 HTTP 请求，不是模型运行数或计费次数。</p>
+            {delivery.details.slice(0, 20).map(row => <details className="usage-request usage-delivery-row" key={row.id}><summary><time>{new Date(row.startedAt).toLocaleString()}</time><strong>{clients.find(client => client.id === row.clientId)?.name || row.clientId}</strong><span>{resultLabels[row.result.status] || "状态未知"}</span><span>{row.result.artifactCount ?? "--"} 文件</span><small>{callbackLabels[row.callback.status] || "状态未知"}</small></summary><div className="usage-request-expanded"><span>任务 <code>{row.id}</code></span><span>自动化 <code>{row.automationId}</code></span>{row.result.expiresAt && <span>结果有效至 {new Date(row.result.expiresAt).toLocaleString()}</span>}{row.callback.attempts !== undefined && <span>回调领取 {row.callback.attempts} 次</span>}{row.callback.lastCode && <span>最近回执 <code>{row.callback.lastCode}</code></span>}{row.callback.nextAttemptAt && <span>下次尝试 {new Date(row.callback.nextAttemptAt).toLocaleString()}</span>}{row.callback.deliveredAt && <span>接收确认 {new Date(row.callback.deliveredAt).toLocaleString()}</span>}{onOpenRun && <button type="button" className="mini-action" onClick={() => onOpenRun(row.automationId, row.id)}>打开任务</button>}</div></details>)}
+            <p className="usage-note">最近 {Math.min(delivery.details.length, 20)} 条，汇总覆盖 {delivery.tasks.toLocaleString()} 条任务。</p>
+          </details>
+        </> : <p className="usage-empty">{loading ? "正在加载交付统计…" : "服务器未提供交付汇总，未按零处理。"}</p>}
       </section>
       <section className="usage-section" aria-label="调用方">
         <div className="usage-section-head"><h2>调用方</h2><ShieldCheck size={18} /></div>

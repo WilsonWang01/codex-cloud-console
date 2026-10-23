@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { createExternalTaskStore } from "../server/external-task-store.mjs";
 import { createExternalResultStore, resultLimits, normalizeArtifactPaths, artifactBaseline, requestedArtifacts, nativeSources } from "../server/external-results.mjs";
 import { openRunUsageLedger } from "../server/run-usage-ledger.mjs";
+import { summarizeDeliveryUsage } from "../server/delivery-usage.mjs";
 
 const start = Date.parse("2026-10-23T00:00:00Z");
 const hash = value => createHash("sha256").update(value).digest("hex");
@@ -38,6 +39,95 @@ async function fixture(t, limits = {}) {
   };
   return { root, ledger, tasks, results, accept, begin, complete, advance: ms => { clock += ms; } };
 }
+
+test("delivery usage scopes metadata, separates outcomes, and never reads or writes result files", async t => {
+  const f = await fixture(t);
+  const ready = await f.complete("ready", { files: [{ name: "report.md", mimeType: "text/markdown", buffer: Buffer.from("secret file contents"), provenance: "requested-path-changed-during-run" }] });
+  const other = await f.complete("other", {}, "client-b");
+  const failed = f.begin("failed");
+  const failedRun = f.tasks.update({ ...failed.run, status: "failed", finishedAt: new Date(start).toISOString() }, failed.claim);
+  const unresolved = f.begin("unresolved");
+  const unknownRun = f.tasks.update({ ...unresolved.run, status: "needs_reconciliation" }, unresolved.claim);
+  const queued = f.accept("queued");
+  const legacy = { ...ready, id: "old-without-metadata" };
+  const binding = { id: "secret-target", fingerprint: "a".repeat(64) };
+  f.tasks.callbacks.reserve(ready, binding); f.tasks.callbacks.terminal(ready);
+  const claim = f.tasks.callbacks.claim();
+  assert.equal(claim.run_id, ready.id);
+  f.tasks.callbacks.finish(claim, { ok: true, code: "http_204" });
+  await f.results.sweep();
+  const manifest = await f.results.manifest(ready);
+  // The summary must not mistake metadata for verified bytes or fail on a missing blob.
+  fs.unlinkSync(path.join(f.root, "blobs", manifest.artifacts[0].id + ".blob"));
+  const changes = f.ledger.database.prepare("SELECT total_changes() AS n").get().n;
+  const runs = [ready, other, failedRun, unknownRun, queued, legacy];
+  const range = { from: start, to: start + 1, clientId: "client-a" };
+  const view = summarizeDeliveryUsage(f.ledger.database, runs, range, { now: start });
+  assert.equal(f.ledger.database.prepare("SELECT total_changes() AS n").get().n, changes);
+  assert.equal(view.tasks, 5);
+  assert.deepEqual(view.results, { ready: 1, preparing: 1, expired: 0, notDelivered: 1, notRetained: 0, untracked: 1, unknown: 1 });
+  assert.equal(view.artifacts, 1);
+  assert.equal(view.callbacks.delivered, 1); assert.equal(view.callbacks.notRetained, 3); assert.equal(view.callbacks.untracked, 1);
+  assert.equal(view.attempts, 1); assert.equal(view.retries, 0);
+  assert.equal(view.verification, "metadata_only");
+  assert.equal(view.details.find(row => row.id === "ready").callback.lastCode, "http_204");
+  for (const secret of ["secret file contents", "secret-target", binding.fingerprint, manifest.artifacts[0].sha256, manifest.artifacts[0].name, "report.md", f.root]) assert.equal(JSON.stringify(view).includes(secret), false);
+  assert.equal(summarizeDeliveryUsage(f.ledger.database, runs, { ...range, clientId: "client-b" }, { now: start }).tasks, 1);
+  assert.equal(summarizeDeliveryUsage(f.ledger.database, runs, { from: start - 1, to: start }, { now: start }).tasks, 0);
+  assert.equal(summarizeDeliveryUsage(f.ledger.database, runs, { ...range, clientId: "no-client" }, { now: start }).tasks, 0);
+});
+
+test("delivery expiry and callback attempts use current snapshots without sweeping or replaying", async t => {
+  const f = await fixture(t);
+  const ready = await f.complete("ready");
+  const binding = { id: "receiver", fingerprint: "b".repeat(64) };
+  f.tasks.callbacks.reserve(ready, binding); f.tasks.callbacks.terminal(ready);
+  f.tasks.callbacks.finish(f.tasks.callbacks.claim(), { code: "http_503" });
+  const range = { from: start, to: start + 1 };
+  let view = summarizeDeliveryUsage(f.ledger.database, [ready], range, { now: start });
+  assert.equal(view.results.ready, 1); assert.equal(view.callbacks.pending, 1); assert.equal(view.retries, 0);
+  assert.equal(view.details[0].callback.nextAttemptAt, new Date(start + 30000).toISOString());
+  f.advance(30000);
+  f.tasks.callbacks.finish(f.tasks.callbacks.claim(), { code: "http_400", retryable: false });
+  view = summarizeDeliveryUsage(f.ledger.database, [ready], range, { now: start + 30000 });
+  assert.equal(view.results.expired, 1); assert.equal(view.callbacks.failed, 1); assert.equal(view.attempts, 2); assert.equal(view.retries, 1);
+  assert.equal(view.details[0].callback.nextAttemptAt, null);
+  assert.equal(f.ledger.database.prepare("SELECT state FROM external_results").get().state, "ready");
+  const db = f.ledger.database;
+  db.prepare("UPDATE external_callbacks SET state='pending',expires_ms=?,next_ms=?").run(start, start);
+  view = summarizeDeliveryUsage(db, [ready], range, { now: start + 1 });
+  assert.equal(view.callbacks.failed, 1); assert.equal(view.details[0].callback.lastCode, "delivery_expired");
+  assert.equal(db.prepare("SELECT state FROM external_callbacks").get().state, "pending");
+});
+
+test("delivery metadata conflicts and unavailable records remain unknown or unretained, not successful", async t => {
+  const f = await fixture(t), ready = await f.complete("ready"), db = f.ledger.database;
+  const range = { from: start, to: start + 1 };
+  const original = db.prepare("SELECT record FROM external_results").get().record;
+  const invalid = { ...JSON.parse(original), manifestId: "different" };
+  for (const malformed of ["null", JSON.stringify({ ...JSON.parse(original), files: [null] })]) {
+    db.prepare("UPDATE external_results SET record=?").run(malformed);
+    assert.equal(summarizeDeliveryUsage(db, [ready], range, { now: start }).results.unknown, 1);
+  }
+  db.prepare("UPDATE external_results SET record=?").run(JSON.stringify(invalid));
+  assert.equal(summarizeDeliveryUsage(db, [ready], range, { now: start }).results.unknown, 1);
+  db.prepare("UPDATE external_results SET record=?,client_id='wrong-client'").run(original);
+  assert.equal(summarizeDeliveryUsage(db, [ready], range, { now: start }).results.unknown, 1);
+  db.prepare("DELETE FROM external_results").run();
+  assert.equal(summarizeDeliveryUsage(db, [ready], range, { now: start }).results.notRetained, 1);
+  const wrong = { ...ready, clientId: "other-owner" };
+  const view = summarizeDeliveryUsage(db, [wrong], range, { now: start });
+  assert.equal(view.results.unknown, 1); assert.equal(view.callbacks.unknown, 1);
+  assert.throws(() => summarizeDeliveryUsage(db, [ready], range, { now: start, limit: 201 }));
+});
+
+test("delivery summaries cover the complete cohort while details are bounded and sorted", async t => {
+  const f = await fixture(t), ready = await f.complete("ready");
+  const runs = Array.from({ length: 450 }, (_, i) => ({ ...ready, id: `old-${i}`, executionStartedAt: new Date(start + i).toISOString() }));
+  const view = summarizeDeliveryUsage(f.ledger.database, runs, { from: start + 10, to: start + 449 }, { now: start + 1000 });
+  assert.equal(view.tasks, 439); assert.equal(view.results.untracked, 439); assert.equal(view.details.length, 200);
+  assert.equal(view.details[0].id, "old-448"); assert.equal(view.details.at(-1).id, "old-249");
+});
 
 test("artifact requests reject system paths and only changed/new requested files are deliverable", async t => {
   const f = await fixture(t);

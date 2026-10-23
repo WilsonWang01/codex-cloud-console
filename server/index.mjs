@@ -26,6 +26,7 @@ import { notificationAttempt, pendingNotificationChannels } from "./notification
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol, summarizeRunUsage } from "./run-usage.mjs";
+import { summarizeDeliveryUsage } from "./delivery-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner, executionPayloadLimits } from "./external-task-store.mjs";
 import { normalizeInlineAttachments } from "./inline-inputs.mjs";
@@ -9251,11 +9252,13 @@ app.get("/api/clients/usage", async (req, res) => {
         const store = await readAutomationRuns();
         const ledger = usageLedger();
         ledger.sync(store.runs);
-        return { runs: mergeUsageRuns(store.runs, ledger.rows({ from, to })), info: ledger.info() };
+        externalResultStore();
+        const runs = mergeUsageRuns(store.runs, ledger.rows({ from, to }));
+        return { runs, info: ledger.info(), delivery: summarizeDeliveryUsage(ledger.database, runs, { from, to, clientId }) };
       }),
     ]);
     if (!res.destroyed) res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(usage.runs, { from, to, clientId }),
-      runs: runUsageDetails(usage.runs, { from, to, clientId }), runSummary: summarizeRunUsage(usage.runs, { from, to, clientId }), usageLedger: usage.info });
+      runs: runUsageDetails(usage.runs, { from, to, clientId }), runSummary: summarizeRunUsage(usage.runs, { from, to, clientId }), deliverySummary: usage.delivery, usageLedger: usage.info });
   } catch (error) { if (!res.destroyed) res.status(500).json({ ok: false, error: error.message }); }
   finally { controller.abort(); res.off("close", closed); }
 });

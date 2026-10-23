@@ -528,6 +528,14 @@ await check("client limits preserve budget accounting, replay, policy conflicts 
     const usage = await jsonRequest(base, "/api/clients/usage", { headers });
     assert.equal(usage.data.runBuckets.reduce((sum, row) => sum + row.totalTokens, 0), 650);
     assert.equal(usage.data.runSummary.unknownUsage, 1);
+    assert.equal(usage.data.deliverySummary.results.ready, 5);
+    assert.equal(usage.data.deliverySummary.results.untracked, 1);
+    assert.equal(usage.data.deliverySummary.tasks, usage.data.runSummary.tasks);
+    assert.equal(usage.data.deliverySummary.callbacks.notRetained, 5);
+    const ownDelivery = await jsonRequest(base, `/api/clients/usage?clientId=${a.client.id}`, { headers });
+    assert.equal(ownDelivery.data.deliverySummary.tasks, 2);
+    assert.equal(ownDelivery.data.deliverySummary.results.ready, 2);
+    assert.ok(ownDelivery.data.deliverySummary.details.every(row => row.clientId === a.client.id));
     const clientsFile = path.join(stateRoot, "api-clients.json");
     const savedClients = await fs.readFile(clientsFile, "utf8"), damaged = JSON.parse(savedClients);
     damaged.clients[0].dailyKnownTokenLimit = -1;
@@ -972,6 +980,9 @@ await check("usage API retains accounting across history pruning and restart; co
     assert.equal(first.data.runSummary.observedModelTurns, 450);
     assert.equal(first.data.runSummary.successRate, 1);
     assert.equal(first.data.runSummary.unknownUsageRate, 0);
+    assert.equal(first.data.deliverySummary.tasks, 450);
+    assert.equal(first.data.deliverySummary.results.untracked, 450);
+    assert.equal(first.data.deliverySummary.details.length, 200);
     assert.deepEqual(first.data.runSummary.execution, { samples: 0, p50Ms: null, p95Ms: null });
     assert.deepEqual(first.data.requestSummary.groups, []);
     await stopProcess(server);
@@ -981,11 +992,14 @@ await check("usage API retains accounting across history pruning and restart; co
     assert.equal(after.response.status, 200);
     assert.deepEqual(after.data.runBuckets, first.data.runBuckets);
     assert.deepEqual(after.data.runSummary, first.data.runSummary);
+    assert.deepEqual(after.data.deliverySummary.results, first.data.deliverySummary.results);
     const other = await jsonRequest(base, "/api/clients/usage?clientId=other", { headers });
     assert.deepEqual(other.data.runBuckets, []);
     assert.deepEqual(other.data.runs, []);
     assert.equal(other.data.runSummary.tasks, 0);
     assert.equal(other.data.runSummary.successRate, null);
+    assert.equal(other.data.deliverySummary.tasks, 0);
+    assert.deepEqual(other.data.deliverySummary.details, []);
     await stopProcess(server);
     for (const suffix of ["", "-wal", "-shm"]) {
       await fs.rename(path.join(stateRoot, `run-usage.sqlite${suffix}`), path.join(stateRoot, `saved.sqlite${suffix}`)).catch((error) => {

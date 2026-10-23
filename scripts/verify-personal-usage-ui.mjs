@@ -31,6 +31,7 @@ let pending = [{
 }];
 let decision = null;
 let createdToken = "";
+let includeDeliverySummary = true;
 let createClientFailure = false;
 let createClientCalls = 0;
 let clientPolicyCalls = 0;
@@ -293,6 +294,14 @@ await context.route("**/api/**", async (route) => {
     ], errorTypes: [{ type: "unavailable_object", count: 1 }] },
     runSummary: { tasks: 2, completed: 1, failed: 0, unresolved: 1, canceled: 0, active: 0, unclassified: 0, observedModelTurns: 1, successRate: 1, unknownUsageRate: 0.5,
       queueWait: { samples: 1, p50Ms: 1000, p95Ms: 1000 }, execution: { samples: 1, p50Ms: 2000, p95Ms: 2000 } },
+    ...(includeDeliverySummary ? { deliverySummary: { asOf: new Date().toISOString(), tasks: 2,
+      results: { ready: 1, preparing: 0, expired: 0, notDelivered: 0, notRetained: 0, untracked: 0, unknown: 1 },
+      callbacks: { awaiting: 0, pending: 1, sending: 0, delivered: 0, failed: 0, notRetained: 0, untracked: 1, unknown: 0 },
+      artifacts: 2, attempts: 2, retries: 1,
+      details: [{ id: "run-1", clientId: "client-a", automationId: status.automations[0].id, startedAt: new Date().toISOString(),
+        result: { status: "ready", artifactCount: 2, expiresAt: new Date(Date.now() + 86400000).toISOString() },
+        callback: { status: "pending", attempts: 2, lastCode: "http_503", nextAttemptAt: new Date(Date.now() + 30000).toISOString(), deliveredAt: null } }],
+    } } : {}),
     runBuckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", runs: 2, completed: 1, failed: 0, knownRuns: 1, unknownRuns: 1, inputTokens: 100, outputTokens: 20, totalTokens: 120 }],
     requests: [{ id: "request-1", clientId: "client-a", automationId: status.automations[0].id, trigger: "webhook", status: 200, runId: "run-1", deduplicated: false, durationMs: 5, time: new Date().toISOString() }],
     runs: [{ id: "run-1", clientId: "client-a", automationId: status.automations[0].id, status: "completed", startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), model: "gpt-5.6-terra", reasoning: "medium", usage: { status: "complete", inputTokens: 100, outputTokens: 20, totalTokens: 120 } }],
@@ -541,11 +550,29 @@ try {
   assert.match(await page.locator(".usage-quality").first().innerText(), /未知用量占比\s*50%/);
   assert.match(await page.locator(".usage-metrics-table").innerText(), /后台处理\s*2 秒\s*2 秒\s*1/);
   assert.match(await page.locator(".usage-metrics-table").innerText(), /取消请求\s*--\s*--\s*0/);
+  const deliveries = page.getByRole("region", { name: "结果与投递", exact: true });
+  assert.match(await deliveries.innerText(), /清单就绪\s*1/);
+  assert.match(await deliveries.innerText(), /就绪文件\s*2/);
+  assert.match(await deliveries.innerText(), /结果待核对\s*1/);
+  await deliveries.locator(".usage-delivery-details > summary").click();
+  assert.match(await deliveries.innerText(), /历史未覆盖\s*1/);
+  await deliveries.locator(".usage-delivery-row > summary").click();
+  assert.match(await deliveries.innerText(), /回调领取 2 次/);
+  assert.match(await deliveries.innerText(), /http_503/);
+  assert.match(await deliveries.innerText(), /下载时才校验文件/);
+  includeDeliverySummary = false;
+  await page.getByRole("button", { name: "刷新用量", exact: true }).click();
+  await deliveries.getByText("服务器未提供交付汇总，未按零处理。").waitFor();
+  includeDeliverySummary = true;
+  await page.getByRole("button", { name: "刷新用量", exact: true }).click();
+  await deliveries.locator(".usage-quality").first().waitFor();
+  await deliveries.locator(".usage-delivery-details > summary").click();
+  await deliveries.locator(".usage-delivery-row > summary").click();
   await page.getByRole("group", { name: "曲线指标" }).getByRole("button", { name: "能力", exact: true }).click();
   await page.getByRole("img", { name: "能力 趋势" }).waitFor();
   assert.ok(await page.locator('.usage-chart-column[title$=": 2"]').count());
-  await page.locator(".usage-request summary").first().click();
-  assert.match(await page.locator(".usage-request-expanded").innerText(), /Token 120/);
+  await page.locator(".usage-requests .usage-request summary").first().click();
+  assert.match(await page.locator(".usage-requests .usage-request-expanded").innerText(), /Token 120/);
   await page.getByRole("group", { name: "曲线指标" }).getByRole("button", { name: "查询" }).click();
   await page.getByRole("img", { name: "查询 趋势" }).waitFor();
   assert.ok(await page.locator('.usage-chart-column[title$=": 3"]').count());
@@ -622,12 +649,15 @@ try {
   await page.screenshot({ path: new URL("usage-desktop.png", out).pathname, fullPage: true });
   for (const width of [320, 360, 390, 430, 768, 820, 1280]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : width <= 430 ? 800 : 900 });
+    if (await page.locator(".usage-delivery-details").getAttribute("open") === null) await page.locator(".usage-delivery-details > summary").click();
+    if (await page.locator(".usage-delivery-row").getAttribute("open") === null) await page.locator(".usage-delivery-row > summary").click();
+    await page.locator(".usage-delivery-row .usage-request-expanded").getByText(/http_503/).waitFor();
     if (width <= 820) await page.getByRole("button", { name: "打开侧边栏" }).click();
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
     assert.equal(overflow, false, `horizontal overflow at ${width}px`);
     if (width <= 820) {
       await page.locator(".mobile-sidebar-close").click();
-      const undersized = await page.locator(".usage-header .icon-button, .usage-client .icon-button, .usage-policy-fields input, .usage-token button, .usage-filters button, .usage-filters select, .usage-section-head .usage-segmented button").evaluateAll((buttons) => buttons.filter((button) => {
+      const undersized = await page.locator(".usage-header .icon-button, .usage-client .icon-button, .usage-policy-fields input, .usage-token button, .usage-filters button, .usage-filters select, .usage-section-head .usage-segmented button, .usage-delivery-details > summary, .usage-delivery-row button").evaluateAll((buttons) => buttons.filter((button) => {
         const rect = button.getBoundingClientRect();
         return rect.width < 44 || rect.height < 44;
       }).map((button) => button.outerHTML.slice(0, 160)));

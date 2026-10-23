@@ -7112,6 +7112,11 @@ pre {
 .usage-request-expanded { display: flex; align-items: center; gap: 8px 20px; flex-wrap: wrap; padding: 12px 0 0; color: var(--muted-strong); }
 .usage-request-expanded code { overflow-wrap: anywhere; }
 .usage-request-expanded button { min-height: 40px; }
+.usage-delivery-details > summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
+.usage-delivery-details h3 { margin: 20px 0 8px; font-size: 14px; }
+.usage-delivery-row { display: block; }
+.usage-delivery-row summary > * { min-width: 0; overflow-wrap: anywhere; }
+.usage-delivery-row button { min-height: 44px; }
 .usage-request small { overflow-wrap: anywhere; color: var(--muted); }
 .usage-error { color: #a23b2b; }
 

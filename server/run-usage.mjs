@@ -2,7 +2,7 @@ import { recordDuration, summarizeDurations } from "./usage-statistics.mjs";
 
 const terminalStatuses = new Set(["completed", "failed", "interrupted", "needs_reconciliation", "canceled", "cancelled"]);
 const unresolvedStatuses = new Set(["interrupted", "needs_reconciliation"]);
-const inRange = (run, { from, to, clientId = "" }) => {
+export const runInUsageRange = (run, { from, to, clientId = "" }) => {
   const time = Date.parse(run.executionStartedAt || run.startedAt || "");
   return run.clientId && (!clientId || run.clientId === clientId) && Number.isFinite(time) && time >= from && time < to;
 };
@@ -35,7 +35,7 @@ export function runUsageFromProtocol(value) {
 export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
   const buckets = new Map();
   for (const run of runs) {
-    if (!inRange(run, { from, to, clientId })) continue;
+    if (!runInUsageRange(run, { from, to, clientId })) continue;
     const time = Date.parse(run.executionStartedAt || run.startedAt || "");
     const hour = new Date(time).toISOString().slice(0, 13) + ":00:00Z";
     const key = `${hour}:${run.clientId}`;
@@ -69,7 +69,7 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
 }
 
 export function runUsageDetails(runs, { from, to, clientId = "", limit = 200 }) {
-  return runs.filter(run => inRange(run, { from, to, clientId })).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map((run) => ({
+  return runs.filter(run => runInUsageRange(run, { from, to, clientId })).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map((run) => ({
     id: run.id,
     clientId: run.clientId,
     automationId: run.automationId,
@@ -92,7 +92,7 @@ export function summarizeRunUsage(runs, range) {
   const counts = { tasks: 0, completed: 0, failed: 0, canceled: 0, unresolved: 0, active: 0, unclassified: 0, knownUsage: 0, unknownUsage: 0 };
   const queue = new Map(), execution = new Map(), turns = new Set();
   for (const run of runs) {
-    if (!inRange(run, range)) continue;
+    if (!runInUsageRange(run, range)) continue;
     counts.tasks++;
     if (run.status === "completed") counts.completed++;
     else if (run.status === "failed") counts.failed++;
