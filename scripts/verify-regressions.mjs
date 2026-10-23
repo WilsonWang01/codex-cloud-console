@@ -3353,7 +3353,7 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
   }
 });
 
-await check("atomic installer gates on strict health, prunes, and rolls back", async () => {
+await check("atomic installer gates on strict health, installs locked runtime dependencies, and rolls back", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-deploy-regression-"));
   const sourceRoot = path.join(tempRoot, "source");
   const releaseRoot = path.join(tempRoot, "releases");
@@ -3400,7 +3400,7 @@ exec "$@"
   );
   await fs.writeFile(path.join(binDir, "npm"), `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_NPM_CALLS"
-if [ "$1" = "prune" ] && [ "$FAKE_NPM_FAIL_PRUNE" = "1" ]; then exit 1; fi
+if [ "$1" = "ci" ] && [ "$2" = "--omit=dev" ] && [ "$FAKE_NPM_FAIL_RUNTIME" = "1" ]; then exit 1; fi
 if [ "$1" = "audit" ] && [ "$FAKE_NPM_FAIL_AUDIT" = "1" ]; then exit 1; fi
 exit 0
 `, { mode: 0o755 });
@@ -3480,7 +3480,7 @@ exec /usr/bin/readlink "$@"
     assert.equal(await fs.readFile(path.join(sourceRoot, "source-marker.txt"), "utf8"), "source data remains intact\n");
     assert.deepEqual((await fs.readFile(npmCallsPath, "utf8")).trim().split("\n"), [
       "ci --include=dev", "audit --audit-level=high", "run build", "run codex:schema:check", "run verify:normalizers",
-      "prune --omit=dev --ignore-scripts --package-lock=false", "ls --omit=dev --depth=0",
+      "ci --omit=dev --ignore-scripts --no-audit --no-fund", "ls --omit=dev --depth=0",
     ]);
     for (const folder of ["docs/research", "test-results", "playwright-report"]) {
       await assert.rejects(fs.access(path.join(activeRelease, folder)), { code: "ENOENT" });
@@ -3501,11 +3501,11 @@ exec /usr/bin/readlink "$@"
     assert.equal(await fs.realpath(currentLink), activeRelease);
     assert.equal((await fs.readdir(releaseRoot)).length, 1);
 
-    const pruneFailed = await runCaptured("bash", installerArgs, {
+    const runtimeInstallFailed = await runCaptured("bash", installerArgs, {
       cwd: projectRoot,
-      env: { ...installerEnv, FAKE_HEALTH_MODE: "recover", FAKE_NPM_FAIL_PRUNE: "1" },
+      env: { ...installerEnv, FAKE_HEALTH_MODE: "recover", FAKE_NPM_FAIL_RUNTIME: "1" },
     });
-    assert.notEqual(pruneFailed.code, 0);
+    assert.notEqual(runtimeInstallFailed.code, 0);
     assert.equal(await fs.realpath(currentLink), activeRelease);
     assert.equal((await fs.readdir(releaseRoot)).length, 1);
 

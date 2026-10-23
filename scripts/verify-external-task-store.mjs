@@ -166,15 +166,16 @@ test("queued material capacity is byte-based, atomic, scoped and released only a
   assert.equal(ledger.database.prepare("SELECT execution FROM external_tasks WHERE id='3'").get().execution, "{}");
 }));
 
-test("version-three queued inputs remain intact and accepted material descriptors are immutable", () => fixture(({ store, ledger }) => {
+for (const version of [3, 4]) test(`version-${version} queued inputs remain intact and accepted material descriptors are immutable`, () => fixture(({ store, ledger }) => {
   const inputFiles = [{ index: 1, name: "notes.md", mimeType: "text/markdown", bytes: 5, sha256: "f".repeat(64) }];
   const accepted = options("1");
   accepted.run.inputFiles = inputFiles;
   accepted.execution = { attachments: [{ name: "notes.md", mimeType: "text/markdown", dataBase64: "aGVsbG8=" }] };
   store.accept(accepted);
   const before = ledger.database.prepare("SELECT * FROM external_tasks").all();
-  ledger.database.exec("UPDATE external_tasks_meta SET value=3 WHERE key='schema_version'");
+  ledger.database.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(version);
   const reopened = createExternalTaskStore(ledger.database);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 5);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
   const owned = reopened.claim({ owner: "worker" });
   assert.deepEqual(owned.execution, accepted.execution);

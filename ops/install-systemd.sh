@@ -129,7 +129,7 @@ node "${SOURCE_ROOT}/ops/write-release-manifest.mjs" "$SOURCE_ROOT" "$RELEASE_DI
   npm run build
   npm run codex:schema:check
   npm run verify:normalizers
-  npm prune --omit=dev --ignore-scripts --package-lock=false
+  npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 )
 
 chmod -R u=rwX,go=rX "$RELEASE_DIR"
