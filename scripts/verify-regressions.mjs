@@ -1893,7 +1893,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   await fs.writeFile(unmanagedTemp, "must remain");
   await fs.mkdir(binDir, { recursive: true });
   await fs.writeFile(codexShim, `#!/bin/sh\nexec "${process.execPath}" "${fakePath}"\n`, { mode: 0o755 });
-  const child = spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
+  const start = () => spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
     cwd: projectRoot,
     env: {
       ...process.env,
@@ -1918,6 +1918,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let child = start();
   const baseUrl = `http://127.0.0.1:${port}/`;
   try {
     await waitForOutput(child, /listening on/i);
@@ -3003,6 +3004,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       .update(`sample-hourly:webhook:${interruptedKey}`)
       .digest("hex");
     const automationRunPath = path.join(stateRoot, "automation-runs.json");
+    await stopProcess(child);
     const interruptedStore = JSON.parse(await fs.readFile(automationRunPath, "utf8"));
     interruptedStore.runs.unshift({
       ...progressRun,
@@ -3017,7 +3019,10 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       triggerRequestHash: null,
     });
     await fs.writeFile(automationRunPath, JSON.stringify(interruptedStore), "utf8");
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    child = start();
+    await waitForOutput(child, /listening on/i);
+    const seededRuns = await jsonRequest(baseUrl, "/api/automations/runs?automationId=sample-hourly&verifyLimit=0");
+    assert.ok(seededRuns.data.runs.some(run => run.id === "run-sample-research-interrupted-regression" && run.triggerIdempotencyHash === interruptedHash));
     const retriedInterruptedTrigger = await jsonRequest(baseUrl, "/api/automations/sample-hourly/webhook", {
       method: "POST",
       headers: { ...triggerHeaders, "idempotency-key": interruptedKey },
