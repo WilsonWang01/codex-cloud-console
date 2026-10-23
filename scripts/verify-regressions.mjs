@@ -836,15 +836,25 @@ await check("usage API retains accounting across history pruning and restart; co
     assert.equal(first.data.runBuckets.reduce((sum, row) => sum + row.totalTokens, 0), 54000);
     assert.equal(JSON.stringify(first.data).includes("private accounting fixture"), false);
     assert.equal(first.data.usageLedger.rows, 450);
+    assert.equal(first.data.runs.length, 200);
+    assert.equal(first.data.runSummary.tasks, 450);
+    assert.equal(first.data.runSummary.observedModelTurns, 450);
+    assert.equal(first.data.runSummary.successRate, 1);
+    assert.equal(first.data.runSummary.unknownUsageRate, 0);
+    assert.deepEqual(first.data.runSummary.execution, { samples: 0, p50Ms: null, p95Ms: null });
+    assert.deepEqual(first.data.requestSummary.groups, []);
     await stopProcess(server);
     await fs.writeFile(source, JSON.stringify({ version: 1, runs: runs.slice(0, 200) }));
     server = startServer(); await waitForOutput(server, /listening on/);
     const after = await jsonRequest(base, "/api/clients/usage", { headers });
     assert.equal(after.response.status, 200);
     assert.deepEqual(after.data.runBuckets, first.data.runBuckets);
+    assert.deepEqual(after.data.runSummary, first.data.runSummary);
     const other = await jsonRequest(base, "/api/clients/usage?clientId=other", { headers });
     assert.deepEqual(other.data.runBuckets, []);
     assert.deepEqual(other.data.runs, []);
+    assert.equal(other.data.runSummary.tasks, 0);
+    assert.equal(other.data.runSummary.successRate, null);
     await stopProcess(server);
     for (const suffix of ["", "-wal", "-shm"]) {
       await fs.rename(path.join(stateRoot, `run-usage.sqlite${suffix}`), path.join(stateRoot, `saved.sqlite${suffix}`)).catch((error) => {

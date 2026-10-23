@@ -31,6 +31,8 @@ let pending = [{
 }];
 let decision = null;
 let createdToken = "";
+let createClientFailure = false;
+let createClientCalls = 0;
 let personalLoginFlow = null;
 let includeNewModel = false;
 let selectedRuntime = null;
@@ -253,7 +255,12 @@ await context.route("**/api/**", async (route) => {
   if (url.pathname === "/api/approvals") return send({ ok: true, pending });
   if (url.pathname === "/api/approvals/approval-test/decision") { decision = body; pending = []; return send({ ok: true }); }
   if (url.pathname === "/api/clients") {
-    if (req.method() === "POST") { createdToken = "ccc_test-token-only-once"; return send({ ok: true, token: createdToken, client: { id: "new", name: body.name } }, 201); }
+    if (req.method() === "POST") {
+      createClientCalls++;
+      if (createClientFailure) return send({ ok: false, error: "fixture ambiguous create" }, 502);
+      createdToken = "ccc_test-token-only-once";
+      return send({ ok: true, token: createdToken, client: { id: "new", name: body.name } }, 201);
+    }
     return send({ ok: true, clients: [{ id: "client-a", name: "研究服务", tokenPrefix: "ccc_test", automationIds: [status.automations[0].id], createdAt: new Date().toISOString(), expiresAt: null, revokedAt: null, lastUsedAt: new Date().toISOString() }] });
   }
   if (url.pathname === "/api/clients/usage") {
@@ -263,7 +270,15 @@ await context.route("**/api/**", async (route) => {
     const requests = usageRace && requestedDays > 20 ? 30 : usageRace && requestedDays > 4 ? 7 : 2;
     return send({ ok: true, droppedRequests: 0,
     usageLedger: { seededAt: "2026-10-23T00:00:00Z", retentionDays: 32, timezone: "UTC" },
-    buckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", requests, accepted: 1, errors: 0, replayed: 1, polls: 3, controls: 1 }],
+    buckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", requests, accepted: 1, errors: 0, replayed: 1, polls: 3, controls: 1, discovery: 2 }],
+    requestSummary: { groups: [
+      { kind: "submit", requests, errors: 0, accepted: 1, replayed: 1, duration: { samples: requests, p50Ms: 5, p95Ms: 50 } },
+      { kind: "discovery", requests: 2, errors: 0, duration: { samples: 2, p50Ms: 8, p95Ms: 20 } },
+      { kind: "poll", requests: 3, errors: 1, duration: { samples: 3, p50Ms: 3, p95Ms: 10 } },
+      { kind: "control", requests: 1, errors: 0, duration: { samples: 0, p50Ms: null, p95Ms: null } },
+    ], errorTypes: [{ type: "unavailable_object", count: 1 }] },
+    runSummary: { tasks: 2, completed: 1, failed: 0, unresolved: 1, canceled: 0, active: 0, unclassified: 0, observedModelTurns: 1, successRate: 1, unknownUsageRate: 0.5,
+      queueWait: { samples: 1, p50Ms: 1000, p95Ms: 1000 }, execution: { samples: 1, p50Ms: 2000, p95Ms: 2000 } },
     runBuckets: [{ hour: new Date().toISOString().slice(0, 13) + ":00:00Z", clientId: "client-a", runs: 2, completed: 1, failed: 0, knownRuns: 1, unknownRuns: 1, inputTokens: 100, outputTokens: 20, totalTokens: 120 }],
     requests: [{ id: "request-1", clientId: "client-a", automationId: status.automations[0].id, trigger: "webhook", status: 200, runId: "run-1", deduplicated: false, durationMs: 5, time: new Date().toISOString() }],
     runs: [{ id: "run-1", clientId: "client-a", automationId: status.automations[0].id, status: "completed", startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), model: "gpt-5.6-terra", reasoning: "medium", usage: { status: "complete", inputTokens: 100, outputTokens: 20, totalTokens: 120 } }],
@@ -340,6 +355,17 @@ try {
   assert.equal(new URL(pendingStatusPage.url()).hash, "#/automations/_personal");
   assert.doesNotMatch(await pendingStatusPage.locator("body").innerText(), /sample-app|Sample repository maintenance/);
   await pendingStatusPage.close();
+  const pendingUsagePage = await context.newPage();
+  let releaseUsageStatus;
+  const usageStatusGate = new Promise(resolve => { releaseUsageStatus = resolve; });
+  await pendingUsagePage.route("**/api/status", async route => { await usageStatusGate; await route.fallback().catch(() => null); });
+  await pendingUsagePage.goto(`${baseUrl}#/usage`);
+  await pendingUsagePage.getByText("自动化权限范围尚未加载，请先刷新控制台状态。").waitFor();
+  assert.equal(await pendingUsagePage.locator(".usage-scopes input").count(), 0);
+  assert.equal(await pendingUsagePage.getByRole("button", { name: "创建令牌" }).isEnabled(), false);
+  releaseUsageStatus();
+  await pendingUsagePage.locator(".usage-scopes input").first().waitFor();
+  await pendingUsagePage.close();
   await page.goto(`${baseUrl}#/project/sample-app/thread/sample-app-session`);
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
   await page.getByRole("heading", { name: "今日" }).waitFor();
@@ -494,6 +520,16 @@ try {
   assert.match(await page.locator(".usage-view").innerText(), /此前历史仅覆盖仍保留的记录/);
   assert.match(await page.locator(".usage-view").innerText(), /每日预算按 UTC/);
   assert.match(await page.locator(".usage-summary").innerText(), /结果查询\s*3/);
+  assert.match(await page.locator(".usage-summary").innerText(), /能力查询\s*2/);
+  assert.match(await page.locator(".usage-summary").innerText(), /同键重放\s*1/);
+  assert.match(await page.locator(".usage-summary").innerText(), /调用错误\s*1/);
+  assert.match(await page.locator(".usage-quality").first().innerText(), /任务成功率\s*100%/);
+  assert.match(await page.locator(".usage-quality").first().innerText(), /未知用量占比\s*50%/);
+  assert.match(await page.locator(".usage-metrics-table").innerText(), /后台处理\s*2 秒\s*2 秒\s*1/);
+  assert.match(await page.locator(".usage-metrics-table").innerText(), /取消请求\s*--\s*--\s*0/);
+  await page.getByRole("group", { name: "曲线指标" }).getByRole("button", { name: "能力", exact: true }).click();
+  await page.getByRole("img", { name: "能力 趋势" }).waitFor();
+  assert.ok(await page.locator('.usage-chart-column[title$=": 2"]').count());
   await page.locator(".usage-request summary").first().click();
   assert.match(await page.locator(".usage-request-expanded").innerText(), /Token 120/);
   await page.getByRole("group", { name: "曲线指标" }).getByRole("button", { name: "查询" }).click();
@@ -503,8 +539,17 @@ try {
   assert.match(await page.locator(".usage-chart-data table").innerText(), /查询[\s\S]*3/);
   await page.getByRole("textbox", { name: "调用方名称" }).fill("第二个服务");
   await page.locator(".usage-scopes input[type='checkbox']").first().check();
+  createClientFailure = true;
+  await page.getByRole("button", { name: "创建令牌" }).click();
+  await page.getByText(/创建结果未确认，请先刷新调用方列表核对/).waitFor();
+  assert.equal(createClientCalls, 1);
+  createClientFailure = false;
+  await page.getByRole("button", { name: "刷新用量" }).click();
+  await page.waitForFunction(() => !document.querySelector(".usage-error"));
   await page.getByRole("button", { name: "创建令牌" }).click();
   await page.getByText(createdToken).waitFor();
+  assert.equal(createClientCalls, 2);
+  assert.equal(await page.getByRole("button", { name: "创建令牌" }).isEnabled(), false);
   await page.getByRole("group", { name: "时间范围" }).getByRole("button", { name: "24 小时" }).click();
   await page.waitForFunction(() => document.querySelector(".usage-summary > div:first-child strong")?.textContent === "2");
   usageRace = true;

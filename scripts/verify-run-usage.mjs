@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "../server/run-usage.mjs";
+import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol, summarizeRunUsage } from "../server/run-usage.mjs";
 
 test("last-turn usage does not add cache or reasoning subfields twice", () => {
   const usage = runUsageFromProtocol({
@@ -61,4 +61,35 @@ test("request drilldown returns scoped per-run usage without prompt content", ()
   assert.equal(rows.length, 1);
   assert.equal(rows[0].usage.totalTokens, 120);
   assert.equal("prompt" in rows[0], false);
+});
+
+test("task quality separates uncertain outcomes and computes percentiles from valid timings only", () => {
+  const range = { from: Date.parse("2026-09-26T00:00:00Z"), to: Date.parse("2026-09-27T00:00:00Z"), clientId: "a" };
+  const base = { clientId: "a", startedAt: "2026-09-26T06:00:00Z", executionStartedAt: "2026-09-26T06:00:01Z", finishedAt: "2026-09-26T06:00:03Z" };
+  const rows = [
+    { ...base, id: "complete", status: "completed", threadId: "thread", turnId: "turn", usage: runUsageFromProtocol({ last: { inputTokens: 10, outputTokens: 2 } }) },
+    { ...base, id: "failed", status: "failed", threadId: "thread", turnId: "turn", finishedAt: "2026-09-26T06:00:11Z" },
+    { ...base, id: "canceled", status: "canceled", executionStartedAt: null },
+    { ...base, id: "interrupted", status: "interrupted", finishedAt: "2026-09-26T23:00:00Z" },
+    { ...base, id: "reconcile", status: "needs_reconciliation", finishedAt: "2026-09-26T23:00:00Z" },
+    { ...base, id: "running", status: "running" },
+    { ...base, id: "queued", status: "queued", executionStartedAt: null },
+    { ...base, id: "future-status", status: "new-status", executionStartedAt: "2026-09-26T05:59:59Z" },
+    { ...base, id: "other", status: "completed", clientId: "b" },
+    { ...base, id: "outside", status: "completed", executionStartedAt: "2026-09-27T00:00:00Z" },
+  ];
+  const summary = summarizeRunUsage(rows, range);
+  assert.deepEqual(summary, { tasks: 8, completed: 1, failed: 1, canceled: 1, unresolved: 2, active: 2, unclassified: 1,
+    knownUsage: 1, unknownUsage: 4, observedModelTurns: 1, successRate: 0.5, unknownUsageRate: 0.8,
+    queueWait: { samples: 5, p50Ms: 1000, p95Ms: 1000 }, execution: { samples: 2, p50Ms: 2000, p95Ms: 10000 },
+    attribution: "execution_start_else_acceptance", successRateBasis: "completed_and_failed_only" });
+  const bucket = aggregateRunUsage(rows, range).find(bucket => bucket.hour === "2026-09-26T06:00:00Z");
+  assert.equal(bucket.failed, 1);
+  assert.equal(bucket.unresolved, 2);
+  assert.equal(bucket.canceled, 1);
+  assert.equal(bucket.unknownRuns, 4);
+  const empty = summarizeRunUsage([], range);
+  assert.equal(empty.successRate, null);
+  assert.equal(empty.unknownUsageRate, null);
+  assert.deepEqual(empty.execution, { samples: 0, p50Ms: null, p95Ms: null });
 });

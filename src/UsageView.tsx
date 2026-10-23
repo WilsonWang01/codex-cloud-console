@@ -3,12 +3,21 @@ import { Activity, Copy, Download, Plus, RefreshCw, ShieldCheck, Trash2 } from "
 import type { Automation } from "./types";
 
 type Client = { id: string; name: string; tokenPrefix: string; automationIds: string[]; createdAt: string; expiresAt: string | null; revokedAt: string | null; lastUsedAt: string | null };
-type RequestBucket = { hour: string; clientId: string; requests: number; accepted: number; errors: number; replayed: number; polls?: number; pollErrors?: number; controls?: number };
+type RequestBucket = { hour: string; clientId: string; requests: number; accepted: number; errors: number; replayed: number; polls?: number; pollErrors?: number; controls?: number; discovery?: number };
 type RunBucket = { hour: string; clientId: string; runs: number; completed: number; failed: number; knownRuns: number; unknownRuns: number; inputTokens: number; outputTokens: number; totalTokens: number };
-type RequestRow = { id: string; clientId: string; automationId: string; trigger: string; status: number; runId: string | null; deduplicated: boolean; durationMs: number; time: string };
+type RequestRow = { id: string; clientId: string; automationId: string; trigger: string; status: number; runId: string | null; deduplicated: boolean; durationMs: number | null; time: string };
 type RunRow = { id: string; clientId: string; automationId: string; status: string; startedAt: string; finishedAt: string | null; model: string | null; reasoning: string | null; usage: { status: "complete" | "unknown"; inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number | null } };
-type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; runs?: RunRow[]; droppedRequests: number; usageLedger?: { seededAt: string | null; retentionDays: number; timezone: string } };
+type Duration = { samples: number; p50Ms: number | null; p95Ms: number | null };
+type RequestSummary = { groups: { kind: string; requests: number; errors: number; accepted: number; replayed: number; duration: Duration }[]; errorTypes: { type: string; count: number }[] };
+type RunSummary = { tasks: number; completed: number; failed: number; canceled: number; unresolved: number; active: number; unclassified: number; observedModelTurns: number; successRate: number | null; unknownUsageRate: number | null; queueWait: Duration; execution: Duration };
+type Usage = { buckets: RequestBucket[]; runBuckets: RunBucket[]; requests: RequestRow[]; runs?: RunRow[]; droppedRequests: number; missingMetricFiles?: number; requestSummary?: RequestSummary; runSummary?: RunSummary; usageLedger?: { seededAt: string | null; retentionDays: number; timezone: string } };
 const emptyUsage: Usage = { buckets: [], runBuckets: [], requests: [], runs: [], droppedRequests: 0 };
+const requestLabels: Record<string, string> = { submit: "提交请求", discovery: "能力查询", poll: "结果查询", control: "取消请求" };
+const errorLabels: Record<string, string> = { authorization: "权限拒绝", rate_limited: "频率受限", wait_ended: "等待超时或断开", conflict: "状态冲突", unavailable_object: "对象不可用", input_rejected: "输入拒绝", service_error: "服务错误" };
+const runLabels: Record<string, string> = { completed: "已完成", failed: "明确失败", canceled: "已取消", cancelled: "已取消", interrupted: "中断待核对", needs_reconciliation: "待核对", queued: "排队中", running: "处理中", canceling: "取消中" };
+const triggerLabels: Record<string, string> = { discovery: "能力查询", result: "结果查询", cancel: "取消请求", webhook: "新任务", heartbeat: "续接任务", "chat-completions": "OpenAI 对话", responses: "OpenAI Responses", messages: "Anthropic 消息", "image-generations": "图片生成" };
+const durationText = (value: number | null | undefined) => value == null ? "--" : value < 1000 ? `${value.toLocaleString()} ms` : `${(value / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} 秒`;
+const rateText = (value: number | null | undefined) => value == null ? "--" : `${(value * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
 
 function localDay(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
@@ -20,19 +29,12 @@ function queryStart(rangeDays: number) {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate() - rangeDays + 1).toISOString();
 }
 
-async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, { cache: "no-store", ...options });
-  const data = await response.json() as T & { error?: string };
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
-}
-
-export default function UsageView({ automations, onOpenRun }: { automations: Automation[]; onOpenRun?: (automationId: string, runId: string) => void }) {
+export default function UsageView({ automations, automationsReady, apiRequest: request, onOpenRun }: { automations: Automation[]; automationsReady: boolean; apiRequest: <T>(url: string, options?: RequestInit) => Promise<T>; onOpenRun?: (automationId: string, runId: string) => void }) {
   const [clients, setClients] = useState<Client[]>([]);
   const [usage, setUsage] = useState<Usage>(emptyUsage);
   const [rangeDays, setRangeDays] = useState(7);
   const [clientId, setClientId] = useState("");
-  const [chartMode, setChartMode] = useState<"requests" | "polls" | "tokens">("requests");
+  const [chartMode, setChartMode] = useState<"requests" | "discovery" | "polls" | "tokens">("requests");
   const [newName, setNewName] = useState("");
   const [newScopes, setNewScopes] = useState<string[]>([]);
   const [createdToken, setCreatedToken] = useState("");
@@ -45,6 +47,11 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
   const filterKey = `${rangeDays}:${clientId}`;
   const visibleUsage = loadedFilter === filterKey ? usage : emptyUsage;
   const hasCurrentData = loadedFilter === filterKey;
+  const availableAutomations = useMemo(() => automationsReady ? automations : [], [automations, automationsReady]);
+
+  useEffect(() => {
+    setNewScopes(current => current.filter(id => availableAutomations.some(automation => automation.id === id)));
+  }, [availableAutomations]);
 
   const refresh = useCallback(async () => {
     requestRef.current?.controller.abort();
@@ -69,7 +76,7 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
     } finally {
       if (requestRef.current?.id === id && !controller.signal.aborted) setLoading(false);
     }
-  }, [clientId, rangeDays]);
+  }, [clientId, rangeDays, request]);
 
   useEffect(() => {
     void refresh();
@@ -77,8 +84,9 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
   }, [refresh]);
 
   const createClient = async () => {
-    if (busy) return;
+    if (busy || !automationsReady || createdToken || !newName.trim() || !newScopes.length) return;
     setBusy(true);
+    setError("");
     try {
       const result = await request<{ token: string }>("/api/clients", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -88,7 +96,12 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
       setNewName("");
       setNewScopes([]);
       await refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "创建失败"); }
+    } catch (cause) {
+      const status = (cause as { status?: number })?.status;
+      setError(status && status >= 400 && status < 500 && ![408, 499].includes(status)
+        ? cause instanceof Error ? cause.message : "创建被拒绝"
+        : "创建结果未确认，请先刷新调用方列表核对；如发现多余令牌，请手动撤销，不要直接重复创建。");
+    }
     finally { setBusy(false); }
   };
 
@@ -103,18 +116,19 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
   };
 
   const chart = useMemo(() => {
-    const values = new Map<string, { requests: number; polls: number; tokens: number }>();
+    const values = new Map<string, { requests: number; discovery: number; polls: number; tokens: number }>();
     const keyFor = (hour: string) => rangeDays === 1 ? hour : localDay(new Date(hour));
     for (const row of visibleUsage.buckets) {
       const key = keyFor(row.hour);
-      const value = values.get(key) || { requests: 0, polls: 0, tokens: 0 };
+      const value = values.get(key) || { requests: 0, discovery: 0, polls: 0, tokens: 0 };
       value.requests += row.requests;
+      value.discovery += row.discovery || 0;
       value.polls += row.polls || 0;
       values.set(key, value);
     }
     for (const row of visibleUsage.runBuckets) {
       const key = keyFor(row.hour);
-      const value = values.get(key) || { requests: 0, polls: 0, tokens: 0 };
+      const value = values.get(key) || { requests: 0, discovery: 0, polls: 0, tokens: 0 };
       value.tokens += row.totalTokens;
       values.set(key, value);
     }
@@ -129,7 +143,7 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
         key,
         label: rangeDays === 1 ? date.toLocaleTimeString("zh-CN", { hour: "2-digit", hour12: false }) : key.slice(5),
         fullLabel: rangeDays === 1 ? date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", hour12: false, timeZoneName: "short" }) : key,
-        ...(values.get(key) || { requests: 0, polls: 0, tokens: 0 }),
+        ...(values.get(key) || { requests: 0, discovery: 0, polls: 0, tokens: 0 }),
       };
     });
   }, [rangeDays, visibleUsage.buckets, visibleUsage.runBuckets]);
@@ -137,13 +151,16 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
   const peak = Math.max(1, ...chart.map((point) => point[chartMode]));
   const totalRequests = visibleUsage.buckets.reduce((sum, row) => sum + row.requests, 0);
   const accepted = visibleUsage.buckets.reduce((sum, row) => sum + row.accepted, 0);
-  const errors = visibleUsage.buckets.reduce((sum, row) => sum + row.errors, 0);
+  const errors = visibleUsage.requestSummary?.groups.reduce((sum, row) => sum + row.errors, 0);
+  const replayed = visibleUsage.buckets.reduce((sum, row) => sum + row.replayed, 0);
+  const discovery = visibleUsage.requestSummary ? visibleUsage.buckets.reduce((sum, row) => sum + (row.discovery || 0), 0) : undefined;
   const polls = visibleUsage.buckets.reduce((sum, row) => sum + (row.polls || 0), 0);
   const controls = visibleUsage.buckets.reduce((sum, row) => sum + (row.controls || 0), 0);
   const totalTokens = visibleUsage.runBuckets.reduce((sum, row) => sum + row.totalTokens, 0);
   const knownRuns = visibleUsage.runBuckets.reduce((sum, row) => sum + row.knownRuns, 0);
   const unknownRuns = visibleUsage.runBuckets.reduce((sum, row) => sum + row.unknownRuns, 0);
-  const metric = (value: number) => hasCurrentData ? value.toLocaleString() : "--";
+  const metric = (value: number | undefined) => hasCurrentData && value != null ? value.toLocaleString() : "--";
+  const runSummary = visibleUsage.runSummary;
   const runsById = new Map((visibleUsage.runs || []).map((run) => [run.id, run]));
 
   const exportUsage = () => {
@@ -178,30 +195,49 @@ export default function UsageView({ automations, onOpenRun }: { automations: Aut
         </select>
       </div>
       <div className="usage-summary" aria-label="用量摘要">
-        <div><span>请求</span><strong>{metric(totalRequests)}</strong></div>
-        <div><span>接受任务</span><strong>{metric(accepted)}</strong></div>
-        <div><span>请求错误</span><strong>{metric(errors)}</strong></div>
+        <div><span>提交请求</span><strong>{metric(totalRequests)}</strong></div>
+        <div><span>受理任务</span><strong>{metric(accepted)}</strong></div>
+        <div><span>同键重放</span><strong>{metric(replayed)}</strong></div>
+        <div><span>能力查询</span><strong>{metric(discovery)}</strong></div>
         <div><span>结果查询</span><strong>{metric(polls)}</strong></div>
         <div><span>取消请求</span><strong>{metric(controls)}</strong></div>
+        <div><span>调用错误</span><strong>{metric(errors)}</strong></div>
         <div><span>已知 token</span><strong>{metric(totalTokens)}</strong>{hasCurrentData && <small>{unknownRuns ? `${unknownRuns} 次运行用量未知` : `${knownRuns} 次运行已计量`}</small>}</div>
       </div>
+      <p className="usage-note">仅统计已记录的已认证调用，部分限流拒绝未记录，不是完整网关流量或账单。调用错误含流式错误；等待超时或断开不等于后台任务失败。</p>
       <section className="usage-section" aria-label="调用曲线">
-        <div className="usage-section-head"><h2>趋势</h2><div className="usage-segmented" role="group" aria-label="曲线指标"><button type="button" className={chartMode === "requests" ? "selected" : ""} onClick={() => setChartMode("requests")}>请求</button><button type="button" className={chartMode === "polls" ? "selected" : ""} onClick={() => setChartMode("polls")}>查询</button><button type="button" className={chartMode === "tokens" ? "selected" : ""} onClick={() => setChartMode("tokens")}>Token</button></div></div>
-        {hasCurrentData ? <div className="usage-chart" role="img" aria-label={`${chartMode === "requests" ? "请求" : chartMode === "polls" ? "查询" : "Token"} 趋势`}>{chart.map((point) => <div className="usage-chart-column" key={point.key} title={`${point.fullLabel}: ${point[chartMode].toLocaleString()}`}><div className="usage-chart-bar" style={{ height: `${Math.max(point[chartMode] ? 5 : 1, point[chartMode] / peak * 100)}%` }} /><small>{point.label}</small></div>)}</div> : <p className="usage-empty">{loading ? "正在加载趋势…" : "所选范围暂时无法显示趋势。"}</p>}
-        {hasCurrentData && <details className="usage-chart-data"><summary>查看分时数据</summary><div><table><thead><tr><th scope="col">时间</th><th scope="col">请求</th><th scope="col">查询</th><th scope="col">Token</th></tr></thead><tbody>{chart.map((point) => <tr key={point.key}><th scope="row">{point.fullLabel}</th><td>{point.requests.toLocaleString()}</td><td>{point.polls.toLocaleString()}</td><td>{point.tokens.toLocaleString()}</td></tr>)}</tbody></table></div></details>}
+        <div className="usage-section-head"><h2>趋势</h2><div className="usage-segmented" role="group" aria-label="曲线指标">{([['requests', '提交'], ['discovery', '能力'], ['polls', '查询'], ['tokens', 'Token']] as const).map(([mode, label]) => <button type="button" key={mode} className={chartMode === mode ? "selected" : ""} disabled={mode === "discovery" && !visibleUsage.requestSummary} onClick={() => setChartMode(mode)}>{label}</button>)}</div></div>
+        {hasCurrentData && (chartMode !== "discovery" || visibleUsage.requestSummary) ? <div className="usage-chart" role="img" aria-label={`${chartMode === "requests" ? "提交" : chartMode === "discovery" ? "能力" : chartMode === "polls" ? "查询" : "Token"} 趋势`}>{chart.map((point) => <div className="usage-chart-column" key={point.key} title={`${point.fullLabel}: ${point[chartMode].toLocaleString()}`}><div className="usage-chart-bar" style={{ height: `${Math.max(point[chartMode] ? 5 : 1, point[chartMode] / peak * 100)}%` }} /><small>{point.label}</small></div>)}</div> : <p className="usage-empty">{loading ? "正在加载趋势…" : "所选范围暂时无法显示趋势。"}</p>}
+        {hasCurrentData && <details className="usage-chart-data"><summary>查看分时数据</summary><div><table><thead><tr><th scope="col">时间</th><th scope="col">提交</th><th scope="col">能力</th><th scope="col">查询</th><th scope="col">Token</th></tr></thead><tbody>{chart.map((point) => <tr key={point.key}><th scope="row">{point.fullLabel}</th><td>{point.requests.toLocaleString()}</td><td>{visibleUsage.requestSummary ? point.discovery.toLocaleString() : "--"}</td><td>{point.polls.toLocaleString()}</td><td>{point.tokens.toLocaleString()}</td></tr>)}</tbody></table></div></details>}
         {visibleUsage.droppedRequests > 0 && <p className="usage-note">有 {visibleUsage.droppedRequests} 条损坏的请求明细未计入，曲线可能不完整。</p>}
+        {!!visibleUsage.missingMetricFiles && <p className="usage-note">读取期间有 {visibleUsage.missingMetricFiles} 个指标文件已移除，统计可能不完整。</p>}
         {unknownRuns > 0 && <p className="usage-note">Token 仅统计 {knownRuns} 次有完整单轮快照的运行；未知用量未计入，不代表零消耗。</p>}
+      </section>
+      <section className="usage-section" aria-label="任务质量与耗时">
+        <div className="usage-section-head"><h2>任务质量与耗时</h2></div>
+        {runSummary ? <><dl className="usage-quality">{[
+          ["任务记录", metric(runSummary.tasks)], ["已观测模型回合", metric(runSummary.observedModelTurns)],
+          ["任务成功率", rateText(runSummary.successRate)], ["未知用量占比", rateText(runSummary.unknownUsageRate)],
+          ["已完成", metric(runSummary.completed)], ["明确失败", metric(runSummary.failed)], ["已取消", metric(runSummary.canceled)],
+          ["待核对", metric(runSummary.unresolved)], ["处理中或排队", metric(runSummary.active)], ["未分类", metric(runSummary.unclassified)],
+        ].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl><p className="usage-note">成功率仅按已完成与明确失败计算；未知用量占比仅含终态任务。模型回合只统计已取得会话和回合标识的记录，不代表完整计费次数。</p></> : <p className="usage-empty">{loading ? "正在加载任务统计…" : "服务器未提供任务汇总。"}</p>}
+        <div className="usage-metrics-table"><table><thead><tr><th scope="col">耗时范围</th><th scope="col">P50</th><th scope="col">P95</th><th scope="col">样本</th></tr></thead><tbody>{[
+          { label: "任务排队", duration: runSummary?.queueWait }, { label: "后台处理", duration: runSummary?.execution },
+          ...["submit", "discovery", "poll", "control"].map(kind => ({ label: requestLabels[kind], duration: visibleUsage.requestSummary ? visibleUsage.requestSummary.groups.find(group => group.kind === kind)?.duration || { samples: 0, p50Ms: null, p95Ms: null } : undefined })),
+        ].map(row => <tr key={row.label}><th scope="row">{row.label}</th><td>{durationText(row.duration?.p50Ms)}</td><td>{durationText(row.duration?.p95Ms)}</td><td>{row.duration?.samples.toLocaleString() ?? "--"}</td></tr>)}</tbody></table></div>
+        <p className="usage-note">P50 为中位数，P95 表示 95% 样本不超过该耗时；无样本显示 --。后台处理包含准备及收尾，不等同于模型推理时间；中断待核对的结束时间不参与耗时统计。</p>
+        {!!visibleUsage.requestSummary?.errorTypes.length && <dl className="usage-quality usage-error-types">{visibleUsage.requestSummary.errorTypes.map(row => <div key={row.type}><dt>{errorLabels[row.type] || "其他调用错误"}</dt><dd>{row.count.toLocaleString()}</dd></div>)}</dl>}
       </section>
       <section className="usage-section" aria-label="调用方">
         <div className="usage-section-head"><h2>调用方</h2><ShieldCheck size={18} /></div>
-        <div className="usage-client-list">{clients.map((client) => <div className="usage-client" key={client.id}><div><strong>{client.name}</strong><span>{client.revokedAt ? "已撤销" : "启用"} · {client.tokenPrefix}… · {client.automationIds.join("、")}</span><small>最近调用 {client.lastUsedAt ? new Date(client.lastUsedAt).toLocaleString() : "无"}</small></div>{!client.revokedAt && <button type="button" className="icon-button" title="撤销令牌" aria-label={`撤销 ${client.name}`} disabled={busy} onClick={() => void revokeClient(client)}><Trash2 size={17} /></button>}</div>)}</div>
-        {!clients.length && <p className="usage-empty">尚无独立调用方。旧共享令牌仍可按现有配置使用。</p>}
-        <div className="usage-create"><input aria-label="调用方名称" placeholder="服务名称" value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={80} /><div className="usage-scopes">{automations.map((automation) => <label key={automation.id}><input type="checkbox" checked={newScopes.includes(automation.id)} onChange={(event) => setNewScopes((current) => event.target.checked ? [...current, automation.id] : current.filter((id) => id !== automation.id))} />{automation.name}</label>)}</div><button type="button" disabled={busy || !newName.trim() || !newScopes.length} onClick={() => void createClient()}><Plus size={16} />创建令牌</button></div>
+        <div className="usage-client-list">{clients.map((client) => <div className="usage-client" key={client.id}><div><strong>{client.name}</strong><span>{client.revokedAt ? "已撤销" : client.expiresAt && Date.parse(client.expiresAt) <= Date.now() ? "已到期" : "启用"} · {client.tokenPrefix}… · {client.automationIds.join("、")}</span><small>最近调用 {client.lastUsedAt ? new Date(client.lastUsedAt).toLocaleString() : "无"}{client.expiresAt ? ` · 有效至 ${new Date(client.expiresAt).toLocaleString()}` : ""}</small></div>{!client.revokedAt && <button type="button" className="icon-button" title="撤销令牌" aria-label={`撤销 ${client.name}`} disabled={busy} onClick={() => void revokeClient(client)}><Trash2 size={17} /></button>}</div>)}</div>
+        {!clients.length && loadedAt && <p className="usage-empty">尚无独立调用方。旧共享令牌仍可按现有配置使用。</p>}
+        <div className="usage-create"><input aria-label="调用方名称" placeholder="服务名称" value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={80} /><div className="usage-scopes">{!automationsReady ? <p className="usage-note" role="status">自动化权限范围尚未加载，请先刷新控制台状态。</p> : !availableAutomations.length ? <p className="usage-note">暂无可授权的自动化。</p> : availableAutomations.map((automation) => <label key={automation.id}><input type="checkbox" disabled={busy} checked={newScopes.includes(automation.id)} onChange={(event) => setNewScopes((current) => event.target.checked ? [...current, automation.id] : current.filter((id) => id !== automation.id))} />{automation.name}</label>)}</div><button type="button" disabled={busy || !automationsReady || !!createdToken || !newName.trim() || !newScopes.length} onClick={() => void createClient()}><Plus size={16} />创建令牌</button></div>
         {createdToken && <div className="usage-token" role="status"><strong>新令牌仅显示一次</strong><code>{createdToken}</code><button type="button" onClick={() => void navigator.clipboard.writeText(createdToken)} aria-label="复制新令牌"><Copy size={16} /></button><button type="button" onClick={() => setCreatedToken("")}>关闭</button></div>}
       </section>
       <section className="usage-section" aria-label="请求明细"><div className="usage-section-head"><h2>最近请求</h2><Activity size={18} /></div><div className="usage-requests">{visibleUsage.requests.map((row) => {
         const run = row.runId ? runsById.get(row.runId) : null;
-        return <details className="usage-request" key={row.id}><summary><time>{new Date(row.time).toLocaleString()}</time><strong>{clients.find((client) => client.id === row.clientId)?.name || (row.clientId === "legacy-shared" ? "旧共享令牌" : row.clientId)}</strong><span>{row.automationId} · {row.trigger === "result" ? "结果查询" : row.trigger === "cancel" ? "取消" : row.trigger}</span><span>{row.status}{row.deduplicated ? " · 重放" : ""}</span><small>{row.runId || "未接受任务"}</small></summary><div className="usage-request-expanded"><span>请求 ID <code>{row.id}</code></span><span>耗时 {row.durationMs} ms</span>{run ? <><span>任务 {run.status} · {run.model || "模型未知"} / {run.reasoning || "推理未知"}</span><span>Token {run.usage.status === "complete" ? `${run.usage.totalTokens}（输入 ${run.usage.inputTokens}，输出 ${run.usage.outputTokens}）` : "未知，未计为零"}</span>{onOpenRun && <button type="button" className="mini-action" onClick={() => onOpenRun(run.automationId, run.id)}>打开任务</button>}</> : row.runId ? <span>任务明细超出当前保留范围</span> : <span>本次请求未接受任务</span>}</div></details>;
+        return <details className="usage-request" key={row.id}><summary><time>{new Date(row.time).toLocaleString()}</time><strong>{clients.find((client) => client.id === row.clientId)?.name || (row.clientId === "legacy-shared" ? "旧共享令牌" : row.clientId)}</strong><span>{row.automationId} · {triggerLabels[row.trigger] || row.trigger}</span><span>{row.status}{row.deduplicated ? " · 重放" : ""}</span><small>{row.runId || "无关联任务"}</small></summary><div className="usage-request-expanded"><span>请求 ID <code>{row.id}</code></span><span>耗时 {durationText(row.durationMs)}</span>{run ? <><span>任务 {runLabels[run.status] || "状态未知"} · {run.model || "模型未知"} / {run.reasoning || "推理未知"}</span><span>Token {run.usage.status === "complete" ? `${run.usage.totalTokens}（输入 ${run.usage.inputTokens}，输出 ${run.usage.outputTokens}）` : "未知，未计为零"}</span>{onOpenRun && <button type="button" className="mini-action" onClick={() => onOpenRun(run.automationId, run.id)}>打开任务</button>}</> : row.runId ? <span>任务明细超出当前保留范围</span> : <span>本次请求没有关联任务记录</span>}</div></details>;
       })}</div>{hasCurrentData && !visibleUsage.requests.length && <p className="usage-empty">所选范围暂无请求。</p>}</section>
     </div>
   );

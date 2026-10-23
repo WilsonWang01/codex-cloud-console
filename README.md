@@ -163,6 +163,8 @@ Codex 请求执行命令、改文件、扩大权限或补充信息时，页面�
 
 “调用与用量”可按服务查看触发、结果轮询、运行与已知 token 趋势，下钻请求对应的任务/模型/用量，并导出不含令牌和输入正文的 JSON。曲线按浏览器本地时区显示，加载、未知用量和失败分别标示。可以创建范围限定到自动化的独立令牌，或撤销旧令牌。独立调用方可用触发响应中的 `resultPath` 查询自己的结果、按事件游标跟踪近期进展或请求取消；新令牌只显示一次，请求记录默认保留约 30 天。缺失完整单轮用量的运行标为“未知”，token 数不是美元账单。接入步骤见[独立调用方](docs/setup.md#独立调用方)，[第二轮验收与 review](docs/acceptance/2026-09-26-personal-second-iteration.md)列出当前边界。
 
+新版区分提交、受理和同键重放，补充能力查询、任务成功率、未知用量占比及带样本数的 P50/P95 耗时。等待超时不直接判为任务失败；指标只覆盖已记录的已认证调用。具体口径和兼容边界见[调用与用量](docs/api-usage.md)。
+
 作为业务后端使用时，先用受限令牌查询 `/api/automations/:id/v1/models` 和 `capabilities`，了解模型目录、默认设置与真实协议边界，再提交已审核的任务。提供 Node/Python 参考客户端及 [OpenAPI 契约](docs/openapi.json)，支持稳定事件键、有限重试、超时后查询、显式取消、[txt/md/PDF/图片内联材料](docs/file-inputs.md)、[受限 JSON Schema](docs/structured-output.md)及[私有报告/图片文件交付](docs/artifact-delivery.md)；CLI 可用 `--attach` 读取明确指定的文件，下载校验内容哈希，不跟随重定向转发令牌。接入方法见[后端服务集成](docs/backend-integration.md)。另支持 [OpenAI Chat / Responses / Images、Anthropic Messages 协议子集](docs/model-api-adapters.md)，可用官方 SDK 提交图文、受限文本和 PDF 文件，获取文本与生成图片结果；图片生成仍取决于原生工具及账号权限。暂不支持音视频、密码/交互表单 PDF、客户端工具和通用 Files API，也无法原生保证 `max_tokens` 预算。文件交付仅覆盖支持该能力版本接收的新任务，有大小和有效期限制；它不是完整模型 API 或不可信多租户沙箱。
 
 已登记的独立调用方可使用[签名完成回调](docs/callbacks.md)，不必一直轮询。服务器操作者先确认并登记 HTTPS 接收地址；通知有稳定事件 ID、有限重试和查询兜底，不传任务正文或访问令牌。默认不启用，也不能在请求中指定任意回调地址。

@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
+import { recordDuration, summarizeDurations, requestErrorType } from "./usage-statistics.mjs";
 
 const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const safeClient = ({ tokenHash, ...client }) => client;
@@ -44,25 +47,84 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
     }
     prunedDay = today;
   };
-  const requestRows = async ({ from, to }) => {
+  const requestRows = async ({ from, to, clientId, signal }) => {
     await requestQueue;
-    const rows = [];
+    signal?.throwIfAborted();
+    let recent = [];
+    let ordinal = 0;
     let droppedRequests = 0;
+    let missingMetricFiles = 0;
+    const buckets = new Map(), groups = new Map(), errorTypes = new Map();
+    const trimRecent = () => { recent.sort((a, b) => b.row.time.localeCompare(a.row.time) || b.ordinal - a.ordinal); recent.length = Math.min(500, recent.length); };
     for (const name of await metricFiles()) {
+      signal?.throwIfAborted();
       const day = Date.parse(name.slice(0, 10) + "T00:00:00Z");
       if (day + 86_400_000 <= from || day >= to) continue;
-      const contents = await fs.readFile(path.join(metricsRoot, name), "utf8");
-      for (const line of contents.split("\n")) {
-        if (!line) continue;
-        try {
-          const row = JSON.parse(line);
-          const time = Date.parse(row.time);
-          if (Number.isFinite(time) && time >= from && time < to) rows.push(row);
-        } catch { droppedRequests += 1; }
-      }
+      let handle;
+      try { handle = await fs.open(path.join(metricsRoot, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+      catch (error) { if (error.code === "ENOENT") { missingMetricFiles++; continue; } throw error; }
+      try {
+        if (!(await handle.stat()).isFile()) throw new Error("请求指标必须是普通文件");
+        signal?.throwIfAborted();
+      } catch (error) { await handle.close(); throw error; }
+      const stream = handle.createReadStream({ autoClose: false });
+      const lines = createInterface({ input: stream, crlfDelay: Infinity });
+      let readError = null;
+      const failedRead = error => { readError = error; lines.close(); };
+      const aborted = () => stream.destroy(signal.reason);
+      stream.on("error", failedRead);
+      signal?.addEventListener("abort", aborted, { once: true });
+      try {
+        if (signal?.aborted) aborted();
+        for await (const line of lines) {
+          signal?.throwIfAborted();
+          if (!line) continue;
+          let row, time;
+          try {
+            row = JSON.parse(line);
+            time = typeof row?.time === "string" ? Date.parse(row.time) : NaN;
+            if (!Number.isFinite(time) || typeof row.clientId !== "string" || !row.clientId || typeof row.trigger !== "string" || !row.trigger ||
+                !Number.isInteger(row.status) || row.status < 100 || row.status > 599 || typeof row.id !== "string" || typeof row.automationId !== "string" ||
+                row.runId != null && typeof row.runId !== "string" || row.deduplicated != null && typeof row.deduplicated !== "boolean") throw new Error("Invalid metric row");
+          } catch { droppedRequests++; continue; }
+          if (time < from || time >= to || clientId && row.clientId !== clientId) continue;
+          row = { id: row.id, clientId: row.clientId, automationId: row.automationId, trigger: row.trigger, status: row.status,
+            runId: row.runId || null, deduplicated: row.deduplicated === true, time: new Date(time).toISOString(),
+            durationMs: Number.isSafeInteger(row.durationMs) && row.durationMs >= 0 ? row.durationMs : null };
+          recent.push({ row, ordinal: ordinal++ });
+          if (recent.length >= 1000) trimRecent();
+          const hour = row.time.slice(0, 13) + ":00:00Z", key = `${hour}:${row.clientId}`;
+          const bucket = buckets.get(key) || { hour, clientId: row.clientId, requests: 0, accepted: 0, errors: 0, replayed: 0, polls: 0, pollErrors: 0, controls: 0, discovery: 0 };
+          const kind = row.trigger === "discovery" ? "discovery" : row.trigger === "cancel" ? "control" : row.trigger === "result" ? "poll" : "submit";
+          const group = groups.get(kind) || { kind, requests: 0, errors: 0, accepted: 0, replayed: 0, durations: new Map() };
+          group.requests++;
+          recordDuration(group.durations, row.durationMs);
+          if (row.status >= 400) {
+            group.errors++;
+            const type = requestErrorType(row.status);
+            errorTypes.set(type, (errorTypes.get(type) || 0) + 1);
+          }
+          if (kind === "discovery") bucket.discovery++;
+          else if (kind === "control") bucket.controls++;
+          else if (kind === "poll") { bucket.polls++; if (row.status >= 400) bucket.pollErrors++; }
+          else {
+            bucket.requests++;
+            // A synchronous timeout can follow durable acceptance; a run ID is the evidence, not HTTP 2xx.
+            if (row.runId && !row.deduplicated) { bucket.accepted++; group.accepted++; }
+            if (row.status >= 400) bucket.errors++;
+            if (row.deduplicated) { bucket.replayed++; group.replayed++; }
+          }
+          groups.set(kind, group); buckets.set(key, bucket);
+        }
+        signal?.throwIfAborted();
+        if (readError) throw readError;
+      } finally { signal?.removeEventListener("abort", aborted); lines.close(); stream.destroy(); await handle.close(); }
     }
-    rows.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
-    return { rows, droppedRequests };
+    trimRecent();
+    return { buckets: [...buckets.values()].sort((a, b) => a.hour.localeCompare(b.hour)), requests: recent.map(({ row }) => row), droppedRequests, missingMetricFiles,
+      requestSummary: { groups: [...groups.values()].map(({ durations, ...group }) => ({ ...group, duration: summarizeDurations(durations) })),
+        errorTypes: [...errorTypes].sort((a, b) => b[1] - a[1]).map(([type, count]) => ({ type, count })),
+        coverage: "recorded_authenticated_requests_only;_some_rate_limit_rejections_excluded" } };
   };
 
   return {
@@ -134,30 +196,8 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
       requestQueue = task.catch(() => null);
       return task;
     },
-    async usage({ from = now() - 7 * 24 * 60 * 60_000, to = now(), clientId = "" } = {}) {
-      const { rows: allRows, droppedRequests } = await requestRows({ from, to });
-      const rows = allRows.filter((item) => !clientId || item.clientId === clientId);
-      const buckets = new Map();
-      for (const row of rows) {
-        const hour = row.time.slice(0, 13) + ":00:00Z";
-        const key = `${hour}:${row.clientId}`;
-        const bucket = buckets.get(key) || { hour, clientId: row.clientId, requests: 0, accepted: 0, errors: 0, replayed: 0, polls: 0, pollErrors: 0, controls: 0 };
-        if (row.trigger === "discovery") {
-          bucket.discovery = (bucket.discovery || 0) + 1;
-        } else if (row.trigger === "cancel") {
-          bucket.controls += 1;
-        } else if (row.trigger === "result") {
-          bucket.polls += 1;
-          if (row.status >= 400) bucket.pollErrors += 1;
-        } else {
-          bucket.requests += 1;
-          if (row.status >= 200 && row.status < 300 && !row.deduplicated) bucket.accepted += 1;
-          if (row.status >= 400) bucket.errors += 1;
-          if (row.deduplicated) bucket.replayed += 1;
-        }
-        buckets.set(key, bucket);
-      }
-      return { buckets: [...buckets.values()].sort((a, b) => a.hour.localeCompare(b.hour)), requests: rows.slice(-500).reverse(), droppedRequests };
+    async usage({ from = now() - 7 * 24 * 60 * 60_000, to = now(), clientId = "", signal } = {}) {
+      return requestRows({ from, to, clientId, signal });
     },
   };
 }

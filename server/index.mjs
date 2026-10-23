@@ -25,7 +25,7 @@ import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
-import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
+import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol, summarizeRunUsage } from "./run-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner, executionPayloadLimits } from "./external-task-store.mjs";
 import { normalizeInlineAttachments } from "./inline-inputs.mjs";
@@ -9210,10 +9210,13 @@ app.get("/api/clients/usage", async (req, res) => {
   if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || to - from > 31 * 24 * 60 * 60_000) {
     return res.status(400).json({ ok: false, error: "Invalid usage time range" });
   }
+  const controller = new AbortController();
+  const closed = () => { if (!res.writableEnded) controller.abort(); };
+  res.once("close", closed);
   try {
     const clientId = String(req.query.clientId || "");
     const [requests, usage] = await Promise.all([
-      apiClientStore.usage({ from, to, clientId }),
+      apiClientStore.usage({ from, to, clientId, signal: controller.signal }),
       enqueueWrite("automation", async () => {
         const store = await readAutomationRuns();
         const ledger = usageLedger();
@@ -9221,8 +9224,10 @@ app.get("/api/clients/usage", async (req, res) => {
         return { runs: mergeUsageRuns(store.runs, ledger.rows({ from, to })), info: ledger.info() };
       }),
     ]);
-    res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(usage.runs, { from, to, clientId }), runs: runUsageDetails(usage.runs, { from, to, clientId }), usageLedger: usage.info });
-  } catch (error) { res.status(500).json({ ok: false, error: error.message }); }
+    if (!res.destroyed) res.json({ ok: true, ...requests, runBuckets: aggregateRunUsage(usage.runs, { from, to, clientId }),
+      runs: runUsageDetails(usage.runs, { from, to, clientId }), runSummary: summarizeRunUsage(usage.runs, { from, to, clientId }), usageLedger: usage.info });
+  } catch (error) { if (!res.destroyed) res.status(500).json({ ok: false, error: error.message }); }
+  finally { controller.abort(); res.off("close", closed); }
 });
 
 app.post("/api/repos", async (req, res) => {

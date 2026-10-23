@@ -6189,7 +6189,7 @@ export function App() {
           setActiveView("cli");
         }} /></Suspense>}
 
-        {activeView === "usage" && <Suspense fallback={<div className="usage-view">加载用量中...</div>}><LazyUsageView automations={status.automations} onOpenRun={(automationId, runId) => {
+        {activeView === "usage" && <Suspense fallback={<div className="usage-view">加载用量中...</div>}><LazyUsageView automations={status.automations} automationsReady={statusReady} apiRequest={apiWithDeadline} onOpenRun={(automationId, runId) => {
           const run = (status.automationRuns || []).find((item) => item.id === runId && item.automationId === automationId);
           if (run) openAutomationRun(run);
           else { setSelectedAutomationId(automationId); setActiveView("automations"); }
