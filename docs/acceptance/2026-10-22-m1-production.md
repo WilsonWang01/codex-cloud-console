@@ -47,6 +47,8 @@ EC2 备份目录：`/home/ubuntu/codex-cloud/backups/pre-m1-20261022`，目录 0
 
 安装器 `npm prune` 原先会移除锁文件的部分 peer 标记，未改变依赖版本，但使运行锁文件哈希不同。增加 `--package-lock=false` 保留来源锁文件，仍裁剪实际开发依赖。
 
+2026-10-23 更正：上述处理不足。后续逐包核对发现 `--package-lock=false` 会忽略锁文件、重新解析版本范围；仅比较锁文件哈希不能证明实际依赖一致。已在 `546cdd8` 改为构建后 `npm ci --omit=dev --ignore-scripts`，加入逐包版本核对和 CI 纯运行包检查。发现、修复及最终发布证据见 [PDF 与运行包验收](2026-10-23-pdf-inputs.md)；本节原记录保留为当时结论，不作为最终版本一致性证明。
+
 测试补充：Express 实际使用的 `proxy-addr` 回环、非信任来源、伪造转发头和异常 IPv6 子网；安装器审计失败不切换、不删除原版本。`npm run verify:local` 全部通过；`verify:status:ui` 通过首屏、局部错误、超时、恢复及 30 次重载，84 次状态请求、0 次写入。
 
 首次 CI [39769628624](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39769628624) 审计通过，但回归失败：测试只等待模型任务结束，没有等待自动化结果持久化与并发名额释放，下一提交得到 429。补充等待已有 `activeRunIds` 为空且模型任务为空，不修改生产并发上限，不跳过断言，不以无条件重试掩盖。修复后的本地回归及 [CI 39770031394](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/39770031394) 全部通过，CI 使用 Linux / Node 22，包含全量 verify:local 和安全审计。
