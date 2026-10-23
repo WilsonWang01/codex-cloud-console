@@ -46,7 +46,7 @@ MCP 是 AI 客户端调用工具的标准协议。本仓库提供本地 `stdio` 
 | `codex_cloud_capabilities` | 无参数；读取该自动化的实际能力与限制 |
 | `codex_cloud_models` | 无参数；读取可见模型目录，不发起推理 |
 | `codex_cloud_status` | `runId`；读取本调用方任务的状态、已知用量、交付状态等。摘要最多 4000 个 UTF-16 字符，`summaryTruncated` 明示裁剪；完整结果用下一个工具 |
-| `codex_cloud_output` | `runId`，可选 `section:"text"/"structured"`、`offset`、`limit`；默认最多 16000 个 UTF-16 字符，返回 `nextOffset/done` 和产物清单。`structured` 分段内容拼接后是完整结构化结果的 JSON |
+| `codex_cloud_output` | `runId`，可选 `section:"text"/"structured"/"metadata"`、`offset`、`limit`；默认最多 16000 个 UTF-16 字符，返回 `nextOffset/done` 和产物清单。`structured` 分段拼接后是完整结构化结果的 JSON；`metadata` 则保留来源、原回合和捕获/到期信息 |
 | `codex_cloud_read_artifact` | `runId/fileId`，可选字节 `offset/limit`（最多 65536）；先下载并验证完整文件大小与 SHA-256，再返回 Base64 分块。`asImage:true` 可直接返回 1 MiB 内 PNG/JPEG/WebP 图片内容块，不会生成图片 |
 | `codex_cloud_submit` | **仅执行开关为 `1` 时存在**；`eventId`、可选 `trigger:"webhook"/"heartbeat"`、`input`。返回已接受的运行 ID/状态，不等待模型结束 |
 | `codex_cloud_cancel` | **仅执行开关为 `1` 时存在**；`runId`。显式请求中断，不会撤销已经发生的外部动作；`canceling` 不代表最终已取消 |
@@ -54,6 +54,8 @@ MCP 是 AI 客户端调用工具的标准协议。本仓库提供本地 `stdio` 
 UTF-16 是 JavaScript 的字符串计数方式，通常中文字符占 1、部分表情占 2；按返回的 `nextOffset` 继续，不自行换算字节。分段可跨表情的编码边界，拼接原字符串后再展示或解析。`done:true` 表示该段已到完整结果末尾，不是整个业务目标已完成。无结果、已过期、文件不匹配和读取超界都明确报错。
 
 文件下载不接收路径或 URL，不跟随服务端提供的下载地址。适配器不会向本机文件系统写入下载内容。每次分块都重新验证完整文件，适合少量检查；批量/大文件应使用[HTTP 客户端下载](artifact-delivery.md)，避免反复下载 8 MiB 文件。直接图片展示是额外读取表示；其他类型或超过 1 MiB 的图片用分块/HTTP 下载。
+
+SHA-256 是文件内容的指纹，用来验证下载内容与原产物一致，不是加密或对报告结论正确性的保证。来源元信息也是任务数据；适配器不会因为出现链接就自动访问它，更不据此授权第三方写入。
 
 `asImage:true` 返回完整的小图片内容块，此时 `offset` 只能是 0，分块 `limit` 不适用；不是按输入 limit 返回一段残缺图片。
 

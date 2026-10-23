@@ -113,6 +113,7 @@ test("MCP paginates complete text/JSON and returns verified private bytes and re
   const text = "中文😀结果".repeat(100);
   const structured = { status: "validated", data: { text } };
   const manifest = { version: 1, runId: "run-1", automationId: "research", status: "completed", text, structuredOutput: structured,
+    turnId: "original-turn", sources: [{ url: "https://example.com/source", title: "来源" }],
     artifacts: [{ id: fileId, name: "generated.png", mimeType: "image/png", size: buffer.length, sha256, downloadPath: "https://foreign.invalid/PRIVATE_BODY" }] };
   let corrupt = false;
   const { origin, calls } = await apiFixture(t, (req, res) => {
@@ -120,7 +121,7 @@ test("MCP paginates complete text/JSON and returns verified private bytes and re
     res.setHeader("X-Content-SHA256", sha256); res.end(corrupt ? Buffer.from("bad") : buffer);
   });
   const client = await connect(t, origin);
-  for (const section of ["text", "structured"]) {
+  for (const section of ["text", "structured", "metadata"]) {
     let offset = 0, joined = "";
     while (true) {
       const page = data(await call(client, "output", { runId: "run-1", section, offset, limit: 37 }));
@@ -129,7 +130,8 @@ test("MCP paginates complete text/JSON and returns verified private bytes and re
       if (page.done) { assert.equal(page.nextOffset, null); break; }
       assert(page.nextOffset > offset); offset = page.nextOffset;
     }
-    assert.equal(joined, section === "text" ? text : JSON.stringify(structured));
+    if (section === "metadata") { assert.equal(JSON.parse(joined).turnId, "original-turn"); assert.deepEqual(JSON.parse(joined).sources, manifest.sources); }
+    else assert.equal(joined, section === "text" ? text : JSON.stringify(structured));
   }
   let offset = 0, chunks = [];
   while (true) {
