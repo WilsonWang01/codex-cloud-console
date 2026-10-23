@@ -202,6 +202,10 @@ test("multiple linked calendars or invalid source identifiers require an explici
   const invalid = fixture(); invalid.tools.data[0].tools["google_calendar.search"]._meta.link_id = {};
   assert.equal((await invalid.source.refresh("Asia/Shanghai")).lastAttempt.code, "calendar_not_connected");
   assert.equal(invalid.reads(), 0);
+  const consolidated = fixture();
+  consolidated.tools.data[0].tools["google_calendar.search"]._meta.link_accounts = [{ link_id: "account-1" }, { link_id: "account-2" }];
+  assert.equal((await consolidated.source.refresh("Asia/Shanghai")).lastAttempt.code, "calendar_account_ambiguous");
+  assert.equal(consolidated.reads(), 0);
 });
 
 test("observed Calendar connector strings and web_link become verifiable sources without inventing an original time zone", async () => {

@@ -6,6 +6,7 @@ import { chromium } from "playwright";
 import { nextPersonalOccurrence } from "../server/personal-schedule.mjs";
 import { buildPersonalBrief } from "../server/personal-brief.mjs";
 import { calendarDayWindow } from "../server/personal-calendar.mjs";
+import { mailWindow } from "../server/personal-mail.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -91,6 +92,7 @@ await context.route("**/api/**", async (route) => {
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
+  if (url.pathname === "/api/personal/mail") return send({ ok: true, mail: { window: mailWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
   if (url.pathname === "/api/personal/calendar") return send({ ok: true, calendar: calendarView || { window: calendarDayWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
   if (url.pathname === "/api/personal/calendar/refresh") {
     calendarReads++;

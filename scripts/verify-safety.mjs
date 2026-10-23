@@ -106,7 +106,7 @@ test("本机草稿保存返回可靠结果，失败仍允许原服务端保存�
 });
 
 test("所有延迟模块共用局部恢复，加载拒绝不抛出且不会自动刷新", async () => {
-  assert.equal((frontend.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 11);
+  assert.equal((frontend.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 12);
   assert.doesNotMatch(frontend, /\blazy\(\(\) => import\(/);
   const reported = [], exports = {};
   const context = { exports, console: { error: (...args) => reported.push(args) }, require: name => {

@@ -10,7 +10,7 @@ import { chromium } from "playwright";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const source = await fs.readFile(path.join(root, "src/App.tsx"), "utf8");
-assert.equal((source.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 11);
+assert.equal((source.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 12);
 assert.doesNotMatch(source, /\blazy\(\(\) => import\(/);
 const fixture = { Date };
 vm.createContext(fixture);
