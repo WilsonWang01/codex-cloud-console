@@ -53,6 +53,8 @@
 
 POST 的 Content-Type 为 application/json，正文最多 2048 字节。三个请求头：`x-codex-event-id`、`x-codex-timestamp`（本次发送的 Unix 秒）、`x-codex-signature`。签名为 `v1=` 加 `HMAC-SHA256(secret, timestamp + "." + 原始正文)` 的小写十六进制结果。不要先解析再重序列化 JSON 后验签。
 
+[OpenAPI 契约](openapi.json)的 `webhooks.automationRunTerminal` 描述外部接收端及 CallbackEvent，不是服务器开放了一个匿名 webhook 路由；这一组织方式使用 [OpenAPI 3.1 的 webhooks 字段](https://spec.openapis.org/oas/v3.1.1.html#openapi-object)。
+
 可直接复用独立的 [Node 验签函数](../scripts/callback-receiver-example.mjs)，仅依赖标准库、不导入服务器内部模块：
 
 ```js

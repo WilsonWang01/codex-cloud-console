@@ -3,9 +3,25 @@
   "info": {
     "title": "Codex Cloud 能力发现与异步任务",
     "version": "2026-10-23",
-    "description": "覆盖能力发现、异步任务、受限内联 txt/md/PDF/图片材料、结构化结果及新任务的私有产物清单/下载。推理适配字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 或 Files API 兼容。部署能力以 capabilities 为准。"
+    "description": "覆盖能力发现、异步任务、受限内联材料、结构化结果、私有产物交付及预登记签名完成回调。webhooks 描述外部接收端，不是本服务器新增路由。推理字段见 model-api-adapters.md；不宣称全 OpenAI/Anthropic 或 Files API 兼容。部署能力以 capabilities 为准。"
   },
   "servers": [{"url": "https://your-codex-cloud.example"}],
+  "webhooks": {
+    "automationRunTerminal": {
+      "post": {
+        "operationId": "receiveAutomationRunTerminal",
+        "summary": "外部接收端：接收已登记作用范围的任务终态通知",
+        "description": "URL 由操作者预登记，不属于上方 servers。用 timestamp + '.' + 原始正文的 HMAC-SHA256 验签，拒绝超过正负 5 分钟的发送时间；事件 ID 去重和后续工作必须先持久化再响应 2xx。可能重复投递，完整结果仍需原令牌查询。详见 callbacks.md。",
+        "parameters": [
+          {"name": "x-codex-event-id", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+          {"name": "x-codex-timestamp", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[0-9]{10}$"}},
+          {"name": "x-codex-signature", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^v1=[a-f0-9]{64}$"}}
+        ],
+        "requestBody": {"required": true, "description": "原始 UTF-8 JSON 总计最多 2048 字节，不可先重序列化再验签", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CallbackEvent"}}}},
+        "responses": {"204": {"description": "事件及后续工作已可靠接收，或相同事件已处理；不表示后续业务动作已完成"}, "401": {"description": "签名、时间或正文无效；不自动重试"}, "503": {"description": "暂时无法可靠接收，将有限重试"}}
+      }
+    }
+  },
   "paths": {
     "/api/automations/{automationId}/v1/models": {
       "get": {
@@ -159,6 +175,14 @@
       "Run": {"description": "运行快照，HTTP 成功不等于业务完成；202 表示取消处理中", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RunResponse"}}}}
     },
     "schemas": {
+      "CallbackEvent": {"type": "object", "additionalProperties": false, "required": ["id", "type", "created_at", "data"], "properties": {
+        "id": {"type": "string", "format": "uuid"}, "type": {"const": "automation.run.terminal"}, "created_at": {"type": "string", "format": "date-time"},
+        "data": {"type": "object", "additionalProperties": false, "required": ["run_id", "automation_id", "status", "result_path"], "properties": {
+          "run_id": {"type": "string", "minLength": 1, "maxLength": 240}, "automation_id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "status": {"enum": ["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]},
+          "result_path": {"type": "string", "description": "既有同源运行查询相对路径，不含令牌"}, "output_path": {"type": "string", "description": "既有同源结果清单相对路径，任务失败时未必可读取"}
+        }}
+      }},
       "Models": {"type": "object", "required": ["object", "data", "codex_cloud"], "properties": {
         "object": {"const": "list"},
         "data": {"type": "array", "items": {"type": "object", "required": ["id", "object", "created", "owned_by", "codex_cloud"], "properties": {"id": {"type": "string"}, "object": {"const": "model"}, "created": {"const": 0}, "owned_by": {"const": "unknown"}, "codex_cloud": {"type": "object", "description": "display_name、reasoning_efforts、input_modalities、inference。inference 仅使用本调用方和自动化的保留记录，不代表当前账号权限；创建日期和所有者未由上游提供。"}}}},
