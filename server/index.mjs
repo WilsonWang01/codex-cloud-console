@@ -28,7 +28,8 @@ import { checkKnownTokenBudget } from "./run-budget.mjs";
 import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol } from "./run-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner, executionPayloadLimits } from "./external-task-store.mjs";
-import { normalizeInlineAttachments, inlineAttachmentInputs } from "./inline-inputs.mjs";
+import { normalizeInlineAttachments } from "./inline-inputs.mjs";
+import { prepareInlineAttachmentInputs, probePdfInputRuntime } from "./pdf-inputs.mjs";
 import { createExternalBodyParser } from "./external-input-body.mjs";
 import { createExternalResultStore, normalizeArtifactPaths, artifactBaseline, requestedArtifacts, nativeSources } from "./external-results.mjs";
 import { createExternalResultHandler } from "./external-result-api.mjs";
@@ -59,6 +60,7 @@ const server = http.createServer(app);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
+const pdfInputRuntime = await probePdfInputRuntime();
 const releaseInfo = readReleaseInfo(projectRoot);
 const defaultCloudRoot = process.platform === "linux" && process.env.NODE_ENV === "production"
   ? "/home/ubuntu/codex-cloud"
@@ -5224,6 +5226,7 @@ function normalizeAutomationRun(run = {}) {
     ...(run.artifactPaths?.length ? { artifactPaths: run.artifactPaths } : {}),
     ...(run.delivery ? { delivery: run.delivery } : {}),
     ...(Array.isArray(run.inputFiles) && run.inputFiles.length ? { inputFiles: run.inputFiles } : {}),
+    ...(run.inputProcessing ? { inputProcessing: run.inputProcessing } : {}),
     runner: String(run.runner || "systemd"),
     status: run.status === "cancelled" ? "canceled" : String(run.status || "queued"),
     startedAt,
@@ -6909,6 +6912,14 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
   };
 }
 
+async function assertAutomationClientActive(clientId, automationId) {
+  if (!clientId || ["legacy-shared", "local-development"].includes(clientId)) return;
+  const client = (await apiClientStore.list()).find(item => item.id === clientId);
+  if (!client || client.revokedAt || (client.expiresAt && Date.parse(client.expiresAt) <= Date.now()) || !client.automationIds.includes(automationId)) {
+    throw automationRequestError(403, "调用方已撤销、过期或不再拥有自动化权限，未启动模型");
+  }
+}
+
 async function startAppServerAutomationRun(automation, repo, options = {}) {
   if (!options.publicationLockHeld) return withPublicationLock(publicationLockPath, () => startAppServerAutomationRun(automation, repo, { ...options, publicationLockHeld: true }));
   const updateRun = (id, patch, event) => appendAutomationRunEvent(id, patch, event, { taskClaim: options.taskClaim });
@@ -6977,6 +6988,8 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       budgetLimit: options.budgetLimit ?? process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
       taskClaim: options.taskClaim,
     });
+    const prepared = await prepareInlineAttachmentInputs(inline, options.imageInputs || []);
+    if (prepared.processing) await updateRun(runId, { inputProcessing: prepared.processing }, { type: "input-ready", text: "PDF 已完成受限文本提取与页面渲染；未截断" });
     if (heartbeatSession) {
       runRecord = await updateRun(
         runId,
@@ -7002,6 +7015,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       return canceled;
     }
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
+    if (options.taskClaim) await assertAutomationClientActive(options.clientId, automation.id);
     modelStartAttempted = true;
     job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
@@ -7010,7 +7024,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       unattendedPersonalSchedule: options.trigger === "personal-schedule",
       reviewUnverifiedMcpCalls: ["personal-test", "personal-schedule"].includes(options.trigger),
       maxRuntimeMs: options.maxRuntimeMs,
-      imageInputs: [...(options.imageInputs || []), ...inlineAttachmentInputs(inline)],
+      imageInputs: [...(options.imageInputs || []), ...prepared.inputs],
       outputSchema: options.outputSchema,
     });
     job.externalTaskClaim = options.taskClaim;
@@ -7149,6 +7163,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       error: error.message,
       completionOutcome: completionContract ? "turn-failed" : null,
       completionCheckedAt: completionContract ? new Date().toISOString() : null,
+      ...(error.inputProcessing ? { inputProcessing: error.inputProcessing } : {}),
       ...(!modelStartAttempted ? { usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 } } : {}),
     }, { type: job ? "needs-reconciliation" : "error", text: error.message }).catch(() => null);
     throw error;
@@ -7220,10 +7235,7 @@ async function drainExternalTasks() {
       try {
         const automation = automations.find((item) => item.id === task.execution.automationId);
         if (!automation || automation.repoId !== task.execution.repoId || automation.personalRoutine) throw new Error("排队任务的自动化配置已变化，请核对后重试");
-        if (!["legacy-shared", "local-development"].includes(task.run.clientId)) {
-          const client = (await apiClientStore.list()).find((item) => item.id === task.run.clientId);
-          if (!client || client.revokedAt || (client.expiresAt && Date.parse(client.expiresAt) <= Date.now()) || !client.automationIds.includes(automation.id)) throw new Error("调用方已撤销、过期或不再拥有自动化权限");
-        }
+        await assertAutomationClientActive(task.run.clientId, automation.id);
         const repo = getRepoById(task.execution.repoId);
         handedToRunner = true;
         await startAppServerAutomationRun(automation, repo, { ...task.execution.options, runId: task.run.id, taskClaim: task.claim, publicationLockHeld: true });
@@ -9129,7 +9141,7 @@ app.get("/healthz", async (_req, res) => {
   const responseHealth =
     {
       ...health,
-      layers: { ...health.layers, usageLedger: ledgerHealth },
+      layers: { ...health.layers, usageLedger: ledgerHealth, pdfInput: pdfInputRuntime },
       ok: strictOk,
       strictOk,
       partial: !strictOk && reachable,
@@ -11935,6 +11947,7 @@ async function readDiscoveryRuntime() {
   if (!discoveryRuntimeCache || Date.now() - discoveryRuntimeCache.at > 60_000) {
     discoveryRuntimeCache = { at: Date.now(), value: run("codex", ["--version"], { timeout: 8_000 }).then((result) => ({
       version: result.ok ? /\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/.exec(result.stdout)?.[0] || null : null,
+      pdfInput: pdfInputRuntime,
       probedAt: new Date().toISOString(),
     })) };
   }

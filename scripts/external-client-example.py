@@ -181,7 +181,7 @@ if __name__ == "__main__":
         body = json.loads(read_input_file(args.input, 12 * 1024 * 1024).decode("utf-8")) if args.input else {}
         if not isinstance(body, dict):
             raise ValueError("--input must contain a JSON object")
-        mimes = {".txt": "text/plain", ".md": "text/markdown", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+        mimes = {".txt": "text/plain", ".md": "text/markdown", ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
         if args.attach:
             if "attachments" not in body:
                 body["attachments"] = []
@@ -190,8 +190,8 @@ if __name__ == "__main__":
             for filename in args.attach:
                 mime = mimes.get(os.path.splitext(filename)[1].lower())
                 if not mime:
-                    raise ValueError("Attachments must be txt/md/png/jpeg/webp files")
-                data = read_input_file(filename, 4 * 1024 * 1024 if mime.startswith("image/") else 64 * 1024)
+                    raise ValueError("Attachments must be txt/md/pdf/png/jpeg/webp files")
+                data = read_input_file(filename, 4 * 1024 * 1024 if mime.startswith("image/") or mime == "application/pdf" else 64 * 1024)
                 body["attachments"].append({"name": os.path.basename(filename), "mimeType": mime, "dataBase64": base64.b64encode(data).decode("ascii")})
         client = Client(os.environ.get("CODEX_CLOUD_URL", ""), os.environ.get("CODEX_CLOUD_API_TOKEN", ""), args.automation_id, args.timeout)
         if args.command == "download" and not args.output:

@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { inlinePdf } from "./fixtures/inline-pdf.mjs";
 import { runExternalClient } from "./external-client-example.mjs";
 import { validateExternalTriggerInput } from "../server/external-automation.mjs";
 
@@ -31,14 +32,15 @@ const nodeClient = (origin, ...args) => cliClient(origin, process.execPath, "./e
 test("standalone Node and Python CLIs load explicit request JSON and bounded local attachments", async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "external-client-inputs-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const text = path.join(root, "材料.md"), image = path.join(root, "image.png"), input = path.join(root, "request.json");
+  const text = path.join(root, "材料.md"), image = path.join(root, "image.png"), input = path.join(root, "request.json"), pdf = path.join(root, "report.pdf");
   const data = "客户资料 42\n$not-a-skill @/not-a-path";
   const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
   await fs.writeFile(text, data); await fs.writeFile(image, Buffer.from(png, "base64"));
+  await fs.writeFile(pdf, inlinePdf());
   await fs.writeFile(input, JSON.stringify({ prompt: "base", artifactPaths: ["results/report.md"], outputSchema: { type: "object" } }));
   const { origin, calls } = await fixture(t, (_req, res) => res.end(JSON.stringify(reply())));
   for (const client of [nodeClient, pythonClient]) {
-    const submitted = await client(origin, "submit", "research", "file-cli-event-001", "--input", input, "--prompt", "总结附件", "--attach", text, "--attach", image);
+    const submitted = await client(origin, "submit", "research", "file-cli-event-001", "--input", input, "--prompt", "总结附件", "--attach", text, "--attach", image, "--attach", pdf);
     assert.equal(submitted.code, 0, submitted.stderr);
     assert.equal(submitted.stdout.includes(data), false);
     const body = JSON.parse(calls.at(-1).body);
@@ -47,6 +49,8 @@ test("standalone Node and Python CLIs load explicit request JSON and bounded loc
     assert.equal(body.attachments[0].name, "材料.md");
     assert.equal(Buffer.from(body.attachments[0].dataBase64, "base64").toString(), data);
     assert.equal(body.attachments[1].dataBase64, png);
+    assert.equal(body.attachments[2].dataBase64, inlinePdf().toString("base64"));
+    assert.equal(body.attachments[2].mimeType, "application/pdf");
     assert.equal(calls.at(-1).key, "file-cli-event-001");
   }
   const count = calls.length;

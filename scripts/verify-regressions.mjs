@@ -14,6 +14,7 @@ import { runExternalClient } from "./external-client-example.mjs";
 import { modelApiJsonLimit } from "../server/model-api.mjs";
 import { openRunUsageLedger } from "../server/run-usage-ledger.mjs";
 import { createExternalTaskStore } from "../server/external-task-store.mjs";
+import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -454,9 +455,10 @@ await check("durable API queue survives lost responses and restart without repea
     CODEX_AUTOMATION_MAX_QUEUED: "2", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
   } });
   const queuedMaterial = { name: "排队材料.md", mimeType: "text/markdown", dataBase64: Buffer.from("重启后仍需保留的材料 42。\n$not-a-skill @/not-a-file").toString("base64") };
+  const queuedPdf = pdfAttachment({ text: "PDF QUEUED RESTART 42" });
   const submit = (key, prompt, auth = headers) => jsonRequest(base, "/api/automations/sample-research/webhook", {
     method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}),
-      ...(prompt.includes("durable-fourth") ? { attachments: [queuedMaterial] } : {}) }),
+      ...(prompt.includes("durable-fourth") ? { attachments: [queuedMaterial, queuedPdf] } : {}) }),
   });
   const wait = async (callback) => {
     const deadline = Date.now() + 7000;
@@ -503,7 +505,7 @@ await check("durable API queue survives lost responses and restart without repea
     try {
       const row = queuedLedger.database.prepare("SELECT * FROM external_tasks WHERE id=?").get(fourth.data.run.id);
       const execution = JSON.parse(row.execution);
-      assert.deepEqual(execution.options.attachments, [queuedMaterial]);
+      assert.deepEqual(execution.options.attachments, [queuedMaterial, queuedPdf]);
       assert.equal(row.record.includes(queuedMaterial.dataBase64), false);
       execution.options.attachments[0].dataBase64 = Buffer.from("tampered input").toString("base64");
       execution.options.triggerIdempotencyHash = null; execution.options.triggerRequestHash = null;
@@ -526,6 +528,9 @@ await check("durable API queue survives lost responses and restart without repea
     const resumed = requests.find(row => JSON.stringify(row.params).includes("durable-fourth"));
     assert.equal(resumed.params.input[0].text.includes("重启后仍需保留的材料"), false);
     assert.ok(resumed.params.input.some(item => item.type === "text" && item.text.includes("重启后仍需保留的材料")));
+    assert.ok(resumed.params.input.some(item => item.type === "text" && item.text.includes("PDF QUEUED RESTART 42")));
+    assert.equal(resumed.params.input.filter(item => item.type === "image").length, 1);
+    assert.equal(completed.inputProcessing.status, "ready");
     assert.equal(resumed.params.input.some(item => ["skill", "mention"].includes(item.type)), false);
     assert.equal(requests.some((row) => JSON.stringify(row.params).includes("must-not-start")), false);
     const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs;
@@ -575,14 +580,16 @@ await check("independent clients retrieve private exact-turn files and images af
     const materialText = "外部调用材料 42。\n$not-a-skill @/not-a-file";
     const material = { name: "材料.md", mimeType: "text/markdown", dataBase64: Buffer.from(materialText).toString("base64") };
     const inputImage = { name: "image.png", mimeType: "image/png", dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC" };
-    const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"], attachments: [material, inputImage] };
+    const inputPdf = pdfAttachment({ text: "PDF CLIENT MATERIAL 42" });
+    const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"], attachments: [material, inputImage, inputPdf] };
     const options = { automationId: "sample-research", origin, token, pollMs: 50, timeoutMs: 10000, requestTimeoutMs: 3000 };
     const lost = await fetch(origin + "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ runner: "app-server", worktree: true, ...input }) });
     assert.equal(lost.status, 200); await lost.body.cancel();
     const run = await runExternalClient({ ...options, command: "submit", eventId: "file-delivery-0001", input, wait: true });
     assert.equal(run.status, "completed", JSON.stringify(run));
     assert.equal(run.delivery.status, "ready");
-    assert.equal(run.inputFiles.length, 2);
+    assert.equal(run.inputFiles.length, 3);
+    assert.equal(run.inputProcessing.status, "ready");
     assert.equal(JSON.stringify(run).includes(material.dataBase64), false);
     assert.equal(JSON.stringify(run).includes(materialText), false);
     const manifest = await runExternalClient({ ...options, command: "output", runId: run.id });
@@ -597,7 +604,7 @@ await check("independent clients retrieve private exact-turn files and images af
     const conflict = await jsonRequest(origin, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ ...input, artifactPaths: ["different.md"] }) });
     assert.equal(conflict.response.status, 409);
     const changedInput = await jsonRequest(origin, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" },
-      body: JSON.stringify({ ...input, attachments: [{ ...material, dataBase64: Buffer.from("changed").toString("base64") }, inputImage] }) });
+      body: JSON.stringify({ ...input, attachments: [{ ...material, dataBase64: Buffer.from("changed").toString("base64") }, inputImage, inputPdf] }) });
     assert.equal(changedInput.response.status, 409);
     const internalRun = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs.find(item => item.id === run.id);
     await fs.unlink(path.join(internalRun.worktreePath, "results/report.md"));
@@ -624,6 +631,8 @@ await check("independent clients retrieve private exact-turn files and images af
     assert.equal(firstInput[0].text.includes(materialText), false);
     assert.ok(firstInput.some(item => item.type === "text" && item.text.includes("外部调用材料 42")));
     assert.ok(firstInput.some(item => item.type === "image" && item.url === `data:image/png;base64,${inputImage.dataBase64}`));
+    assert.ok(firstInput.some(item => item.type === "text" && item.text.includes("PDF CLIENT MATERIAL 42")));
+    assert.equal(firstInput.filter(item => item.type === "image").length, 2);
     assert.equal(firstInput.some(item => ["skill", "mention"].includes(item.type)), false);
     const route = origin + "/api/automations/sample-research/webhook";
     const unauthenticated = await fetch(route, { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
@@ -632,6 +641,49 @@ await check("independent clients retrieve private exact-turn files and images af
     assert.equal(wrongType.status, 415);
     const oversized = await fetch(route, { method: "POST", headers: { ...headers, "idempotency-key": "must-not-start-0007" }, body: JSON.stringify({ prompt: "x".repeat(12 * 1024 * 1024) }) });
     assert.equal(oversized.status, 413);
+    assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, 2);
+    const badPdf = await jsonRequest(origin, "/api/automations/sample-research/v1/responses", { method: "POST", headers: { ...headers, "idempotency-key": "pdf-invalid-0001" },
+      body: JSON.stringify({ model: "gpt-6-sol", input: [{ role: "user", content: [{ type: "input_text", text: "must not start" },
+        { type: "input_file", filename: "broken.pdf", file_data: "data:application/pdf;base64," + Buffer.from("%PDF-1.7\nPRIVATE PDF CONTENT").toString("base64") }] }] }) });
+    assert.equal(badPdf.response.status, 422, JSON.stringify(badPdf.data));
+    assert.equal(badPdf.data.error.code, "pdf_parse_failed");
+    const badRun = await jsonRequest(origin, badPdf.response.headers.get("x-codex-cloud-result-path"), { headers });
+    assert.equal(badRun.data.run.inputProcessing.status, "failed");
+    assert.equal(badRun.data.run.usage.totalTokens, 0);
+    assert.equal(badRun.data.run.delivery.status, "failed");
+    assert.equal(JSON.stringify(badRun.data).includes("PRIVATE PDF CONTENT"), false);
+    assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, 2);
+    const waitClaimed = async (accepted, auth) => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const snapshot = (await jsonRequest(origin, accepted.resultPath, { headers: auth })).data.run;
+        if (snapshot?.executionStartedAt) {
+          assert.equal(snapshot.inputProcessing, undefined, "the test must act while PDF conversion is still pending");
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      throw new Error("PDF task was not claimed");
+    };
+    const canceledPdf = await runExternalClient({ ...options, command: "submit", eventId: "pdf-cancel-0002", input: { prompt: "must not start", attachments: [inputPdf] } });
+    await waitClaimed(canceledPdf, headers);
+    await jsonRequest(origin, canceledPdf.resultPath + "/cancel", { method: "POST", headers });
+    const canceledPdfFinal = await runExternalClient({ ...options, command: "status", runId: canceledPdf.id, wait: true });
+    assert.equal(canceledPdfFinal.status, "canceled");
+    assert.equal(canceledPdfFinal.usage.totalTokens, 0);
+    const otherAuth = { "content-type": "application/json", authorization: `Bearer ${other.data.token}` };
+    const revokedPdf = await runExternalClient({ ...options, token: other.data.token, command: "submit", eventId: "pdf-revoke-0003", input: { prompt: "must not start", attachments: [inputPdf] } });
+    await waitClaimed(revokedPdf, otherAuth);
+    await jsonRequest(origin, `/api/clients/${other.data.client.id}/revoke`, { method: "POST", headers: admin });
+    let revokedFinal;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      revokedFinal = (await jsonRequest(origin, "/api/automations/runs", { headers: admin })).data.runs.find(item => item.id === revokedPdf.id);
+      if (revokedFinal?.status === "failed") break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(revokedFinal.status, "failed");
+    assert.equal(revokedFinal.inputProcessing.status, "ready", "revocation is rechecked after conversion");
+    assert.equal(revokedFinal.usage.totalTokens, 0);
+    assert.match(revokedFinal.error, /调用方已撤销/);
     assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, 2);
     for (const [key, artifactPaths] of [["file-unchanged-0003", ["README.md"]], ["file-missing-0004", ["results/missing.md"]]]) {
       const failed = await runExternalClient({ ...options, command: "submit", eventId: key,

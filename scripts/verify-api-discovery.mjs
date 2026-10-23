@@ -7,13 +7,13 @@ import fs from "node:fs/promises";
 import { createDiscoveryHandler } from "../server/api-discovery.mjs";
 
 async function fixture(task) {
-  const state = { lookups: 0, rate: 0, catalog: { ok: true, cachedAt: "2026-10-22T00:00:00Z", models: [{ id: "gpt-6-sol", supportedReasoningEfforts: ["medium"] }] }, metrics: [] };
+  const state = { lookups: 0, rate: 0, pdfInput: { ok: true, parser: "pdfjs:fixture", checkedAt: "2026-10-23T00:00:00Z" }, catalog: { ok: true, cachedAt: "2026-10-22T00:00:00Z", models: [{ id: "gpt-6-sol", supportedReasoningEfforts: ["medium"] }] }, metrics: [] };
   const app = express();
   const handler = createDiscoveryHandler({
     authenticate: async (req, token) => token === "allowed" && req.params.id === "demo" ? { id: "client-a" } : null,
     automation: () => ({ model: "gpt-6-sol", reasoning: "medium" }),
     catalog: async () => { state.lookups++; return state.catalog; },
-    runtime: async () => ({ version: "0.157.1", probedAt: "2026-10-22T00:00:00Z" }),
+    runtime: async () => ({ version: "0.157.1", probedAt: "2026-10-22T00:00:00Z", pdfInput: state.pdfInput }),
     runs: async () => [
       { clientId: "client-a", automationId: "demo", model: "gpt-6-sol", status: "completed", finishedAt: "2026-10-21T00:00:00Z", prompt: "PRIVATE" },
       { clientId: "client-b", automationId: "demo", model: "gpt-6-sol", status: "failed", finishedAt: "2026-10-22T00:00:00Z" },
@@ -42,7 +42,7 @@ test("OpenAI pinned SDK discovers models without leaking other clients or claimi
   assert.equal(state.metrics[0].trigger, "discovery");
 }));
 
-test("Anthropic pinned SDK headers can read capabilities, without pretending models.list compatibility", () => fixture(async ({ origin }) => {
+test("Anthropic pinned SDK headers can read capabilities, without pretending models.list compatibility", () => fixture(async ({ origin, state, get }) => {
   const sdk = new Anthropic({ baseURL: `${origin}/api/automations/demo`, apiKey: "allowed", maxRetries: 0 });
   const data = await sdk.get("/v1/capabilities");
   assert.equal(data.features.structured_output, true);
@@ -50,6 +50,12 @@ test("Anthropic pinned SDK headers can read capabilities, without pretending mod
   assert.equal(data.features.request_output_token_limit, false);
   assert.equal(data.runtime.cli_version, "0.157.1");
   assert.equal(data.defaults.reasoning, "medium");
+  assert.equal(data.features.file_input.pdf.supported, true);
+  assert.equal(data.limits.pdf_input.pagesEach, 6);
+  state.pdfInput = { ok: false };
+  const unavailable = (await (await get("demo/v1/capabilities")).json()).features.file_input;
+  assert.equal(unavailable.pdf.supported, false);
+  assert.equal(unavailable.chat_file_parts, false);
 }));
 
 test("missing, invalid, wrong-scope and conflicting tokens reject before reading runtime", () => fixture(async ({ get, state }) => {

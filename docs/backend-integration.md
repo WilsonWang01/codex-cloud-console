@@ -53,7 +53,7 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 
 新任务支持受限产物清单和鉴权下载，须先查询部署能力；Node/Python 的 `output`、`download` 用法、20 MiB 结果包限额和保留策略见[文件交付](artifact-delivery.md)。异步任务的 `summary` 仍可能截断，不等于完整结果；旧任务不会补造副本。
 
-支持首批[受限内联文件输入](file-inputs.md)：异步正文 `attachments` 或 Node/Python 的 `--attach`、`--input`，用于 txt/md 和静态图片材料。先查 `features.file_input`，不把文件名当服务器路径；同事件键的材料变化会冲突，正文、队列材料和接收缓冲均有上限。
+支持[受限内联文件输入](file-inputs.md)：异步正文 `attachments` 或 Node/Python 的 `--attach`、`--input`，用于 txt/md、普通 PDF 和静态图片材料。先查 `features.file_input` 及 PDF 的运行时状态，不把文件名当服务器路径；同事件键的材料变化会冲突，正文、队列材料和接收缓冲均有上限。PDF 的文字和页面图片在模型前转换，失败和未识别文字层有明确状态。
 
 ## HTTP 契约
 

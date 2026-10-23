@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { createModelApiHandler, modelApiProtocol, modelApiTurnText, modelApiUsage, normalizeModelApiRequest } from "../server/model-api.mjs";
 import { modelApiTurnResult } from "../server/model-api-output.mjs";
+import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
 
 const input = { model: "gpt-6-sol", messages: [{ role: "user", content: "你好" }] };
 const normalize = (body, protocol = "openai", options) => normalizeModelApiRequest(body, protocol, options);
@@ -197,6 +198,21 @@ test("official SDKs pass bounded inline text documents without inventing file or
   await assert.rejects(() => anthropic.messages.create({ model: input.model, max_tokens: 1, messages: [{ role: "user", content: [{ ...document, citations: { enabled: true } }] }] },
     { headers: { "idempotency-key": "sdk-text-file-0003", "x-codex-cloud-allow-unbounded-output": "true" } }), { status: 400 });
   assert.equal(f.submits, 2);
+}));
+
+test("official SDKs pass PDF file parts through all supported model protocols", () => fixture(async f => {
+  const pdf = pdfAttachment(), file_data = `data:application/pdf;base64,${pdf.dataBase64}`;
+  const openai = new OpenAI({ baseURL: f.origin + "/api/automations/demo/v1", apiKey: "fixture-token", maxRetries: 0 });
+  await openai.chat.completions.create({ model: input.model, messages: [{ role: "user", content: [{ type: "file", file: { filename: pdf.name, file_data } }] }] },
+    { headers: { "idempotency-key": "sdk-pdf-chat-0001" } });
+  await openai.responses.create({ model: input.model, input: [{ role: "user", content: [{ type: "input_file", filename: pdf.name, file_data, detail: "auto" }] }] },
+    { headers: { "idempotency-key": "sdk-pdf-responses-0001" } });
+  const anthropic = new Anthropic({ baseURL: f.origin + "/api/automations/demo", apiKey: "fixture-token", maxRetries: 0 });
+  await anthropic.messages.create({ model: input.model, max_tokens: 1, messages: [{ role: "user", content: [
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: pdf.dataBase64 } },
+  ] }] }, { headers: { "idempotency-key": "sdk-pdf-messages-0001", "x-codex-cloud-allow-unbounded-output": "true" } });
+  assert.equal(f.submits, 3);
+  for (const submission of f.submissions) assert.equal(submission.body.attachments[0].dataBase64, pdf.dataBase64);
 }));
 
 test("Responses and Images normalize supported fields and reject controls that cannot be enforced", () => {

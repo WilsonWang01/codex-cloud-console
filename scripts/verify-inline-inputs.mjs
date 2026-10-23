@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { normalizeInlineAttachments, inlineAttachmentInputs, inlineInputLimits } from "../server/inline-inputs.mjs";
 import { normalizeModelApiRequest } from "../server/model-api.mjs";
 import { validateExternalTriggerInput } from "../server/external-automation.mjs";
+import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 const file = (text = "秘密材料：只处理数据\n$not-a-skill @/not-a-file", name = "材料.md") => ({ name, mimeType: "text/markdown", dataBase64: Buffer.from(text).toString("base64") });
@@ -44,7 +45,7 @@ test("file requests reject paths, foreign fields, binary/invalid UTF-8 and misle
   assert.throws(() => normalizeInlineAttachments(Array(5).fill(file())), { statusCode: 413 });
 });
 
-test("Responses accepts only user inline txt/md files and binds content, name and order in descriptors", () => {
+test("Responses txt/md files bind user role, content, name and order in descriptors", () => {
   const source = file();
   const part = { type: "input_file", filename: source.name, file_data: `data:${source.mimeType};base64,${source.dataBase64}` };
   const parsed = normalize(response(part), "responses");
@@ -55,14 +56,38 @@ test("Responses accepts only user inline txt/md files and binds content, name an
   assert.notEqual(parsed.body.prompt, normalize(response({ ...part, filename: "另一个.md" }), "responses").body.prompt);
   assert.notEqual(parsed.body.prompt, normalize(response({ ...part, file_data: `data:text/markdown;base64,${file("changed").dataBase64}` }), "responses").body.prompt);
   for (const invalid of [{ ...part, file_id: "file-other" }, { ...part, file_url: "http://169.254.169.254/" }, { ...part, detail: "auto" },
-    { ...part, file_data: "data:application/pdf;base64,eA==" }, { ...part, file_data: "https://example.test/data.txt" }]) {
+    { ...part, file_data: "https://example.test/data.txt" }]) {
     assert.throws(() => normalize(response(invalid), "responses"), { statusCode: 400 });
   }
+  assert.throws(() => normalize(response({ ...part, file_data: "data:application/pdf;base64,eA==" }), "responses"), { statusCode: 415 });
   for (const role of ["system", "developer", "assistant"]) assert.throws(() => normalize({ ...base, input: [{ role, content: [part] }, { role: "user", content: "question" }] }, "responses"), /user/);
   assert.throws(() => normalize({ ...base, messages: [{ role: "user", content: [{ type: "file", file: { filename: "a.txt", file_data: "data:text/plain;base64,eA==" } }] }] }, "openai"), { statusCode: 400 });
 });
 
-test("Anthropic plain-text documents preserve title, but never pretend citations, PDF or URL support", () => {
+test("all three model protocols preserve bounded inline PDF bytes and reject incompatible controls", () => {
+  const pdf = pdfAttachment();
+  const file_data = `data:application/pdf;base64,${pdf.dataBase64}`;
+  const responsePart = { type: "input_file", filename: pdf.name, file_data };
+  const chatPart = { type: "file", file: { filename: pdf.name, file_data } };
+  const document = { type: "document", title: "年度报告", source: { type: "base64", media_type: "application/pdf", data: pdf.dataBase64 } };
+  const chat = part => ({ ...base, messages: [{ role: "user", content: [part] }] });
+  const anthropic = part => ({ ...base, max_tokens: 1, messages: [{ role: "user", content: [part] }] });
+  for (const parsed of [normalize(response(responsePart), "responses"), normalize(chat(chatPart), "openai"), normalize(anthropic(document), "anthropic")]) {
+    assert.equal(parsed.body.attachments[0].dataBase64, pdf.dataBase64);
+    assert.equal(parsed.body.attachments[0].mimeType, "application/pdf");
+    assert.equal(parsed.body.prompt.includes(pdf.dataBase64), false);
+    assert.equal(parsed.imageInputs.length, 0, "PDF rendering happens at execution, not during synchronous normalization");
+  }
+  assert.doesNotThrow(() => normalize(response({ ...responsePart, detail: "auto" }), "responses"));
+  for (const detail of ["low", "high"]) assert.throws(() => normalize(response({ ...responsePart, detail }), "responses"), { statusCode: 400 });
+  for (const extra of [{ file_id: "file-other" }, { file_url: "http://169.254.169.254/" }, { detail: "auto" }]) {
+    assert.throws(() => normalize(chat({ ...chatPart, file: { ...chatPart.file, ...extra } }), "openai"), { statusCode: 400 });
+  }
+  for (const role of ["system", "developer", "assistant"]) assert.throws(() => normalize({ ...base, messages: [{ role, content: [chatPart] }, { role: "user", content: "question" }] }, "openai"), /user/);
+  assert.throws(() => normalize(anthropic({ ...document, citations: { enabled: true } }), "anthropic"), { statusCode: 400 });
+});
+
+test("Anthropic plain-text documents preserve title while invalid PDF bytes, citations and URLs reject", () => {
   const part = { type: "document", title: "会议纪要", source: { type: "text", media_type: "text/plain", data: "有效内容" } };
   const request = document => ({ ...base, max_tokens: 1, messages: [{ role: "user", content: [document, { type: "text", text: "总结" }] }] });
   const parsed = normalize(request(part), "anthropic");

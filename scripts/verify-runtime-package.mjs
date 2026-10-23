@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
 
 const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-runtime-package-")));
@@ -21,10 +22,12 @@ try {
   for (const name of ["package.json", "package-lock.json"]) {
     await fs.copyFile(path.join(projectRoot, name), path.join(root, name));
   }
+  await fs.mkdir(path.join(root, "server"));
+  for (const name of ["pdf-inputs.mjs", "pdf-input-worker.mjs", "inline-inputs.mjs", "run-admission.mjs"]) await fs.copyFile(path.join(projectRoot, "server", name), path.join(root, "server", name));
   execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
     cwd: root, stdio: "pipe", timeout: 120_000,
   });
-  const dependencies = ["ajv", "cron-parser", "express", "ws", "web-push", "playwright"];
+  const dependencies = ["ajv", "cron-parser", "express", "ws", "web-push", "playwright", "@napi-rs/canvas", "pdfjs-dist/legacy/build/pdf.mjs"];
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
     for (const name of ${JSON.stringify(dependencies)}) {
@@ -32,6 +35,11 @@ try {
       const module = await import(name);
       if (name === "playwright") assert.equal(typeof module.chromium.launch, "function");
     }
+    const {normalizeInlineAttachments} = await import("./server/inline-inputs.mjs");
+    const {prepareInlineAttachmentInputs} = await import("./server/pdf-inputs.mjs");
+    const parsed = await prepareInlineAttachmentInputs(normalizeInlineAttachments([${JSON.stringify(pdfAttachment())}]));
+    assert.equal(parsed.processing.status, "ready");
+    assert.equal(parsed.inputs.filter(input=>input.type==="image").length, 1);
   `], { cwd: root, stdio: "pipe", timeout: 30_000 });
   for (const name of ["vite", "typescript", "lucide-react", "react-dom", "@vitejs/plugin-react"]) {
     await assert.rejects(fs.access(path.join(root, "node_modules", name)), { code: "ENOENT" });

@@ -188,7 +188,7 @@ test("version-one tasks migrate without changing identity, execution or claims",
   ledger.database.exec("UPDATE external_tasks_meta SET value=1 WHERE key='schema_version'");
   createExternalTaskStore(ledger.database);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
-  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 4);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 5);
 }));
 
 test("accepted output schema is immutable and structured results survive reopening", () => fixture(({ store, ledger }) => {
@@ -229,6 +229,9 @@ test("rollback rejects incompatible releases without altering task data", () => 
   const script = new URL("../ops/check-task-rollback.mjs", import.meta.url).pathname;
   const execute = () => promisify(execFile)(process.execPath, [script, root, previous], { timeout: 10000 });
   await execute();
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 4;");
+  await execute();
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 4);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 3;");
   await execute();
   assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 3);
@@ -248,6 +251,8 @@ test("rollback rejects incompatible releases without altering task data", () => 
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 3;");
   await assert.rejects(execute, /不能自动退回/);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 4;");
+  await assert.rejects(execute, /不能自动退回/);
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 5;");
   await execute();
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 99;");
   await assert.rejects(execute, /不能自动退回/);

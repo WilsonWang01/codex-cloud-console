@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 
 const terminal = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
-export const externalTaskSchemaVersion = 4;
+export const externalTaskSchemaVersion = 5;
 export const executionPayloadLimits = Object.freeze({ perRun: 12 * 1024 * 1024, global: 128 * 1024 * 1024, client: 32 * 1024 * 1024 });
 const decode = (row) => row ? JSON.parse(row.record) : null;
 function processIdentity(pid) {
@@ -29,7 +29,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
   db.exec("CREATE TABLE IF NOT EXISTS external_tasks_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('schema_version', ?)").run(externalTaskSchemaVersion);
   const version = db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value;
-  if (![1, 2, 3, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
+  if (![1, 2, 3, 4, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('revision', 0)").run();
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS external_tasks (
@@ -47,7 +47,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       key_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
       run_id TEXT NOT NULL REFERENCES external_tasks(id), expires_ms INTEGER NOT NULL
     ) STRICT;`);
-  // V4 adds inline materials; old executors cannot silently omit their payload.
+  // V5 adds PDF execution inputs; older executors cannot safely resume those tasks.
   if (version !== externalTaskSchemaVersion) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
   const get = db.prepare("SELECT id, record, state, owner, owner_pid, epoch FROM external_tasks WHERE id=?");
   const save = db.prepare("UPDATE external_tasks SET record=?, state=?, execution=CASE WHEN ?='terminal' THEN '{}' ELSE execution END WHERE id=?");

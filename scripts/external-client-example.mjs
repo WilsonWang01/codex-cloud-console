@@ -223,15 +223,15 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     }
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("--input must contain a JSON object");
     if (prompt !== undefined) input.prompt = prompt;
-    const mimes = { ".txt": "text/plain", ".md": "text/markdown", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
+    const mimes = { ".txt": "text/plain", ".md": "text/markdown", ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
     if (attachments.length) {
       if (input.attachments !== undefined && !Array.isArray(input.attachments)) throw new Error("attachments must be an array");
       input.attachments ||= [];
       if (input.attachments.length + attachments.length > 8) throw new Error("At most eight attachments are allowed");
       for (const name of attachments) {
         const mimeType = mimes[path.extname(name).toLowerCase()];
-        if (!mimeType) throw new Error("Attachments must be txt/md/png/jpeg/webp files");
-        const bytes = await read(name, mimeType.startsWith("image/") ? 4 * 1024 * 1024 : 64 * 1024);
+        if (!mimeType) throw new Error("Attachments must be txt/md/pdf/png/jpeg/webp files");
+        const bytes = await read(name, mimeType.startsWith("image/") || mimeType === "application/pdf" ? 4 * 1024 * 1024 : 64 * 1024);
         input.attachments.push({ name: path.basename(name), mimeType, dataBase64: bytes.toString("base64") });
       }
     }

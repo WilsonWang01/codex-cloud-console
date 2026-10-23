@@ -46,6 +46,7 @@ export function externalRunView(run, automationId) {
     error: run.error,
     usage: run.usage,
     ...(run.inputFiles?.length ? { inputFiles: run.inputFiles } : {}),
+    ...(run.inputProcessing ? { inputProcessing: run.inputProcessing } : {}),
     ...(run.structuredOutput ? { structuredOutput: run.structuredOutput } : {}),
     ...(run.delivery ? { delivery: run.delivery.status === "ready" && Date.parse(run.delivery.expiresAt) <= Date.now()
       ? { ...run.delivery, status: "expired" } : run.delivery, outputPath: resultPath(run) } : {}),

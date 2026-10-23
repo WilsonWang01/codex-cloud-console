@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 
 export const inlineInputLimits = Object.freeze({ files: 8, textFiles: 4, textBytesEach: 64 * 1024, textBytesTotal: 128 * 1024,
   imageBytesEach: 4 * 1024 * 1024, imageBytesTotal: 8 * 1024 * 1024 });
+export const pdfInputLimits = Object.freeze({ files: 2, bytesEach: 4 * 1024 * 1024, bytesTotal: 4 * 1024 * 1024,
+  pagesEach: 6, pagesTotal: 8, renderLongEdge: 1440, textBytesTotal: 128 * 1024, timeoutMs: 15000, oldSpaceMb: 128,
+  outputBytes: 12 * 1024 * 1024, maxConcurrentParsers: 1, linuxAddressSpaceBytes: 1536 * 1024 * 1024, linuxCpuSeconds: 12 });
 const fail = (message, statusCode = 400, code = "invalid_inline_input") => { throw Object.assign(new Error(message), { statusCode, code }); };
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 
@@ -29,8 +32,8 @@ export function decodeInlineImage(mime, data) {
 export function normalizeInlineAttachments(value) {
   if (value === undefined) value = [];
   if (!Array.isArray(value) || value.length > inlineInputLimits.files) fail("attachments 必须是最多八项的内联附件列表");
-  const metadata = [], textInputs = [], imageInputs = [];
-  let textBytes = 0, imageBytes = 0;
+  const metadata = [], textInputs = [], imageInputs = [], pdfInputs = [];
+  let textBytes = 0, imageBytes = 0, pdfBytes = 0;
   for (const file of value) {
     if (!file || typeof file !== "object" || Array.isArray(file) || Object.keys(file).some(key => !["name", "mimeType", "dataBase64"].includes(key))) fail("附件仅支持 name、mimeType 和 dataBase64；不接受路径、URL 或文件 ID");
     const { name, mimeType, dataBase64 } = file;
@@ -38,11 +41,17 @@ export function normalizeInlineAttachments(value) {
     const extension = path.extname(name).toLowerCase();
     const text = (extension === ".txt" && mimeType === "text/plain") || (extension === ".md" && ["text/plain", "text/markdown"].includes(mimeType));
     const image = [[".png", "image/png"], [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"], [".webp", "image/webp"]].some(([ext, mime]) => extension === ext && mimeType === mime);
-    if (!text && !image) fail("附件只支持 UTF-8 txt/md 及 PNG/JPEG/WebP，文件名与 MIME 必须匹配", 415, "unsupported_input_file");
-    const bytes = text ? decodeInlineBase64(dataBase64, inlineInputLimits.textBytesEach, true) : decodeInlineImage(mimeType, dataBase64);
+    const pdf = extension === ".pdf" && mimeType === "application/pdf";
+    if (!text && !image && !pdf) fail("附件只支持 UTF-8 txt/md、PDF 及 PNG/JPEG/WebP，文件名与 MIME 必须匹配", 415, "unsupported_input_file");
+    const bytes = text || pdf ? decodeInlineBase64(dataBase64, pdf ? pdfInputLimits.bytesEach : inlineInputLimits.textBytesEach, text) : decodeInlineImage(mimeType, dataBase64);
     const item = { index: metadata.length + 1, name, mimeType, bytes: bytes.length, sha256: hash(bytes) };
     metadata.push(item);
-    if (text) {
+    if (pdf) {
+      pdfBytes += bytes.length;
+      if (pdfInputs.length >= pdfInputLimits.files || pdfBytes > pdfInputLimits.bytesTotal) fail("PDF 最多两份、合计 4 MiB", 413, "input_too_large");
+      if (!/^%PDF-[12]\.\d/.test(bytes.toString("ascii", 0, 8))) fail("PDF 文件头无效", 400, "invalid_pdf");
+      pdfInputs.push({ ...item, dataBase64 });
+    } else if (text) {
       textBytes += bytes.length;
       if (textInputs.length >= inlineInputLimits.textFiles || textBytes > inlineInputLimits.textBytesTotal) fail("文本附件最多四份、每份 64 KiB、合计 128 KiB", 413, "input_too_large");
       const content = bytes.toString("utf8");
@@ -55,7 +64,7 @@ export function normalizeInlineAttachments(value) {
         { type: "image", url: `data:${mimeType};base64,${dataBase64}`, detail: "auto" });
     }
   }
-  return { metadata, textInputs, imageInputs };
+  return { metadata, textInputs, imageInputs, pdfInputs };
 }
 
 export function inlineAttachmentInputs(input) {

@@ -1,6 +1,6 @@
 # 受限内联文件输入
 
-先查询当前部署的 `capabilities`，确认 `features.file_input.supported` 为 true，并读取 `limits.inline_attachments`、`input_buffers` 和 `task_queue`。这是首批文本/Markdown/静态图片材料输入，不是通用 Files API、可复用文件 ID 或服务器文件访问接口。旧部署可能不支持。
+先查询当前部署的 `capabilities`，确认 `features.file_input.supported` 为 true；PDF 还需 `features.file_input.pdf.supported` 为 true，并读取 `limits.inline_attachments`、`pdf_input`、`input_buffers` 和 `task_queue`。支持文本、Markdown、普通 PDF 和静态图片材料，不是通用 Files API、可复用文件 ID 或服务器文件访问接口。旧部署可能不支持。
 
 ## 最简单的用法
 
@@ -35,7 +35,7 @@ python3 scripts/external-client-example.py submit my-automation report-event-202
 }
 ```
 
-`dataBase64` 是文件字节的标准 Base64，不带 data URL 前缀。仅接受 `name`、`mimeType`、`dataBase64` 三个字段，不接受路径、URL、file_id 或额外参数。文件名不可含路径、控制字符或隐藏名称，UTF-8 最多 255 字节。后缀与 MIME 必须匹配：txt/text/plain，md/text/markdown 或 text/plain，png/image/png，jpg/jpeg/image/jpeg，webp/image/webp。
+`dataBase64` 是文件字节的标准 Base64，不带 data URL 前缀。仅接受 `name`、`mimeType`、`dataBase64` 三个字段，不接受路径、URL、file_id 或额外参数。文件名不可含路径、控制字符或隐藏名称，UTF-8 最多 255 字节。后缀与 MIME 必须匹配：txt/text/plain，md/text/markdown 或 text/plain，pdf/application/pdf，png/image/png，jpg/jpeg/image/jpeg，webp/image/webp。
 
 文本须有效 UTF-8，可保留换行、制表符和空内容，不可含二进制控制字符；不自动猜测 GBK、UTF-16 或截断。图片复用原有标准 Base64、大小和文件头校验，完整图片解码仍由 Codex 负责。
 
@@ -47,13 +47,29 @@ python3 scripts/external-client-example.py submit my-automation report-event-202
 
 ## 模型协议
 
-Responses 支持 user 消息中的受限 `input_file`，仅接受 `type`、`filename`、`file_data`。`file_data` 使用 `data:text/plain;base64,...` 或 `data:text/markdown;base64,...`，文件后缀仍须匹配。不支持 file_id、file_url、detail 或 PDF。该格式来自 [OpenAI 文件输入文档](https://developers.openai.com/api/docs/guides/file-inputs)，本项目只实现上述子集，不继承官方支持的所有文件类型。
+Responses 支持 user 消息中的受限 `input_file`，接受 `type`、`filename`、`file_data`；`file_data` 使用 `data:text/plain;base64,...`、`data:text/markdown;base64,...` 或 `data:application/pdf;base64,...`，文件后缀须匹配。PDF 可显式设置 `detail:"auto"`，拒绝 low/high；其他文件不接受 detail。不支持 file_id、file_url。格式见 [OpenAI 文件输入文档](https://developers.openai.com/api/docs/guides/file-inputs)，本项目只实现上述子集。
 
-Anthropic Messages 支持 user 消息中的 `document`，`source` 只接受 `{type:"text",media_type:"text/plain",data:"内容"}`；可选 `title` 最多 255 UTF-8 字节。没有提供 title 时仍有生成的材料序号。允许明确的 `citations:{enabled:false}`，拒绝启用引用、PDF、URL、file_id、context 和缓存控制，不伪造文档引用。原格式见 [Anthropic 纯文本文档](https://platform.claude.com/docs/en/build-with-claude/citations)。底层仍是 Codex，不会改为调用 Claude。
+Anthropic Messages 支持 user 消息中的 `document`：纯文本 `source:{type:"text",media_type:"text/plain",data:"内容"}` 或 PDF `source:{type:"base64",media_type:"application/pdf",data:"标准Base64"}`；可选 `title` 最多 255 UTF-8 字节。材料名按序号生成，title 不作为路径。允许 `citations:{enabled:false}`，拒绝启用引用、URL、file_id、context 和缓存控制。格式见 [Anthropic PDF 文档](https://platform.claude.com/docs/en/build-with-claude/pdf-support)；底层仍是 Codex，不会调用 Claude。
 
-Chat Completions 的文件块不用于传 txt/md；官方 Chat 文件块只支持 PDF，而本项目尚未实现 PDF 输入。请将文本作为普通 text 消息，或改用 Responses/异步附件。图片仍使用各协议原有的内联 image 块。
+Chat Completions 的 user 文件块只接受 `{type:"file",file:{filename:"report.pdf",file_data:"data:application/pdf;base64,..."}}`，不接受文件 ID、URL 或 detail。txt/md 请使用普通 text 消息或 Responses/异步附件。图片仍使用各协议原有的内联 image 块。
 
-协议适配把文件转换为编号的材料描述与独立数据块，不把全文复制进运行 prompt 索引；原请求顺序、文件名和内容摘要用于区分材料。它不提供官方 Files 上传/保存服务、PDF 解析、引用坐标或浏览任意远程文件。
+协议适配把文件转换为编号的材料描述与独立数据块，不把全文复制进运行 prompt 索引；原请求顺序、文件名和内容摘要用于区分材料。它不提供官方 Files 上传/保存服务、引用坐标或浏览任意远程文件。
+
+## PDF 的处理方式
+
+PDF 原字节按现有任务配额保存，执行时在受限子进程中通过 PDF.js 提取页面文字，并把每页渲染为 PNG，一起交给支持视觉输入的 Codex 模型。不是把 PDF 直接转发给 OpenAI/Claude，也不保证与官方 PDF detail/计费一致。页面图片会增加模型输入消耗，密集小字应先拆分或提供合适的图片，不承诺 `max_tokens` 硬预算。
+
+每请求最多 2 份 PDF、原字节合计 4 MiB，每份最多 6 页、合计最多 8 页；每页还占原有八份图片名额，并与普通图片共享每张 4 MiB/总计 8 MiB 的图片字节限额。页面长边最多 1440 像素，不无限放大小页面；PDF 提取文本合计最多 128 KiB，单独于 txt/md 的限额。超页数、过大文本/图片、超时、解析/渲染警告都会失败，不静默跳页或截断后运行模型。
+
+只分析页面内容，不读取嵌入文件、不运行 PDF JavaScript、不访问注释中的外链。不支持需要密码、交互/动态表单、异常页面尺寸或无法完整渲染的文件；请先导出普通 PDF。没有文字层的页面仍传入图片，并记录 `pagesWithoutText`；服务器不做 OCR，也不保证识别率。文字提取遵循 PDF.js 的页面内容语义，不等于抽出 PDF 内所有隐藏字符串或元数据。
+
+运行快照 `inputProcessing` 区分 `ready` 和 `failed`，包含解析器版本、页数、文字/渲染字节、无文字层页号、控制字符规范化数量及错误代码，不含文件内容。`truncated:false` 只表示本服务没有为通过限额主动截断，不保证原文件自身文字层与视觉内容完全一致。ready 只证明转换完成，不代表模型已完成业务任务。
+
+同一控制台进程最多 1 个 PDF 解析子进程，15 秒墙钟超时，V8 旧生代堆（JS 对象的主要内存区）限制 128 MiB。Linux 额外通过 `/usr/bin/prlimit` 限制虚拟地址空间 1536 MiB、CPU 时间 12 秒并禁用 core 文件；启动时实际加载组件/编码 PNG，缺少组件或 prlimit 时不接受流量。其他平台没有这项 Linux 地址空间保护。该堆限制不等于总内存，地址空间限制也不是 RSS 指标；不对多个控制台进程提供整机配额。
+
+子进程不继承凭据环境，仅允许 Node 读取代码和依赖，不允许写盘或启动其他进程，禁用字符串生成代码。原生绘图插件仍须允许加载；这些是纵深保护，不是独立操作系统安全沙箱，不能据此面向不可信租户开放。[Node 的相关说明](https://nodejs.org/download/release/v22.23.0/docs/api/cli.html#--disable-wasm-trap-handler)解释了为何限制地址空间时关闭 Wasm 大块虚拟内存预留。
+
+PDF 在持久接收后解析，失败仍有原运行 ID，模型未启动的失败记录已证实的 0 用量并释放执行载荷。同步模型协议返回 422 及原结果路径；流式已经开始时以错误事件结束。取消和撤销在模型启动前复核，不把解析完成误当授权继续。收到失败后先查原任务，不自动换键重新执行。
 
 ## 限额和留存
 
@@ -67,4 +83,4 @@ Chat Completions 的文件块不用于传 txt/md；官方 Chat 文件块只支�
 
 常见拒绝：401 认证问题；400 格式/编码错误；409 同键输入变化；413 大小超限；415 类型、MIME、压缩或 Content-Type 不支持；429 接收缓冲/队列/材料容量或频率受限；503 存储或摘要核对异常。无论超时还是失败，都先核对原任务，不自动重发外部动作。
 
-升级使用任务格式 4，需按安全发布流程备份并验证 SQLite 和 state。旧格式 1/2/3 的记录与执行凭据保留；一旦新任务产生数据，不能直接退回不理解新材料的旧执行器，也不能用旧备份覆盖新任务。现有接口路径不变，无需另开公网文件上传路径。
+升级使用任务格式 5，需按安全发布流程备份并验证 SQLite 和 state。旧格式 1/2/3/4 的记录与执行凭据保留；一旦新任务产生数据，不能直接退回不理解新材料的旧执行器，也不能用旧备份覆盖新任务。现有接口路径不变，无需另开公网文件上传路径。
