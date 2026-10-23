@@ -1,6 +1,8 @@
 # 个人邮箱来源候选验收与 Review
 
-日期：2026-10-24，Asia/Shanghai。状态：候选代码与隔离验收完成，准备提交独立分支和草稿 PR；没有合并 main 或部署 EC2。真实邮件读取仍等待用户选择已连接邮箱，不能把模拟数据通过写成真实邮箱已接通。整体 goal 保持 active。
+日期：2026-10-24，Asia/Shanghai。状态：候选代码与隔离验收完成，已推送独立分支并建立[草稿 PR #1](https://github.com/WilsonWang01/codex-cloud-console/pull/1)；没有合并 main 或部署 EC2。真实邮件读取仍等待用户选择已连接邮箱，不能把模拟数据通过写成真实邮箱已接通。整体 goal 保持 active。
+
+功能提交为 `6acfdad2cedc9082c1dd097040ce4f47d6481b11`，主分支保持 `6bab939`。CI 的当前结果见上述 PR 检查；CI 与本地测试都不替代真实邮箱读取和上线验收。
 
 ## 范围
 
