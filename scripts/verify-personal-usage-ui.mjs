@@ -464,6 +464,7 @@ try {
     assert.match(await source.innerText(), /未将失败视为没有日程/);
     assert.equal(await source.getByRole("button", { name: "规划今天" }).isDisabled(), true);
     assert.equal(await source.locator(".personal-calendar-row").count(), 1);
+    assert.ok(await source.getByRole("button", { name: "检查连接服务" }).evaluate(el => el.getBoundingClientRect().height >= 44));
     calendarFailure = false; calendarView = makeCalendar(calendarView.window.timeZone); calendarView.snapshot.complete = false;
     await calendarPage.reload();
     await source.getByText(/仅展示部分记录/).waitFor();
