@@ -26,6 +26,7 @@ try {
   try {
     if (db.prepare("SELECT name FROM sqlite_master WHERE name='external_tasks'").get()) {
       if (db.prepare("SELECT count(*) AS n FROM external_tasks WHERE state IN ('queued','running')").get().n) throw new Error("存在持久排队或执行中任务，停止发布");
+      if (db.prepare("SELECT name FROM sqlite_master WHERE name='external_callbacks'").get() && db.prepare("SELECT count(*) AS n FROM external_callbacks WHERE state='sending'").get().n) throw new Error("存在投递中的回调，停止发布");
       const revision = db.prepare("SELECT value FROM external_tasks_meta WHERE key='revision'").get()?.value;
       if (before.taskStoreRevision !== undefined && before.taskStoreRevision !== revision) throw new Error("持久任务已变化，停止发布");
     }

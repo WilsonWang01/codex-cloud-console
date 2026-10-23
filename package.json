@@ -34,7 +34,7 @@
     "verify:external-client": "node --test scripts/verify-external-client-example.mjs",
     "verify:model-api": "node --test scripts/verify-model-api.mjs scripts/verify-api-discovery.mjs scripts/verify-structured-output.mjs scripts/verify-inline-inputs.mjs scripts/verify-external-input-body.mjs scripts/verify-pdf-inputs.mjs",
     "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
-    "verify:automation-events": "node --test scripts/verify-automation-events.mjs",
+    "verify:automation-events": "node --test scripts/verify-automation-events.mjs scripts/verify-external-callbacks.mjs",
     "verify:usage": "node --test scripts/verify-run-usage.mjs scripts/verify-run-usage-ledger.mjs",
     "verify:admission": "node --test scripts/verify-run-admission.mjs scripts/verify-run-budget.mjs scripts/verify-external-task-store.mjs scripts/verify-external-results.mjs scripts/verify-external-result-api.mjs",
     "verify:notifications": "node --test scripts/verify-notifications.mjs",

@@ -166,7 +166,7 @@ test("queued material capacity is byte-based, atomic, scoped and released only a
   assert.equal(ledger.database.prepare("SELECT execution FROM external_tasks WHERE id='3'").get().execution, "{}");
 }));
 
-for (const version of [3, 4]) test(`version-${version} queued inputs remain intact and accepted material descriptors are immutable`, () => fixture(({ store, ledger }) => {
+for (const version of [3, 4, 5]) test(`version-${version} queued inputs remain intact and accepted material descriptors are immutable`, () => fixture(({ store, ledger }) => {
   const inputFiles = [{ index: 1, name: "notes.md", mimeType: "text/markdown", bytes: 5, sha256: "f".repeat(64) }];
   const accepted = options("1");
   accepted.run.inputFiles = inputFiles;
@@ -175,7 +175,7 @@ for (const version of [3, 4]) test(`version-${version} queued inputs remain inta
   const before = ledger.database.prepare("SELECT * FROM external_tasks").all();
   ledger.database.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(version);
   const reopened = createExternalTaskStore(ledger.database);
-  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 5);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 6);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
   const owned = reopened.claim({ owner: "worker" });
   assert.deepEqual(owned.execution, accepted.execution);
@@ -189,7 +189,7 @@ test("version-one tasks migrate without changing identity, execution or claims",
   ledger.database.exec("UPDATE external_tasks_meta SET value=1 WHERE key='schema_version'");
   createExternalTaskStore(ledger.database);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
-  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 5);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 6);
 }));
 
 test("accepted output schema is immutable and structured results survive reopening", () => fixture(({ store, ledger }) => {
@@ -230,6 +230,9 @@ test("rollback rejects incompatible releases without altering task data", () => 
   const script = new URL("../ops/check-task-rollback.mjs", import.meta.url).pathname;
   const execute = () => promisify(execFile)(process.execPath, [script, root, previous], { timeout: 10000 });
   await execute();
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 5;");
+  await execute();
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 5);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 4;");
   await execute();
   assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 4);
@@ -254,6 +257,8 @@ test("rollback rejects incompatible releases without altering task data", () => 
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 4;");
   await assert.rejects(execute, /不能自动退回/);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 5;");
+  await assert.rejects(execute, /不能自动退回/);
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 6;");
   await execute();
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 99;");
   await assert.rejects(execute, /不能自动退回/);

@@ -1,10 +1,11 @@
 import { mergeAutomationEvents } from "./automation-events.mjs";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { createExternalCallbackStore } from "./external-callback-store.mjs";
 
 const terminal = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
-export const externalTaskSchemaVersion = 5;
+export const externalTaskSchemaVersion = 6;
 export const executionPayloadLimits = Object.freeze({ perRun: 12 * 1024 * 1024, global: 128 * 1024 * 1024, client: 32 * 1024 * 1024 });
 const decode = (row) => row ? JSON.parse(row.record) : null;
 function processIdentity(pid) {
@@ -29,7 +30,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
   db.exec("CREATE TABLE IF NOT EXISTS external_tasks_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('schema_version', ?)").run(externalTaskSchemaVersion);
   const version = db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value;
-  if (![1, 2, 3, 4, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
+  if (![1, 2, 3, 4, 5, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('revision', 0)").run();
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS external_tasks (
@@ -47,7 +48,8 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       key_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
       run_id TEXT NOT NULL REFERENCES external_tasks(id), expires_ms INTEGER NOT NULL
     ) STRICT;`);
-  // V5 adds PDF execution inputs; older executors cannot safely resume those tasks.
+  const callbacks = createExternalCallbackStore(db, { now });
+  // V6 commits callback intent with acceptance and terminal notification with the result.
   if (version !== externalTaskSchemaVersion) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
   const get = db.prepare("SELECT id, record, state, owner, owner_pid, epoch FROM external_tasks WHERE id=?");
   const save = db.prepare("UPDATE external_tasks SET record=?, state=?, execution=CASE WHEN ?='terminal' THEN '{}' ELSE execution END WHERE id=?");
@@ -77,6 +79,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       }
     }
     save.run(JSON.stringify(record), state, state, row.id);
+    if (state === "terminal") callbacks.terminal(record);
     return record;
   };
   const assertClaim = (row, claim) => {
@@ -97,6 +100,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
     row_number() OVER (PARTITION BY json_extract(record,'$.clientId'), json_extract(record,'$.automationId') ORDER BY created_ms DESC, id DESC) AS n
     FROM external_tasks WHERE json_extract(record,'$.clientId') IS NOT NULL AND json_extract(record,'$.sessionId') IS NOT NULL AND json_extract(record,'$.sessionId')!='') WHERE n=1`).all().map(row => row.id);
   return {
+    callbacks,
     read(id) { return decode(get.get(id)); },
     runs() { return db.prepare("SELECT record FROM external_tasks ORDER BY created_ms DESC, id").all().map(decode); },
     ids() { return db.prepare("SELECT id FROM external_tasks").all().map(row => row.id); },
@@ -114,7 +118,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       return db.prepare("SELECT t.id FROM external_tasks t LEFT JOIN usage_runs u ON u.id=t.id WHERE t.state='terminal' AND u.id IS NULL").all().map(row => row.id);
     },
     lookup,
-    accept({ run, execution, keyHash, requestHash, ttlMs, maxQueued = 32, check = () => {}, onAccepted = () => {} }) {
+    accept({ run, execution, keyHash, requestHash, ttlMs, maxQueued = 32, callback = null, check = () => {}, onAccepted = () => {} }) {
       return transaction(() => {
         const existing = lookup(keyHash, requestHash);
         if (existing) return { run: existing, deduplicated: true };
@@ -134,6 +138,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         db.prepare("INSERT INTO external_tasks VALUES (?, ?, ?, ?, 'queued', NULL, NULL, 0)").run(
           run.id, JSON.stringify(run), encoded, now(),
         );
+        callbacks.reserve(run, callback);
         onAccepted(run);
         if (keyHash) db.prepare("INSERT INTO external_task_keys VALUES (?, ?, ?, ?)").run(keyHash, requestHash, run.id, now() + ttlMs);
         return { run, deduplicated: false };
@@ -225,7 +230,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         db.prepare("DELETE FROM external_task_keys WHERE expires_ms<=? AND run_id IN (SELECT id FROM external_tasks WHERE state='terminal' AND json_extract(record,'$.status')!='needs_reconciliation')").run(now());
         const results = db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get();
         for (const row of db.prepare("SELECT id FROM external_tasks WHERE state='terminal' AND json_extract(record,'$.status')!='needs_reconciliation' AND id NOT IN (SELECT run_id FROM external_task_keys)" +
-          (results ? " AND id NOT IN (SELECT run_id FROM external_results)" : "")).all()) {
+          (results ? " AND id NOT IN (SELECT run_id FROM external_results)" : "") + " AND id NOT IN (SELECT run_id FROM external_callbacks)").all()) {
           if (!kept.has(row.id)) db.prepare("DELETE FROM external_tasks WHERE id=?").run(row.id);
         }
       });

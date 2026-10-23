@@ -23,10 +23,11 @@ try {
         const empty = db.prepare("SELECT count(*) AS n FROM external_tasks").get().n === 0 && db.prepare("SELECT count(*) AS n FROM external_task_keys").get().n === 0;
         const resultsEmpty = !db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get() || db.prepare("SELECT count(*) AS n FROM external_results").get().n === 0;
         // Only known, empty format changes are reversible without understanding new records.
-        if (empty && resultsEmpty && ((version === 5 && previous === 4) || (version === 4 && previous === 3) || (version === 3 && previous === 2) || (version === 2 && previous === 1))) {
+        const callbacksEmpty = !db.prepare("SELECT name FROM sqlite_master WHERE name='external_callbacks'").get() || db.prepare("SELECT count(*) AS n FROM external_callbacks").get().n === 0;
+        if (empty && resultsEmpty && callbacksEmpty && ((version === 6 && previous === 5) || (version === 5 && previous === 4) || (version === 4 && previous === 3) || (version === 3 && previous === 2) || (version === 2 && previous === 1))) {
           db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(previous);
           compatible = true;
-        } else if (empty && resultsEmpty && [1, 2, 3, 4, 5].includes(version) && previous === null) compatible = true;
+        } else if (empty && resultsEmpty && callbacksEmpty && [1, 2, 3, 4, 5, 6].includes(version) && previous === null) compatible = true;
         db.exec("COMMIT");
       } catch (error) { db.exec("ROLLBACK"); throw error; }
     }

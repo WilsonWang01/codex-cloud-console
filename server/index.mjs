@@ -33,6 +33,7 @@ import { prepareInlineAttachmentInputs, probePdfInputRuntime } from "./pdf-input
 import { createExternalBodyParser } from "./external-input-body.mjs";
 import { createExternalResultStore, normalizeArtifactPaths, artifactBaseline, requestedArtifacts, nativeSources } from "./external-results.mjs";
 import { createExternalResultHandler } from "./external-result-api.mjs";
+import { readCallbackTargets, createCallbackDispatcher } from "./external-callbacks.mjs";
 import { externalApiToken } from "./external-auth.mjs";
 import { withPublicationLock } from "./publication-lock.mjs";
 import { normalizeOutputSchema, validateStructuredOutput, structuredTurnText } from "./structured-output.mjs";
@@ -106,6 +107,18 @@ function externalResultStore() {
   } catch { throw automationRequestError(503, "结果存储不可用，需要管理员核对；未接收新任务"); }
 }
 const externalTaskOwner = createExternalTaskOwner();
+const callbackTargets = await readCallbackTargets(process.env.CODEX_CLOUD_CALLBACKS_FILE);
+// Keep signing keys in the registry, not in environments inherited by CLI/shell children.
+for (const key of Object.keys(process.env)) if (key.startsWith("CODEX_CLOUD_CALLBACK_SECRET_")) delete process.env[key];
+let callbackDispatcher;
+async function drainExternalCallbacks() {
+  try {
+    const tasks = externalTaskStore();
+    if (!tasks.callbacks.due()) return;
+    callbackDispatcher ||= createCallbackDispatcher({ store: tasks.callbacks, targets: callbackTargets, authorize: assertAutomationClientActive });
+    await withPublicationLock(publicationLockPath, callbackDispatcher);
+  } catch (error) { if (error.statusCode !== 503) console.error("回调存储或投递暂不可用；原任务结果不受影响"); }
+}
 let drainingExternalTasks = false;
 const publicationLockPath = process.env.CODEX_CLOUD_RELEASE_LOCK || path.join(cloudRoot, "locks/console-release.lock");
 const auditEventsPath = path.join(stateRoot, "audit-events.json");
@@ -5276,7 +5289,7 @@ async function readAutomationRuns() {
 
 async function readAutomationRun(id) {
   const saved = externalTaskStore().read(id);
-  return saved ? normalizeAutomationRun(saved) : (await readAutomationRuns()).runs.find(run => run.id === id);
+  return saved ? { ...normalizeAutomationRun(saved), callbackDelivery: externalTaskStore().callbacks.status(id) } : (await readAutomationRuns()).runs.find(run => run.id === id);
 }
 
 async function writeAutomationRunsWithinQueue(store) {
@@ -7195,6 +7208,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
     const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt } },
       keyHash: options.triggerIdempotencyHash, requestHash: options.triggerRequestHash, ttlMs: automationTriggerIdempotencyTtlMs,
       maxQueued: automationMaxQueued,
+      callback: callbackTargets.binding(options.clientId,automation.id),
       onAccepted: run => results.reserve(run),
       check() {
         const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT, now });
@@ -7217,7 +7231,7 @@ async function drainExternalTasks() {
   drainingExternalTasks = true;
   try {
     if (Date.now() - lastResultSweep >= 60000) {
-      await withPublicationLock(publicationLockPath, () => externalResultStore().sweep());
+      await withPublicationLock(publicationLockPath, async () => { externalTaskStore().callbacks.sweep(); await externalResultStore().sweep(); });
       lastResultSweep = Date.now();
     }
     const counts = externalTaskStore().info();
@@ -9130,7 +9144,7 @@ app.get("/healthz", async (_req, res) => {
   const { data, cache } = await getStatusForRoute();
   const health = data?.health || fastStatusFallback("health snapshot unavailable").health;
   let ledgerHealth;
-  try { usageLedger().info(); externalTaskStore().info(); externalResultStore().info(); ledgerHealth = { ok: true }; }
+  try { usageLedger().info(); externalTaskStore().info(); externalTaskStore().callbacks.info(); externalResultStore().info(); ledgerHealth = { ok: true }; }
   catch { ledgerHealth = { ok: false, error: "任务、结果或用量存储不可用" }; }
   const strictOk = Boolean(health.ok && ledgerHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
@@ -9141,7 +9155,7 @@ app.get("/healthz", async (_req, res) => {
   const responseHealth =
     {
       ...health,
-      layers: { ...health.layers, usageLedger: ledgerHealth, pdfInput: pdfInputRuntime },
+      layers: { ...health.layers, usageLedger: ledgerHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
       ok: strictOk,
       strictOk,
       partial: !strictOk && reachable,
@@ -11969,6 +11983,8 @@ const handleDiscovery = createDiscoveryHandler({
   record: (metric) => apiClientStore.record(metric),
   idempotencyTtlMs: automationTriggerIdempotencyTtlMs,
   modelWaitMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
+  callback: (client,id) => ({ supported: true, configured: Boolean(callbackTargets.binding(client.id,id)), events: ["automation.run.terminal"],
+    signature: "hmac_sha256_v1", max_attempts: 5, lifetime_ms: 86_400_000, duplicate_delivery_possible: true, polling_fallback: true }),
   queueLimits: () => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: runAdmission.status().maxPerClient,
     max_execution_payload_bytes: executionPayloadLimits.perRun, max_global_execution_payload_bytes: executionPayloadLimits.global, max_client_execution_payload_bytes: executionPayloadLimits.client }),
   resultStorage: () => {
@@ -12259,4 +12275,6 @@ server.listen(port, host, () => {
   console.log(`Codex Cloud Console listening on http://${host}:${port}`);
   void drainExternalTasks();
   setInterval(() => void drainExternalTasks(), 1000).unref();
+  void drainExternalCallbacks();
+  setInterval(() => void drainExternalCallbacks(), 1000).unref();
 });

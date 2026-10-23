@@ -116,6 +116,7 @@ async function writeFakeCodex(tempRoot) {
     `#!/usr/bin/env node
 import fsSync from "node:fs";
 import readline from "node:readline";
+if (process.env.FAKE_CAPTURE_CALLBACK_ENV_PATH) fsSync.writeFileSync(process.env.FAKE_CAPTURE_CALLBACK_ENV_PATH, JSON.stringify(Object.keys(process.env).filter(key => key.startsWith("CODEX_CLOUD_CALLBACK_SECRET_"))));
 const initDelay = Number(process.env.FAKE_INIT_DELAY_MS || 0);
 const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
 const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
@@ -437,6 +438,49 @@ input.on("line", (line) => {
   );
   return fakePath;
 }
+
+await check("scoped API callback intent survives restart and changed registration never receives old events", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-callback-api-"));
+  const cloudRoot = path.join(root,"cloud"), stateRoot = path.join(root,"state"), bin = path.join(root,"bin");
+  const repo = path.join(cloudRoot,"workspace/sample-app"), config = path.join(root,"callbacks.json"), capturedEnv = path.join(root,"child-env.json");
+  for (const directory of [repo,stateRoot,bin]) await fs.mkdir(directory,{recursive:true});
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin,"codex"),`#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`,{mode:0o755});
+  const clients = ["a","b"].map(letter=>({id:`callback-client-${letter}`,name:`callback-${letter}`,tokenHash:crypto.createHash("sha256").update(`callback-fixture-token-${letter}`).digest("hex"),automationIds:["sample-research"],expiresAt:null,revokedAt:null}));
+  await fs.writeFile(path.join(stateRoot,"api-clients.json"),JSON.stringify({version:1,clients}));
+  const target = {id:"receiver",clientId:clients[0].id,automationId:"sample-research",url:"https://callback.invalid/old",secretEnv:"CODEX_CLOUD_CALLBACK_SECRET_FIXTURE"};
+  await fs.writeFile(config,JSON.stringify([target]),{mode:0o600});
+  const port=await freePort(),base=`http://127.0.0.1:${port}`,admin={"content-type":"application/json","x-codex-cloud-token":"callback-admin-fixture-token"};
+  const auth=letter=>({"content-type":"application/json",authorization:`Bearer callback-fixture-token-${letter}`});
+  const start=()=>spawn(process.execPath,[path.join(projectRoot,"server/index.mjs")],{cwd:projectRoot,stdio:["ignore","pipe","pipe"],env:{...process.env,NODE_ENV:"production",HOST:"127.0.0.1",PORT:String(port),CODEX_CLOUD_ROOT:cloudRoot,CODEX_STATE_ROOT:stateRoot,CODEX_HOME:path.join(root,".codex"),CODEX_CLOUD_WEBHOOK_TOKEN:admin["x-codex-cloud-token"],CODEX_CLOUD_CALLBACKS_FILE:config,CODEX_CLOUD_CALLBACK_SECRET_FIXTURE:"synthetic-fixture-secret-not-a-real-credential",FAKE_CAPTURE_CALLBACK_ENV_PATH:capturedEnv,CODEX_AUTOMATION_RECOVERY_ENABLED:"0",CODEX_AUTOMATION_MAX_CONCURRENT:"1",CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT:"1",PATH:`${bin}:${process.env.PATH}`}});
+  const submit=(key,prompt,headers,extra={})=>jsonRequest(base,"/api/automations/sample-research/webhook",{method:"POST",headers:{...headers,"idempotency-key":key},body:JSON.stringify({prompt,...extra})});
+  const wait=async task=>{const deadline=Date.now()+12000;while(Date.now()<deadline){const result=await task();if(result)return result;await new Promise(resolve=>setTimeout(resolve,40));}throw new Error("Callback API fixture did not settle");};
+  let server;
+  try {
+    server=start();await waitForOutput(server,/listening on/);
+    const caps=await jsonRequest(base,"/api/automations/sample-research/v1/capabilities",{headers:auth("a")});
+    assert.equal(caps.data.features.callback.supported,true);assert.equal(caps.data.features.callback.configured,true);
+    assert.deepEqual(JSON.parse(await fs.readFile(capturedEnv,"utf8")),[]);
+    const otherCaps=await jsonRequest(base,"/api/automations/sample-research/v1/capabilities",{headers:auth("b")});
+    assert.equal(otherCaps.data.features.callback.configured,false);
+    const busy=await submit("callback-hold-0001","progress regression queue first",admin,{worktree:false});assert.equal(busy.response.status,200);
+    const queued=await submit("callback-pending-0002","queue regression next",auth("a"));
+    assert.equal(queued.response.status,200);assert.equal(queued.data.run.status,"queued");
+    const first=await jsonRequest(base,queued.data.run.resultPath,{headers:auth("a")});
+    assert.equal(first.data.run.callbackDelivery.status,"awaiting");const eventId=first.data.run.callbackDelivery.eventId;
+    assert.equal((await jsonRequest(base,queued.data.run.resultPath,{headers:auth("b")})).response.status,404);
+    const rejected=await submit("callback-override-0003","must not run",auth("a"),{callbackUrl:"https://not-registered.invalid/"});assert.equal(rejected.response.status,400);
+    await stopProcess(server);
+    await fs.writeFile(config,JSON.stringify([{...target,url:"https://callback.invalid/changed"}]));
+    server=start();await waitForOutput(server,/listening on/);
+    const finished=await wait(async()=>{const result=await jsonRequest(base,queued.data.run.resultPath,{headers:auth("a")});return result.data.run?.callbackDelivery?.status==="failed"?result.data.run:null;});
+    assert.equal(finished.status,"completed");assert.equal(finished.callbackDelivery.eventId,eventId);assert.equal(finished.callbackDelivery.lastCode,"target_changed");
+    const replay=await submit("callback-pending-0002","queue regression next",auth("a"));assert.equal(replay.data.run.id,queued.data.run.id);assert.equal(replay.data.deduplicated,true);
+    const output=await jsonRequest(base,queued.data.run.resultPath+"/output",{headers:auth("a")});assert.equal(output.response.status,200);
+    assert.equal(JSON.stringify(finished.callbackDelivery).includes("callback.invalid"),false);
+  } finally {await stopProcess(server);await fs.rm(root,{recursive:true,force:true});}
+});
 
 await check("durable API queue survives lost responses and restart without repeating claimed work", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-durable-api-"));

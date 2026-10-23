@@ -27,7 +27,7 @@ export function discoveryModels(catalog, runs, client, automationId) {
   }));
 }
 
-export function discoveryCapabilities({ automationId, defaults, catalog, cli, idempotencyTtlMs, modelWaitMs, queueLimits, resultStorage }) {
+export function discoveryCapabilities({ automationId, defaults, catalog, cli, idempotencyTtlMs, modelWaitMs, queueLimits, resultStorage, callback }) {
   return {
     object: "codex_cloud.capabilities", version: "2026-10-23", automation_id: automationId,
     defaults: { model: defaults.model, reasoning: defaults.reasoning },
@@ -42,7 +42,7 @@ export function discoveryCapabilities({ automationId, defaults, catalog, cli, id
       file_input: { supported: true, mode: "inline_task_material", text_formats: ["txt", "md"], image_formats: ["png", "jpeg", "webp"],
         pdf: { supported: cli.pdfInput?.ok === true, mode: "server_text_and_page_images", runtime: cli.pdfInput || null, requires_vision_model: true },
         responses: "text_or_pdf_input_file", anthropic: "plain_text_or_pdf_document", chat_file_parts: cli.pdfInput?.ok === true, chat_file_formats: ["pdf"] },
-      request_output_token_limit: false, callback: false,
+      request_output_token_limit: false, callback: callback || false,
     },
     limits: { json_bytes: 12 * 1024 * 1024, messages: 100, normalized_text_bytes: 64 * 1024, model_wait_ms: modelWaitMs, discovery_and_poll_requests_per_minute: 60,
       structured_output: structuredOutputLimits, inline_attachments: inlineInputLimits, pdf_input: pdfInputLimits, input_buffers: inputBufferLimits, ...(queueLimits ? { task_queue: queueLimits } : {}), ...(resultStorage ? { result_storage: resultStorage } : {}) },
@@ -54,7 +54,7 @@ export function discoveryCapabilities({ automationId, defaults, catalog, cli, id
   };
 }
 
-export function createDiscoveryHandler({ authenticate, automation, catalog, runtime, runs, rateLimit, record, idempotencyTtlMs, modelWaitMs, queueLimits, resultStorage }) {
+export function createDiscoveryHandler({ authenticate, automation, catalog, runtime, runs, rateLimit, record, idempotencyTtlMs, modelWaitMs, queueLimits, resultStorage, callback }) {
   return async (req, res, kind) => {
     const protocol = req.get("x-api-key") || req.get("anthropic-version") ? "anthropic" : "openai";
     res.setHeader("Cache-Control", "no-store");
@@ -75,7 +75,7 @@ export function createDiscoveryHandler({ authenticate, automation, catalog, runt
         res.json({ object: "list", data: discoveryModels(listed, await runs(client, req.params.id), client, req.params.id),
           codex_cloud: { catalog_status: listed.stale || listed.refreshError ? "stale" : "available", observed_at: timestamp(listed.cachedAt), inference_verified: false } });
       } else {
-        res.json(discoveryCapabilities({ automationId: req.params.id, defaults, catalog: listed, cli: await runtime(), idempotencyTtlMs, modelWaitMs, queueLimits: queueLimits?.(), resultStorage: resultStorage?.() }));
+        res.json(discoveryCapabilities({ automationId: req.params.id, defaults, catalog: listed, cli: await runtime(), idempotencyTtlMs, modelWaitMs, queueLimits: queueLimits?.(), resultStorage: resultStorage?.(), callback: callback?.(client,req.params.id) }));
       }
     } catch (error) {
       sendModelApiError(res, protocol, error.statusCode ? error : failure(503, "能力信息暂不可用，请稍后重试"));

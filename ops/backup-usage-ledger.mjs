@@ -20,6 +20,7 @@ try {
       externalTaskRows: hasTasks ? restored.prepare("SELECT count(*) AS n FROM external_tasks").get().n : 0,
       externalTaskRevision: hasTasks ? restored.prepare("SELECT value FROM external_tasks_meta WHERE key='revision'").get()?.value : null,
       externalResultRows: restored.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get() ? restored.prepare("SELECT count(*) AS n FROM external_results").get().n : 0,
+      externalCallbackRows: restored.prepare("SELECT name FROM sqlite_master WHERE name='external_callbacks'").get() ? restored.prepare("SELECT count(*) AS n FROM external_callbacks").get().n : 0,
       verified: true }));
   } finally { restored.close(); }
 } catch (error) {
