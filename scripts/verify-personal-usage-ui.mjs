@@ -5,6 +5,7 @@ import ts from "typescript";
 import { chromium } from "playwright";
 import { nextPersonalOccurrence } from "../server/personal-schedule.mjs";
 import { buildPersonalBrief } from "../server/personal-brief.mjs";
+import { calendarDayWindow } from "../server/personal-calendar.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -65,6 +66,14 @@ let personalCommitments = [];
 let briefReviewedAt = null;
 const briefEvent = { id: "run:recent-personal:completed", kind: "completed", title: "资料整理完成", detail: "定时任务已完成", time: new Date().toISOString(), sessionId: "_personal-session" };
 let canceledBriefItems = [];
+let calendarView = null, calendarReads = 0, calendarFailure = false;
+const makeCalendar = (zone) => {
+  const window = calendarDayWindow(zone), start = new Date(Date.parse(window.from) + 14 * 3600000).toISOString(), end = new Date(Date.parse(start) + 3600000).toISOString();
+  return { window, stale: false, reading: false, lastAttempt: { at: new Date().toISOString(), status: "success", error: null }, snapshot: {
+    account: { label: "calendar@example.test" }, window, fetchedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString(), complete: true, version: "source-version",
+    items: [{ id: "source-one", title: "核对今天需要提交的材料与行程".repeat(12), start: { dateTime: start, date: null, timeZone: "America/New_York" }, end: { dateTime: end, date: null, timeZone: "America/New_York" }, url: "https://calendar.google.com/calendar/event?eid=fixture", status: "tentative", version: "item-version" }],
+  } };
+};
 const personalPushEndpoint = "https://push.example.test/personal-browser";
 let personalReminderSettings = { enabled: false, timeZone: "Asia/Shanghai", quietStart: "22:00", quietEnd: "08:00" };
 let failNextCommitmentDraftResponse = false;
@@ -82,6 +91,12 @@ await context.route("**/api/**", async (route) => {
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
+  if (url.pathname === "/api/personal/calendar") return send({ ok: true, calendar: calendarView || { window: calendarDayWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
+  if (url.pathname === "/api/personal/calendar/refresh") {
+    calendarReads++;
+    calendarView = calendarFailure ? { ...calendarView, stale: true, lastAttempt: { at: new Date().toISOString(), status: "error", error: "日历读取被拒绝，请核对授权" } } : makeCalendar(body.timeZone);
+    return send({ ok: true, calendar: calendarView });
+  }
   if (url.pathname === "/api/automations/personal-plan/run" && req.method() === "POST") { manualAutomationRuns += 1; return send({ ok: true }); }
   if (url.pathname === "/api/personal/routines" && req.method() === "GET") return send({ ok: true, routines: [...status.automations.filter((item) => item.personalRoutine), ...archivedPersonalRoutines] });
   if (url.pathname === "/api/personal/routines" && req.method() === "POST") {
@@ -391,11 +406,77 @@ try {
   await pendingUsagePage.close();
   await page.goto(`${baseUrl}#/project/sample-app/thread/sample-app-session`);
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   await page.getByRole("heading", { name: "可以交办" }).waitFor();
   await page.getByRole("heading", { name: "关注事项" }).waitFor();
   await page.getByRole("heading", { name: "新变化" }).waitFor();
   await page.getByText("资料整理完成", { exact: true }).waitFor();
+  const calendarPage = await context.newPage();
+  const calendarSessionsBefore = [...sessions], calendarNewCountBefore = newSessionCount;
+  calendarPage.on("pageerror", (error) => errors.push(error.message));
+  const calendarOut = new URL("../docs/research/acceptance/p01-sources-20261023/", import.meta.url);
+  await fs.mkdir(calendarOut, { recursive: true });
+  try {
+    await calendarPage.goto(`${baseUrl}#/project/_personal/today`);
+    const source = calendarPage.getByRole("region", { name: "今日日程" });
+    await source.getByText("尚无成功读取的日程，不能判断今天是否空闲。").waitFor();
+    assert.equal(calendarReads, 0, "opening today never reads the connected calendar automatically");
+    await source.getByRole("button", { name: "刷新日程" }).click();
+    await source.getByText("原日程时区：America/New_York").waitFor();
+    assert.equal(calendarReads, 1);
+    let releaseOldCalendar, oldCalendarStarted;
+    const oldCalendarGate = new Promise(resolve => { releaseOldCalendar = resolve; });
+    const oldCalendarRead = new Promise(resolve => { oldCalendarStarted = resolve; });
+    const delayedCalendar = structuredClone(calendarView);
+    delayedCalendar.stale = true; delayedCalendar.snapshot.items[0].title = "迟到的旧日历记录";
+    await calendarPage.route("**/api/personal/calendar?**", async route => {
+      oldCalendarStarted(); await oldCalendarGate;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, calendar: delayedCalendar }) }).catch(() => null);
+    });
+    try {
+      await calendarPage.reload(); await oldCalendarRead;
+      await source.getByRole("button", { name: "刷新日程" }).click();
+      await source.getByText("原日程时区：America/New_York").waitFor();
+      releaseOldCalendar();
+      assert.equal(await source.getByText("迟到的旧日历记录").count(), 0);
+      assert.equal(await source.getByRole("button", { name: "规划今天" }).isEnabled(), true);
+    } finally { releaseOldCalendar(); await calendarPage.unroute("**/api/personal/calendar?**"); }
+    for (const width of [320, 360, 390, 768, 1024, 1280, 1600]) {
+      await calendarPage.setViewportSize({ width, height: 900 });
+      assert.ok(await calendarPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+      for (const control of [source.getByRole("button", { name: "刷新日程" }), source.getByRole("button", { name: "规划今天" }), source.getByRole("link")]) {
+        assert.ok(await control.evaluate(el => el.getBoundingClientRect().width >= 44 && el.getBoundingClientRect().height >= 44));
+      }
+      assert.equal(await source.getByRole("link").getAttribute("rel"), "noopener noreferrer");
+      await calendarPage.screenshot({ path: new URL(`calendar-${width}.png`, calendarOut).pathname, fullPage: true });
+    }
+    const sendsBefore = submittedMessages;
+    await source.getByRole("button", { name: "规划今天" }).click();
+    const input = calendarPage.getByPlaceholder("向个人助理发送消息");
+    await input.waitFor();
+    assert.match(await input.inputValue(), /暂不创建或修改任何日程/);
+    assert.match(await input.inputValue(), /source-version/);
+    assert.equal(submittedMessages, sendsBefore, "planning creates only an unsent draft");
+    calendarFailure = true;
+    await calendarPage.goto(`${baseUrl}#/project/_personal/today`);
+    await source.getByRole("button", { name: "刷新日程" }).click();
+    await source.getByRole("alert").waitFor();
+    assert.match(await source.innerText(), /未将失败视为没有日程/);
+    assert.equal(await source.getByRole("button", { name: "规划今天" }).isDisabled(), true);
+    assert.equal(await source.locator(".personal-calendar-row").count(), 1);
+    calendarFailure = false; calendarView = makeCalendar(calendarView.window.timeZone); calendarView.snapshot.complete = false;
+    await calendarPage.reload();
+    await source.getByText(/仅展示部分记录/).waitFor();
+    assert.equal(await source.getByRole("button", { name: "规划今天" }).isDisabled(), true);
+    calendarView.snapshot.complete = true; calendarView.snapshot.items = [];
+    await calendarPage.reload();
+    await source.getByText(/本次读取的主日历中没有今日日程/).waitFor();
+    calendarView.snapshot.expiresAt = new Date(Date.now() - 1000).toISOString();
+    await calendarPage.reload();
+    await source.getByText(/不能据此确认当前安排/).waitFor();
+    assert.equal(await source.getByText(/本次读取的主日历中没有今日日程/).count(), 0);
+    console.log("日程来源：7 个宽度、显式刷新、旧读取不覆盖新结果、来源与原时区、只生成草稿、失效/拒绝/部分/真实空结果均通过。");
+  } finally { calendarView = null; calendarFailure = false; sessions.splice(0, sessions.length, ...calendarSessionsBefore); newSessionCount = calendarNewCountBefore; await calendarPage.close(); }
   const priorRuns = status.automationRuns;
   const canceledExamples = ["canceled", "cancelled"].map((runStatus, index) => ({
     id: `canceled-example-${index}`, automationId: "personal-plan", repoId: "_personal", name: index ? "旧取消记录" : "新取消记录",
@@ -520,7 +601,7 @@ try {
   await page.locator(".session-current[data-session-id='sample-app-session']").waitFor();
   assert.equal(await composer.inputValue(), "");
   await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   await openRecentPersonalChat();
   await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
   assert.equal(await composer.inputValue(), "独立个人草稿");
@@ -666,7 +747,7 @@ try {
       if (width === 390) {
         await page.getByRole("button", { name: "打开侧边栏" }).click();
         await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
-        await page.getByRole("heading", { name: "今日" }).waitFor();
+        await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
         await page.screenshot({ path: new URL("today-390.png", out).pathname });
         await openRecentPersonalChat();
         await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
@@ -696,7 +777,7 @@ try {
   await page.goto(`${baseUrl}#/inbox`);
   await page.evaluate(() => localStorage.setItem("codex-cloud-last-space-repo", "_personal"));
   await page.reload();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   assert.match(page.url(), /#\/project\/_personal/);
   assert.equal(await page.getByText("仅草稿", { exact: true }).count(), 0);
   await page.evaluate(() => { window.open = () => null; });
@@ -1022,12 +1103,12 @@ try {
   status.automationRuns.push(unrelatedRun);
   status.attention.items.push({ ...status.attention.items[0], id: "automation:unrelated-run-ui", runId: unrelatedRun.id, title: "另一项待核对运行" });
   await page.reload();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   assert.equal(await page.locator(".personal-priority-section .personal-task-row").count(), 2);
   status.automationRuns.pop();
   status.attention.items.pop();
   await page.reload();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   assert.match(await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "最近结果" }) }).innerText(), /外部操作待核对/);
   await page.locator(".sidebar .nav-item").filter({ hasText: "计划任务" }).click();
   await page.locator(".automation-runs-panel").waitFor();
@@ -1167,10 +1248,10 @@ try {
   await page.screenshot({ path: new URL("personal-routine-edit-320.png", out).pathname });
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.locator(".sidebar .nav-item").filter({ hasText: "今日" }).click();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   assert.match(await page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "可复用流程" }) }).innerText(), /每次整理资料/);
   await page.reload();
-  await page.getByRole("heading", { name: "今日" }).waitFor();
+  await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
   const reviewButton = page.locator(".personal-priority-section").getByRole("button", { name: "已核对" });
   assert.equal(await reviewButton.count(), 1, `Missing review action on ${page.url()}: ${(await page.locator("body").innerText()).slice(0, 2200)}`);
   let reviewConfirmation = "";

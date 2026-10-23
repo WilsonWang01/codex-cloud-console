@@ -63,6 +63,7 @@ const LazyPersonalFiles = lazy(() => import("./PersonalFiles"));
 const LazyPersonalFacts = lazy(() => import("./PersonalFacts"));
 const LazyPersonalCommitments = lazy(() => import("./PersonalCommitments"));
 const LazyPersonalBrief = lazy(() => import("./PersonalBrief"));
+const LazyPersonalCalendar = lazy(() => import("./PersonalCalendar"));
 const LazyPersonalReminders = lazy(() => import("./PersonalReminders"));
 const LazyGitHubIssues = lazy(() => import("./GitHubIssues"));
 
@@ -6594,6 +6595,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
       })}
     </section>}
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取变化…</p></section>}><LazyPersonalBrief refreshKey={status.generatedAt} onContinue={onContinue} /></Suspense>
+    <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取日历记录…</p></section>}><LazyPersonalCalendar refreshKey={status.generatedAt} onChooseTask={onChooseTask} onConnections={onConnections} /></Suspense>
     {guideFirst && guide}
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取关注事项…</p></section>}>
       <LazyPersonalCommitments sessions={sessions} onStart={onStartCommitment} onContinue={onContinue} onDueCountChange={updateDueCount} />

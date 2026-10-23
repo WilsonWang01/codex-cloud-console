@@ -40,5 +40,5 @@ const headers = { "x-codex-cloud-token": env.CODEX_CLOUD_WEBHOOK_TOKEN };
 const response = await fetch("http://127.0.0.1:8787/api/codex/app-host/status", { headers, signal: AbortSignal.timeout(10_000) });
 if (!response.ok) throw new Error("无法确认控制台任务空闲，停止发布");
 const status = await response.json();
-if (status.ok !== true || !Array.isArray(status.activeJobs) || status.activeJobs.length || status.activeCompactions !== 0) throw new Error("控制台仍有任务或状态不明确，停止发布");
+if (status.ok !== true || !Array.isArray(status.activeJobs) || status.activeJobs.length || status.activeCompactions !== 0 || (status.activeSourceReads ?? 0) !== 0) throw new Error("控制台仍有任务、来源读取或状态不明确，停止发布");
 process.stdout.write("发布前门禁通过：状态未变化，无活动任务。\n");

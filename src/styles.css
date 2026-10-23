@@ -7239,6 +7239,15 @@ pre {
 .personal-brief-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
 .personal-brief-row strong { font-size: 14px; }
 .personal-brief-row small { color: var(--muted); font-size: 12px; }
+.personal-calendar .personal-section-heading { flex-wrap: wrap; }
+.personal-calendar h2 { display: flex; align-items: center; gap: 7px; }
+.personal-calendar .personal-section-actions { flex-wrap: wrap; }
+.personal-calendar-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: center; gap: 8px; min-height: 64px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.personal-calendar-row > span { display: grid; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.personal-calendar-row strong { font-size: 14px; }
+.personal-calendar-row small { color: var(--muted); font-size: 12px; }
+.personal-calendar-row a { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 6px; color: var(--muted-strong); }
+.personal-calendar-row a:hover { background: var(--surface); }
 .personal-reminder-settings { display: grid; gap: 12px; margin-top: 18px; }
 .personal-reminder-toggle { display: flex; align-items: center; gap: 10px; min-height: 44px; font-size: 14px; }
 .personal-reminder-toggle input { width: 18px; height: 18px; }

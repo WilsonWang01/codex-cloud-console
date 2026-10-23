@@ -48,6 +48,7 @@ import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
+import { calendarSourceLimits, createPersonalCalendarSource } from "./personal-calendar.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 import { readReleaseInfo } from "./release-info.mjs";
 
@@ -85,6 +86,22 @@ const personalFactsStore = createPersonalFactsStore(path.join(stateRoot, "person
 const personalCommitmentsStore = createPersonalCommitmentsStore(path.join(stateRoot, "personal-commitments.json"));
 const personalRoutinesStore = createPersonalRoutinesStore(path.join(stateRoot, "personal-routines.json"));
 const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
+const personalCalendarPath = path.join(stateRoot, "personal-calendar-source.json");
+const personalCalendarSource = createPersonalCalendarSource({
+  read: async () => {
+    try { return JSON.parse((await readRootedFile(stateRoot, path.basename(personalCalendarPath), calendarSourceLimits.resultBytes)).buffer.toString("utf8")); }
+    catch (error) {
+      if (error.code === "file_not_found") return { version: 1, snapshot: null, lastAttempt: null };
+      throw Object.assign(new Error("日历缓存无法安全读取，未覆盖原记录"), { code: "calendar_cache_invalid", statusCode: 503 });
+    }
+  },
+  write: value => atomicWriteJson(personalCalendarPath, value),
+  request: (method, params, timeout) => getPersonalAppServerClient().request(method, params, timeout),
+  context: () => {
+    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行不可用"), { statusCode: 503 });
+    return { cwd: getRepoById(personalRepoId).path, model: defaultRuntime.model };
+  },
+});
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
 let runUsageLedger;
@@ -2555,6 +2572,7 @@ const approvalBroker = createApprovalBroker({
 });
 
 async function appServerRequestResult(method, params = {}) {
+  if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const job = findTurnJob(params) || findCompactJob(params);
   if (job?.unattendedPersonalSchedule) {
     job.unattendedApprovalDenied = true;
@@ -2581,6 +2599,7 @@ function personalAppServerRequestResult(method, params = {}) {
 }
 
 function personalAppServerNotification(message) {
+  if (message.method === "thread/closed") personalCalendarSource.closedThread(message.params?.threadId);
   if (message.method === "account/login/completed") {
     completeAccountLoginFlow(message.params || {}, personalRepoId);
     return;
@@ -2670,6 +2689,7 @@ function getAppServerClient() {
     });
   });
   appServerClient.on("exit", ({ message }) => {
+    if (!personalRuntime.enabled) personalCalendarSource.resetRuntime();
     if (personalRuntime.enabled) {
       for (const repo of repos.filter((item) => item.kind !== "personal")) {
         approvalBroker.closeForRepo(repo.id, message || "Codex app-server stopped");
@@ -2698,6 +2718,7 @@ function getPersonalAppServerClient() {
   });
   personalAppServerClient.on("notification", personalAppServerNotification);
   personalAppServerClient.on("exit", ({ message }) => {
+    personalCalendarSource.resetRuntime();
     approvalBroker.closeForRepo(personalRepoId, message || "Personal app-server stopped");
     for (const job of [...activeTurns.values()].filter((item) => item.repoId === personalRepoId)) {
       finishTurnJob(job, false, 1, message || "Personal app-server stopped");
@@ -3413,6 +3434,7 @@ async function finishCompactJob(job, ok, error = null) {
 
 function handleAppServerNotification(rpcMessage) {
   const params = rpcMessage.params || {};
+  if (rpcMessage.method === "thread/closed") personalCalendarSource.closedThread(params.threadId);
   const owner = ownerFromParams(params);
   const turnJob = findTurnJob(params);
   const compactJob = findCompactJob(params);
@@ -9695,6 +9717,7 @@ app.get("/api/codex/app-host/status", (req, res) => {
     appHost: client.status(),
     activeTurns: activeTurns.size,
     activeCompactions: activeCompactions.size,
+    activeSourceReads: personalCalendarSource.activeCount(),
     activeJobs: activeJobSummaries({ includeEvents: true }),
   });
 });
@@ -11065,6 +11088,19 @@ app.patch("/api/personal/commitments/:id", async (req, res) => {
 
 app.delete("/api/personal/commitments/:id", async (req, res) => {
   try { res.json({ ok: true, commitment: await personalCommitmentsStore.remove(req.params.id, req.body?.revision) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.get("/api/personal/calendar", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ ok: true, calendar: await personalCalendarSource.snapshot(req.query.timeZone) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/calendar/refresh", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!req.body || Object.keys(req.body).some(key => key !== "timeZone")) return res.status(400).json({ ok: false, error: "只接受当前时区，不允许指定工具、账号或任意日历查询" });
+  try { res.json({ ok: true, calendar: await personalCalendarSource.refresh(req.body.timeZone) }); }
   catch (error) { sendRouteError(res, error); }
 });
 

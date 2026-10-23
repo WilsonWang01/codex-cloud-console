@@ -79,6 +79,7 @@ test("unattended personal schedules decline approvals before they enter the pend
   const events = [];
   let brokerCalls = 0;
   const context = vm.createContext({
+    personalCalendarSource: { ownsThread: () => false },
     findTurnJob: () => job,
     findCompactJob: () => null,
     personalRepoId: "_personal",
@@ -103,6 +104,12 @@ test("unattended personal schedules decline approvals before they enter the pend
   const interactive = await appServerRequestResult("item/commandExecution/requestApproval", { threadId: "personal-thread" });
   assert.equal(interactive.decision, "accept");
   assert.equal(brokerCalls, 1);
+  context.personalCalendarSource.ownsThread = id => id === "source-thread";
+  for (const handler of [appServerRequestResult, personalAppServerRequestResult]) {
+    await assert.rejects(handler("item/commandExecution/requestApproval", { threadId: "source-thread" }), /既定只读/);
+    await assert.rejects(handler("mcpServer/elicitation/request", { threadId: "source-thread" }), /既定只读/);
+  }
+  assert.equal(brokerCalls, 1, "calendar refresh never prompts the user to grant runtime permissions");
 });
 
 test("immediate decline follows each supported app-server response shape", () => {

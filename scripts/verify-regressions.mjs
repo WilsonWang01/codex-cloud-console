@@ -149,8 +149,23 @@ input.on("line", (line) => {
     process.stdout.write(JSON.stringify(payload) + "\\n");
   }, delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
+  if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: "calendar-ephemeral", ephemeral: true } } });
+  if (message.method === "mcpServerStatus/list" && message.params.threadId === "calendar-ephemeral") return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: { "google_calendar.search": {
+    name: "google_calendar.search", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
+    _meta: { connector_id: "calendar", link_id: "synthetic-calendar-account", link_owner_profile: { email: "calendar@example.test" } }
+  } } }], nextCursor: null } });
+  if (message.method === "mcpServer/tool/call" && message.params.threadId === "calendar-ephemeral") {
+    send({ id: "calendar-unexpected-approval", method: "item/commandExecution/requestApproval", params: { threadId: "calendar-ephemeral", command: "must-not-run" } });
+    const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".calendar-release")
+      ? send({ id: message.id, result: { structuredContent: { events: [], next_page_token: null } } }) : setTimeout(reply, 10);
+    return reply();
+  }
+  if (message.method === "thread/unsubscribe" && message.params.threadId === "calendar-ephemeral") {
+    send({ id: message.id, result: { status: "unsubscribed" } });
+    return send({ method: "thread/closed", params: { threadId: "calendar-ephemeral" } });
+  }
   if (message.method === "app/list") return send({ id: message.id, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true, installUrl: "https://chatgpt.com/apps/mail/mail" }], nextCursor: null } });
-  if (message.method === "app/installed") return send({ id: message.id, result: { apps: [{ id: "mail", enabled: true, callable: true }] } });
+  if (message.method === "app/installed") return send({ id: message.id, result: { apps: [{ id: "mail", enabled: true, callable: true }, { id: "calendar", enabled: true, callable: true }] } });
   if (sharedPersonal && message.method === "account/read") return send({ id: message.id, result: { account: { type: "chatgpt", email: "fixture@example.test", planType: "plus" } } });
   if (sharedPersonal && message.method === "thread/list") return send({ id: message.id, result: { data: threads.filter((thread) => message.params.cwd.includes(thread.cwd)), nextCursor: null } });
   if (sharedPersonal && message.method === "thread/start") {
@@ -1541,6 +1556,65 @@ await check("external automation interrupted by restart waits for reconciliation
     await stopProcess(secondServer);
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+await check("calendar source HTTP is explicit, read-only, durable and protected from cross-site requests and approvals", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-calendar-"));
+  const fake = await writeFakeCodex(root), cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const capture = path.join(root, "requests.jsonl"), port = await freePort(), base = `http://127.0.0.1:${port}`;
+  for (const dir of [path.join(cloudRoot, "workspace", "sample-app"), stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "login" ]; then echo "Logged in using ChatGPT"; exit 0; fi\nif [ "$1" = "--version" ]; then echo "fixture"; exit 0; fi\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "calendar-admin-test-only" };
+  const env = { ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_PERSONAL_MODE: "shared", CODEX_PERSONAL_ROOT: path.join(cloudRoot, "personal"), CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    CODEX_AUTOMATION_RECOVERY_ENABLED: "0", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}` };
+  const start = () => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env });
+  let child = start();
+  try {
+    await waitForOutput(child, /listening on/i);
+    const crossSite = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers: { ...headers, origin: "https://untrusted.example.test" }, body: JSON.stringify({ timeZone: "UTC" }) });
+    assert.equal(crossSite.response.status, 403);
+    const initial = await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers });
+    assert.equal(initial.response.status, 200); assert.equal(initial.data.calendar.snapshot, null);
+    const captured = () => fs.readFile(capture, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; }).then(raw => raw.trim().split("\n").filter(Boolean).map(JSON.parse));
+    assert.equal((await captured().catch(() => [])).filter(item => item.method === "mcpServer/tool/call").length, 0);
+    const invalid = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC", tool: "write" }) });
+    assert.equal(invalid.response.status, 400);
+    const refreshing = jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC" }) });
+    refreshing.catch(() => null);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await captured()).some(item => item.method === "mcpServer/tool/call")) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    const during = await jsonRequest(base, "/api/codex/app-host/status", { headers });
+    assert.equal(during.data.activeSourceReads, 1); assert.deepEqual(during.data.activeJobs, []);
+    await fs.writeFile(capture + ".calendar-release", "release fixture only");
+    const done = await refreshing;
+    assert.equal(done.response.status, 200); assert.equal(done.data.calendar.stale, false); assert.deepEqual(done.data.calendar.snapshot.items, []);
+    assert.equal(done.response.headers.get("cache-control"), "no-store");
+    const native = await captured();
+    assert.equal(native.filter(item => item.method === "mcpServer/tool/call").length, 1);
+    assert.equal(native.some(item => item.method === "turn/start"), false);
+    assert.ok(native.find(item => item.id === "calendar-unexpected-approval")?.error);
+    const stateFile = path.join(stateRoot, "personal-calendar-source.json"), preserved = await fs.readFile(stateFile, "utf8");
+    const history = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8").catch(() => '{"sessions":{}}'));
+    assert.equal(Object.keys(history.sessions).length, 0, "ephemeral source is not a console conversation");
+    await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
+    const restored = await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers });
+    assert.equal(restored.data.calendar.snapshot.version, done.data.calendar.snapshot.version);
+    assert.equal(await fs.readFile(stateFile, "utf8"), preserved);
+    const oversized = "x".repeat(1024 * 1024 + 1);
+    await fs.writeFile(stateFile, oversized);
+    assert.equal((await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers })).response.status, 503);
+    assert.equal(await fs.readFile(stateFile, "utf8"), oversized);
+    await fs.unlink(stateFile); await fs.symlink(capture, stateFile);
+    assert.equal((await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers })).response.status, 503);
+    assert.equal((await fs.lstat(stateFile)).isSymbolicLink(), true);
+    await fs.unlink(stateFile);
+    await fs.writeFile(stateFile, '{"version":99,"preserve":"invalid fixture"}');
+    const broken = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC" }) });
+    assert.equal(broken.response.status, 503); assert.equal(JSON.parse(await fs.readFile(stateFile, "utf8")).preserve, "invalid fixture");
+  } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
 await check("personal and work reuse authentication without sharing threads or stale worker status", async () => {
