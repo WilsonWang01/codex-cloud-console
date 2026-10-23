@@ -17,13 +17,14 @@ async function withProxy(target, check, extraEnv = {}) {
   await fs.writeFile(credentials, `url=${target}\nusername=test\npassword=PRIVATE-PASSWORD\ntoken=PRIVATE-TOKEN\n`, { mode: 0o600 });
   const child = spawn(process.execPath, [path.join(root, "scripts/local-cloud-console-proxy.mjs")], {
     cwd: root,
-    env: { ...process.env, ...extraEnv, CODEX_CLOUD_CONSOLE_PORT: "0", CODEX_CLOUD_CONSOLE_HOST: "127.0.0.1",
+    env: { ...process.env, CODEX_CLOUD_CONSOLE_PORT: "0", CODEX_CLOUD_CONSOLE_HOST: "127.0.0.1",
       CODEX_CLOUD_CONSOLE_CREDENTIALS: credentials, CODEX_CLOUD_CONSOLE_CACHE: path.join(dir, "cache.json"),
       CODEX_CLOUD_CONSOLE_TARGET: target, CODEX_CLOUD_CONSOLE_UPSTREAM_IP: "127.0.0.1",
-      CODEX_CLOUD_CONSOLE_HEADER_TIMEOUT_MS: "600", CODEX_CLOUD_CONSOLE_GET_RETRY_LIMIT: "1" },
+      CODEX_CLOUD_CONSOLE_HEADER_TIMEOUT_MS: "600", CODEX_CLOUD_CONSOLE_GET_RETRY_LIMIT: "1", ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let stderr = "";
+  let stderr = "", stdout = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   try {
     const base = await new Promise((resolve, reject) => {
@@ -37,11 +38,14 @@ async function withProxy(target, check, extraEnv = {}) {
     const events = () => stderr.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
     await check(base, events);
     assert.doesNotMatch(stderr, /PRIVATE-PASSWORD|PRIVATE-TOKEN|PRIVATE-QUERY|PRIVATE-BODY|PRIVATE-HEADER|private-command/);
+    assert.doesNotMatch(stdout, /PRIVATE-PASSWORD|PRIVATE-TOKEN|PRIVATE-QUERY|PRIVATE-BODY|PRIVATE-HEADER|private-command/);
+    assert.doesNotMatch(stderr, /MaxListenersExceededWarning/);
     for (const event of events()) {
       assert(event.transport.length >= 1 && event.transport.length <= 2);
       assert.equal(event.transport.length, event.attempts);
       for (const attempt of event.transport) {
-        assert.deepEqual(Object.keys(attempt).sort(), ["attempt", "cause", "connectMs", "durationMs", "headersMs", "phase", "requestFlushedMs", "socketMs", "tlsMs"].sort());
+        assert.deepEqual(Object.keys(attempt).sort(), ["attempt", "cause", "connectMs", "durationMs", "headersMs", "phase", "requestFlushedMs", "reusedSocket", "socketMs", "tlsMs"].sort());
+        assert.equal(typeof attempt.reusedSocket, "boolean");
         for (const key of ["socketMs", "connectMs", "tlsMs", "requestFlushedMs", "headersMs", "durationMs"])
           assert(attempt[key] === null || Number.isSafeInteger(attempt[key]) && attempt[key] >= 0);
       }
@@ -70,7 +74,7 @@ test("proxy records refused connections and TLS handshake resets without private
   const raw = net.createServer((socket) => { connections++; socket.once("data", () => socket.destroy()); });
   const rawPort = await listen(raw);
   try {
-    await withProxy(`https://localhost:${rawPort}/`, async (base, events) => {
+    await withProxy(`https://PRIVATE-HEADER:PRIVATE-PASSWORD@localhost:${rawPort}/?secret=PRIVATE-QUERY#PRIVATE-BODY`, async (base, events) => {
       const response = await fetch(`${base}/api/terminal/run`, { method: "POST", body: "PRIVATE-BODY" });
       assert.equal(response.status, 502); await response.arrayBuffer();
       assert.equal(connections, 1, "TLS failure must not replay a write");
@@ -135,6 +139,115 @@ test("proxy distinguishes trusted TLS, header waits, reset writes, recovered rea
     }, { NODE_EXTRA_CA_CERTS: cert, CODEX_CLOUD_CONSOLE_HEALTH_TIMEOUT_MS: "600" });
   } finally {
     for (const socket of sockets) socket.destroy();
+    await close(upstream); await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bounded TLS reuse retains streaming, rotates closed sockets and never repeats uncertain writes", { timeout: 50000 }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-proxy-pool-"));
+  const key = path.join(dir, "key.pem"), cert = path.join(dir, "cert.pem");
+  execFileSync(process.platform === "darwin" ? "/usr/bin/openssl" : "openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"], { stdio: "pipe", timeout: 15000 });
+  let connections = 0, writes = 0, holds = 0, peak = 0, activeStreams = 0, releaseHeld;
+  const live = new Set(), timers = new Set();
+  const held = new Promise(resolve => { releaseHeld = resolve; });
+  let sixteenReady;
+  const sixteen = new Promise(resolve => { sixteenReady = resolve; });
+  const upstream = https.createServer({ key: await fs.readFile(key), cert: await fs.readFile(cert) }, (req, res) => {
+    req.resume();
+    req.once("end", async () => {
+      if (req.method === "POST") { writes++; req.socket.destroy(); return; }
+      if (req.url === "/api/chat/stalled/stream") {
+        activeStreams++;
+        res.once("close", () => { activeStreams--; });
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: subscribed\n\n"); return;
+      }
+      if (req.url === "/api/chat/stream") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: start\n\n");
+        const timer = setTimeout(() => { timers.delete(timer); res.end("data: finished\n\n"); }, 31000);
+        timers.add(timer); return;
+      }
+      if (req.url.startsWith("/api/chat/held")) {
+        if (++holds === 16) sixteenReady();
+        await held;
+      }
+      res.end("ok");
+    });
+  });
+  upstream.on("secureConnection", socket => {
+    connections++; live.add(socket); peak = Math.max(peak, live.size);
+    socket.once("close", () => live.delete(socket));
+  });
+  const port = await listen(upstream);
+  try {
+    await withProxy(`https://localhost:${port}/`, async (base, events) => {
+      for (let n = 0; n < 20; n++) assert.equal(await (await fetch(`${base}/api/chat/reuse/${n}`)).text(), "ok");
+      assert.equal(connections, 1, "successive HTTPS requests should reuse a single verified TLS connection");
+      upstream.closeIdleConnections();
+      for (let n = 0; n < 200 && live.size; n++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(live.size, 0);
+      assert.equal(await (await fetch(`${base}/api/chat/rotated`)).text(), "ok");
+      assert.equal(connections, 2);
+      const failed = await fetch(`${base}/api/terminal/run`, { method: "POST", body: "PRIVATE-BODY" });
+      assert.equal(failed.status, 502);
+      const failure = await failed.json();
+      assert.equal(writes, 1, "a reset pooled write must not be replayed");
+      const trace = events().find(event => event.requestId === failure.requestId).transport[0];
+      assert.equal(trace.phase, "response-headers");
+      assert.equal(trace.reusedSocket, true);
+      assert.notEqual(trace.tlsMs, null, "already verified pooled TLS must not be mislabeled as a new handshake");
+      assert.notEqual(trace.connectMs, null);
+      const stream = await fetch(`${base}/api/chat/stream`);
+      assert.match(await stream.text(), /data: start[\s\S]*data: finished/, "the 30s free-socket timeout must not close a 31s active stream");
+      const requests = Array.from({ length: 24 }, (_, n) => fetch(`${base}/api/chat/held/${n}`).then(async response => { assert.equal(response.status, 200); assert.equal(await response.text(), "ok"); }));
+      const allRequests = Promise.all(requests);
+      allRequests.catch(() => {});
+      for (let n = 0; n < 300 && holds < 16; n++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(holds, 16);
+      await sixteen;
+      assert.ok(live.size <= 32, "both connection lanes must remain bounded");
+      releaseHeld();
+      await allRequests;
+      for (let n = 0; n < 100 && live.size > 6; n++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.ok(live.size <= 6, "control and streaming lanes retain at most four plus two idle connections");
+      assert.ok(peak <= 32);
+      assert.equal(writes, 1);
+      const subscriptions = await Promise.all(Array.from({ length: 16 }, async () => {
+        const controller = new AbortController();
+        const response = await fetch(`${base}/api/chat/stalled/stream`, { signal: controller.signal });
+        assert.equal(response.status, 200);
+        const reader = response.body.getReader(); await reader.read();
+        return { controller, reader };
+      }));
+      assert.equal(activeStreams, 16);
+      assert.equal(await (await fetch(`${base}/api/chat/control-while-streaming`)).text(), "ok", "long-lived streams must not starve control requests");
+      for (const { controller, reader } of subscriptions) { controller.abort(); await reader.read().catch(() => null); }
+      for (let n = 0; n < 100 && activeStreams; n++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(activeStreams, 0);
+      for (let n = 0; n < 20; n++) {
+        const controller = new AbortController();
+        const response = await fetch(`${base}/api/chat/stalled/stream`, { signal: controller.signal });
+        assert.equal(response.status, 200);
+        const reader = response.body.getReader();
+        assert.match(Buffer.from((await reader.read()).value).toString(), /subscribed/);
+        controller.abort();
+        await reader.read().catch(() => null);
+        for (let attempt = 0; attempt < 50 && activeStreams; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+        assert.equal(activeStreams, 0, "closing a browser subscription must release its upstream pool slot without canceling a model task");
+      }
+    }, { NODE_EXTRA_CA_CERTS: cert, CODEX_CLOUD_CONSOLE_HEADER_TIMEOUT_MS: "5000" });
+    const acceptedBeforeUntrusted = writes;
+    await withProxy(`https://localhost:${port}/`, async base => {
+      const response = await fetch(`${base}/api/terminal/run`, { method: "POST", body: "PRIVATE-BODY" });
+      assert.equal(response.status, 502, "an untrusted TLS certificate must still fail closed");
+      await response.arrayBuffer();
+      assert.equal(writes, acceptedBeforeUntrusted);
+    }, { NODE_EXTRA_CA_CERTS: "" });
+  } finally {
+    releaseHeld();
+    for (const timer of timers) clearTimeout(timer);
+    for (const socket of live) socket.destroy();
     await close(upstream); await fs.rm(dir, { recursive: true, force: true });
   }
 });

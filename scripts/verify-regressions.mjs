@@ -3543,6 +3543,13 @@ await check("local proxy survives malformed URLs and rejects symlink escapes", a
       request.on("error", reject);
     });
     assert.equal(malformedStatus, 400);
+    for (const requestPath of ["http://untrusted.invalid/private-command", "https://untrusted.invalid/?secret=QUERY-SECRET", "//untrusted.invalid/private-command"]) {
+      const status = await new Promise((resolve, reject) => {
+        const request = http.get({ host: "127.0.0.1", port: proxyPort, path: requestPath }, (response) => { response.resume(); response.once("end", () => resolve(response.statusCode)); });
+        request.once("error", reject);
+      });
+      assert.equal(status, 400, "console forwarding must reject a different upstream origin before attaching credentials");
+    }
     assert.equal(child.exitCode, null);
     const healthStartedAt = Date.now();
     const syncId = "sync-00000000-0000-4000-8000-000000000001";

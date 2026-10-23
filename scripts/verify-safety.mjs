@@ -7,6 +7,7 @@ import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
+import { EventEmitter } from "node:events";
 import ts from "typescript";
 import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcurrent } from "../server/run-safety.mjs";
 import { handleReviewRoutes } from "../server/review-git.mjs";
@@ -125,6 +126,21 @@ test("所有延迟模块共用局部恢复，加载拒绝不抛出且不会自�
   assert.equal(recovered.default(), null);
   assert.equal(reported.length, 1);
   assert.equal(reported[0][1], failure);
+});
+
+test("关闭任务事件订阅只移除监听，不中断或重跑后台任务", () => {
+  const context = { writeEventPayload() {} };
+  vm.createContext(context);
+  vm.runInContext(section(source, "function subscribeJobEvents(", "function ownerFromParams("), context);
+  const job = { emitter: new EventEmitter(), events: [], state: "running", interrupt: () => assert.fail("must not interrupt"), restart: () => assert.fail("must not restart") };
+  const response = new EventEmitter();
+  context.subscribeJobEvents(job, response);
+  assert.equal(job.emitter.listenerCount("event"), 1);
+  response.emit("close");
+  assert.equal(job.emitter.listenerCount("event"), 0);
+  assert.equal(job.state, "running");
+  response.emit("finish");
+  assert.equal(job.emitter.listenerCount("event"), 0);
 });
 
 test("状态刷新并行读取、保留局部连接，旧响应不能覆盖重试结果", async () => {

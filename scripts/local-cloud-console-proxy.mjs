@@ -24,6 +24,9 @@ const proxyModelApiHeaderTimeoutMs = Math.max(1000, Math.min(930_000, Number(pro
 const proxyHealthHeaderTimeoutMs = Math.max(500, Number(process.env.CODEX_CLOUD_CONSOLE_HEALTH_TIMEOUT_MS || 8_000));
 const proxyBufferedIdleTimeoutMs = Math.max(1_000, Number(process.env.CODEX_CLOUD_CONSOLE_BUFFER_IDLE_TIMEOUT_MS || 20_000));
 const proxyGetRetryLimit = Math.min(3, Math.max(0, Number(process.env.CODEX_CLOUD_CONSOLE_GET_RETRY_LIMIT || 1)));
+const tlsPoolOptions = { keepAlive: true, maxSockets: 16, maxFreeSockets: 4, timeout: 30_000, scheduling: "lifo" };
+const upstreamHttpsAgent = new https.Agent(tlsPoolOptions);
+const streamingHttpsAgent = new https.Agent({ ...tlsPoolOptions, maxFreeSockets: 2 });
 
 function isIpv4Address(value) {
   const parts = String(value || "").split(".");
@@ -223,7 +226,7 @@ function refreshCacheInBackground(targetUrl, headers, method = "GET") {
       method,
       path: `${targetUrl.pathname}${targetUrl.search}`,
       headers,
-      agent: false,
+      agent: targetUrl.protocol === "https:" ? upstreamHttpsAgent : false,
     },
     (upstreamRes) => {
       const chunks = [];
@@ -358,7 +361,7 @@ function requestCloudJson(pathname, payload) {
         method: "POST",
         path: `${targetUrl.pathname}${targetUrl.search}`,
         headers,
-        agent: false,
+        agent: targetUrl.protocol === "https:" ? upstreamHttpsAgent : false,
       },
       (upstreamRes) => {
         const chunks = [];
@@ -541,6 +544,7 @@ function createHttpProxy() {
     let targetUrl;
     try {
       targetUrl = new URL(req.url || "/", credentials.target);
+      if (targetUrl.origin !== credentials.target.origin) throw new Error("Unexpected upstream origin");
     } catch {
       sendPlainError(res, 400, "Invalid request URL\n");
       return;
@@ -572,7 +576,7 @@ function createHttpProxy() {
     delete headers["proxy-connection"];
     delete headers["connection"];
     delete headers["accept-encoding"];
-    headers.connection = "close";
+    headers.connection = targetUrl.protocol === "https:" ? "keep-alive" : "close";
 
     const transport = targetUrl.protocol === "http:" ? http : https;
     const canRetry = req.method === "GET" || req.method === "HEAD";
@@ -581,6 +585,9 @@ function createHttpProxy() {
       targetUrl.pathname.includes("job-events") ||
       String(req.headers.accept || "").includes("text/event-stream");
     const shouldBufferResponse = canRetry && !isStreamingRequest;
+    const upstreamAgent = targetUrl.protocol === "https:"
+      ? (isStreamingRequest || isModelApiRequest ? streamingHttpsAgent : upstreamHttpsAgent)
+      : false;
     const isHealthRequest = targetUrl.pathname === "/healthz" || targetUrl.pathname === "/api/status";
     const maxRetries = isHealthRequest ? 0 : proxyGetRetryLimit;
     let completed = false;
@@ -609,6 +616,7 @@ function createHttpProxy() {
             : targetUrl.protocol === "https:" && timing.tlsMs === null ? "tls"
             : timing.requestFlushedMs === null ? "request-body" : "response-headers",
           ...timing,
+          reusedSocket: upstream?.reusedSocket === true,
           durationMs: trace.durationMs ?? elapsed(),
         }),
       };
@@ -628,7 +636,7 @@ function createHttpProxy() {
           method: req.method,
           path: `${targetUrl.pathname}${targetUrl.search}`,
           headers,
-          agent: false,
+          agent: upstreamAgent,
         },
         (upstreamRes) => {
           if (completed || res.headersSent || res.destroyed) {
@@ -699,14 +707,19 @@ function createHttpProxy() {
             report(attempt, "interrupted-response", upstreamRes.statusCode || 200, "stream-closed");
             safeEnd(res);
           });
+          upstreamRes.once("end", () => { completed = true; });
           upstreamRes.pipe(res);
         },
       );
 
       upstream.once("socket", (socket) => {
         timing.socketMs = elapsed();
-        socket.once("connect", () => { timing.connectMs = elapsed(); });
-        if (targetUrl.protocol === "https:") socket.once("secureConnect", () => { timing.tlsMs = elapsed(); });
+        if (!socket.connecting) timing.connectMs = elapsed();
+        else socket.once("connect", () => { timing.connectMs = elapsed(); });
+        if (targetUrl.protocol === "https:") {
+          if (socket.authorized) timing.tlsMs = elapsed();
+          else socket.once("secureConnect", () => { timing.tlsMs = elapsed(); });
+        }
       });
       // finish means handed to the OS, not acknowledged or executed by the server.
       upstream.once("finish", () => { timing.requestFlushedMs = elapsed(); });
@@ -729,20 +742,16 @@ function createHttpProxy() {
         report(attempt, cause, 502, "error");
         sendProxyError(res, 502, "upstream request failed", targetUrl, requestId, { cause });
       });
-      if (isHealthRequest && canRetry) {
-        res.once("close", () => {
-          if (completed || res.writableEnded) return;
-          completed = true;
-          clearTimeout(responseTimer);
-          recordFailure("client-aborted");
-          report(attempt, "client-aborted", 499, "client-closed");
-          upstream.destroy();
-        });
-      } else if (isModelApiRequest) {
-        const closeUpstream = () => upstream.destroy();
-        res.once("close", closeUpstream);
-        upstream.once("close", () => res.off("close", closeUpstream));
-      }
+      const closeUpstream = () => {
+        if (completed || res.writableEnded) return;
+        completed = true;
+        clearTimeout(responseTimer);
+        recordFailure("client-aborted");
+        if (isHealthRequest && canRetry) report(attempt, "client-aborted", 499, "client-closed");
+        upstream.destroy();
+      };
+      res.once("close", closeUpstream);
+      upstream.once("close", () => res.off("close", closeUpstream));
 
       if (canRetry) {
         upstream.end();
@@ -763,5 +772,5 @@ server.on("clientError", (_error, socket) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`Codex Cloud Console local http proxy ready: http://${host}:${server.address().port}/ -> ${credentials.target.href}`);
+  console.log(`Codex Cloud Console local http proxy ready: http://${host}:${server.address().port}/ -> ${credentials.target.origin}`);
 });
