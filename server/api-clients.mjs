@@ -5,20 +5,37 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import { recordDuration, summarizeDurations, requestErrorType } from "./usage-statistics.mjs";
 
-const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
-const safeClient = ({ tokenHash, ...client }) => client;
+export const apiClientPolicyVersion = 1;
 
-export function createApiClientStore({ read, write, metricsRoot, now = () => Date.now() }) {
+const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const policyError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
+const positiveLimit = (value, statusCode = 503) => {
+  if (value == null) return null;
+  if (!Number.isSafeInteger(value) || value <= 0) throw policyError(statusCode, "调用方限制必须是正整数或 null");
+  return value;
+};
+const clientPolicy = client => {
+  const policyRevision = client.policyRevision ?? 0;
+  if (!Number.isSafeInteger(policyRevision) || policyRevision < 0 || client.expiresAt != null && (typeof client.expiresAt !== "string" || !Number.isFinite(Date.parse(client.expiresAt)))) throw policyError(503, "调用方限制记录无效，需要核对配置");
+  return { maxConcurrent: positiveLimit(client.maxConcurrent), dailyKnownTokenLimit: positiveLimit(client.dailyKnownTokenLimit), policyRevision };
+};
+const safeClient = ({ tokenHash, ...client }) => ({ ...client, ...clientPolicy(client) });
+
+export function createApiClientStore({ read, write, metricsRoot, now = () => Date.now(), concurrencyCeiling = 1 }) {
+  if (positiveLimit(concurrencyCeiling) === null) throw new Error("Invalid server concurrency ceiling");
   let writeQueue = Promise.resolve();
   let requestQueue = Promise.resolve();
   let prunedDay = "";
   const lastSeenWrite = new Map();
   const load = async () => {
     const state = await read();
-    return {
-      version: 1,
-      clients: Array.isArray(state?.clients) ? state.clients : [],
-    };
+    if (!state || typeof state !== "object" || state.version != null && state.version !== 1 || !Array.isArray(state.clients)) throw policyError(503, "调用方记录格式无效，未修改原配置");
+    const ids = new Set();
+    for (const client of state.clients) {
+      if (!client || typeof client.id !== "string" || !client.id || ids.has(client.id) || !Array.isArray(client.automationIds) || client.automationIds.some(id => typeof id !== "string" || !id)) throw policyError(503, "调用方身份或权限范围记录无效，未修改原配置");
+      ids.add(client.id); clientPolicy(client);
+    }
+    return { ...state, version: 1 };
   };
   const mutate = (callback) => {
     const task = writeQueue.catch(() => null).then(async () => {
@@ -29,6 +46,19 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
     });
     writeQueue = task.catch(() => null);
     return task;
+  };
+  const policyChanges = (input, current = {}) => {
+    const result = {};
+    for (const field of ["maxConcurrent", "dailyKnownTokenLimit"]) {
+      if (!Object.hasOwn(input, field)) continue;
+      result[field] = positiveLimit(input[field], 400);
+    }
+    if (result.maxConcurrent > concurrencyCeiling) throw policyError(400, "调用方并发不能超过服务器上限");
+    if (Object.hasOwn(input, "expiresAt")) {
+      if (input.expiresAt != null && (typeof input.expiresAt !== "string" || !Number.isFinite(Date.parse(input.expiresAt)) || input.expiresAt !== current.expiresAt && Date.parse(input.expiresAt) <= now())) throw policyError(400, "有效期必须是未来时间或 null");
+      result.expiresAt = input.expiresAt == null ? null : new Date(input.expiresAt).toISOString();
+    }
+    return result;
   };
 
   const metricFileName = (time) => `${new Date(time).toISOString().slice(0, 10)}.ndjson`;
@@ -132,15 +162,14 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
       await writeQueue;
       return (await load()).clients.map(safeClient);
     },
-    async create({ name, automationIds, expiresAt = null }) {
+    limits() { return { maxConcurrent: concurrencyCeiling, dailyBudgetTimezone: "UTC", budgetMode: "known_usage_soft_limit" }; },
+    async create({ name, automationIds, expiresAt = null, maxConcurrent = null, dailyKnownTokenLimit = null }) {
       const label = String(name || "").trim().slice(0, 80);
       if (!label) throw Object.assign(new Error("Client name is required"), { statusCode: 400 });
       if (!Array.isArray(automationIds) || !automationIds.length || automationIds.some((id) => typeof id !== "string" || !id)) {
         throw Object.assign(new Error("At least one automation scope is required"), { statusCode: 400 });
       }
-      if (expiresAt && (!Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= now())) {
-        throw Object.assign(new Error("Expiry must be in the future"), { statusCode: 400 });
-      }
+      const policy = policyChanges({ expiresAt, maxConcurrent, dailyKnownTokenLimit });
       const token = `ccc_${crypto.randomBytes(32).toString("base64url")}`;
       const client = {
         id: crypto.randomUUID(),
@@ -149,7 +178,8 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
         tokenHash: digest(token),
         automationIds: [...new Set(automationIds)],
         createdAt: new Date(now()).toISOString(),
-        expiresAt: expiresAt || null,
+        ...policy,
+        policyRevision: 0,
         revokedAt: null,
         lastUsedAt: null,
       };
@@ -158,16 +188,32 @@ export function createApiClientStore({ read, write, metricsRoot, now = () => Dat
       });
       return { client: safeClient(client), token };
     },
+    async updatePolicy(id, input) {
+      if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => !["expectedRevision", "expiresAt", "maxConcurrent", "dailyKnownTokenLimit"].includes(key)) || !Number.isSafeInteger(input.expectedRevision) || Object.keys(input).length < 2) throw policyError(400, "限制更新需要当前版本及明确的修改字段");
+      return mutate(state => {
+        const client = state.clients.find(item => item.id === id);
+        if (!client) throw policyError(404, "调用方不存在");
+        const policy = clientPolicy(client);
+        if (client.revokedAt) throw policyError(409, "已撤销的调用方不能重新启用");
+        if (policy.policyRevision !== input.expectedRevision) throw policyError(409, "调用方限制已在其他页面修改，请刷新核对；当前输入未保存");
+        Object.assign(client, policy, policyChanges(input, client), { policyRevision: policy.policyRevision + 1 });
+        return safeClient(client);
+      });
+    },
     async revoke(id) {
       return mutate((state) => {
         const client = state.clients.find((item) => item.id === id);
         if (!client) throw Object.assign(new Error("Unknown API client"), { statusCode: 404 });
-        client.revokedAt ||= new Date(now()).toISOString();
+        if (!client.revokedAt) {
+          client.policyRevision = clientPolicy(client).policyRevision + 1;
+          client.revokedAt = new Date(now()).toISOString();
+        }
         return safeClient(client);
       });
     },
     async authenticate(token, automationId) {
       if (!token) return null;
+      await writeQueue;
       const tokenHash = digest(String(token));
       const state = await load();
       for (const client of state.clients) {

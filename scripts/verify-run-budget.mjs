@@ -44,6 +44,20 @@ test("a task accepted yesterday but executed today belongs to today's UTC budget
   assert.equal(checkKnownTokenBudget([queuedYesterday], { limit: 100, now: now + 86400000 }).ok, true);
 });
 
+test("execution excludes its own queued record while client budgets retain other unknown usage", () => {
+  const rows = [
+    { ...run("queued", null), id: "current", clientId: "a" },
+    { ...run("queued", null), id: "waiting", clientId: "a" },
+    { ...run("completed", 80), id: "done", clientId: "a" },
+    { ...run("needs_reconciliation", null), id: "other", clientId: "b" },
+  ];
+  assert.equal(checkKnownTokenBudget(rows, { limit: 100, clientId: "a", now }).code, "token_usage_pending");
+  assert.deepEqual(checkKnownTokenBudget(rows, { limit: 100, clientId: "a", excludeRunId: "current", ignoreUnstartedQueue: true, now }), { ok: true, enabled: true, used: 80, limit: 100 });
+  rows[1].executionStartedAt = rows[1].startedAt;
+  assert.equal(checkKnownTokenBudget(rows, { limit: 100, clientId: "a", excludeRunId: "current", ignoreUnstartedQueue: true, now }).code, "token_usage_pending");
+  assert.equal(checkKnownTokenBudget(rows, { limit: 100, clientId: "b", now }).code, "token_usage_incomplete");
+});
+
 test("retention preserves all current-day budget records beyond the history limit", () => {
   const runs = dailyRuns();
   const retained = retainAutomationRuns(runs, retention);

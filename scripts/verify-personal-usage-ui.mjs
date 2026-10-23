@@ -33,6 +33,10 @@ let decision = null;
 let createdToken = "";
 let createClientFailure = false;
 let createClientCalls = 0;
+let clientPolicyCalls = 0;
+let clientPolicyMode = "ok";
+let lastClientCreate = null;
+const apiClients = [{ id: "client-a", name: "研究服务", tokenPrefix: "ccc_test", automationIds: [status.automations[0].id], createdAt: new Date().toISOString(), expiresAt: null, revokedAt: null, lastUsedAt: new Date().toISOString(), maxConcurrent: 1, dailyKnownTokenLimit: 1000, policyRevision: 0 }];
 let personalLoginFlow = null;
 let includeNewModel = false;
 let selectedRuntime = null;
@@ -258,10 +262,20 @@ await context.route("**/api/**", async (route) => {
     if (req.method() === "POST") {
       createClientCalls++;
       if (createClientFailure) return send({ ok: false, error: "fixture ambiguous create" }, 502);
+      lastClientCreate = body;
       createdToken = "ccc_test-token-only-once";
       return send({ ok: true, token: createdToken, client: { id: "new", name: body.name } }, 201);
     }
-    return send({ ok: true, clients: [{ id: "client-a", name: "研究服务", tokenPrefix: "ccc_test", automationIds: [status.automations[0].id], createdAt: new Date().toISOString(), expiresAt: null, revokedAt: null, lastUsedAt: new Date().toISOString() }] });
+    return send({ ok: true, clients: apiClients, limits: { maxConcurrent: 2, dailyBudgetTimezone: "UTC", budgetMode: "known_usage_soft_limit" } });
+  }
+  if (url.pathname === "/api/clients/client-a/policy" && req.method() === "PATCH") {
+    clientPolicyCalls++;
+    const client = apiClients[0];
+    if (clientPolicyMode === "conflict") { client.policyRevision++; client.dailyKnownTokenLimit = 333; clientPolicyMode = "ok"; return send({ ok: false, error: "调用方限制已在其他页面修改，请刷新核对；当前输入未保存" }, 409); }
+    if (body.expectedRevision !== client.policyRevision) return send({ ok: false, error: "版本冲突" }, 409);
+    const { expectedRevision, ...policy } = body;
+    Object.assign(client, policy, { policyRevision: client.policyRevision + 1 });
+    return clientPolicyMode === "ambiguous" ? send({ ok: false, error: "fixture uncertain policy" }, 502) : send({ ok: true, client });
   }
   if (url.pathname === "/api/clients/usage") {
     if (usageFailure) return send({ ok: false, error: "模拟统计不可用" }, 502);
@@ -539,6 +553,12 @@ try {
   assert.match(await page.locator(".usage-chart-data table").innerText(), /查询[\s\S]*3/);
   await page.getByRole("textbox", { name: "调用方名称" }).fill("第二个服务");
   await page.locator(".usage-scopes input[type='checkbox']").first().check();
+  await page.locator(".usage-new-policy summary").click();
+  await page.getByLabel("新调用方并发上限", { exact: true }).fill("1");
+  await page.getByLabel("新调用方每日已知 Token", { exact: true }).fill("200");
+  const newExpiry = new Date(Date.now() + 86_400_000);
+  const expiryInput = new Date(newExpiry.getTime() - newExpiry.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  await page.getByLabel("新调用方有效至", { exact: true }).fill(expiryInput);
   createClientFailure = true;
   await page.getByRole("button", { name: "创建令牌" }).click();
   await page.getByText(/创建结果未确认，请先刷新调用方列表核对/).waitFor();
@@ -549,7 +569,38 @@ try {
   await page.getByRole("button", { name: "创建令牌" }).click();
   await page.getByText(createdToken).waitFor();
   assert.equal(createClientCalls, 2);
+  assert.equal(lastClientCreate.maxConcurrent, 1);
+  assert.equal(lastClientCreate.dailyKnownTokenLimit, 200);
+  assert.equal(lastClientCreate.expiresAt, new Date(expiryInput).toISOString());
   assert.equal(await page.getByRole("button", { name: "创建令牌" }).isEnabled(), false);
+  await page.getByRole("button", { name: "调整 研究服务 的限制", exact: true }).click();
+  await page.getByLabel("编辑调用方每日已知 Token", { exact: true }).fill("555");
+  clientPolicyMode = "conflict";
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "保存 研究服务 的限制", exact: true }).click();
+  await page.locator(".usage-policy-editor").getByRole("alert").waitFor();
+  assert.equal(await page.getByLabel("编辑调用方每日已知 Token", { exact: true }).inputValue(), "555");
+  assert.equal(clientPolicyCalls, 1);
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "载入最新调用限制", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="编辑调用方每日已知 Token"]')?.value === "333");
+  await page.getByLabel("编辑调用方每日已知 Token", { exact: true }).fill("666");
+  clientPolicyMode = "ambiguous";
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "保存 研究服务 的限制", exact: true }).click();
+  await page.getByText(/保存结果未确认，当前输入保留/).waitFor();
+  assert.equal(clientPolicyCalls, 2);
+  assert.equal(await page.getByLabel("编辑调用方每日已知 Token", { exact: true }).inputValue(), "666");
+  clientPolicyMode = "ok";
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "载入最新调用限制", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector(".usage-policy-editor [role='alert']"));
+  await page.getByLabel("编辑调用方每日已知 Token", { exact: true }).fill("777");
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "保存 研究服务 的限制", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector(".usage-policy-editor"));
+  assert.equal(clientPolicyCalls, 3);
+  assert.equal(apiClients[0].dailyKnownTokenLimit, 777);
   await page.getByRole("group", { name: "时间范围" }).getByRole("button", { name: "24 小时" }).click();
   await page.waitForFunction(() => document.querySelector(".usage-summary > div:first-child strong")?.textContent === "2");
   usageRace = true;
@@ -567,6 +618,7 @@ try {
   usageFailure = false;
   await page.getByRole("button", { name: "刷新用量" }).click();
   await page.waitForFunction(() => !document.querySelector(".usage-error"));
+  await page.getByRole("button", { name: "调整 研究服务 的限制", exact: true }).click();
   await page.screenshot({ path: new URL("usage-desktop.png", out).pathname, fullPage: true });
   for (const width of [320, 360, 390, 430, 768, 820, 1280]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : width <= 430 ? 800 : 900 });
@@ -575,7 +627,7 @@ try {
     assert.equal(overflow, false, `horizontal overflow at ${width}px`);
     if (width <= 820) {
       await page.locator(".mobile-sidebar-close").click();
-      const undersized = await page.locator(".usage-header .icon-button, .usage-client .icon-button, .usage-token button, .usage-filters button, .usage-filters select, .usage-section-head .usage-segmented button").evaluateAll((buttons) => buttons.filter((button) => {
+      const undersized = await page.locator(".usage-header .icon-button, .usage-client .icon-button, .usage-policy-fields input, .usage-token button, .usage-filters button, .usage-filters select, .usage-section-head .usage-segmented button").evaluateAll((buttons) => buttons.filter((button) => {
         const rect = button.getBoundingClientRect();
         return rect.width < 44 || rect.height < 44;
       }).map((button) => button.outerHTML.slice(0, 160)));

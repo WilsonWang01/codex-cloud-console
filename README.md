@@ -165,6 +165,8 @@ Codex 请求执行命令、改文件、扩大权限或补充信息时，页面�
 
 新版区分提交、受理和同键重放，补充能力查询、任务成功率、未知用量占比及带样本数的 P50/P95 耗时。等待超时不直接判为任务失败；指标只覆盖已记录的已认证调用。具体口径和兼容边界见[调用与用量](docs/api-usage.md)。
 
+每个调用方可配置更严格的并发、每日已知 Token 上限和有效期；修改先确认并检查版本冲突，不清空用量、不自动取消已运行任务。每日保护不是费用硬上限，未知用量需要核对；既有服务器上限仍生效。
+
 作为业务后端使用时，先用受限令牌查询 `/api/automations/:id/v1/models` 和 `capabilities`，了解模型目录、默认设置与真实协议边界，再提交已审核的任务。提供 Node/Python 参考客户端及 [OpenAPI 契约](docs/openapi.json)，支持稳定事件键、有限重试、超时后查询、显式取消、[txt/md/PDF/图片内联材料](docs/file-inputs.md)、[受限 JSON Schema](docs/structured-output.md)及[私有报告/图片文件交付](docs/artifact-delivery.md)；CLI 可用 `--attach` 读取明确指定的文件，下载校验内容哈希，不跟随重定向转发令牌。接入方法见[后端服务集成](docs/backend-integration.md)。另支持 [OpenAI Chat / Responses / Images、Anthropic Messages 协议子集](docs/model-api-adapters.md)，可用官方 SDK 提交图文、受限文本和 PDF 文件，获取文本与生成图片结果；图片生成仍取决于原生工具及账号权限。暂不支持音视频、密码/交互表单 PDF、客户端工具和通用 Files API，也无法原生保证 `max_tokens` 预算。文件交付仅覆盖支持该能力版本接收的新任务，有大小和有效期限制；它不是完整模型 API 或不可信多租户沙箱。
 
 已登记的独立调用方可使用[签名完成回调](docs/callbacks.md)，不必一直轮询。服务器操作者先确认并登记 HTTPS 接收地址；通知有稳定事件 ID、有限重试和查询兜底，不传任务正文或访问令牌。默认不启用，也不能在请求中指定任意回调地址。

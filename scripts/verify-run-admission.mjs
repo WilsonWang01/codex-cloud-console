@@ -21,3 +21,14 @@ test("invalid limits use conservative defaults", () => {
   const admission = createRunAdmission({ maxGlobal: 0, maxPerClient: -1 });
   assert.deepEqual(admission.status(), { active: 0, maxGlobal: 2, maxPerClient: 1 });
 });
+
+test("client-specific limits can tighten but never widen the server ceiling", () => {
+  const admission = createRunAdmission({ maxGlobal: 4, maxPerClient: 2 });
+  const first = admission.reserve("a", 1);
+  assert.throws(() => admission.reserve("a", 1), { statusCode: 429 });
+  const second = admission.reserve("a", 50);
+  assert.throws(() => admission.reserve("a", 50), { statusCode: 429 });
+  assert.throws(() => admission.reserve("b", 0), /Invalid client/);
+  first(); second();
+  assert.equal(admission.status().active, 0);
+});

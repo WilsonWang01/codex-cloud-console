@@ -144,7 +144,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         return { run, deduplicated: false };
       });
     },
-    claim({ owner, pid = process.pid, maxGlobal = 2, maxPerClient = 1 }) {
+    claim({ owner, pid = process.pid, maxGlobal = 2, maxPerClient = 1, clientLimits = new Map(), blockedClients = new Set() }) {
       return transaction(() => {
         if (!owner || !Number.isSafeInteger(pid) || pid < 1 || ![maxGlobal, maxPerClient].every((n) => Number.isSafeInteger(n) && n > 0)) throw new Error("Invalid execution owner or concurrency limits");
         const running = db.prepare("SELECT record FROM external_tasks WHERE state='running'").all().map(decode);
@@ -152,7 +152,9 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         const queued = db.prepare("SELECT id, record, epoch FROM external_tasks WHERE state='queued' ORDER BY created_ms, id").all();
         for (const row of queued) {
           const record = decode(row);
-          if (running.filter((run) => run.clientId === record.clientId).length >= maxPerClient) continue;
+          const maximum = clientLimits.get(record.clientId) ?? maxPerClient;
+          if (!Number.isSafeInteger(maximum) || maximum < 1) throw new Error("Invalid client concurrency limit");
+          if (blockedClients.has(record.clientId) || running.filter((run) => run.clientId === record.clientId).length >= Math.min(maxPerClient, maximum)) continue;
           db.prepare("UPDATE external_tasks SET state='running', owner=?, owner_pid=?, epoch=epoch+1 WHERE id=?").run(owner, pid, row.id);
           return { run: record, execution: JSON.parse(db.prepare("SELECT execution FROM external_tasks WHERE id=?").get(row.id).execution), claim: { owner, epoch: row.epoch + 1 } };
         }

@@ -10,9 +10,10 @@ export function createRunAdmission({ maxGlobal = 2, maxPerClient = 1 } = {}) {
   let total = 0;
 
   return {
-    reserve(clientId = "console") {
+    reserve(clientId = "console", maximum = null) {
       const key = String(clientId || "console");
-      if (total >= globalLimit || (active.get(key) || 0) >= clientLimit) {
+      if (maximum != null && (!Number.isSafeInteger(maximum) || maximum < 1)) throw new Error("Invalid client concurrency limit");
+      if (total >= globalLimit || (active.get(key) || 0) >= Math.min(clientLimit, maximum ?? clientLimit)) {
         throw Object.assign(new Error("Automation concurrency limit reached; retry after a running task finishes"), {
           statusCode: 429,
           retryAfterMs: 30_000,

@@ -75,7 +75,7 @@ export function createDiscoveryHandler({ authenticate, automation, catalog, runt
         res.json({ object: "list", data: discoveryModels(listed, await runs(client, req.params.id), client, req.params.id),
           codex_cloud: { catalog_status: listed.stale || listed.refreshError ? "stale" : "available", observed_at: timestamp(listed.cachedAt), inference_verified: false } });
       } else {
-        res.json(discoveryCapabilities({ automationId: req.params.id, defaults, catalog: listed, cli: await runtime(), idempotencyTtlMs, modelWaitMs, queueLimits: queueLimits?.(), resultStorage: resultStorage?.(), callback: callback?.(client,req.params.id) }));
+        res.json(discoveryCapabilities({ automationId: req.params.id, defaults, catalog: listed, cli: await runtime(), idempotencyTtlMs, modelWaitMs, queueLimits: queueLimits?.(client), resultStorage: resultStorage?.(), callback: callback?.(client,req.params.id) }));
       }
     } catch (error) {
       sendModelApiError(res, protocol, error.statusCode ? error : failure(503, "能力信息暂不可用，请稍后重试"));

@@ -48,6 +48,15 @@ test("queue limits reject only new acceptance; claims enforce global and per-cli
   assert.equal(store.claim({ owner: "worker-c", maxGlobal: 2, maxPerClient: 1 }), null);
 }));
 
+test("transactional claims honor current client limits and skip temporarily blocked clients", () => fixture(({ store }) => {
+  for (const [id, client] of [["1", "a"], ["2", "a"], ["3", "b"], ["4", "c"]]) store.accept(options(id, client));
+  const limits = { maxGlobal: 4, maxPerClient: 2, clientLimits: new Map([["a", 1]]) };
+  assert.equal(store.claim({ owner: "one", ...limits }).run.id, "1");
+  assert.equal(store.claim({ owner: "two", ...limits, blockedClients: new Set(["b"]) }).run.id, "4");
+  assert.equal(store.claim({ owner: "three", ...limits }).run.id, "3");
+  assert.equal(store.claim({ owner: "four", ...limits }), null);
+}));
+
 test("unclaimed tasks survive reopen; dead executions need reconciliation and old owners cannot overwrite", () => fixture(({ store, ledger }) => {
   store.accept(options("1")); store.accept(options("2", "client-b"));
   const claimed = store.claim({ owner: "old", pid: 12345 });

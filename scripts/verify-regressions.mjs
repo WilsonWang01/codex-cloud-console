@@ -441,6 +441,137 @@ input.on("line", (line) => {
   return fakePath;
 }
 
+await check("client limits preserve budget accounting, replay, policy conflicts and execution checks", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-client-policy-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "client-policy-fixture-admin" };
+  let globalBudget = "500", globalConcurrency = "2", backendError = "";
+  const start = () => {
+    const child = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot,
+    CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0",
+    CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"], CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT: globalBudget,
+    CODEX_AUTOMATION_MAX_CONCURRENT: globalConcurrency, CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "2", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100",
+    FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
+    } });
+    child.stderr.on("data", data => { backendError = (backendError + data).slice(-4000); });
+    return child;
+  };
+  const submit = (key, auth = headers, prompt = "model api regression client-policy") => jsonRequest(base, "/api/automations/sample-research/webhook", {
+    method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}) }),
+  });
+  const waitRun = async (submitted, auth = headers) => {
+    let lastResult;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const result = await jsonRequest(base, submitted.data.run.resultPath, { headers: auth }); lastResult = result.data;
+      if (["completed", "failed", "needs_reconciliation"].includes(result.data.run?.status)) return result.data.run;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error(JSON.stringify({ lastResult, backendError }));
+  };
+  const create = async (name, policy) => {
+    const result = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name, automationIds: ["sample-research"], ...policy }) });
+    assert.equal(result.response.status, 201);
+    return { client: result.data.client, auth: { "content-type": "application/json", authorization: `Bearer ${result.data.token}` } };
+  };
+  let server;
+  try {
+    server = start();
+    await waitForOutput(server, /listening on/);
+    const submitted = await submit("budget-self-0001");
+    assert.equal(submitted.response.status, 200);
+    const terminal = await waitRun(submitted);
+    assert.equal(terminal.status, "completed", terminal.error);
+    assert.equal(terminal.usage.totalTokens, 130);
+    const a = await create("client-a", { maxConcurrent: 1, dailyKnownTokenLimit: 100 });
+    const b = await create("client-b", { dailyKnownTokenLimit: 300 });
+    const aRun = await submit("client-a-first-0001", a.auth);
+    assert.equal(aRun.response.status, 200);
+    assert.equal((await waitRun(aRun, a.auth)).status, "completed");
+    const rejected = await submit("client-a-second-0002", a.auth);
+    assert.equal(rejected.response.status, 429);
+    assert.equal(rejected.data.code, "known_token_limit_reached");
+    const replay = await submit("client-a-first-0001", a.auth);
+    assert.equal(replay.data.run.id, aRun.data.run.id); assert.equal(replay.data.deduplicated, true);
+    const bRun = await submit("client-b-first-0001", b.auth);
+    const pending = await submit("client-b-second-0002", b.auth);
+    assert.equal(pending.response.status, 429); assert.equal(pending.data.code, "token_usage_pending");
+    assert.equal((await waitRun(bRun, b.auth)).status, "completed");
+    const policyPath = `/api/clients/${a.client.id}/policy`;
+    const update = await jsonRequest(base, policyPath, { method: "PATCH", headers, body: JSON.stringify({ expectedRevision: 0, dailyKnownTokenLimit: 200 }) });
+    assert.equal(update.response.status, 200); assert.equal(update.data.client.policyRevision, 1);
+    const stale = await jsonRequest(base, policyPath, { method: "PATCH", headers, body: JSON.stringify({ expectedRevision: 0, dailyKnownTokenLimit: null }) });
+    assert.equal(stale.response.status, 409);
+    const cap = await jsonRequest(base, "/api/automations/sample-research/v1/capabilities", { headers: a.auth });
+    assert.equal(cap.data.limits.task_queue.max_concurrent_per_client, 1);
+    assert.equal(cap.data.limits.task_queue.client_daily_known_token_limit, 200);
+    const aSecond = await submit("client-a-second-0002", a.auth);
+    assert.equal((await waitRun(aSecond, a.auth)).status, "completed");
+    assert.equal((await submit("server-budget-reached-0001", b.auth)).response.status, 429);
+    await stopProcess(server);
+    // Change only this synthetic server's policy; retained accounting is not cleared.
+    globalBudget = ""; server = start(); await waitForOutput(server, /listening on/);
+    const c = await create("unknown-client", { dailyKnownTokenLimit: 200 });
+    const ledger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    try { ledger.sync([{ id: "unknown-client-fixture", clientId: c.client.id, automationId: "sample-research", runner: "app-server", status: "needs_reconciliation", startedAt: new Date().toISOString(), usage: { status: "unknown" } }]); }
+    finally { ledger.close(); }
+    const unknown = await submit("unknown-client-0001", c.auth);
+    assert.equal(unknown.response.status, 409); assert.equal(unknown.data.code, "token_usage_incomplete");
+    assert.equal((await waitRun(await submit("client-b-second-0002", b.auth), b.auth)).status, "completed");
+    const usage = await jsonRequest(base, "/api/clients/usage", { headers });
+    assert.equal(usage.data.runBuckets.reduce((sum, row) => sum + row.totalTokens, 0), 650);
+    assert.equal(usage.data.runSummary.unknownUsage, 1);
+    const clientsFile = path.join(stateRoot, "api-clients.json");
+    const savedClients = await fs.readFile(clientsFile, "utf8"), damaged = JSON.parse(savedClients);
+    damaged.clients[0].dailyKnownTokenLimit = -1;
+    await fs.writeFile(clientsFile, JSON.stringify(damaged));
+    const brokenHealth = await jsonRequest(base, "/healthz");
+    assert.equal(brokenHealth.response.status, 503);
+    assert.equal(brokenHealth.data.layers.apiClients.ok, false);
+    assert.equal((await submit("damaged-policy-0001", b.auth)).response.status, 503);
+    await fs.writeFile(clientsFile, savedClients);
+    const calls = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(calls.filter(row => row.method === "turn/start").length, 5);
+    await stopProcess(server);
+    globalConcurrency = "1"; server = start(); await waitForOutput(server, /listening on/);
+    const expiring = await create("expiring-while-queued", {});
+    const holding = await submit("policy-hold-0001", headers, "progress regression queue first policy hold");
+    const startedDeadline = Date.now() + 5000;
+    while (Date.now() < startedDeadline) {
+      const active = await jsonRequest(base, holding.data.run.resultPath, { headers });
+      if (active.data.run?.status === "running") break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    const queued = await submit("expiry-queued-0001", expiring.auth);
+    assert.equal(queued.data.run.status, "queued");
+    const expires = await jsonRequest(base, `/api/clients/${expiring.client.id}/policy`, { method: "PATCH", headers, body: JSON.stringify({ expectedRevision: 0, expiresAt: new Date(Date.now() + 500).toISOString() }) });
+    assert.equal(expires.response.status, 200);
+    await waitRun(holding);
+    let expiredRun;
+    const expiryDeadline = Date.now() + 5000;
+    while (Date.now() < expiryDeadline) {
+      const list = await jsonRequest(base, "/api/automations/runs", { headers });
+      expiredRun = list.data.runs.find(run => run.id === queued.data.run.id);
+      if (expiredRun?.status === "failed") break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.equal(expiredRun?.status, "failed"); assert.equal(expiredRun.usage.totalTokens, 0);
+    assert.equal((await submit("expiry-queued-0001", expiring.auth)).response.status, 401);
+    await jsonRequest(base, `/api/clients/${expiring.client.id}/policy`, { method: "PATCH", headers, body: JSON.stringify({ expectedRevision: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() }) });
+    const recovered = await submit("expiry-queued-0001", expiring.auth);
+    assert.equal(recovered.data.run.id, queued.data.run.id); assert.equal(recovered.data.run.status, "failed");
+    const finalCalls = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(finalCalls.filter(row => row.method === "turn/start").length, 6);
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
 await check("scoped API callback intent survives restart and changed registration never receives old events", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-callback-api-"));
   const cloudRoot = path.join(root,"cloud"), stateRoot = path.join(root,"state"), bin = path.join(root,"bin");

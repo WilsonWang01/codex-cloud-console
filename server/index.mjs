@@ -285,6 +285,7 @@ const apiClientStore = createApiClientStore({
   read: () => readJsonState(apiClientsPath, { version: 1, clients: [] }),
   write: (state) => atomicWriteJson(apiClientsPath, state),
   metricsRoot: apiRequestMetricsRoot,
+  concurrencyCeiling: Math.min(runAdmission.status().maxGlobal, runAdmission.status().maxPerClient),
 });
 const githubWorkflow = createGitHubWorkflow();
 const configuredOwnerEntries = Number(process.env.CODEX_OWNER_INDEX_MAX || 5_000);
@@ -5310,10 +5311,10 @@ async function upsertAutomationRun(run, event = null, { budgetLimit = null, task
     ledger.sync(store.runs);
     const now = Date.now();
     const dayStart = Date.parse(new Date(now).toISOString().slice(0, 10) + "T00:00:00Z");
-    const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: budgetLimit, now });
-    if (!budget.ok) {
-      throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
-    }
+    const client = await assertAutomationClientActive(run.clientId, run.automationId);
+    assertAutomationBudgets(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), {
+      globalLimit: budgetLimit, client, now, excludeRunId: run.id, ignoreUnstartedQueue: true,
+    });
     const index = store.runs.findIndex((item) => item.id === run.id);
     const current = index >= 0 ? store.runs[index] : externalTaskStore().read(run.id);
     const { events, eventSeq } = mergeAutomationEvents(current, run.events || [], event ? [event] : []);
@@ -6926,10 +6927,21 @@ function automationTriggerOptions(req, trigger, clientId, triggerIdempotencyHash
 }
 
 async function assertAutomationClientActive(clientId, automationId) {
-  if (!clientId || ["legacy-shared", "local-development"].includes(clientId)) return;
+  // Internal personal runners are not API credentials; independently issued clients always use UUIDs.
+  if (!clientId || ["legacy-shared", "local-development", "personal-console", "personal-scheduler"].includes(clientId)) return;
   const client = (await apiClientStore.list()).find(item => item.id === clientId);
   if (!client || client.revokedAt || (client.expiresAt && Date.parse(client.expiresAt) <= Date.now()) || !client.automationIds.includes(automationId)) {
     throw automationRequestError(403, "调用方已撤销、过期或不再拥有自动化权限，未启动模型");
+  }
+  return client;
+}
+
+function assertAutomationBudgets(runs, { globalLimit, client, ...options }) {
+  for (const scope of [{ limit: globalLimit, label: "服务器", clientId: "" }, { limit: client?.dailyKnownTokenLimit, label: "调用方", clientId: client?.id }]) {
+    const budget = checkKnownTokenBudget(runs, { ...options, limit: scope.limit, clientId: scope.clientId });
+    if (!budget.ok) throw Object.assign(new Error(`${scope.label}预算：${budget.reason}`), {
+      statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs, code: budget.code,
+    });
   }
 }
 
@@ -6964,7 +6976,8 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   if (heartbeatSessionId && (!heartbeatSession || heartbeatSession.repoId !== repo.id)) {
     throw new Error("Heartbeat session does not belong to this automation repo");
   }
-  const releaseAdmission = runAdmission.reserve(options.clientId || "console");
+  const client = await assertAutomationClientActive(options.clientId, automation.id);
+  const releaseAdmission = runAdmission.reserve(options.clientId || "console", client?.maxConcurrent);
   const useWorktree = heartbeatSession ? false : options.worktree !== false;
   let worktreePath = options.heartbeatWorktreePath || null;
   let runRecord;
@@ -7166,6 +7179,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         releaseAdmission();
       }
     }
+    if (!runRecord && options.taskClaim && error.code === "token_usage_pending") throw error;
     await updateRun(runId, job ? {
       status: "needs_reconciliation",
       error: `任务已启动但运行记录更新失败：${error.message}`,
@@ -7193,6 +7207,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
     await results.sweep();
     return enqueueWrite("automation", async () => {
     const store = await readAutomationRuns(), ledger = usageLedger(), now = Date.now();
+    const client = await assertAutomationClientActive(options.clientId, automation.id);
     ledger.sync(store.runs);
     const dayStart = Date.parse(new Date(now).toISOString().slice(0, 10) + "T00:00:00Z");
     const run = normalizeAutomationRun({ id: automationRunId(automation.id), automationId: automation.id, repoId: repo.id, name: automation.name,
@@ -7211,8 +7226,9 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
       callback: callbackTargets.binding(options.clientId,automation.id),
       onAccepted: run => results.reserve(run),
       check() {
-        const budget = checkKnownTokenBudget(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), { limit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT, now });
-        if (!budget.ok) throw Object.assign(new Error(budget.reason), { statusCode: budget.statusCode, retryAfterMs: budget.retryAfterMs });
+        assertAutomationBudgets(mergeUsageRuns(store.runs, ledger.rows({ from: dayStart, to: now + 1 })), {
+          globalLimit: process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT, client, now,
+        });
       },
     });
     const index = store.runs.findIndex((item) => item.id === result.run.id);
@@ -7241,9 +7257,11 @@ async function drainExternalTasks() {
     const recovered = externalTaskStore().recover();
     if (recovered.length) await enqueueWrite("automation", async () => writeAutomationRunsWithinQueue(await readAutomationRuns()));
     const limits = runAdmission.status();
+    const clientLimits = new Map((await apiClientStore.list()).map(client => [client.id, client.maxConcurrent]));
+    const blockedClients = new Set();
     for (let attempt = 0; attempt < limits.maxGlobal; attempt += 1) {
       if (runAdmission.status().active >= limits.maxGlobal) break;
-      const task = externalTaskStore().claim({ owner: externalTaskOwner, maxGlobal: limits.maxGlobal, maxPerClient: limits.maxPerClient });
+      const task = externalTaskStore().claim({ owner: externalTaskOwner, maxGlobal: limits.maxGlobal, maxPerClient: limits.maxPerClient, clientLimits, blockedClients });
       if (!task) break;
       let handedToRunner = false;
       try {
@@ -7256,7 +7274,7 @@ async function drainExternalTasks() {
       } catch (error) {
         const current = externalTaskStore().read(task.run.id);
         if (error.statusCode === 429 && ["queued", "canceling"].includes(current?.status) && !current.executionStartedAt) {
-          externalTaskStore().release(task.run.id, task.claim); break;
+          externalTaskStore().release(task.run.id, task.claim); blockedClients.add(task.run.clientId); continue;
         }
         if (current?.status !== "queued" && (handedToRunner || current?.status !== "canceling")) continue;
         if (error.statusCode === 429) { externalTaskStore().release(task.run.id, task.claim); break; }
@@ -9146,7 +9164,10 @@ app.get("/healthz", async (_req, res) => {
   let ledgerHealth;
   try { usageLedger().info(); externalTaskStore().info(); externalTaskStore().callbacks.info(); externalResultStore().info(); ledgerHealth = { ok: true }; }
   catch { ledgerHealth = { ok: false, error: "任务、结果或用量存储不可用" }; }
-  const strictOk = Boolean(health.ok && ledgerHealth.ok);
+  let clientsHealth;
+  try { await apiClientStore.list(); clientsHealth = { ok: true }; }
+  catch { clientsHealth = { ok: false, error: "调用方权限或限制记录不可用" }; }
+  const strictOk = Boolean(health.ok && ledgerHealth.ok && clientsHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
   const reachable =
@@ -9155,7 +9176,7 @@ app.get("/healthz", async (_req, res) => {
   const responseHealth =
     {
       ...health,
-      layers: { ...health.layers, usageLedger: ledgerHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
+      layers: { ...health.layers, usageLedger: ledgerHealth, apiClients: clientsHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
       ok: strictOk,
       strictOk,
       partial: !strictOk && reachable,
@@ -9180,7 +9201,7 @@ app.post("/api/approvals/:id/decision", (req, res) => {
 
 app.get("/api/clients", async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  try { res.json({ ok: true, clients: await apiClientStore.list() }); }
+  try { res.json({ ok: true, clients: await apiClientStore.list(), limits: apiClientStore.limits() }); }
   catch (error) { res.status(500).json({ ok: false, error: error.message }); }
 });
 
@@ -9193,7 +9214,16 @@ app.post("/api/clients", async (req, res) => {
   try {
     res.status(201).json({ ok: true, ...(await apiClientStore.create({
       name: req.body?.name, automationIds, expiresAt: req.body?.expiresAt,
+      maxConcurrent: req.body?.maxConcurrent, dailyKnownTokenLimit: req.body?.dailyKnownTokenLimit,
     })) });
+  } catch (error) { res.status(error.statusCode || 500).json({ ok: false, error: error.message }); }
+});
+
+app.patch("/api/clients/:id/policy", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const client = await withPublicationLock(publicationLockPath, () => enqueueWrite("automation", () => apiClientStore.updatePolicy(req.params.id, req.body)));
+    res.json({ ok: true, client });
   } catch (error) { res.status(error.statusCode || 500).json({ ok: false, error: error.message }); }
 });
 
@@ -11912,7 +11942,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
   try {
     return await runPromise;
   } catch (error) {
-    throw Object.assign(automationRequestError([400, 409, 413, 415, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs), error.code ? { code: error.code } : {});
+    throw Object.assign(automationRequestError([400, 403, 409, 413, 415, 429, 503].includes(error.statusCode) ? error.statusCode : 500, error.message, error.retryAfterMs), error.code ? { code: error.code } : {});
   }
 }
 
@@ -11990,7 +12020,8 @@ const handleDiscovery = createDiscoveryHandler({
   modelWaitMs: Number(process.env.CODEX_MODEL_API_WAIT_TIMEOUT_MS || 300_000),
   callback: (client,id) => ({ supported: true, configured: Boolean(callbackTargets.binding(client.id,id)), events: ["automation.run.terminal"],
     signature: "hmac_sha256_v1", max_attempts: 5, lifetime_ms: 86_400_000, duplicate_delivery_possible: true, polling_fallback: true }),
-  queueLimits: () => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: runAdmission.status().maxPerClient,
+  queueLimits: client => ({ max_queued: automationMaxQueued, max_concurrent: runAdmission.status().maxGlobal, max_concurrent_per_client: Math.min(runAdmission.status().maxGlobal, runAdmission.status().maxPerClient, client.maxConcurrent ?? runAdmission.status().maxPerClient),
+    client_daily_known_token_limit: client.dailyKnownTokenLimit ?? null, client_expires_at: client.expiresAt ?? null, daily_budget_timezone: "UTC", budget_mode: "known_usage_soft_limit",
     max_execution_payload_bytes: executionPayloadLimits.perRun, max_global_execution_payload_bytes: executionPayloadLimits.global, max_client_execution_payload_bytes: executionPayloadLimits.client }),
   resultStorage: () => {
     const info = externalResultStore().info();

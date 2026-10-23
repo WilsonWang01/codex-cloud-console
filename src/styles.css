@@ -7088,6 +7088,14 @@ pre {
 .usage-note, .usage-empty { color: var(--muted); font-size: 13px; }
 .usage-client, .usage-request { padding: 12px 0; border-bottom: 1px solid var(--border); }
 .usage-client > div { display: grid; gap: 3px; min-width: 0; }
+.usage-client { flex-wrap: wrap; }
+.usage-client > .usage-client-actions, .usage-policy-actions { display: flex; gap: 6px; }
+.usage-policy-editor, .usage-new-policy { flex-basis: 100%; width: 100%; min-width: 0; }
+.usage-policy-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; width: 100%; min-width: 0; margin: 12px 0 0; padding: 0; border: 0; }
+.usage-policy-fields legend { padding: 0; margin-bottom: 8px; font-size: 13px; font-weight: 600; }
+.usage-policy-fields label { display: grid; gap: 5px; min-width: 0; color: var(--muted-strong); font-size: 12px; }
+.usage-policy-fields input { width: 100%; min-width: 0; min-height: 38px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
+.usage-new-policy summary { width: fit-content; min-height: 44px; padding: 12px 0; color: var(--muted-strong); font-size: 13px; cursor: pointer; }
 .usage-client span, .usage-client small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .usage-create { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
 .usage-scopes { display: flex; flex-wrap: wrap; gap: 6px 12px; max-height: 100px; overflow: auto; }
@@ -7116,6 +7124,9 @@ pre {
   .usage-chart { grid-auto-columns: minmax(30px, 1fr); }
   .usage-create { display: grid; }
   .usage-scopes { max-height: 140px; }
+  .usage-policy-fields { grid-template-columns: minmax(0, 1fr); }
+  .usage-policy-fields input { min-height: 44px; }
+  .usage-policy-actions .icon-button { min-width: 44px; min-height: 44px; }
   .usage-create > button, .usage-filters select, .usage-segmented button { min-height: 44px; }
   .usage-token button { min-height: 44px; }
   .usage-token button[aria-label] { width: 44px; }

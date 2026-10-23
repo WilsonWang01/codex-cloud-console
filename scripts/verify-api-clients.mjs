@@ -153,3 +153,63 @@ test("metric scans reject unsafe file types and honor cancellation", async (t) =
   assert.equal((await store.usage(range)).requestSummary.groups[0].requests, 20_000);
   await assert.rejects(store.usage({ ...range, signal: AbortSignal.abort() }), { name: "AbortError" });
 });
+
+test("client policy updates are scoped, versioned, bounded and preserve existing tokens", async () => {
+  let state = { clients: [] }, clock = Date.parse("2026-10-23T06:00:00Z");
+  const store = createApiClientStore({ read: async () => structuredClone(state), write: async next => { state = structuredClone(next); }, concurrencyCeiling: 2, now: () => clock });
+  const created = await store.create({ name: "bounded", automationIds: ["research"], maxConcurrent: 1, dailyKnownTokenLimit: 500, expiresAt: "2026-10-24T14:00:00+08:00" });
+  assert.equal(created.client.expiresAt, "2026-10-24T06:00:00.000Z");
+  const hash = state.clients[0].tokenHash;
+  const changed = await store.updatePolicy(created.client.id, { expectedRevision: 0, dailyKnownTokenLimit: 1000, maxConcurrent: null });
+  assert.equal(changed.policyRevision, 1);
+  assert.equal(changed.maxConcurrent, null);
+  assert.equal(changed.dailyKnownTokenLimit, 1000);
+  assert.equal(state.clients[0].tokenHash, hash);
+  assert.equal((await store.authenticate(created.token, "research")).policyRevision, 1);
+  assert.equal(JSON.stringify(changed).includes(hash), false);
+  await assert.rejects(store.updatePolicy(created.client.id, { expectedRevision: 0, dailyKnownTokenLimit: null }), { statusCode: 409 });
+  for (const patch of [{ maxConcurrent: 3 }, { maxConcurrent: 0 }, { dailyKnownTokenLimit: "100" }, { expiresAt: "yesterday" }, { expiresAt: clock + 1000 }, { automationIds: ["other"] }]) {
+    await assert.rejects(store.updatePolicy(created.client.id, { expectedRevision: 1, ...patch }), { statusCode: 400 });
+  }
+  const second = await store.create({ name: "other", automationIds: ["research"] });
+  assert.equal((await store.list()).find(row => row.id === second.client.id).dailyKnownTokenLimit, null);
+  clock += 2 * 86_400_000;
+  assert.equal(await store.authenticate(created.token, "research"), null);
+  const renewed = await store.updatePolicy(created.client.id, { expectedRevision: 1, expiresAt: "2026-10-26T06:00:00Z" });
+  assert.equal(renewed.policyRevision, 2);
+  assert.ok(await store.authenticate(created.token, "research"));
+  await store.revoke(created.client.id);
+  assert.equal((await store.list()).find(row => row.id === created.client.id).policyRevision, 3);
+  await assert.rejects(store.updatePolicy(created.client.id, { expectedRevision: 3, expiresAt: null }), { statusCode: 409 });
+});
+
+test("legacy policy defaults do not rewrite state; malformed limits and expiry fail closed", async () => {
+  let writes = 0;
+  const row = { id: "legacy", name: "legacy", tokenHash: "0".repeat(64), automationIds: ["research"], expiresAt: null };
+  const store = createApiClientStore({ read: async () => ({ clients: [row] }), write: async () => { writes++; } });
+  assert.deepEqual((await store.list())[0], { id: "legacy", name: "legacy", automationIds: ["research"], expiresAt: null, policyRevision: 0, maxConcurrent: null, dailyKnownTokenLimit: null });
+  assert.equal(writes, 0);
+  for (const patch of [{ dailyKnownTokenLimit: -1 }, { maxConcurrent: "2" }, { policyRevision: -1 }, { expiresAt: "invalid" }]) {
+    const damaged = createApiClientStore({ read: async () => ({ clients: [{ ...row, ...patch }] }), write: async () => {} });
+    await assert.rejects(damaged.list(), { statusCode: 503 });
+  }
+  for (const state of [{ version: 2, clients: [] }, { clients: "damaged" }, { clients: [row, row] }]) {
+    const damaged = createApiClientStore({ read: async () => state, write: async () => { throw new Error("must not overwrite damaged state"); } });
+    await assert.rejects(damaged.create({ name: "new", automationIds: ["research"] }), { statusCode: 503 });
+  }
+});
+
+test("rollback never drops client policy enforcement, including deployments without a task database", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-client-policy-rollback-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const state = path.join(root, "state"), previous = path.join(root, "previous");
+  await fs.mkdir(state); await fs.mkdir(path.join(previous, "server"), { recursive: true });
+  const filename = path.join(state, "api-clients.json"), saved = JSON.stringify({ version: 1, clients: [{ id: "a", maxConcurrent: 1, dailyKnownTokenLimit: 100 }] });
+  await fs.writeFile(filename, saved);
+  const script = new URL("../ops/check-task-rollback.mjs", import.meta.url).pathname;
+  assert.throws(() => execFileSync(process.execPath, [script, state, previous], { stdio: "pipe" }), error => error.status === 1 && /调用方限制/.test(String(error.stderr)));
+  assert.equal(await fs.readFile(filename, "utf8"), saved);
+  await fs.writeFile(path.join(previous, "server/api-clients.mjs"), "export const apiClientPolicyVersion = 1;\n");
+  execFileSync(process.execPath, [script, state, previous], { stdio: "pipe" });
+  assert.equal(await fs.readFile(filename, "utf8"), saved);
+});

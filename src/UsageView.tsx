@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Copy, Download, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Activity, Check, Copy, Download, Plus, RefreshCw, Settings2, ShieldCheck, Trash2, X } from "lucide-react";
 import type { Automation } from "./types";
 
-type Client = { id: string; name: string; tokenPrefix: string; automationIds: string[]; createdAt: string; expiresAt: string | null; revokedAt: string | null; lastUsedAt: string | null };
+type Client = { id: string; name: string; tokenPrefix: string; automationIds: string[]; createdAt: string; expiresAt: string | null; revokedAt: string | null; lastUsedAt: string | null; maxConcurrent?: number | null; dailyKnownTokenLimit?: number | null; policyRevision?: number };
+type ClientLimits = { maxConcurrent: number; dailyBudgetTimezone: string; budgetMode: string };
+type PolicyDraft = { maxConcurrent: string; dailyKnownTokenLimit: string; expiresAt: string };
 type RequestBucket = { hour: string; clientId: string; requests: number; accepted: number; errors: number; replayed: number; polls?: number; pollErrors?: number; controls?: number; discovery?: number };
 type RunBucket = { hour: string; clientId: string; runs: number; completed: number; failed: number; knownRuns: number; unknownRuns: number; inputTokens: number; outputTokens: number; totalTokens: number };
 type RequestRow = { id: string; clientId: string; automationId: string; trigger: string; status: number; runId: string | null; deduplicated: boolean; durationMs: number | null; time: string };
@@ -18,6 +20,17 @@ const runLabels: Record<string, string> = { completed: "已完成", failed: "明
 const triggerLabels: Record<string, string> = { discovery: "能力查询", result: "结果查询", cancel: "取消请求", webhook: "新任务", heartbeat: "续接任务", "chat-completions": "OpenAI 对话", responses: "OpenAI Responses", messages: "Anthropic 消息", "image-generations": "图片生成" };
 const durationText = (value: number | null | undefined) => value == null ? "--" : value < 1000 ? `${value.toLocaleString()} ms` : `${(value / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} 秒`;
 const rateText = (value: number | null | undefined) => value == null ? "--" : `${(value * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+const localDateInput = (value: string | null) => value ? new Date(Date.parse(value) - new Date(value).getTimezoneOffset() * 60_000).toISOString().slice(0, 16) : "";
+const policyDraft = (client?: Client): PolicyDraft => ({ maxConcurrent: client?.maxConcurrent?.toString() || "", dailyKnownTokenLimit: client?.dailyKnownTokenLimit?.toString() || "", expiresAt: localDateInput(client?.expiresAt || null) });
+const policyPayload = (draft: PolicyDraft) => ({ maxConcurrent: draft.maxConcurrent ? Number(draft.maxConcurrent) : null, dailyKnownTokenLimit: draft.dailyKnownTokenLimit ? Number(draft.dailyKnownTokenLimit) : null, expiresAt: draft.expiresAt ? new Date(draft.expiresAt).toISOString() : null });
+
+function ClientPolicyFields({ value, onChange, ceiling, disabled, prefix }: { value: PolicyDraft; onChange: (value: PolicyDraft) => void; ceiling: number; disabled: boolean; prefix: string }) {
+  return <fieldset className="usage-policy-fields" disabled={disabled}><legend>调用限制</legend>
+    <label>并发上限<input aria-label={`${prefix}并发上限`} type="number" min="1" max={ceiling} step="1" placeholder={`继承服务器（${ceiling}）`} value={value.maxConcurrent} onChange={event => onChange({ ...value, maxConcurrent: event.target.value })} /></label>
+    <label>每日已知 Token<input aria-label={`${prefix}每日已知 Token`} type="number" min="1" step="1" placeholder="未设置" value={value.dailyKnownTokenLimit} onChange={event => onChange({ ...value, dailyKnownTokenLimit: event.target.value })} /></label>
+    <label>有效至（本机时区）<input aria-label={`${prefix}有效至`} type="datetime-local" value={value.expiresAt} onChange={event => onChange({ ...value, expiresAt: event.target.value })} /></label>
+  </fieldset>;
+}
 
 function localDay(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
@@ -31,12 +44,16 @@ function queryStart(rangeDays: number) {
 
 export default function UsageView({ automations, automationsReady, apiRequest: request, onOpenRun }: { automations: Automation[]; automationsReady: boolean; apiRequest: <T>(url: string, options?: RequestInit) => Promise<T>; onOpenRun?: (automationId: string, runId: string) => void }) {
   const [clients, setClients] = useState<Client[]>([]);
+  const [clientLimits, setClientLimits] = useState<ClientLimits | null>(null);
   const [usage, setUsage] = useState<Usage>(emptyUsage);
   const [rangeDays, setRangeDays] = useState(7);
   const [clientId, setClientId] = useState("");
   const [chartMode, setChartMode] = useState<"requests" | "discovery" | "polls" | "tokens">("requests");
   const [newName, setNewName] = useState("");
   const [newScopes, setNewScopes] = useState<string[]>([]);
+  const [newPolicy, setNewPolicy] = useState<PolicyDraft>(() => policyDraft());
+  const [editingPolicy, setEditingPolicy] = useState<{ id: string; revision: number; draft: PolicyDraft } | null>(null);
+  const [policyError, setPolicyError] = useState("");
   const [createdToken, setCreatedToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -62,11 +79,12 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
     setError("");
     try {
       const [clientResult, usageResult] = await Promise.all([
-        request<{ clients: Client[] }>("/api/clients", { signal: controller.signal }),
+        request<{ clients: Client[]; limits?: ClientLimits }>("/api/clients", { signal: controller.signal }),
         request<Usage>(`/api/clients/usage?from=${encodeURIComponent(queryStart(rangeDays))}&clientId=${encodeURIComponent(clientId)}`, { signal: controller.signal }),
       ]);
       if (requestRef.current?.id !== id || controller.signal.aborted) return;
       setClients(clientResult.clients);
+      setClientLimits(clientResult.limits || null);
       setUsage(usageResult);
       setLoadedFilter(`${rangeDays}:${clientId}`);
       setLoadedAt(new Date().toISOString());
@@ -90,11 +108,12 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
     try {
       const result = await request<{ token: string }>("/api/clients", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newName, automationIds: newScopes }),
+        body: JSON.stringify({ name: newName, automationIds: newScopes, ...(clientLimits ? policyPayload(newPolicy) : {}) }),
       });
       setCreatedToken(result.token);
       setNewName("");
       setNewScopes([]);
+      setNewPolicy(policyDraft());
       await refresh();
     } catch (cause) {
       const status = (cause as { status?: number })?.status;
@@ -103,6 +122,41 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
         : "创建结果未确认，请先刷新调用方列表核对；如发现多余令牌，请手动撤销，不要直接重复创建。");
     }
     finally { setBusy(false); }
+  };
+
+  const editPolicy = (client: Client) => {
+    setEditingPolicy({ id: client.id, revision: client.policyRevision ?? 0, draft: policyDraft(client) });
+    setPolicyError("");
+  };
+  const reloadPolicy = async () => {
+    if (busy || !editingPolicy || !window.confirm("用服务器最新限制替换当前未保存输入？")) return;
+    setBusy(true);
+    try {
+      const result = await request<{ clients: Client[]; limits?: ClientLimits }>("/api/clients");
+      const client = result.clients.find(row => row.id === editingPolicy.id);
+      if (!client || client.revokedAt) throw new Error("调用方已撤销或不可用，请关闭编辑并刷新列表。");
+      setClients(result.clients); setClientLimits(result.limits || null); editPolicy(client);
+    } catch (cause) { setPolicyError(cause instanceof Error ? cause.message : "限制读取失败，当前输入保留。"); }
+    finally { setBusy(false); }
+  };
+  const savePolicy = async () => {
+    if (busy || !editingPolicy || !clientLimits) return;
+    const client = clients.find(row => row.id === editingPolicy.id);
+    if (!client) return;
+    const payload = policyPayload(editingPolicy.draft);
+    if (!window.confirm(`保存「${client.name}」的调用限制？\n并发：${payload.maxConcurrent ?? `继承服务器 ${clientLimits.maxConcurrent}`}\n每日已知 Token：${payload.dailyKnownTokenLimit ?? "未设置"}（UTC）\n有效至：${payload.expiresAt ? new Date(payload.expiresAt).toLocaleString() : "不设到期时间"}\n不会清零已记录用量或中断正在运行的任务；待执行任务会按最新限制重新核对。`)) return;
+    setBusy(true); setPolicyError("");
+    try {
+      const { expiresAt, ...limits } = payload;
+      await request(`/api/clients/${encodeURIComponent(client.id)}/policy`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expectedRevision: editingPolicy.revision, ...limits,
+        ...(editingPolicy.draft.expiresAt === localDateInput(client.expiresAt) ? {} : { expiresAt }) }) });
+      setEditingPolicy(null); await refresh();
+    } catch (cause) {
+      const status = (cause as { status?: number })?.status;
+      setPolicyError(status && status >= 400 && status < 500 && ![408, 499].includes(status)
+        ? cause instanceof Error ? cause.message : "保存被拒绝，当前输入保留。"
+        : "保存结果未确认，当前输入保留；请先载入最新限制核对，不要直接重复保存。");
+    } finally { setBusy(false); }
   };
 
   const revokeClient = async (client: Client) => {
@@ -230,9 +284,21 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
       </section>
       <section className="usage-section" aria-label="调用方">
         <div className="usage-section-head"><h2>调用方</h2><ShieldCheck size={18} /></div>
-        <div className="usage-client-list">{clients.map((client) => <div className="usage-client" key={client.id}><div><strong>{client.name}</strong><span>{client.revokedAt ? "已撤销" : client.expiresAt && Date.parse(client.expiresAt) <= Date.now() ? "已到期" : "启用"} · {client.tokenPrefix}… · {client.automationIds.join("、")}</span><small>最近调用 {client.lastUsedAt ? new Date(client.lastUsedAt).toLocaleString() : "无"}{client.expiresAt ? ` · 有效至 ${new Date(client.expiresAt).toLocaleString()}` : ""}</small></div>{!client.revokedAt && <button type="button" className="icon-button" title="撤销令牌" aria-label={`撤销 ${client.name}`} disabled={busy} onClick={() => void revokeClient(client)}><Trash2 size={17} /></button>}</div>)}</div>
+        <div className="usage-client-list">{clients.map((client) => <div className="usage-client" key={client.id}>
+          <div><strong>{client.name}</strong><span>{client.revokedAt ? "已撤销" : client.expiresAt && Date.parse(client.expiresAt) <= Date.now() ? "已到期" : "启用"} · {client.tokenPrefix}… · {client.automationIds.join("、")}</span><small>最近调用 {client.lastUsedAt ? new Date(client.lastUsedAt).toLocaleString() : "无"}{client.expiresAt ? ` · 有效至 ${new Date(client.expiresAt).toLocaleString()}` : ""}</small>
+            {clientLimits && <small>并发 {client.maxConcurrent ?? `继承（${clientLimits.maxConcurrent}）`} · 每日已知 Token {client.dailyKnownTokenLimit?.toLocaleString() ?? "未设置"}</small>}</div>
+          {!client.revokedAt && <div className="usage-client-actions">{clientLimits && <button type="button" className="icon-button" title="调整调用限制" aria-label={`调整 ${client.name} 的限制`} disabled={busy} onClick={() => editPolicy(client)}><Settings2 size={17} /></button>}<button type="button" className="icon-button" title="撤销令牌" aria-label={`撤销 ${client.name}`} disabled={busy} onClick={() => void revokeClient(client)}><Trash2 size={17} /></button></div>}
+          {editingPolicy?.id === client.id && clientLimits && <form className="usage-policy-editor" onSubmit={event => { event.preventDefault(); void savePolicy(); }}>
+            <ClientPolicyFields value={editingPolicy.draft} ceiling={clientLimits.maxConcurrent} disabled={busy} prefix="编辑调用方" onChange={draft => setEditingPolicy({ ...editingPolicy, draft })} />
+            <p className="usage-note">每日上限按 UTC 已知用量核对，单次任务可能超出；未结算任务会阻止再次启动，不是金额硬上限。</p>
+            {policyError && <p role="alert" className="usage-error">{policyError}</p>}
+            <div className="usage-policy-actions"><button type="submit" className="icon-button" disabled={busy} title="保存限制" aria-label={`保存 ${client.name} 的限制`}><Check size={18} /></button>{policyError && <button type="button" className="icon-button" disabled={busy} title="载入最新限制，替换未保存输入" aria-label="载入最新调用限制" onClick={() => void reloadPolicy()}><RefreshCw size={18} /></button>}<button type="button" className="icon-button" disabled={busy} title="取消编辑" aria-label="取消限制编辑" onClick={() => { setEditingPolicy(null); setPolicyError(""); }}><X size={18} /></button></div>
+          </form>}
+        </div>)}</div>
         {!clients.length && loadedAt && <p className="usage-empty">尚无独立调用方。旧共享令牌仍可按现有配置使用。</p>}
-        <div className="usage-create"><input aria-label="调用方名称" placeholder="服务名称" value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={80} /><div className="usage-scopes">{!automationsReady ? <p className="usage-note" role="status">自动化权限范围尚未加载，请先刷新控制台状态。</p> : !availableAutomations.length ? <p className="usage-note">暂无可授权的自动化。</p> : availableAutomations.map((automation) => <label key={automation.id}><input type="checkbox" disabled={busy} checked={newScopes.includes(automation.id)} onChange={(event) => setNewScopes((current) => event.target.checked ? [...current, automation.id] : current.filter((id) => id !== automation.id))} />{automation.name}</label>)}</div><button type="button" disabled={busy || !automationsReady || !!createdToken || !newName.trim() || !newScopes.length} onClick={() => void createClient()}><Plus size={16} />创建令牌</button></div>
+        <form className="usage-create" onSubmit={event => { event.preventDefault(); void createClient(); }}><input aria-label="调用方名称" placeholder="服务名称" value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={80} /><div className="usage-scopes">{!automationsReady ? <p className="usage-note" role="status">自动化权限范围尚未加载，请先刷新控制台状态。</p> : !availableAutomations.length ? <p className="usage-note">暂无可授权的自动化。</p> : availableAutomations.map((automation) => <label key={automation.id}><input type="checkbox" disabled={busy} checked={newScopes.includes(automation.id)} onChange={(event) => setNewScopes((current) => event.target.checked ? [...current, automation.id] : current.filter((id) => id !== automation.id))} />{automation.name}</label>)}</div>
+          {clientLimits && <details className="usage-new-policy"><summary>调用限制与有效期</summary><ClientPolicyFields value={newPolicy} onChange={setNewPolicy} ceiling={clientLimits.maxConcurrent} disabled={busy} prefix="新调用方" /></details>}
+          <button type="submit" disabled={busy || !automationsReady || !!createdToken || !newName.trim() || !newScopes.length}><Plus size={16} />创建令牌</button></form>
         {createdToken && <div className="usage-token" role="status"><strong>新令牌仅显示一次</strong><code>{createdToken}</code><button type="button" onClick={() => void navigator.clipboard.writeText(createdToken)} aria-label="复制新令牌"><Copy size={16} /></button><button type="button" onClick={() => setCreatedToken("")}>关闭</button></div>}
       </section>
       <section className="usage-section" aria-label="请求明细"><div className="usage-section-head"><h2>最近请求</h2><Activity size={18} /></div><div className="usage-requests">{visibleUsage.requests.map((row) => {
