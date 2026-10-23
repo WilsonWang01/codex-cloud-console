@@ -35,7 +35,10 @@ export class DraftPersistence {
 
   remember(repoId: string, sessionId: string, draft: DraftContent) {
     const key = this.key(repoId, sessionId);
-    try { this.storage.setItem(key, JSON.stringify({ ...draft, revision: this.revisions.get(key) ?? draft.revision })); } catch { /* Server persistence still works when local storage is unavailable. */ }
+    try {
+      this.storage.setItem(key, JSON.stringify({ ...draft, revision: this.revisions.get(key) ?? draft.revision }));
+      return true;
+    } catch { return false; }
   }
 
   async save(repoId: string, sessionId: string, draft: DraftContent) {

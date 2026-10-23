@@ -15,6 +15,7 @@ const source = await fs.readFile(new URL("../server/index.mjs", import.meta.url)
 const frontend = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const draftSource = await fs.readFile(new URL("../src/draft-persistence.ts", import.meta.url), "utf8");
 const streamSource = await fs.readFile(new URL("../src/conversation-stream.ts", import.meta.url), "utf8");
+const lazySource = await fs.readFile(new URL("../src/lazy-recovery.tsx", import.meta.url), "utf8");
 const { ConversationStreamScope } = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(streamSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(draftSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
@@ -56,6 +57,75 @@ function storage() {
   const values = new Map();
   return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) };
 }
+
+test("资源恢复必须确认并保留当前草稿与文件，存储失败或提交未完成不刷新", () => {
+  let confirms = true, reloaded = 0, rememberOk = true;
+  const local = storage(), drafts = [];
+  const context = {
+    Error, useCallback: callback => callback, busyAction: null,
+    window: { confirm: () => confirms, location: { reload: () => { reloaded++; } }, localStorage: local },
+    selectedRepoIdRef: { current: "work" }, activeSessionIdRef: { current: "current-thread" },
+    chatInputRef: { current: "最新未发送内容" }, chatAttachmentsRef: { current: [{ id: "uploaded-file" }] },
+    uploadInFlight: { current: false }, chatSubmissionInFlight: { current: null },
+    editorRef: { current: { file: { repoId: "other-project", path: "notes.md", content: "original", contentHash: "version-a" }, draft: "edited" } },
+    draftPayload: (input, attachments) => ({ input, attachments }),
+    composerDrafts: { remember: (...args) => { drafts.push(args); return rememberOk; } },
+  };
+  vm.createContext(context);
+  vm.runInContext(ts.transpileModule(section(frontend, "  const reloadPageSafely =", "  const selectedRepo =") + "\nglobalThis.reload = reloadPageSafely;", { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  confirms = false; context.reload();
+  assert.equal(reloaded, 0); assert.equal(drafts.length, 0);
+  confirms = true; context.reload();
+  assert.equal(reloaded, 1);
+  assert.deepEqual(drafts[0], ["work", "current-thread", { input: "最新未发送内容", attachments: [{ id: "uploaded-file" }] }]);
+  assert.deepEqual(JSON.parse(local.getItem("codex-cloud-editor:other-project:notes.md")), { content: "edited", contentHash: "version-a" });
+  rememberOk = false;
+  assert.throws(() => context.reload(), /无法保存聊天草稿/);
+  assert.equal(reloaded, 1);
+  rememberOk = true;
+  context.window.localStorage = { setItem: () => { throw new Error("quota"); } };
+  assert.throws(() => context.reload(), /无法保存文件编辑/);
+  assert.equal(reloaded, 1);
+  context.uploadInFlight.current = true;
+  assert.throws(() => context.reload(), /尚未确认完成/);
+  context.uploadInFlight.current = false; context.chatSubmissionInFlight.current = Symbol();
+  assert.throws(() => context.reload(), /尚未确认完成/);
+  assert.equal(reloaded, 1);
+});
+
+test("本机草稿保存返回可靠结果，失败仍允许原服务端保存路径", async () => {
+  let saved = 0;
+  const writer = new DraftPersistence(async () => ({ draft: { input: "", attachments: [], revision: 1 } }), async (_r, _s, draft) => { saved++; return { draft: { ...draft, revision: 2 } }; }, { getItem: () => null, setItem: () => { throw new Error("unavailable"); }, removeItem() {} });
+  assert.equal(writer.remember("r", "s", { input: "保留", attachments: [] }), false);
+  await writer.save("r", "s", { input: "保留", attachments: [] });
+  assert.equal(saved, 1);
+  const local = new DraftPersistence(async () => assert.fail(), async () => assert.fail(), storage());
+  assert.equal(local.remember("r", "s", { input: "本机", attachments: [] }), true);
+  assert.equal(local.recover("r", "s").input, "本机");
+});
+
+test("所有延迟模块共用局部恢复，加载拒绝不抛出且不会自动刷新", async () => {
+  assert.equal((frontend.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 11);
+  assert.doesNotMatch(frontend, /\blazy\(\(\) => import\(/);
+  const reported = [], exports = {};
+  const context = { exports, console: { error: (...args) => reported.push(args) }, require: name => {
+    if (name === "react") return { createContext: () => null, lazy: load => load, useContext: () => null, useState: () => ["", () => {}] };
+    if (name === "react/jsx-runtime") return { jsx: () => null, jsxs: () => null };
+    if (name === "lucide-react") return {};
+    throw new Error("Unexpected import: " + name);
+  } };
+  vm.createContext(context);
+  vm.runInContext(ts.transpileModule(lazySource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText, context);
+  const component = () => null;
+  const loaded = await exports.recoverableLazy(async () => ({ default: component }))();
+  assert.equal(loaded.default, component);
+  const failure = new TypeError("missing asset");
+  const recovered = await exports.recoverableLazy(async () => { throw failure; })();
+  assert.equal(typeof recovered.default, "function");
+  assert.equal(recovered.default(), null);
+  assert.equal(reported.length, 1);
+  assert.equal(reported[0][1], failure);
+});
 
 test("状态刷新并行读取、保留局部连接，旧响应不能覆盖重试结果", async () => {
   const statuses = [];

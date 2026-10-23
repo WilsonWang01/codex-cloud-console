@@ -7583,6 +7583,12 @@ pre {
 .console-sync-state > svg { flex: 0 0 18px; margin-top: 2px; }
 .console-sync-state > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .console-sync-state strong { font-size: 14px; }
+.module-load-failure { display: flex; gap: 10px; padding: 16px; border: 1px solid var(--border); border-radius: 6px; }
+.module-load-failure > svg { flex: 0 0 18px; margin-top: 2px; }
+.module-load-failure > div { min-width: 0; overflow-wrap: anywhere; }
+.module-load-failure strong { font-size: 14px; }
+.module-load-failure p { margin: 8px 0; font-size: 13px; }
+.module-load-failure .mini-action { min-height: 44px; }
 .console-sync-state p { margin: 5px 0 0; }
 .console-sync-state .command-button { flex-shrink: 0; }
 @media (max-width: 600px) {

@@ -1,4 +1,5 @@
 import { DraftPersistence } from "./draft-persistence";
+import { PageReloadContext, recoverableLazy } from "./lazy-recovery";
 import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
 import PersonalAssistantGuide from "./PersonalAssistantGuide";
 import type { PersonalCommitment } from "./PersonalCommitments";
@@ -52,20 +53,20 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
+import { Suspense, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 
-const LazyChatMarkdown = lazy(() => import("./ChatMarkdownRenderer"));
-const LazyCodexPluginManager = lazy(() => import("./CodexPluginManager"));
-const LazyUsageView = lazy(() => import("./UsageView"));
-const LazyConnectedServices = lazy(() => import("./ConnectedServices"));
-const LazyPersonalFiles = lazy(() => import("./PersonalFiles"));
-const LazyPersonalFacts = lazy(() => import("./PersonalFacts"));
-const LazyPersonalCommitments = lazy(() => import("./PersonalCommitments"));
-const LazyPersonalBrief = lazy(() => import("./PersonalBrief"));
-const LazyPersonalCalendar = lazy(() => import("./PersonalCalendar"));
-const LazyPersonalReminders = lazy(() => import("./PersonalReminders"));
-const LazyGitHubIssues = lazy(() => import("./GitHubIssues"));
+const LazyChatMarkdown = recoverableLazy(() => import("./ChatMarkdownRenderer"));
+const LazyCodexPluginManager = recoverableLazy(() => import("./CodexPluginManager"));
+const LazyUsageView = recoverableLazy(() => import("./UsageView"));
+const LazyConnectedServices = recoverableLazy(() => import("./ConnectedServices"));
+const LazyPersonalFiles = recoverableLazy(() => import("./PersonalFiles"));
+const LazyPersonalFacts = recoverableLazy(() => import("./PersonalFacts"));
+const LazyPersonalCommitments = recoverableLazy(() => import("./PersonalCommitments"));
+const LazyPersonalBrief = recoverableLazy(() => import("./PersonalBrief"));
+const LazyPersonalCalendar = recoverableLazy(() => import("./PersonalCalendar"));
+const LazyPersonalReminders = recoverableLazy(() => import("./PersonalReminders"));
+const LazyGitHubIssues = recoverableLazy(() => import("./GitHubIssues"));
 
 type RunEvent = {
   id: string;
@@ -3437,6 +3438,24 @@ export function App() {
   chatAttachmentsRef.current = chatAttachments;
   chatRuntimeRef.current = chatRuntime;
 
+  const reloadPageSafely = useCallback(() => {
+    if (uploadInFlight.current || chatSubmissionInFlight.current || (busyAction && busyAction !== "chat")) {
+      throw new Error("当前操作尚未确认完成，已取消重新加载，请稍后重试");
+    }
+    if (!window.confirm("重新加载会关闭其他未提交的表单。聊天草稿和文件编辑会先保留在本机，不会重发任务。确定重新加载？")) return;
+    const repoId = selectedRepoIdRef.current, sessionId = activeSessionIdRef.current;
+    if (repoId && sessionId && !composerDrafts.remember(repoId, sessionId, draftPayload(chatInputRef.current, chatAttachmentsRef.current))) {
+      throw new Error("本机无法保存聊天草稿，已取消重新加载，请先处理当前输入");
+    }
+    const editor = editorRef.current;
+    if (editor.file && editor.draft !== editor.file.content) {
+      try {
+        window.localStorage.setItem(`codex-cloud-editor:${editor.file.repoId}:${editor.file.path}`, JSON.stringify({ content: editor.draft, contentHash: editor.file.contentHash }));
+      } catch { throw new Error("本机无法保存文件编辑，已取消重新加载，请先保存文件"); }
+    }
+    window.location.reload();
+  }, [busyAction]);
+
   const selectedRepo = useMemo(
     () => status.repos.find((item) => item.id === selectedRepoId) || status.repos[0],
     [selectedRepoId, status.repos],
@@ -6077,7 +6096,7 @@ export function App() {
   }, [notificationsEnabled, openAttentionThread, selectRepo, selectedRepoId, status, writeAppHash]);
 
   return (
-    <main className="app-shell">
+    <PageReloadContext value={reloadPageSafely}><main className="app-shell">
       <Sidebar
         status={status}
         statusReady={statusReady}
@@ -6507,7 +6526,7 @@ export function App() {
           />
         )}
       </section>
-    </main>
+    </main></PageReloadContext>
   );
 }
 
