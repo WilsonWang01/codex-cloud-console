@@ -565,6 +565,7 @@ function createHttpProxy() {
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
     const isModelApiRequest = req.method === "POST" && Boolean(modelApiProtocol(targetUrl.pathname));
+    const isCalendarSourceRead = req.method === "POST" && targetUrl.pathname === "/api/personal/calendar/refresh";
     const isClientApiRequest = isExternalApiPath(targetUrl.pathname);
     if (credentials.token && !isClientApiRequest) headers["x-codex-cloud-token"] = credentials.token;
     if (targetUrl.protocol === "https:" && credentials.password && !isClientApiRequest) headers.authorization = authHeader;
@@ -616,7 +617,7 @@ function createHttpProxy() {
       const responseTimer = setTimeout(() => {
         if (responded) return;
         upstream?.destroy(new Error("upstream did not send headers in time"));
-      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : isModelApiRequest ? proxyModelApiHeaderTimeoutMs : proxyHeaderTimeoutMs);
+      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : isModelApiRequest ? proxyModelApiHeaderTimeoutMs : isCalendarSourceRead ? Math.max(60_000, proxyHeaderTimeoutMs) : proxyHeaderTimeoutMs);
 
       upstream = transport.request(
         {

@@ -85,11 +85,15 @@ test("proxy distinguishes trusted TLS, header waits, reset writes, recovered rea
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-proxy-tls-"));
   const key = path.join(dir, "key.pem"), cert = path.join(dir, "cert.pem");
   execFileSync(process.platform === "darwin" ? "/usr/bin/openssl" : "openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"], { stdio: "pipe", timeout: 15000 });
-  let reads = 0, writes = 0;
+  let reads = 0, writes = 0, calendarReads = 0;
   const sockets = new Set();
   const upstream = https.createServer({ key: await fs.readFile(key), cert: await fs.readFile(cert) }, (req, res) => {
     req.resume();
     req.on("end", () => {
+      if (req.method === "POST" && req.url === "/api/personal/calendar/refresh") {
+        calendarReads++;
+        return setTimeout(() => res.end(JSON.stringify({ ok: true })), 1000);
+      }
       if (req.method === "POST") { writes++; return req.socket.destroy(); }
       if (req.url.startsWith("/api/chat/recover")) {
         if (++reads === 1) return req.socket.destroy();
@@ -112,6 +116,9 @@ test("proxy distinguishes trusted TLS, header waits, reset writes, recovered rea
       const writeTrace = events().find((event) => event.requestId === failed.requestId).transport[0];
       assert.equal(writeTrace.phase, "response-headers"); assert.equal(writeTrace.cause, "ECONNRESET");
       assert.notEqual(writeTrace.tlsMs, null); assert.notEqual(writeTrace.requestFlushedMs, null); assert.equal(writeTrace.headersMs, null);
+      const calendar = await fetch(`${base}/api/personal/calendar/refresh`, { method: "POST", body: "{}" });
+      assert.equal(calendar.status, 200); assert.deepEqual(await calendar.json(), { ok: true });
+      assert.equal(calendarReads, 1, "source read has a sufficient header wait without replaying the POST");
       const recovered = await fetch(`${base}/api/chat/recover?secret=PRIVATE-QUERY`);
       assert.equal(await recovered.text(), "ok"); assert.equal(reads, 2);
       const recovery = events().find((event) => event.outcome === "recovered");
