@@ -468,6 +468,9 @@ try {
     await calendarPage.reload();
     await source.getByText(/仅展示部分记录/).waitFor();
     assert.equal(await source.getByRole("button", { name: "规划今天" }).isDisabled(), true);
+    calendarView.snapshot.complete = true; calendarView.snapshot.items[0].start.timeZone = null;
+    await calendarPage.reload();
+    await source.getByText("来源偏移：UTC；原日历时区未提供").waitFor();
     calendarView.snapshot.complete = true; calendarView.snapshot.items = [];
     await calendarPage.reload();
     await source.getByText(/本次读取的主日历中没有今日日程/).waitFor();

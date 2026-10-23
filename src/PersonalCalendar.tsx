@@ -84,7 +84,7 @@ export default function PersonalCalendar({ refreshKey, onChooseTask, onConnectio
     {snapshot && stale && <p className="personal-empty" role="status">以下保留上次读取的记录（{snapshot.window.date}），不能据此确认当前安排。</p>}
     {snapshot && !snapshot.complete && <p className="warn-text" role="status">日程超过本次读取范围，仅展示部分记录，不能据此判断空闲。</p>}
     {snapshot?.items.map(item => <div className="personal-calendar-row" key={item.id}>
-      <span><strong>{item.title}{item.status === "tentative" ? "（暂定）" : ""}</strong><small>{itemTime(item, snapshot.window.timeZone)}</small>{item.start.timeZone && item.start.timeZone !== snapshot.window.timeZone && <small>原日程时区：{item.start.timeZone}</small>}</span>
+      <span><strong>{item.title}{item.status === "tentative" ? "（暂定）" : ""}</strong><small>{itemTime(item, snapshot.window.timeZone)}</small>{item.start.timeZone && item.start.timeZone !== snapshot.window.timeZone && <small>原日程时区：{item.start.timeZone}</small>}{!item.start.timeZone && item.start.dateTime && <small>来源偏移：{item.start.dateTime.endsWith("Z") ? "UTC" : item.start.dateTime.slice(-6)}；原日历时区未提供</small>}</span>
       {item.url && <a href={item.url} target="_blank" rel="noopener noreferrer" title={`在 Google Calendar 查看：${item.title}`} aria-label={`查看原日程：${item.title}`}><ExternalLink size={17} /></a>}
     </div>)}
     {!calendar && !error && <p className="personal-empty" role="status">正在读取已保存的日历记录…</p>}

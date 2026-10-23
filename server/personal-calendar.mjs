@@ -33,6 +33,7 @@ function sourceUrl(value) {
 }
 
 function eventTime(value) {
+  if (typeof value === "string") value = date(value) ? { date: value } : { dateTime: value };
   if (!value || typeof value !== "object") throw fail("calendar_shape_changed", "日历时间格式无法确认，请在原日历核对");
   if (value.timeZone != null) {
     try { if (typeof value.timeZone !== "string" || value.timeZone.length > 80) throw new Error(); new Intl.DateTimeFormat("en", { timeZone: value.timeZone }); }
@@ -48,7 +49,7 @@ export function normalizeCalendarEvent(value) {
   if (value.status === "cancelled") return null;
   const start = eventTime(value.start), end = eventTime(value.end);
   if (Boolean(start.date) !== Boolean(end.date) || (start.date ? end.date <= start.date : Date.parse(end.dateTime) <= Date.parse(start.dateTime))) throw fail("calendar_shape_changed", "日历起止时间无法确认，请在原日历核对");
-  const event = { id: value.id, title: text(value.summary, 200) || "未命名日程", start, end, url: sourceUrl(value.htmlLink),
+  const event = { id: value.id, title: text(value.summary, 200) || "未命名日程", start, end, url: sourceUrl(value.web_link ?? value.htmlLink),
     status: ["confirmed", "tentative"].includes(value.status) ? value.status : "unspecified", updatedAt: instant(value.updated) ? value.updated : null };
   return { ...event, version: digest(event) };
 }

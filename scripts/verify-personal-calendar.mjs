@@ -203,3 +203,16 @@ test("multiple linked calendars or invalid source identifiers require an explici
   assert.equal((await invalid.source.refresh("Asia/Shanghai")).lastAttempt.code, "calendar_not_connected");
   assert.equal(invalid.reads(), 0);
 });
+
+test("observed Calendar connector strings and web_link become verifiable sources without inventing an original time zone", async () => {
+  const f = fixture();
+  const observed = { id: "synthetic-observed-event", summary: "Codex Cloud 验收测试（自动清理）", status: "confirmed", start: "2026-10-23T15:50:00Z", end: "2026-10-23T15:55:00Z",
+    web_link: "https://www.google.com/calendar/event?eid=synthetic", description: "untrusted description is not copied", organizer: { email: "not-copied@example.test" }, attendees: null, reminders: null };
+  f.payloads[0] = { events: [observed], next_page_token: null };
+  const result = await f.source.refresh("Asia/Shanghai"), item = result.snapshot.items[0];
+  assert.equal(result.stale, false); assert.equal(item.start.dateTime, observed.start); assert.equal(item.start.timeZone, null);
+  assert.equal(item.url, observed.web_link); assert.equal(JSON.stringify(item).includes("not-copied"), false);
+  assert.deepEqual((await f.source.snapshot("Asia/Shanghai")).snapshot.items[0], item);
+  assert.deepEqual(normalizeCalendarEvent(event("string-all-day", { start: "2026-10-23", end: "2026-10-24" })).start, { date: "2026-10-23", dateTime: null, timeZone: null });
+  for (const start of ["2026-02-30", "2026-10-23T15:50:00", "2026-10-23T24:00:00Z", "tomorrow"]) assert.throws(() => normalizeCalendarEvent({ ...observed, start }), { code: "calendar_shape_changed" });
+});
