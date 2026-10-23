@@ -214,7 +214,7 @@ EC2 参考部署使用 systemd 常驻服务、认证 HTTPS 和独立的数据目
 
 ## 规划中的能力
 
-[Personal Agent 统一方案](docs/personal-agent-roadmap.md)整合 Muse、Today、Grok Bot 对标与项目路线图。当前完成部分安全基础、共用账号的个人空间、可选专用 worker、独立调用令牌、结果/取消接口和初步用量页面；事务任务队列、完整个人助理与真实外部产品适配仍未交付。双向权限隔离是可选专用 worker 的未完成项，不阻塞默认共享账号模式。当前工作按[已确认的 M1-M5 方案](docs/development-plan-2026-10-22.md)推进；[发布与能力基线](docs/release-baseline-2026-10-22.md)区分主线、运行服务及未上线修复。历史验收只证明相应版本和用例，不代表最新主线已部署。AWS 指南与配套 Skill 已随仓库提供。
+[Personal Agent 统一方案](docs/personal-agent-roadmap.md)整合 Muse、Today、Grok Bot 对标与项目路线图。已交付共用账号的个人空间、独立调用令牌、事务任务/用量、受限输入与产物、结构化结果、签名回调、MCP 薄适配及调用统计；实际用户客户端接入、完整日常助理效果、真机和连续观察仍未完成。可选专用 worker 的双向文件隔离尚未验收，不阻塞默认共享账号模式。当前按[已确认的 M1-M5 方案](docs/development-plan-2026-10-22.md)推进；[发布与能力基线](docs/release-baseline-2026-10-22.md)和最新验收区分实现、运行版本及未覆盖限制，不以代码存在宣称全面竞品对等。AWS 指南与配套 Skill 已随仓库提供。
 
 ## 常见问题
 
