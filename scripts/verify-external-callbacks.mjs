@@ -187,10 +187,15 @@ test("full callback retention capacity rejects acceptance atomically without dro
 
 test("sender deadline closes a stalled request and permits bounded retry", () => fixture(async ({callbacks,complete}) => {
   complete();const claim=callbacks.claim(),target=targets.resolve(claim);let aborted=false;
-  const outcome=await deliverCallback(claim,target,{authorize:async()=>{},resolve:async()=>["8.8.8.8"],request(_url,options){
-    const req=new EventEmitter();req.end=()=>{};
-    options.signal.addEventListener("abort",()=>{aborted=true;req.emit("error",options.signal.reason);},{once:true});
-    return req;
-  }});
+  // The stub must keep Node 22 alive as a real socket would; AbortSignal.timeout is unref'ed.
+  const keepAlive=setInterval(()=>{},1000);
+  let outcome;
+  try {
+    outcome=await deliverCallback(claim,target,{authorize:async()=>{},resolve:async()=>["8.8.8.8"],request(_url,options){
+      const req=new EventEmitter();req.end=()=>{};
+      options.signal.addEventListener("abort",()=>{aborted=true;req.emit("error",options.signal.reason);},{once:true});
+      return req;
+    }});
+  } finally {clearInterval(keepAlive);}
   assert.equal(aborted,true);assert.equal(outcome.code,"delivery_timeout");assert.equal(outcome.retryable,true);
 }));
