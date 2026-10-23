@@ -247,13 +247,17 @@ node scripts/local-cloud-console-proxy.mjs
 
 主转发请求出现网络故障时，页面显示中文原因和 `proxy-...` 错误编号。手动启动代理时看终端的标准错误输出；使用上述 macOS LaunchAgent 时，可按该编号查询 `~/.codex/cloud-console-local-proxy.err.log`。不要上传整个凭据文件或未经检查的历史日志。
 
-新增记录采用单行 JSON，只包含时间、编号、固定接口分组、方法、失败类型、HTTP 状态、尝试次数和耗时；不保存查询参数、请求/响应正文、鉴权头、私人文件名或原始异常文本。每个主请求最多记录一次异常结果，正常一次成功不记录；没有新增日志数据库或云监控资源，日志保留仍由现有启动环境管理，长期故障时仍应关注日志占用。
+新增记录采用单行 JSON，只包含时间、编号、固定接口分组、方法、失败类型、HTTP 状态、尝试次数和连接阶段耗时；不保存查询参数、请求/响应正文、鉴权头、私人文件名、网络地址或原始异常文本。每个主请求最多记录一次异常结果，正常一次成功不记录；没有新增日志数据库或云监控资源，日志保留仍由现有启动环境管理，长期故障时仍应关注日志占用。
 
 - `header-timeout`：等待远端响应超时；`body-timeout`：接收响应过程中超时。
 - `ECONNRESET` / `interrupted-response`：连接或响应中断；`ECONNREFUSED`：服务暂不可达。
 - `upstream-http` + `forwarded`：远端实际返回了 5xx（服务器错误），与代理自身连接失败不同。
 - `recovered`：只读请求按原有策略重试后成功；`stale-cache`：失败后回退旧通知状态，**不证明云端健康或数据最新**。
 - `stream-closed`：流式传输中断，不代表云端任务已停止；应继续从任务状态核对，不能据此自动重跑任务。
+
+`transport` 最多包含首次连接和原有只读重试共 4 次的记录，保留重试前的失败，而不是仅记录最后一次成功。`phase` 表示失败或报告时正在等待的步骤：`socket-pending` 分配连接、`connect` 建立 TCP 连接、`tls` 加密握手、`request-body` 请求正文、`response-headers` 响应头、`response-body` 响应正文。`socketMs/connectMs/tlsMs/requestFlushedMs/headersMs` 均为本次连接开始后的毫秒数，`null` 表示尚未观察到该事件；HTTP 不需要 TLS，故 `tlsMs` 为 `null`。每次尝试的 `durationMs` 使用单调计时，不受系统校时影响。
+
+`requestFlushedMs` 只说明 Node 已把请求交给操作系统，**不证明服务器收到或执行了任务**；即使没有响应头，也不能自动重发写请求。TLS 阶段失败可将排查范围缩小到建立加密连接之前，但不能单凭该阶段认定哪一方设备有故障。字段含义参见 [Node HTTP 事件](https://nodejs.org/docs/latest-v22.x/api/http.html#event-finish) 和 [TLS 握手事件](https://nodejs.org/docs/latest-v22.x/api/tls.html#event-secureconnect)。
 
 这些诊断不增加重试次数或延长超时，不自动重放 POST/PATCH 等写请求，也不代表已经排除了所有断线原因。错误编号只关联本机代理的主转发链路，不是完整的后端调用追踪；OAuth 辅助转发和后台缓存刷新尚未纳入此记录。
 

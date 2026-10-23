@@ -549,16 +549,18 @@ function createHttpProxy() {
     const syncId = /^sync-[a-f0-9-]{36}$/.test(String(req.headers["x-codex-cloud-sync-id"] || ""))
       ? req.headers["x-codex-cloud-sync-id"] : null;
     const startedAt = Date.now();
+    const transportAttempts = [];
     let reported = false;
     const report = (attempt, cause, status, outcome) => {
       if (reported) return;
       reported = true;
       // Only fixed route groups and failure codes belong in logs, never URLs or error messages.
-      const route = ["/healthz", "/api/status", "/api/chat", "/api/codex", "/api/automations", "/api/personal", "/api/notifications", "/api/files", "/api/uploads"]
+      const route = ["/healthz", "/api/status", "/api/chat", "/api/codex", "/api/automations", "/api/personal", "/api/notifications", "/api/files", "/api/uploads", "/api/terminal"]
         .find((prefix) => targetUrl.pathname === prefix || targetUrl.pathname.startsWith(`${prefix}/`)) || "other";
       console.error(JSON.stringify({ event: "proxy_request", time: new Date().toISOString(), requestId, syncId,
         method: ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"].includes(req.method) ? req.method : "OTHER",
-        route, cause, status, outcome, attempts: attempt + 1, durationMs: Date.now() - startedAt }));
+        route, cause, status, outcome, attempts: attempt + 1, durationMs: Date.now() - startedAt,
+        transport: transportAttempts.map((trace) => ({ ...trace.snapshot(), cause: trace.cause })) }));
     };
     const headers = { ...req.headers, host: targetUrl.host };
     headers["x-codex-cloud-request-id"] = requestId;
@@ -593,6 +595,24 @@ function createHttpProxy() {
       if (completed || res.destroyed) return;
       let responded = false;
       let upstream = null;
+      const attemptStarted = performance.now();
+      const timing = { socketMs: null, connectMs: null, tlsMs: null, requestFlushedMs: null, headersMs: null };
+      const elapsed = () => Math.round(performance.now() - attemptStarted);
+      const trace = {
+        cause: null,
+        durationMs: null,
+        snapshot: () => ({
+          attempt: attempt + 1,
+          phase: timing.headersMs !== null ? "response-body"
+            : timing.connectMs === null ? timing.socketMs === null ? "socket-pending" : "connect"
+            : targetUrl.protocol === "https:" && timing.tlsMs === null ? "tls"
+            : timing.requestFlushedMs === null ? "request-body" : "response-headers",
+          ...timing,
+          durationMs: trace.durationMs ?? elapsed(),
+        }),
+      };
+      transportAttempts.push(trace);
+      const recordFailure = (cause) => { trace.cause = cause; trace.durationMs ??= elapsed(); };
       const responseTimer = setTimeout(() => {
         if (responded) return;
         upstream?.destroy(new Error("upstream did not send headers in time"));
@@ -615,6 +635,7 @@ function createHttpProxy() {
             return;
           }
           responded = true;
+          timing.headersMs = elapsed();
           clearTimeout(responseTimer);
           if (shouldBufferResponse) {
             upstreamRes.setTimeout(proxyBufferedIdleTimeoutMs, () => {
@@ -638,6 +659,7 @@ function createHttpProxy() {
               if (completed || res.destroyed) return;
               const expected = Number(upstreamRes.headers["content-length"] || 0);
               if (expected > 0 && bytes !== expected) {
+                recordFailure("truncated-response");
                 if (retryBuffered()) return;
                 completed = true;
                 if (sendCachedResponse(targetUrl, res)) { report(attempt, "truncated-response", 502, "stale-cache"); return; }
@@ -647,7 +669,7 @@ function createHttpProxy() {
               }
               completed = true;
               const status = upstreamRes.statusCode || 502;
-              if (status >= 500) report(attempt, "upstream-http", status, "forwarded");
+              if (status >= 500) { recordFailure("upstream-http"); report(attempt, "upstream-http", status, "forwarded"); }
               else if (attempt > 0 && status >= 200 && status < 300) report(attempt, "retry-succeeded", status, "recovered");
               const body = req.method === "HEAD" ? Buffer.alloc(0) : Buffer.concat(chunks, bytes);
               cacheResponse(targetUrl, upstreamRes.statusCode || 502, upstreamRes.headers, body);
@@ -656,9 +678,10 @@ function createHttpProxy() {
             });
             upstreamRes.on("error", (error) => {
               if (completed || res.destroyed) return;
+              const cause = proxyFailureCause(error) === "body-timeout" ? "body-timeout" : "interrupted-response";
+              recordFailure(cause);
               if (retryBuffered()) return;
               completed = true;
-              const cause = proxyFailureCause(error) === "body-timeout" ? "body-timeout" : "interrupted-response";
               if (sendCachedResponse(targetUrl, res)) { report(attempt, cause, 502, "stale-cache"); return; }
               report(attempt, cause, 502, "error");
               sendProxyError(res, 502, "upstream response was interrupted", targetUrl, requestId, { cause });
@@ -669,8 +692,9 @@ function createHttpProxy() {
             upstreamRes.resume();
             return;
           }
-          if (upstreamRes.statusCode >= 500) report(attempt, "upstream-http", upstreamRes.statusCode, "forwarded");
+          if (upstreamRes.statusCode >= 500) { recordFailure("upstream-http"); report(attempt, "upstream-http", upstreamRes.statusCode, "forwarded"); }
           upstreamRes.on("error", () => {
+            recordFailure("interrupted-response");
             report(attempt, "interrupted-response", upstreamRes.statusCode || 200, "stream-closed");
             safeEnd(res);
           });
@@ -678,15 +702,23 @@ function createHttpProxy() {
         },
       );
 
+      upstream.once("socket", (socket) => {
+        timing.socketMs = elapsed();
+        socket.once("connect", () => { timing.connectMs = elapsed(); });
+        if (targetUrl.protocol === "https:") socket.once("secureConnect", () => { timing.tlsMs = elapsed(); });
+      });
+      // finish means handed to the OS, not acknowledged or executed by the server.
+      upstream.once("finish", () => { timing.requestFlushedMs = elapsed(); });
       upstream.on("error", (error) => {
         clearTimeout(responseTimer);
         if (completed || res.destroyed) return;
+        const cause = proxyFailureCause(error);
+        recordFailure(cause);
         if (canRetry && !responded && !res.headersSent && attempt < maxRetries && isTransientProxyError(error)) {
           setTimeout(() => proxyRequest(attempt + 1), 200 * (attempt + 1));
           return;
         }
         completed = true;
-        const cause = proxyFailureCause(error);
         if (res.headersSent) {
           report(attempt, cause, res.statusCode, "stream-closed");
           safeEnd(res);
@@ -701,6 +733,7 @@ function createHttpProxy() {
           if (completed || res.writableEnded) return;
           completed = true;
           clearTimeout(responseTimer);
+          recordFailure("client-aborted");
           report(attempt, "client-aborted", 499, "client-closed");
           upstream.destroy();
         });
@@ -729,5 +762,5 @@ server.on("clientError", (_error, socket) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`Codex Cloud Console local http proxy ready: http://${host}:${port}/ -> ${credentials.target.href}`);
+  console.log(`Codex Cloud Console local http proxy ready: http://${host}:${server.address().port}/ -> ${credentials.target.href}`);
 });
