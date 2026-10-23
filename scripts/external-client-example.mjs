@@ -23,7 +23,7 @@ function positiveMilliseconds(value, name) {
   if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive integer in milliseconds`);
 }
 
-function serviceOrigin(value) {
+export function serviceOrigin(value) {
   const url = new URL(value);
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/" ||

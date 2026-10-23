@@ -23,7 +23,9 @@ try {
     await fs.copyFile(path.join(projectRoot, name), path.join(root, name));
   }
   await fs.mkdir(path.join(root, "server"));
-  for (const name of ["pdf-inputs.mjs", "pdf-input-worker.mjs", "inline-inputs.mjs", "run-admission.mjs"]) await fs.copyFile(path.join(projectRoot, "server", name), path.join(root, "server", name));
+  for (const name of ["pdf-inputs.mjs", "pdf-input-worker.mjs", "inline-inputs.mjs", "run-admission.mjs", "external-automation.mjs", "structured-output.mjs", "external-results.mjs", "safe-file-read.mjs"]) await fs.copyFile(path.join(projectRoot, "server", name), path.join(root, "server", name));
+  await fs.mkdir(path.join(root, "scripts"));
+  for (const name of ["codex-cloud-mcp.mjs", "external-client-example.mjs"]) await fs.copyFile(path.join(projectRoot, "scripts", name), path.join(root, "scripts", name));
   execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
     cwd: root, stdio: "pipe", timeout: 120_000,
   });
@@ -42,7 +44,7 @@ try {
     lockedPackages += 1;
   }
   execFileSync("npm", ["ls", "--omit=dev", "--all"], { cwd: root, stdio: "pipe", timeout: 30_000 });
-  const dependencies = ["ajv", "cron-parser", "express", "ws", "web-push", "playwright", "@napi-rs/canvas", "pdfjs-dist/legacy/build/pdf.mjs"];
+  const dependencies = ["ajv", "cron-parser", "express", "ws", "web-push", "playwright", "@napi-rs/canvas", "pdfjs-dist/legacy/build/pdf.mjs", "@modelcontextprotocol/server", "zod/v4"];
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
     for (const name of ${JSON.stringify(dependencies)}) {
@@ -55,12 +57,15 @@ try {
     const parsed = await prepareInlineAttachmentInputs(normalizeInlineAttachments([${JSON.stringify(pdfAttachment())}]));
     assert.equal(parsed.processing.status, "ready");
     assert.equal(parsed.inputs.filter(input=>input.type==="image").length, 1);
+    const {createCloudMcpServer} = await import("./scripts/codex-cloud-mcp.mjs");
+    const mcp = createCloudMcpServer({CODEX_CLOUD_URL:"http://127.0.0.1:1",CODEX_CLOUD_API_TOKEN:"synthetic-runtime-token",CODEX_CLOUD_AUTOMATION_ID:"test"});
+    await mcp.close();
   `], { cwd: root, stdio: "pipe", timeout: 30_000 });
-  for (const name of ["vite", "typescript", "lucide-react", "react-dom", "@vitejs/plugin-react"]) {
+  for (const name of ["vite", "typescript", "lucide-react", "react-dom", "@vitejs/plugin-react", "@modelcontextprotocol/client"]) {
     await assert.rejects(fs.access(path.join(root, "node_modules", name)), { code: "ENOENT" });
   }
   console.log(JSON.stringify({
-    ok: true, checks: ["纯运行时依赖可独立安装和加载", "已安装依赖版本与锁文件一致", "浏览器检查依赖保留", "构建依赖不进入运行包"],
+    ok: true, checks: ["纯运行时依赖可独立安装和加载", "已安装依赖版本与锁文件一致", "浏览器检查依赖保留", "MCP 适配器无需测试客户端或构建依赖即可加载", "构建依赖不进入运行包"],
     lockedPackages,
     dependencyBytes: await diskBytes(path.join(root, "node_modules")),
   }, null, 2));

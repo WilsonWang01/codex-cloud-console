@@ -4,6 +4,8 @@ Codex Cloud 的核心是**既有自动化任务的异步执行接口**。适合 
 
 需要用官方 SDK 接入文本或内嵌图片请求时，另有 [OpenAI Chat / Responses / Images、Anthropic Messages 协议适配](model-api-adapters.md)，支持图文输入、文本 SSE 与原生生成图片结果。它不是完整的模型 API，尤其不保证请求级输出 token 上限；下文仍描述原有的异步任务契约，不新增异步 API 的图片字段。
 
+需要从支持本地 stdio 的 AI 客户端调用时，使用 [MCP 薄适配器](mcp-integration.md)：固定自动化与独立令牌，默认只读；明确启用后可提交/续接/取消，复用本文同一任务、隔离和计量，不新增公网端口或第二套执行引擎。
+
 ## 接入前准备
 
 1. 在控制台配置并验证自动化及其仓库，Git 仓库必须已有可解析的 `HEAD`。

@@ -15,6 +15,8 @@ import { modelApiJsonLimit } from "../server/model-api.mjs";
 import { openRunUsageLedger } from "../server/run-usage-ledger.mjs";
 import { createExternalTaskStore } from "../server/external-task-store.mjs";
 import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
+import { Client as McpClient } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -668,6 +670,33 @@ await check("independent clients retrieve private exact-turn files and images af
     const replay = await jsonRequest(origin, "/api/automations/sample-research/v1/images/generations", imageOptions);
     assert.equal(replay.response.status, 200, JSON.stringify(replay.data));
     assert.equal(replay.data.data[0].b64_json, image.data.data[0].b64_json);
+    const mcp = new McpClient({ name: "console-mcp-acceptance", version: "1.0.0" });
+    const crossMcp = new McpClient({ name: "console-mcp-cross-scope", version: "1.0.0" });
+    const mcpTransport = value => new StdioClientTransport({ command: process.execPath, args: [path.join(projectRoot, "scripts/codex-cloud-mcp.mjs")], stderr: "pipe",
+      env: { CODEX_CLOUD_URL: origin, CODEX_CLOUD_API_TOKEN: value, CODEX_CLOUD_AUTOMATION_ID: "sample-research", CODEX_CLOUD_MCP_ALLOW_EXECUTION: "1" } });
+    const mcpCall = async (client, name, args) => {
+      const response = await client.callTool({ name: `codex_cloud_${name}`, arguments: args });
+      return { error: response.isError, data: response.structuredContent || JSON.parse(response.content[0].text) };
+    };
+    try {
+      await mcp.connect(mcpTransport(token));
+      assert.equal((await mcp.listTools()).tools.length, 7);
+      const mcpReplay = await mcpCall(mcp, "submit", { eventId: "file-delivery-0001", input });
+      assert.equal(mcpReplay.error, undefined, JSON.stringify(mcpReplay));
+      assert.equal(mcpReplay.data.run.id, run.id, "MCP reuses the API's durable idempotency record");
+      assert.equal((await mcpCall(mcp, "status", { runId: run.id })).data.run.status, "completed");
+      const mcpOutput = await mcpCall(mcp, "output", { runId: run.id });
+      assert.equal(mcpOutput.data.content, manifest.text);
+      const mcpFile = await mcpCall(mcp, "read_artifact", { runId: run.id, fileId: report.id });
+      assert.equal(mcpFile.data.artifact.sha256, report.sha256);
+      assert.deepEqual(Buffer.from(mcpFile.data.dataBase64, "base64"), file.buffer);
+      const imageArtifact = manifest.artifacts.find(file => file.mimeType === "image/png");
+      const mcpImage = await mcp.callTool({ name: "codex_cloud_read_artifact", arguments: { runId: run.id, fileId: imageArtifact.id, asImage: true } });
+      assert(mcpImage.content.some(item => item.type === "image" && item.data));
+      await crossMcp.connect(mcpTransport(other.data.token));
+      const denied = await mcpCall(crossMcp, "output", { runId: run.id });
+      assert.equal(denied.error, true); assert.equal(denied.data.httpStatus, 404);
+    } finally { await mcp.close(); await crossMcp.close(); }
     const rpc = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
     assert.equal(rpc.filter(call => call.method === "turn/start").length, 2, "reads and restarts must not repeat inference");
     assert.equal(rpc.filter(call => call.method === "thread/read" && call.params.includeTurns).length, 2, "stored delivery does not reread erased native history");

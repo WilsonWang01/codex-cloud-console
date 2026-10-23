@@ -32,6 +32,7 @@
     "verify:approvals": "node --test scripts/verify-approvals.mjs",
     "verify:clients": "node --test scripts/verify-api-clients.mjs",
     "verify:external-client": "node --test scripts/verify-external-client-example.mjs",
+    "verify:mcp": "node --test scripts/verify-mcp.mjs",
     "verify:model-api": "node --test scripts/verify-model-api.mjs scripts/verify-api-discovery.mjs scripts/verify-structured-output.mjs scripts/verify-inline-inputs.mjs scripts/verify-external-input-body.mjs scripts/verify-pdf-inputs.mjs",
     "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
     "verify:automation-events": "node --test scripts/verify-automation-events.mjs scripts/verify-external-callbacks.mjs",
@@ -60,13 +61,14 @@
     "verify:api": "node scripts/smoke-api.mjs",
     "verify:ui": "node scripts/smoke-ui.mjs",
     "verify:e2e": "node scripts/e2e-frontend.mjs",
-    "verify:local": "npm run codex:schema:check && npm run verify:normalizers && npm run verify:runtime-probe && npm run build && npm run verify:regressions && npm run verify:safety && npm run verify:approvals && npm run verify:clients && npm run verify:external-client && npm run verify:model-api && npm run verify:automation-events && npm run verify:usage && npm run verify:admission && npm run verify:notifications && npm run verify:personal-runtime && npm run verify:personal-files && npm run verify:personal-file-bridge && npm run verify:personal-facts && npm run verify:personal-commitments && npm run verify:personal-routines && npm run verify:personal-schedule && npm run verify:personal-brief && npm run verify:external-action-review && npm run verify:caddy-extension && npm run verify:github-workflow && npm run verify:github-api",
+    "verify:local": "npm run codex:schema:check && npm run verify:normalizers && npm run verify:runtime-probe && npm run build && npm run verify:regressions && npm run verify:safety && npm run verify:approvals && npm run verify:clients && npm run verify:external-client && npm run verify:mcp && npm run verify:model-api && npm run verify:automation-events && npm run verify:usage && npm run verify:admission && npm run verify:notifications && npm run verify:personal-runtime && npm run verify:personal-files && npm run verify:personal-file-bridge && npm run verify:personal-facts && npm run verify:personal-commitments && npm run verify:personal-routines && npm run verify:personal-schedule && npm run verify:personal-brief && npm run verify:external-action-review && npm run verify:caddy-extension && npm run verify:github-workflow && npm run verify:github-api",
     "verify:cloud": "npm run verify:local && npm run verify:api && npm run verify:ui",
     "verify:cloud:full": "npm run verify:cloud && npm run verify:e2e",
     "cloud:console": "bash scripts/open-cloud-console.sh",
     "cloud:console:install": "bash scripts/install-cloud-console-agent.sh"
   },
   "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
     "@napi-rs/canvas": "1.0.10",
     "ajv": "8.20.0",
     "cron-parser": "5.10.1",
@@ -74,9 +76,11 @@
     "pdfjs-dist": "6.4.299",
     "playwright": "^1.60.0",
     "web-push": "^3.6.7",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
     "@anthropic-ai/sdk": "0.131.0",
     "@types/express": "^5.0.6",
     "@types/node": "^25.0.0",
