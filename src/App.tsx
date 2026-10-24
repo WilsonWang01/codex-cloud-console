@@ -56,6 +56,7 @@ import {
 import { Suspense, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 import PersonalContextNotice from "./PersonalContextNotice";
+import PersonalFactReferences, { personalFactReferenceData } from "./PersonalFactReferences";
 
 const LazyChatMarkdown = recoverableLazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = recoverableLazy(() => import("./CodexPluginManager"));
@@ -2389,6 +2390,7 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
   const toolResult = detailText(details.result);
   const toolError = detailText(details.error);
   const toolContentItems = detailText(details.contentItems);
+  const factReferences = personalFactReferenceData(details.personalFactReferences);
   const liveEventText = detailText(details.message || details.stdin || details.requestId || details.verifications || details);
   const guardianReview = details.review && typeof details.review === "object" ? (details.review as Record<string, unknown>) : null;
   const guardianAction = details.action && typeof details.action === "object" ? (details.action as Record<string, unknown>) : null;
@@ -2405,8 +2407,9 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
     window.setTimeout(() => setCopied((current) => (current === key ? "" : current)), 1400);
   };
   return (
-    <details className="timeline-details">
-      <summary>详情</summary>
+    <details className={cx("timeline-details", Boolean(factReferences) && "personal-reference-details")}>
+      <summary>{factReferences ? "查看引用的个人资料" : "详情"}</summary>
+      {factReferences && <><PersonalFactReferences record={factReferences} /><details><summary>原生工具回执</summary><pre className="tool-json-block">{toolContentItems}</pre></details></>}
       {kind === "command" && (
         <div className="command-detail-card">
           <div className="timeline-detail-toolbar">
@@ -2728,7 +2731,7 @@ function TimelineDetailsPanel({ details }: { details?: Record<string, unknown> }
           {Boolean(liveEventText) && <pre className="tool-json-block">{liveEventText}</pre>}
         </div>
       )}
-      {(kind === "mcp" || kind === "tool") && (
+      {(kind === "mcp" || kind === "tool") && !factReferences && (
         <div className="command-detail-card tool-detail-card">
           <div className="timeline-detail-toolbar">
             <span>{timelineDetailTitle(kind)}</span>

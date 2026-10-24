@@ -7,11 +7,16 @@ export const personalMemoryTool = {
   } },
 };
 
+export function isActivePersonalToolCall(params, job, tool) {
+  return params?.tool === tool.name && params.namespace == null && job?.repo?.kind === "personal"
+    && job.kind === "turn" && !job.completed && !job.finishing && !job.cancelRequested
+    && typeof params.callId === "string" && params.callId.length > 0 && params.callId.length <= 200
+    && Boolean(job.threadId && job.turnId && job.threadId === params.threadId && job.turnId === params.turnId);
+}
+
 export async function handlePersonalMemoryCall(params, job, store) {
   const reply = (success, text) => ({ success, contentItems: [{ type: "inputText", text }] });
-  if (params.tool !== personalMemoryTool.name || params.namespace != null || !job || job.repo?.kind !== "personal"
-    || job.kind !== "turn" || job.completed || job.finishing || job.cancelRequested || job.unattendedPersonalSchedule
-    || !job.threadId || !job.turnId || job.threadId !== params.threadId || job.turnId !== params.turnId) {
+  if (!isActivePersonalToolCall(params, job, personalMemoryTool) || job.unattendedPersonalSchedule) {
     return reply(false, "记忆候选只允许由当前前台个人回合提出，未保存或接受资料。");
   }
   try {

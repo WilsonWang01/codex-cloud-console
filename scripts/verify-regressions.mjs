@@ -1705,6 +1705,8 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(starts[1].params.cwd, path.join(cloudRoot, "personal"));
     assert.equal(starts[1].params.sandbox, "read-only");
     assert.equal(starts[1].params.config.features.memories, false);
+    assert.equal(starts[0].params.dynamicTools, undefined);
+    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference"]);
     assert.match(starts[1].params.developerInstructions, /only this conversation/);
     const personalSessionId = sessions[1].sessionId;
     const writable = await jsonRequest(base, `/api/chat/sessions/${personalSessionId}/runtime`, {
