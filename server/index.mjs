@@ -44,6 +44,7 @@ import { listPersonalFiles, resolvePersonalFile, sendPersonalFile } from "./pers
 import { readRootedFile } from "./safe-file-read.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore, normalizePersonalFactContext, personalFactContextIssue } from "./personal-facts.mjs";
+import { personalMemoryTool, handlePersonalMemoryCall } from "./personal-memory.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
@@ -2052,7 +2053,7 @@ async function preparePersonalFactContext(repo, session) {
   return snapshot;
 }
 
-async function appServerThreadParams(repo, runtime, personalSnapshot = null) {
+async function appServerThreadParams(repo, runtime, personalSnapshot = null, starting = false) {
   if (repo.kind === "personal" && !personalSnapshot) throw new Error("个人资料上下文尚未核对");
   return {
     cwd: repo.path,
@@ -2061,6 +2062,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null) {
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
+    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool] } : {}),
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
       ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, personalSnapshot.facts, await personalCommitmentsStore.list())] : []),
@@ -2590,6 +2592,11 @@ const approvalBroker = createApprovalBroker({
 async function appServerRequestResult(method, params = {}) {
   if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const job = findTurnJob(params) || findCompactJob(params);
+  if (method === "item/tool/call") {
+    const result = await handlePersonalMemoryCall(params, job, personalFactsStore);
+    if (result.success && job) emitJobEvent(job, "status", { text: "个人记忆候选已保存，等待你在个人设置中核对；尚未成为事实" });
+    return result;
+  }
   if (job?.unattendedPersonalSchedule) {
     job.unattendedApprovalDenied = true;
     recordAppServerRequestDecision(method, params, "declined-unattended");
@@ -3167,7 +3174,7 @@ async function resolveThreadForJob(job) {
       throw new Error(`原 app-server thread 无法恢复，已保留原会话，请重试：${error.message || error}`);
     }
   }
-  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot), 30_000);
+  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot, true), 30_000);
   job.threadId = started?.thread?.id;
   if (!job.threadId) throw new Error("Codex app-server did not return a thread id");
   rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
@@ -9216,7 +9223,7 @@ app.get("/healthz", async (_req, res) => {
   try { await apiClientStore.list(); clientsHealth = { ok: true }; }
   catch { clientsHealth = { ok: false, error: "调用方权限或限制记录不可用" }; }
   let personalFactsHealth;
-  try { await personalFactsStore.list(); personalFactsHealth = { ok: true, readableFormats: [1, 2], writeFormat: 2 }; }
+  try { await personalFactsStore.list(); personalFactsHealth = { ok: true, readableFormats: [1, 2, 3], writeFormat: 3 }; }
   catch { personalFactsHealth = { ok: false, error: "个人资料格式或存储不可用，请勿以旧备份覆盖" }; }
   const strictOk = Boolean(health.ok && ledgerHealth.ok && clientsHealth.ok && personalFactsHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
@@ -10961,7 +10968,17 @@ app.get("/api/personal/files", async (_req, res) => {
 });
 
 app.get("/api/personal/facts", async (_req, res) => {
-  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, governanceVersion: 1, facts: await personalFactsStore.list() }); }
+  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, governanceVersion: 1, candidateVersion: 1, ...await personalFactsStore.overview() }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/memory-candidates/:id/review", async (req, res) => {
+  try { res.json({ ok: true, ...await personalFactsStore.reviewCandidate(req.params.id, req.body) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.delete("/api/personal/memory-candidates/:id", async (req, res) => {
+  try { res.json({ ok: true, candidate: await personalFactsStore.removeCandidate(req.params.id, req.body) }); }
   catch (error) { sendRouteError(res, error); }
 });
 

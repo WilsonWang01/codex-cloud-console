@@ -9,11 +9,11 @@ if (!stateRoot || !previousRelease) throw new Error("Usage: check-task-rollback.
 const factsFile = path.join(stateRoot, "personal-facts.json");
 if (fs.existsSync(factsFile)) {
   const facts = JSON.parse(fs.readFileSync(factsFile, "utf8"));
-  if (![1, 2].includes(facts?.version) || !Array.isArray(facts.facts)) throw new Error("个人资料格式未知，不能自动回退；原数据已保留。");
-  if (facts.version === 2) {
+  if (![1, 2, 3].includes(facts?.version) || !Array.isArray(facts.facts)) throw new Error("个人资料格式未知，不能自动回退；原数据已保留。");
+  if (facts.version >= 2) {
     const modulePath = path.join(previousRelease, "server/personal-facts.mjs");
     const previous = fs.existsSync(modulePath) ? (await import(pathToFileURL(modulePath))).personalFactsFormatVersion : null;
-    if (previous !== 2) throw new Error("旧版本不支持个人资料的停用与有效期，不能自动回退；新数据和当前版本已保留，请修复或使用兼容版本。");
+    if (!Number.isSafeInteger(previous) || previous < facts.version) throw new Error("旧版本不支持当前个人资料或记忆候选，不能自动回退；新数据和当前版本已保留，请修复或使用兼容版本。");
   }
 }
 const clientsFile = path.join(stateRoot, "api-clients.json");
