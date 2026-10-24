@@ -191,10 +191,16 @@
       "Capabilities": {"type": "object", "required": ["object", "version", "automation_id", "defaults", "runtime", "catalog", "protocols", "features", "limits", "retention", "unsupported", "notes"], "properties": {
         "object": {"const": "codex_cloud.capabilities"}, "version": {"type": "string"}, "automation_id": {"type": "string"},
         "defaults": {"type": "object", "properties": {"model": {"type": "string"}, "reasoning": {"type": "string"}}},
+        "execution": {"$ref": "#/components/schemas/ExecutionPolicy"},
         "runtime": {"type": "object", "properties": {"cli_version": {"type": ["string", "null"]}, "probed_at": {"type": "string", "format": "date-time"}, "protocol": {"const": "codex-app-server-v2"}}},
         "catalog": {"type": "object", "properties": {"status": {"enum": ["available", "stale", "unavailable"]}, "observed_at": {"type": ["string", "null"], "format": "date-time"}, "inference_verified": {"const": false}}},
         "protocols": {"type": "object"}, "features": {"type": "object", "properties": {"structured_output": {"type": "boolean", "description": "先查询部署版本；true 时支持 structured-output.md 的受限格式"}, "artifact_download": {"type": "boolean", "description": "true 时仅覆盖该版本接收的新任务，遵守 expiresAt"}, "result_manifest": {"type": "boolean"}, "callback": {"oneOf": [{"const": false}, {"type": "object", "required": ["supported", "configured"], "properties": {"supported": {"type": "boolean"}, "configured": {"type": "boolean"}, "events": {"type": "array", "items": {"const": "automation.run.terminal"}}, "signature": {"const": "hmac_sha256_v1"}, "max_attempts": {"const": 5}, "lifetime_ms": {"const": 86400000}, "duplicate_delivery_possible": {"const": true}, "polling_fallback": {"const": true}}}], "description": "仅操作者预登记目标，不能在提交正文指定 URL；见 callbacks.md"}, "request_output_token_limit": {"const": false}}},
         "limits": {"type": "object"}, "retention": {"type": "object"}, "unsupported": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "array", "items": {"type": "string"}}
+      }},
+      "ExecutionPolicy": {"type": "object", "required": ["profile", "host_read_isolation", "trusted_clients_only"], "description": "由运营者配置，客户端不可覆盖。旧部署可能不返回该字段，缺失不代表安全隔离；受限策略仍不适用于不可信多租户。", "properties": {
+        "profile": {"enum": [null, "workspace-restricted-v1"]}, "mode": {"const": "legacy_console_defaults"}, "sandbox": {"const": "workspace-write"}, "approval": {"const": "never"},
+        "command_network_access": {"const": false}, "web_search": {"const": false}, "mcp_tools": {"const": "disabled_and_checked_before_model"}, "write_scope": {"const": "detached_worktree"},
+        "host_read_isolation": {"const": false}, "delegation_block_verified": {"const": false}, "trusted_clients_only": {"const": true}
       }},
       "Trigger": {"type": "object", "additionalProperties": false, "properties": {
         "runner": {"const": "app-server"}, "prompt": {"type": "string", "minLength": 1, "description": "UTF-8 不超过 65536 字节"}, "model": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{2,64}$"},
@@ -218,6 +224,7 @@
           "id": {"type": "string"}, "automationId": {"type": "string"}, "status": {"enum": ["queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]},
           "startedAt": {"type": "string", "format": "date-time", "description": "任务接收时间"}, "executionStartedAt": {"type": ["string", "null"], "format": "date-time", "description": "实际开始执行时间；排队中可为空，用于 UTC 用量归属"},
           "summary": {"type": "string", "description": "可能截断，不等于完整结果或文件"}, "usage": {"type": "object"}, "error": {"type": ["string", "null"]}, "eventCursor": {"type": "integer", "minimum": 0},
+          "execution": {"$ref": "#/components/schemas/ExecutionPolicy"},
           "inputFiles": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/InputFileMetadata"}, "description": "只含材料描述，不含内容/Base64；参与同事件键校验"},
           "inputProcessing": {"type": "object", "required": ["status"], "description": "PDF 转换状态及有界页数/文字和渲染字节/无文字层页号；不含内容，ready 不代表模型完成", "properties": {"status": {"enum": ["ready", "failed"]}, "parser": {"type": "string"}, "mode": {"const": "text_and_page_images"}, "files": {"type": "array", "maxItems": 2, "items": {"type": "object"}}, "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}},
           "structuredOutput": {"type": "object", "description": "验证成功为 validated/schemaSha256/data，失败为 invalid/error；data 是完整业务对象", "required": ["status"], "properties": {"status": {"enum": ["validated", "invalid"]}, "schemaSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "data": {"type": "object"}, "error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}},

@@ -17,6 +17,7 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
+import { normalizeExecutionProfile, assertExecutionProfile, automationExecutionProfile, assertProfileSource, profileRuntime, profileThreadConfig, profileSandbox, verifyProfileThread } from "./automation-execution-profile.mjs";
 import { authenticateModelApiRequest, createModelApiHandler, modelApiProtocol, sendModelApiError } from "./model-api.mjs";
 import { createDiscoveryHandler } from "./api-discovery.mjs";
 import { modelApiTurnResult } from "./model-api-output.mjs";
@@ -443,6 +444,7 @@ const defaultAutomations = [
 ];
 
 const automations = parseBase64ArrayConfig("CODEX_CLOUD_AUTOMATIONS_CONFIG_B64", defaultAutomations);
+automations.forEach(automationExecutionProfile);
 
 await loadCustomRepos();
 const personalRootOverlapsWork = repos.some((repo) => {
@@ -2059,7 +2061,7 @@ async function preparePersonalFactContext(repo, session) {
   return snapshot;
 }
 
-async function appServerThreadParams(repo, runtime, personalSnapshot = null, starting = false) {
+async function appServerThreadParams(repo, runtime, personalSnapshot = null, starting = false, executionConfig = {}) {
   if (repo.kind === "personal" && !personalSnapshot) throw new Error("个人资料上下文尚未核对");
   return {
     cwd: repo.path,
@@ -2077,6 +2079,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null, sta
       model_reasoning_effort: runtime.reasoning,
       tools: { web_search: runtime.search },
       ...(repo.kind === "personal" ? { features: { memories: false } } : {}),
+      ...executionConfig,
     },
   };
 }
@@ -2106,13 +2109,13 @@ function inlineShellCommand(command, limit = 180) {
   return `${text.slice(0, limit - 1)}…`;
 }
 
-async function appServerTurnParams(threadId, repo, runtime, message, attachments = [], imageInputs = []) {
+async function appServerTurnParams(threadId, repo, runtime, message, attachments = [], imageInputs = [], executionProfile = null) {
   return {
     threadId,
     input: [...await buildUserInputs(repo, message, attachments), ...imageInputs],
     cwd: repo.path,
     approvalPolicy: runtime.approval,
-    sandboxPolicy: appServerSandboxPolicy(runtime, repo),
+    sandboxPolicy: executionProfile ? profileSandbox(repo.path) : appServerSandboxPolicy(runtime, repo),
     model: runtime.model,
     effort: runtime.reasoning,
   };
@@ -2598,6 +2601,12 @@ const approvalBroker = createApprovalBroker({
 async function appServerRequestResult(method, params = {}) {
   if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const job = findTurnJob(params) || findCompactJob(params);
+  if (job?.executionProfile) {
+    job.profileApprovalDenied = true;
+    recordAppServerRequestDecision(method, params, "declined-execution-profile");
+    if (method === "item/tool/call") return { success: false, contentItems: [{ type: "inputText", text: "受限任务不允许调用连接器或控制台工具" }] };
+    return declineAppServerRequest(method, "受限任务不能请求人工确认或扩大权限");
+  }
   if (method === "item/tool/call") {
     if (params.tool === personalFactReferenceTool.name) return handlePersonalFactReferenceCall(params, job);
     const result = await handlePersonalMemoryCall(params, job, personalFactsStore);
@@ -3169,11 +3178,13 @@ async function resolveThreadForJob(job) {
   const client = appServerClientForJob(job);
   const snapshot = job.personalFactSnapshot || await preparePersonalFactContext(job.repo, job.session);
   job.personalFactSnapshot = snapshot;
+  const executionConfig = job.executionProfile ? profileThreadConfig((await client.request("config/read", { cwd: job.repo.path, includeLayers: false }, 15000)).config, job.repo.path) : {};
   const context = (threadId) => snapshot ? { personalFactContext: { ...snapshot.context, threadId } } : {};
   if (job.threadId) {
     if (snapshot) await updateSessionRuntime(job.repoId, job.sessionId, context(job.threadId), { makeActive: false });
     try {
-      await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime, snapshot) }, 30_000);
+      const resumed = await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime, snapshot, false, executionConfig) }, 30_000);
+      if (job.executionProfile) await verifyProfileThread((...args) => client.request(...args), resumed, job.repo.path, job.threadId);
       emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}` });
       rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
       return job.threadId;
@@ -3181,10 +3192,11 @@ async function resolveThreadForJob(job) {
       throw new Error(`原 app-server thread 无法恢复，已保留原会话，请重试：${error.message || error}`);
     }
   }
-  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot, true), 30_000);
+  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot, true, executionConfig), 30_000);
   job.threadId = started?.thread?.id;
   if (!job.threadId) throw new Error("Codex app-server did not return a thread id");
   rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
+  if (job.executionProfile) await verifyProfileThread((...args) => client.request(...args), started, job.repo.path);
   await updateSessionRuntime(job.repoId, job.sessionId, (current) => ({ codexSessionId: job.threadId, ...jobRuntimePatch(job, current), ...context(job.threadId) }), { makeActive: job.makeSessionActive !== false });
   emitJobEvent(job, "session", { codexSessionId: job.threadId, threadId: job.threadId });
   emitJobEvent(job, "status", { text: `已创建 app-server thread ${job.threadId.slice(0, 8)}` });
@@ -3199,7 +3211,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   return serializeSessionTransition(key, async () => {
     const storedSession = await readStoredSessionForJob(repo.id, session.id);
     session = storedSession;
-    runtime = runtimeForRepo(repo, normalizeRuntime(runtime, session));
+    const executionProfile = normalizeExecutionProfile(options.executionProfile);
+    runtime = profileRuntime(runtimeForRepo(repo, normalizeRuntime(runtime, session)), executionProfile);
     const storedQueuedTurn = storedSession.queuedTurn;
     if (storedSession.externalActionReview) {
       throw Object.assign(new Error("连接服务操作尚待核对。请先在对应服务检查结果，再确认已核对。"), { statusCode: 409 });
@@ -3215,6 +3228,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
 
     const personalFactSnapshot = await preparePersonalFactContext(repo, session);
     const job = createServerJob("turn", repo, session, runtime);
+    job.executionProfile = executionProfile;
+    job.modelStartAttempted = false;
     job.personalFactSnapshot = personalFactSnapshot;
     job.maxRuntimeMs = options.maxRuntimeMs;
     job.automationRunId = options.automationRunId || null;
@@ -3241,9 +3256,10 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
           await finishTurnJob(job, false, 130, "Turn cancelled before start");
           return;
         }
-        const params = await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs);
+        const params = await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs, executionProfile);
         if (job.personalFactSnapshot) await preparePersonalFactContext(repo, { ...session, codexSessionId: job.threadId, personalFactContext: { ...job.personalFactSnapshot.context, threadId: job.threadId } });
         if (options.outputSchema) params.outputSchema = options.outputSchema;
+        job.modelStartAttempted = true;
         const result = await appServerClientForJob(job).request("turn/start", params, 30_000);
         job.turnId = result?.turn?.id || null;
         if (job.completed) {
@@ -5316,6 +5332,7 @@ function normalizeAutomationRun(run = {}) {
     worktreePolicy: String(run.worktreePolicy || "none"),
     model: run.model ? String(run.model) : null,
     reasoning: run.reasoning ? String(run.reasoning) : null,
+    ...(run.executionProfile != null ? { executionProfile: normalizeExecutionProfile(run.executionProfile) } : {}),
     prompt: redactAutomationPrompt(run.prompt),
     usage: run.usage && typeof run.usage === "object" ? run.usage : { status: "unknown", reason: "No per-turn usage snapshot" },
     summary: run.summary ? String(run.summary).slice(0, 4000) : "",
@@ -7012,7 +7029,10 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   const updateRun = (id, patch, event) => appendAutomationRunEvent(id, patch, event, { taskClaim: options.taskClaim });
   const settleRun = (id, patch, event) => appendAutomationRunEventWithRetry(id, patch, event, 3, { taskClaim: options.taskClaim });
   const runId = options.runId || automationRunId(automation.id);
-  const runtime = normalizeRuntime(
+  const executionProfile = automationExecutionProfile(automation);
+  if (options.taskClaim || Object.hasOwn(options, "executionProfile")) assertExecutionProfile(options.executionProfile, executionProfile);
+  if (executionProfile && (repo.kind === "personal" || (options.worktree === false && !options.sessionId))) throw automationRequestError(400, "受限任务必须使用独立工作树");
+  const runtime = profileRuntime(normalizeRuntime(
     {
       model: options.model || automation.model,
       reasoning: options.reasoning || automation.reasoning,
@@ -7021,7 +7041,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       search: typeof options.search === "boolean" ? options.search : true,
     },
     {},
-  );
+  ), executionProfile);
   const prompt = String(options.prompt || automation.prompt || "").trim();
   if (!prompt) throw new Error("Automation prompt is required");
   const completionContractSource = Object.prototype.hasOwnProperty.call(options, "completionContract")
@@ -7038,6 +7058,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   if (heartbeatSessionId && (!heartbeatSession || heartbeatSession.repoId !== repo.id)) {
     throw new Error("Heartbeat session does not belong to this automation repo");
   }
+  if (heartbeatSession && executionProfile) {
+    const durable = externalTaskStore().latest(options.clientId, automation.id, { repoId: repo.id, sessionId: heartbeatSessionId });
+    const source = scopedHeartbeatSource([...(await readAutomationRuns()).runs, ...(durable ? [durable] : [])], { clientId: options.clientId || null, automationId: automation.id, repoId: repo.id, sessionId: heartbeatSessionId });
+    assertProfileSource(executionProfile, source);
+    const executionRepo = await recoveryExecutionRepo(getRepoById(repo.id), source, worktreesRoot);
+    if (await fs.realpath(executionRepo.path) === await fs.realpath(getRepoById(repo.id).path)) throw automationRequestError(409, "受限任务不能在主仓库复用会话");
+    options = { ...options, heartbeatWorktreePath: executionRepo.path, executionPolicy: "detached-worktree" };
+  }
   const client = await assertAutomationClientActive(options.clientId, automation.id);
   const releaseAdmission = runAdmission.reserve(options.clientId || "console", client?.maxConcurrent);
   const useWorktree = heartbeatSession ? false : options.worktree !== false;
@@ -7045,7 +7073,6 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   let runRecord;
   let job = null;
   let settlementRegistered = false;
-  let modelStartAttempted = false;
   try {
     runRecord = await upsertAutomationRun({
       id: runId,
@@ -7071,6 +7098,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       worktreePolicy: options.executionPolicy || (heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd"),
       model: runtime.model,
       reasoning: runtime.reasoning,
+      ...(executionProfile ? { executionProfile } : {}),
       prompt,
     }, { type: "queued", text: heartbeatSession ? "Heartbeat turn queued" : "Automation run queued" }, {
       budgetLimit: options.budgetLimit ?? process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
@@ -7104,7 +7132,6 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     }
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
     if (options.taskClaim) await assertAutomationClientActive(options.clientId, automation.id);
-    modelStartAttempted = true;
     job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
@@ -7114,6 +7141,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       maxRuntimeMs: options.maxRuntimeMs,
       imageInputs: [...(options.imageInputs || []), ...prepared.inputs],
       outputSchema: options.outputSchema,
+      executionProfile,
     });
     job.externalTaskClaim = options.taskClaim;
     activeAutomationRuns.set(runId, job);
@@ -7162,7 +7190,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           deliveryError = { code: "original_turn_unavailable", message: "原始回合读取失败，未保存可交付结果" };
         }
       }
-      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && structuredOutput?.status !== "invalid" && !deliveryError;
+      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && !job.profileApprovalDenied && structuredOutput?.status !== "invalid" && !deliveryError;
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const personalKnownWriteObserved = [...job.externalWriteItems.values()].some((item) => !item.unverifiedReadOnly);
@@ -7188,7 +7216,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         ? `检测到连接服务写入；请在对应服务核对结果，${personalActionDisposition}。`
         : `连接服务操作未声明只读；请核对是否造成外部修改，${personalActionDisposition}。`;
       const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
-      const error = needsExternalReview ? result.externalActionReview.reason
+      const error = job.profileApprovalDenied ? "受限任务请求了额外权限或工具，已拒绝；请核对原任务，不会自动重跑。" : needsExternalReview ? result.externalActionReview.reason
         : personalWriteObserved ? personalExternalActionError
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
           : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : structuredOutput?.error?.message || deliveryError?.message || completion.error || result.error || job.error || "自动化任务失败";
@@ -7201,7 +7229,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           threadId: job.threadId,
           turnId: job.turnId,
           summary: job.output || "",
-          usage: runUsageFromProtocol(job.rawTurnUsage),
+          usage: job.modelStartAttempted ? runUsageFromProtocol(job.rawTurnUsage) : { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
           ...(structuredOutput ? { structuredOutput } : {}),
           ...(keepResult ? { delivery: delivery || { status: "failed", error: deliveryError || { code: "run_not_completed", message: error || "任务未成功完成，未交付结果" } } } : {}),
           error,
@@ -7253,7 +7281,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       completionOutcome: completionContract ? "turn-failed" : null,
       completionCheckedAt: completionContract ? new Date().toISOString() : null,
       ...(error.inputProcessing ? { inputProcessing: error.inputProcessing } : {}),
-      ...(!modelStartAttempted ? { usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 } } : {}),
+      usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     }, { type: job ? "needs-reconciliation" : "error", text: error.message }).catch(() => null);
     throw error;
   }
@@ -7261,8 +7289,10 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
 
 async function enqueueExternalAutomationRun(automation, repo, options) {
   const results = externalResultStore();
-  const runtime = normalizeRuntime({ model: options.model || automation.model, reasoning: options.reasoning || automation.reasoning,
-    sandbox: options.sandbox || defaultRuntime.sandbox, approval: options.approval || defaultRuntime.approval, search: options.search !== false }, {});
+  const executionProfile = automationExecutionProfile(automation);
+  if (executionProfile && (repo.kind === "personal" || options.worktree === false)) throw automationRequestError(400, "受限任务必须使用独立工作树");
+  const runtime = profileRuntime(normalizeRuntime({ model: options.model || automation.model, reasoning: options.reasoning || automation.reasoning,
+    sandbox: options.sandbox || defaultRuntime.sandbox, approval: options.approval || defaultRuntime.approval, search: options.search !== false }, {}), executionProfile);
   const prompt = String(options.prompt || automation.prompt || "").trim();
   if (!prompt) throw automationRequestError(400, "Automation prompt is required");
   const accepted = await withPublicationLock(publicationLockPath, async () => {
@@ -7275,6 +7305,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
     const run = normalizeAutomationRun({ id: automationRunId(automation.id), automationId: automation.id, repoId: repo.id, name: automation.name,
       trigger: options.trigger, clientId: options.clientId, runner: "app-server", status: "queued", prompt,
       model: runtime.model, reasoning: runtime.reasoning, completionContract: options.completionContract,
+      ...(executionProfile ? { executionProfile } : {}),
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       ...(options.artifactPaths?.length ? { artifactPaths: options.artifactPaths } : {}),
       ...(options.inputFiles?.length ? { inputFiles: options.inputFiles } : {}),
@@ -7282,7 +7313,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
       triggerIdempotencyHash: options.triggerIdempotencyHash, triggerRequestHash: options.triggerRequestHash,
       ...mergeAutomationEvents(null, [{ type: "queued", text: "任务已持久接收，等待执行" }]),
     });
-    const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt } },
+    const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt, executionProfile } },
       keyHash: options.triggerIdempotencyHash, requestHash: options.triggerRequestHash, ttlMs: automationTriggerIdempotencyTtlMs,
       maxQueued: automationMaxQueued,
       callback: callbackTargets.binding(options.clientId,automation.id),
@@ -7329,6 +7360,8 @@ async function drainExternalTasks() {
       try {
         const automation = automations.find((item) => item.id === task.execution.automationId);
         if (!automation || automation.repoId !== task.execution.repoId || automation.personalRoutine) throw new Error("排队任务的自动化配置已变化，请核对后重试");
+        assertExecutionProfile(task.run.executionProfile, task.execution.options?.executionProfile);
+        assertExecutionProfile(task.run.executionProfile, automationExecutionProfile(automation));
         await assertAutomationClientActive(task.run.clientId, automation.id);
         const repo = getRepoById(task.execution.repoId);
         handedToRunner = true;
@@ -7448,6 +7481,7 @@ async function recoverInterruptedAutomationRuns() {
       const executionRepo = await recoveryExecutionRepo(repo, runRecord, worktreesRoot);
       const recoveryRun = await startAppServerAutomationRun(automation, executionRepo, {
         executionPolicy: runRecord.worktreePolicy,
+        executionProfile: runRecord.executionProfile ?? null,
         trigger: runRecord.trigger,
         clientId: runRecord.clientId,
         triggerIdempotencyHash: runRecord.triggerIdempotencyHash,
@@ -12038,6 +12072,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
       throw automationRequestError(403, "Heartbeat session is outside this API client's automation scope");
     }
     if (source) {
+      assertExecutionProfile(source.executionProfile, automationExecutionProfile(automation));
       if (source.status !== "completed") {
         throw automationRequestError(409, "Previous run needs review before this session can continue");
       }
@@ -12147,7 +12182,7 @@ const handleDiscovery = createDiscoveryHandler({
   authenticate: (req, token) => apiClientStore.authenticate(token, req.params.id),
   automation: (id) => {
     const item = automations.find((automation) => automation.id === id);
-    return item ? { model: item.model || defaultRuntime.model, reasoning: item.reasoning || defaultRuntime.reasoning } : null;
+    return item ? { model: item.model || defaultRuntime.model, reasoning: item.reasoning || defaultRuntime.reasoning, executionProfile: automationExecutionProfile(item) } : null;
   },
   catalog: async () => (await getModelListForRoute()).data,
   runtime: readDiscoveryRuntime,
@@ -12178,6 +12213,8 @@ app.get("/api/automations/:id/v1/capabilities", (req, res) => handleDiscovery(re
 const handleModelApi = createModelApiHandler({
   authenticate: (req, token) => authenticateAutomationTrigger(req, { token, allowLocalDevelopment: false }),
   submit: (req, body, imageInputs) => {
+    const automation = automations.find(item => item.id === req.params.id);
+    if (automation && automationExecutionProfile(automation) && (req.path.endsWith("/images/generations") || req.body?.tools?.some(tool => tool.type === "image_generation"))) throw automationRequestError(400, "当前受限自动化不支持图片生成；未接收任务或启动模型");
     const internal = Object.assign(Object.create(req), { body, modelApiImageInputs: imageInputs });
     const key = automationTriggerIdempotencyKey(internal, req.params.id, "webhook", req.apiClient.id);
     if (key.error) throw automationRequestError(400, key.error);

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
+import { profileThreadConfig, profileSandbox, verifyProfileThread } from "../server/automation-execution-profile.mjs";
 
 // Real CLI, disposable uncredentialed HOME and a loopback synthetic provider only.
 const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", "--package=@openai/codex@0.157.1", "-c", "command -v codex"], { encoding: "utf8" }).trim();
@@ -68,11 +69,10 @@ try {
   assert.equal(requests, 0); await client.stop({ waitForExit: true });
   const startedCount = await fs.readFile(marker, "utf8");
   client = createClient();
-  const restricted = await client.request("thread/start", { cwd, model: "gpt-6-sol", ephemeral: true, approvalPolicy: "never", sandbox: "workspace-write", config: {
-    "mcp_servers.fixture.enabled": false, "features.apps": false, "apps._default.enabled": false, "features.multi_agent": false,
-    "sandbox_workspace_write.network_access": false, "sandbox_workspace_write.exclude_tmpdir_env_var": true, "sandbox_workspace_write.exclude_slash_tmp": true,
-    tools: { web_search: false },
-  } }, 20000);
+  const effective = await client.request("config/read", { cwd, includeLayers: false }, 15000);
+  const restricted = await client.request("thread/start", { cwd, model: "gpt-6-sol", approvalPolicy: "never", sandbox: "workspace-write",
+    config: profileThreadConfig(effective.config, cwd) }, 20000);
+  await verifyProfileThread((...args) => client.request(...args), restricted, cwd);
   assert.equal(restricted.modelProvider, "offline_fixture");
   assert.equal(restricted.approvalPolicy, "never"); assert.equal(restricted.sandbox.type, "workspaceWrite"); assert.equal(restricted.sandbox.networkAccess, false);
   const status = await client.request("mcpServerStatus/list", { threadId: restricted.thread.id, limit: 100, detail: "toolsAndAuthOnly" }, 15000);
@@ -87,17 +87,20 @@ try {
     client.on("notification", listener);
   }); completed.catch(() => {});
   try {
-    await client.request("turn/start", { threadId: restricted.thread.id, input: [{ type: "text", text: "Run the synthetic offline probe." }], sandboxPolicy: {
-      type: "workspaceWrite", writableRoots: [cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true,
-    }, approvalPolicy: "never" }, 15000);
+    await client.request("turn/start", { threadId: restricted.thread.id, input: [{ type: "text", text: "Run the synthetic offline probe." }], sandboxPolicy: profileSandbox(cwd), approvalPolicy: "never" }, 15000);
     assert.equal((await completed).status, "completed");
   } finally { clearTimeout(timer); client.off("notification", listener); }
   assert.equal(providerError, null); assert.equal(requests, 2);
   assert.equal(await fs.readFile(path.join(cwd, "inside.txt"), "utf8"), "synthetic");
   await assert.rejects(fs.stat(outside), { code: "ENOENT" }); assert.equal(networkReceived, false);
+  await client.stop({ waitForExit: true }); client = createClient();
+  const restored = await client.request("thread/resume", { threadId: restricted.thread.id, cwd, model: "gpt-6-sol", approvalPolicy: "never", sandbox: "workspace-write",
+    config: profileThreadConfig((await client.request("config/read", { cwd, includeLayers: false }, 15000)).config, cwd) }, 20000);
+  await verifyProfileThread((...args) => client.request(...args), restored, cwd, restricted.thread.id);
+  assert.equal(await fs.readFile(marker, "utf8"), startedCount); assert.equal(requests, 2);
   outcome = { ok: true, cli: execFileSync(command, ["--version"], { encoding: "utf8" }).trim(), syntheticProviderRequests: requests, externalModelCalls: 0,
     delegationToolsAdvertised: advertisedNames.some(name => /spawn_agent|followup_task/.test(name)),
-    checks: ["已启用连接器按线程禁用且未启动", "模型工具目录不含连接器与网页搜索", "工作区内写入成功", "工作区外写入与命令联网拒绝"] };
+    checks: ["已启用连接器按线程禁用且未启动", "模型工具目录不含连接器与网页搜索", "工作区内写入成功", "工作区外写入与命令联网拒绝", "CLI 重启恢复原线程仍受限且不增加模型请求"] };
 } catch (error) { console.error(JSON.stringify({ error: error.message, providerError, syntheticProviderRequests: requests, advertisedNames, stderr: client?.status().stderrTail })); process.exitCode = 1; }
 finally { await client?.stop({ waitForExit: true }); provider.closeAllConnections(); await new Promise(resolve => provider.close(resolve)); await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 if (outcome && !process.exitCode) console.log(JSON.stringify({ ...outcome, cleanupVerified: true }));
