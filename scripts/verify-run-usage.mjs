@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol, summarizeRunUsage } from "../server/run-usage.mjs";
+import { aggregateRunUsage, createTurnUsageMeter, normalizeRunUsage, runUsageDetails, summarizeRunUsage } from "../server/run-usage.mjs";
+import { externalRunView } from "../server/external-automation.mjs";
 
-test("last-turn usage does not add cache or reasoning subfields twice", () => {
+const runUsageFromProtocol = value => {
+  const meter = createTurnUsageMeter();
+  meter.observe({ ...value, total: value.total || value.last });
+  return meter.snapshot();
+};
+
+test("one request does not add cache or reasoning subfields twice", () => {
   const usage = runUsageFromProtocol({
     total: { inputTokens: 200, outputTokens: 40 },
     last: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 20, reasoningOutputTokens: 5 },
@@ -12,6 +19,66 @@ test("last-turn usage does not add cache or reasoning subfields twice", () => {
   assert.equal(usage.reasoningOutputTokens, 5);
   assert.equal(runUsageFromProtocol({ total: { inputTokens: 200, outputTokens: 40 } }).status, "unknown");
   assert.equal(runUsageFromProtocol({ last: { inputTokens: 100 } }).status, "unknown");
+});
+
+test("one turn accumulates request counter deltas, not only last request or previous turns", () => {
+  const meter = createTurnUsageMeter();
+  const frame = count => ({ total: { inputTokens: count * 10, outputTokens: count * 2 }, last: { inputTokens: 10, outputTokens: 2 } });
+  meter.observe(frame(101)); meter.observe(frame(102)); meter.observe(frame(102));
+  assert.equal(meter.snapshot().totalTokens, 24);
+  assert.equal(meter.snapshot().source, "app-server:turn-counter-delta");
+  const next = createTurnUsageMeter(); next.observe(frame(103));
+  assert.equal(next.snapshot().totalTokens, 12);
+});
+
+test("missing, invalid, regressing or overflowing counters never become complete usage", () => {
+  for (const bad of [null, { last: { inputTokens: 10, outputTokens: 2 } },
+    { total: { inputTokens: 10, outputTokens: 2 }, last: { inputTokens: 20, outputTokens: 2 } },
+    { total: { inputTokens: 0.5, outputTokens: 2 }, last: { inputTokens: 0.5, outputTokens: 2 } },
+    { total: { inputTokens: 10, outputTokens: 2, totalTokens: 15 }, last: { inputTokens: 10, outputTokens: 2 } },
+    { total: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 2 }, last: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 2 } }]) {
+    const meter = createTurnUsageMeter(); meter.observe(bad); assert.equal(meter.snapshot().status, "unknown");
+  }
+  const meter = createTurnUsageMeter();
+  meter.observe({ total: { inputTokens: 20, outputTokens: 4 }, last: { inputTokens: 10, outputTokens: 2 } });
+  meter.observe({ total: { inputTokens: 10, outputTokens: 2 }, last: { inputTokens: 10, outputTokens: 2 } });
+  meter.observe({ total: { inputTokens: 30, outputTokens: 6 }, last: { inputTokens: 10, outputTokens: 2 } });
+  assert.equal(meter.snapshot().status, "unknown");
+});
+
+test("large historical counters subtract before adding current-turn tokens without losing integer precision", () => {
+  const meter = createTurnUsageMeter(), max = Number.MAX_SAFE_INTEGER;
+  meter.observe({ total: { inputTokens: max - 1, outputTokens: 0 }, last: { inputTokens: 10, outputTokens: 0 } });
+  meter.observe({ total: { inputTokens: max, outputTokens: 0 }, last: { inputTokens: 1, outputTokens: 0 } });
+  assert.equal(meter.snapshot().inputTokens, 11);
+  assert.equal(meter.snapshot().totalTokens, 11);
+});
+
+test("delegation remains unknown despite subsequent parent or child-completed snapshots", () => {
+  for (const type of ["subAgentActivity", "collabAgentToolCall"]) {
+    const meter = createTurnUsageMeter();
+    meter.observeItem({ type, kind: "started" });
+    meter.observe({ total: { inputTokens: 10, outputTokens: 2 }, last: { inputTokens: 10, outputTokens: 2 } });
+    meter.observeItem({ type, kind: "completed" });
+    assert.equal(meter.snapshot().status, "unknown");
+    assert.match(meter.snapshot().reason, /独立协作/);
+  }
+});
+
+test("legacy last-request counts remain retained but no longer qualify as complete run totals", () => {
+  const legacy = { status: "complete", source: "app-server:last-turn", inputTokens: 100, outputTokens: 20, totalTokens: 120 };
+  const projected = normalizeRunUsage(legacy);
+  assert.equal(projected.status, "unknown");
+  assert.deepEqual(projected.reportedLastRequest, { source: legacy.source, inputTokens: 100, outputTokens: 20, totalTokens: 120 });
+  assert.equal(legacy.status, "complete");
+  const runs = [{ id: "old", clientId: "a", status: "completed", startedAt: "2026-09-26T06:00:00Z", usage: legacy }];
+  const range = { from: Date.parse("2026-09-26T00:00:00Z"), to: Date.parse("2026-09-27T00:00:00Z") };
+  assert.equal(aggregateRunUsage(runs, range)[0].totalTokens, 0);
+  assert.equal(aggregateRunUsage(runs, range)[0].unknownRuns, 1);
+  assert.equal(runUsageDetails(runs, range)[0].usage.status, "unknown");
+  assert.match(runUsageDetails(runs, range)[0].usage.reason, /历史快照/);
+  assert.equal(summarizeRunUsage(runs, range).unknownUsage, 1);
+  assert.equal(externalRunView({ ...runs[0], automationId: "fixture" }, "fixture").usage.status, "unknown");
 });
 
 test("repeated snapshots replace one run's usage instead of summing events", () => {

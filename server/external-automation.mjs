@@ -2,6 +2,7 @@ import { normalizeOutputSchema } from "./structured-output.mjs";
 import { normalizeArtifactPaths, resultPath } from "./external-results.mjs";
 import { normalizeInlineAttachments } from "./inline-inputs.mjs";
 import { executionProfileView } from "./automation-execution-profile.mjs";
+import { normalizeRunUsage } from "./run-usage.mjs";
 const triggerFields = new Set(["runner", "prompt", "model", "reasoning", "search", "worktree", "sessionId", "completionContract", "outputSchema", "artifactPaths", "attachments"]);
 const reasoningLevels = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
@@ -46,7 +47,7 @@ export function externalRunView(run, automationId) {
     cancelRequestedAt: run.cancelRequestedAt,
     summary: run.summary,
     error: run.error,
-    usage: run.usage,
+    usage: normalizeRunUsage(run.usage),
     ...(run.inputFiles?.length ? { inputFiles: run.inputFiles } : {}),
     ...(run.inputProcessing ? { inputProcessing: run.inputProcessing } : {}),
     ...(run.callbackDelivery ? { callbackDelivery: run.callbackDelivery } : {}),
