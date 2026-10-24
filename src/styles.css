@@ -7362,7 +7362,7 @@ pre {
 .personal-fact-settings .personal-fact-expiry { display: grid; width: 100%; min-width: 0; }
 .personal-fact-expiry input { min-width: 0; max-width: 100%; box-sizing: border-box; }
 .external-review-banner.personal-context-notice { display: flex; flex-wrap: nowrap; align-items: center; }
-.external-review-banner.personal-context-notice .mini-action { min-height: 44px; margin-left: 0; }
+.external-review-banner.personal-context-notice .mini-action { min-width: 44px; min-height: 44px; margin-left: 0; }
 .personal-context-details { display: inline-flex; align-items: center; gap: 4px; min-width: 0; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; }
 .personal-context-details svg { flex-shrink: 0; }
 .personal-context-dialog { width: min(440px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
