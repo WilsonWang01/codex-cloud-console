@@ -57,6 +57,7 @@ import { Suspense, memo, useCallback, useEffect, useMemo, useRef, useState, type
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 import PersonalContextNotice from "./PersonalContextNotice";
 import PersonalFactReferences, { personalFactReferenceData } from "./PersonalFactReferences";
+import { PersonalFeedbackReadError, PersonalMessageFeedback, usePersonalMessageFeedback, type PersonalFeedbackEntry, type PersonalFeedbackInput } from "./PersonalMessageFeedback";
 
 const LazyChatMarkdown = recoverableLazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = recoverableLazy(() => import("./CodexPluginManager"));
@@ -142,6 +143,8 @@ type ChatMessage = {
   status?: string;
   messageType?: string;
   details?: Record<string, unknown>;
+  turnId?: string | null;
+  turnStatus?: string | null;
 };
 
 type ChatHistoryResponse = {
@@ -6961,7 +6964,7 @@ function ChatMarkdown({ text, streaming }: { text: string; streaming?: boolean }
   );
 }
 
-function ChatMessageText({
+const ChatMessageText = memo(function ChatMessageText({
   text,
   pre,
   streaming,
@@ -6997,9 +7000,12 @@ function ChatMessageText({
       )}
     </>
   );
-}
+});
 
-const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }: { message: ChatMessage; repo: Repo }) {
+const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo, feedbackEntry, feedbackDisabled, feedbackSaving, feedbackError, onFeedback }: {
+  message: ChatMessage; repo: Repo; feedbackEntry?: PersonalFeedbackEntry; feedbackDisabled?: boolean; feedbackSaving?: boolean; feedbackError?: string;
+  onFeedback?: (input: PersonalFeedbackInput) => Promise<void>;
+}) {
   const meta = timelineMessageMeta(message);
   const body = displayProjectMessageText(message.text || (message.streaming ? " " : "Codex 没有返回内容。"), repo);
   const attachments = messageTimelineAttachments(message, repo);
@@ -7015,6 +7021,8 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }:
         </strong>
         <ChatMessageText text={body} pre={meta.pre} streaming={message.streaming} />
         <MessageAttachments attachments={attachments} />
+        {onFeedback && message.turnId && <PersonalMessageFeedback message={{ id: message.id, turnId: message.turnId, text: message.text }}
+          entry={feedbackEntry} disabled={Boolean(feedbackDisabled)} saving={Boolean(feedbackSaving)} error={feedbackError} onSave={onFeedback} />}
         <TimelineDetailsPanel details={message.details} />
         {status && <em className="chat-status">{status}</em>}
       </div>
@@ -7022,8 +7030,27 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }:
   );
 });
 
-const ChatTimeline = memo(function ChatTimeline({ messages, repo }: { messages: ChatMessage[]; repo: Repo }) {
-  return messages.map((message) => <ChatTimelineMessage key={message.id} message={message} repo={repo} />);
+const ChatTimeline = memo(function ChatTimeline({ messages, repo, sessionId, feedbackEnabled }: { messages: ChatMessage[]; repo: Repo; sessionId: string; feedbackEnabled: boolean }) {
+  const targets = useMemo(() => {
+    const byTurn = new Map<string, ChatMessage>();
+    for (const message of messages) {
+      if (message.role === "codex" && message.messageType === "agentMessage" && message.turnId && message.turnStatus === "completed" && !message.mocked && !message.streaming
+        && message.text.trim() && (message.details?.phase == null || message.details.phase === "final_answer")) byTurn.set(message.turnId, message);
+    }
+    return new Set(byTurn.values());
+  }, [messages]);
+  const enabled = repo.kind === "personal" && feedbackEnabled && targets.size > 0;
+  const feedback = usePersonalMessageFeedback(sessionId, enabled);
+  const byTurn = useMemo(() => new Map(feedback.entries.map(entry => [entry.turnId, entry])), [feedback.entries]);
+  return <>{messages.map(message => {
+    const eligible = enabled && targets.has(message) && feedback.status !== "unavailable";
+    return <ChatTimelineMessage key={message.id} message={message} repo={repo}
+      feedbackEntry={eligible ? byTurn.get(message.turnId || "") : undefined}
+      feedbackDisabled={eligible ? feedback.status !== "ready" || Boolean(feedback.saving) : undefined}
+      feedbackSaving={eligible ? feedback.saving === message.turnId : undefined}
+      feedbackError={eligible && feedback.saveError && feedback.saveError.turnId === message.turnId ? feedback.saveError.message : undefined}
+      onFeedback={eligible ? feedback.save : undefined} />;
+  })}{enabled && feedback.error && <PersonalFeedbackReadError message={feedback.error} onRetry={feedback.retry} />}</>;
 });
 
 function AttentionRunCard({
@@ -10169,7 +10196,7 @@ function CloudChat({
             </div>
           </article>
         )}
-        <ChatTimeline messages={messages} repo={repo} />
+        <ChatTimeline messages={messages} repo={repo} sessionId={activeSessionId} feedbackEnabled={!historyLoading && !historyError} />
         {busy && !messages.some((message) => message.streaming) && (
           <article className="chat-bubble codex">
             <span className="chat-avatar">
