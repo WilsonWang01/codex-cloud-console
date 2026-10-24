@@ -188,6 +188,8 @@ async function waitForResearch(runId, signal) {
 
 ## 当前边界
 
+上线前可以在已有 CLI 环境运行 `npm run verify:command-isolation:codex`，验证明确配置下的工作区写入、命令禁网和虚构 MCP 禁用。它只使用临时无登录目录和本机模拟模型服务；不是给生产自动化设置权限的接口，不会改变当前执行器的全权限默认值，也不能证明协作工具被禁用。完整步骤、EC2 实测与未覆盖限制见[原生隔离检查](acceptance/2026-10-25-native-command-isolation.md)。
+
 独立令牌不能读取管理页面、其他服务的结果或批准任务；运行响应不泄漏工作目录、会话 ID 和原始工具内容。用量缺失时为“未知”，token 不是美元账单。
 
 服务器操作者预先登记后，可使用[签名完成回调](callbacks.md)：稳定事件 ID、持久投递、有限重试和轮询兜底。先查 `features.callback.configured`，不要把 Node 客户端本地的 onProgress/onStatus 函数误当成服务器回调。回调不运行新的模型任务、不传正文或令牌，不接受请求中指定任意 URL。
