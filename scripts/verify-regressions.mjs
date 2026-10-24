@@ -168,6 +168,21 @@ input.on("line", (line) => {
     process.stdout.write(JSON.stringify(payload) + "\\n");
   }, delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
+  if (process.env.FAKE_EXECUTION_PROFILE === "1") {
+    if (message.method === "config/read") return send({ id: message.id, result: { config: { mcp_servers: { fixture: { command: "fixture", tool_timeout_sec: "" } } } } });
+    if (["thread/start", "thread/resume"].includes(message.method) && message.params.config?.["mcp_servers.fixture.enabled"] === false) {
+      const id = message.params.threadId || "thread-profile-" + threads.length;
+      const thread = { id, cwd: message.params.cwd }; threads.push(thread); fixtureCwds.set(id, message.params.cwd);
+      return send({ id: message.id, result: { thread, cwd: message.params.cwd, approvalPolicy: message.params.approvalPolicy,
+        sandbox: { type: "workspaceWrite", writableRoots: [message.params.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true } } });
+    }
+    if (message.method === "mcpServerStatus/list" && message.params.threadId?.startsWith("thread-profile-")) {
+      return send({ id: message.id, result: { data: [{ name: "fixture", runtimeStatus: fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".unsafe-mcp") ? "connected" : "disabled", tools: {} }], nextCursor: null } });
+    }
+    if (message.method === "turn/start" && JSON.stringify(message.params).includes("profile approval denied")) {
+      send({ id: "profile-request-extra", method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, command: "must-not-run" } }, 30);
+    }
+  }
   if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: "calendar-ephemeral", ephemeral: true } } });
   if (message.method === "mcpServerStatus/list" && message.params.threadId === "calendar-ephemeral") return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: { "google_calendar.search": {
     name: "google_calendar.search", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
@@ -782,6 +797,103 @@ await check("durable API queue survives lost responses and restart without repea
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id=?").get(fourth.data.run.id).execution, "{}");
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
     } finally { checked.close(); }
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("operator execution policy is pinned through API acceptance, continuation and restart and refuses unsafe native runtime before inference", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-profile-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const directory of [repo, stateRoot, bin]) await fs.mkdir(directory, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "profile-fixture-token-123456" };
+  const profile = "workspace-restricted-v1";
+  let apiHeaders = headers;
+  const automation = { id: "restricted", name: "Restricted fixture", repoId: "sample-app", mode: "on-demand", prompt: "model api regression", model: "gpt-6-sol", reasoning: "medium", executionProfile: profile };
+  const start = (executionProfile = profile) => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture,
+    CODEX_CLOUD_AUTOMATIONS_CONFIG_B64: Buffer.from(JSON.stringify([{ ...automation, executionProfile }])).toString("base64"), FAKE_EXECUTION_PROFILE: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const submit = (key, prompt, extra = {}, trigger = "webhook") => jsonRequest(base, `/api/automations/restricted/${trigger}`, {
+    method: "POST", headers: { ...apiHeaders, "idempotency-key": key }, body: JSON.stringify({ prompt, ...extra }),
+  });
+  const wait = async callback => {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 40)); }
+    throw new Error("Execution profile fixture timed out");
+  };
+  const terminal = run => wait(async () => { const { data } = await jsonRequest(base, run.resultPath, { headers: apiHeaders }); return ["completed", "failed"].includes(data.run?.status) ? data.run : null; });
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  let server;
+  try {
+    server = start(); await waitForOutput(server, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "profile-only-fixture", automationIds: ["restricted"] }) });
+    assert.equal(client.response.status, 201);
+    apiHeaders = { ...headers, "x-codex-cloud-token": client.data.token };
+    const caps = await jsonRequest(base, "/api/automations/restricted/v1/capabilities", { headers: apiHeaders });
+    assert.equal(caps.data.execution.profile, profile); assert.equal(caps.data.features.image_output.supported, false);
+    for (const extra of [{ worktree: false }, { executionProfile: null }, { sandbox: "danger-full-access" }]) assert.equal((await submit("profile-invalid-0001", "must-not-start", extra)).response.status, 400);
+    for (const [route, body] of [["images/generations", { prompt: "generated output" }], ["responses", { input: "generated output", tools: [{ type: "image_generation" }] }]]) {
+      const result = await jsonRequest(base, `/api/automations/restricted/v1/${route}`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + client.data.token, "idempotency-key": "profile-image-0001" }, body: JSON.stringify({ model: "gpt-6-sol", ...body }) });
+      assert.equal(result.response.status, 400); assert.match(result.data.error.message, /受限自动化/);
+    }
+    assert.equal((await rpc()).filter(row => row.method === "turn/start").length, 0);
+    const first = await submit("profile-success-0001", "model api regression restricted first", { model: "gpt-6-astra", reasoning: "ultra", search: true });
+    assert.equal(first.response.status, 200);
+    const done = await terminal(first.data.run); assert.equal(done.status, "completed"); assert.equal(done.execution.profile, profile);
+    const replay = await submit("profile-success-0001", "model api regression restricted first", { model: "gpt-6-astra", reasoning: "ultra", search: true });
+    assert.equal(replay.data.run.id, done.id);
+    const continued = await submit("profile-heartbeat-0002", "model api regression restricted continued", {}, "heartbeat");
+    assert.equal((await terminal(continued.data.run)).status, "completed");
+    let requests = await rpc();
+    const turn = requests.find(row => row.method === "turn/start");
+    assert.equal(turn.params.model, "gpt-6-astra"); assert.equal(turn.params.effort, "ultra");
+    assert.deepEqual(turn.params.sandboxPolicy, { type: "workspaceWrite", writableRoots: [turn.params.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
+    assert.equal(turn.params.approvalPolicy, "never");
+    assert.ok(requests.some(row => row.method === "thread/resume" && row.params.config?.["mcp_servers.fixture.enabled"] === false));
+    const beforeUnsafe = requests.filter(row => row.method === "turn/start").length;
+    await fs.writeFile(capture + ".unsafe-mcp", "unsafe");
+    const unsafe = await submit("profile-unsafe-0003", "must-not-start unsafe connector");
+    const rejected = await terminal(unsafe.data.run);
+    assert.equal(rejected.status, "failed"); assert.equal(rejected.usage.totalTokens, 0); assert.equal(rejected.usage.source, "not-started");
+    assert.equal((await rpc()).filter(row => row.method === "turn/start").length, beforeUnsafe);
+    await fs.rm(capture + ".unsafe-mcp");
+    const approval = await submit("profile-approval-0004", "model api regression profile approval denied");
+    const declined = await terminal(approval.data.run);
+    assert.equal(declined.status, "failed"); assert.match(declined.error, /额外权限/);
+    assert.ok((await rpc()).some(row => row.id === "profile-request-extra" && row.result?.decision === "decline"));
+    const holding = await submit("profile-holding-0005", "progress regression queue first held");
+    await wait(async () => (await rpc()).some(row => row.method === "turn/start" && JSON.stringify(row.params).includes("queue first held")));
+    const restored = await submit("profile-restored-0006", "model api regression same profile after restart");
+    assert.equal(restored.data.run.status, "queued");
+    await stopProcess(server);
+    server = start(); await waitForOutput(server, /listening on/);
+    assert.equal((await terminal(restored.data.run)).status, "completed");
+    assert.equal((await jsonRequest(base, holding.data.run.resultPath, { headers: apiHeaders })).data.run.status, "needs_reconciliation");
+    await submit("profile-holding-0007", "progress regression queue first held again");
+    await wait(async () => (await rpc()).some(row => row.method === "turn/start" && JSON.stringify(row.params).includes("held again")));
+    const queued = await submit("profile-change-0008", "model api regression must-not-start after config change");
+    assert.equal(queued.data.run.status, "queued");
+    await stopProcess(server);
+    const ledger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    try {
+      const row = ledger.database.prepare("SELECT record,execution FROM external_tasks WHERE id=?").get(queued.data.run.id);
+      assert.equal(JSON.parse(row.record).executionProfile, profile); assert.equal(JSON.parse(row.execution).options.executionProfile, profile);
+    } finally { ledger.close(); }
+    server = start(null); await waitForOutput(server, /listening on/);
+    const changed = await terminal(queued.data.run);
+    assert.equal(changed.status, "failed"); assert.equal(changed.usage.totalTokens, 0); assert.match(changed.error, /执行策略/);
+    assert.equal((await submit("profile-success-0001", "model api regression restricted first", { model: "gpt-6-astra", reasoning: "ultra", search: true })).data.run.id, done.id);
+    assert.equal((await jsonRequest(base, holding.data.run.resultPath, { headers: apiHeaders })).data.run.status, "needs_reconciliation");
+    requests = await rpc();
+    assert.equal(requests.some(row => row.method === "turn/start" && JSON.stringify(row.params).includes("after config change")), false);
+    const policyMismatch = await submit("profile-mismatch-0009", "must-not-start legacy heartbeat", {}, "heartbeat");
+    assert.equal(policyMismatch.response.status, 409);
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 

@@ -2,10 +2,11 @@ import { mergeAutomationEvents } from "./automation-events.mjs";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createExternalCallbackStore } from "./external-callback-store.mjs";
+import { assertExecutionProfile } from "./automation-execution-profile.mjs";
 
 const terminal = new Set(["completed", "failed", "canceled", "interrupted", "needs_reconciliation"]);
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
-export const externalTaskSchemaVersion = 6;
+export const externalTaskSchemaVersion = 7;
 export const executionPayloadLimits = Object.freeze({ perRun: 12 * 1024 * 1024, global: 128 * 1024 * 1024, client: 32 * 1024 * 1024 });
 const decode = (row) => row ? JSON.parse(row.record) : null;
 function processIdentity(pid) {
@@ -30,7 +31,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
   db.exec("CREATE TABLE IF NOT EXISTS external_tasks_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('schema_version', ?)").run(externalTaskSchemaVersion);
   const version = db.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value;
-  if (![1, 2, 3, 4, 5, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
+  if (![1, 2, 3, 4, 5, 6, externalTaskSchemaVersion].includes(version)) throw new Error("Unsupported persistent task schema");
   db.prepare("INSERT OR IGNORE INTO external_tasks_meta VALUES ('revision', 0)").run();
   db.exec(`PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS external_tasks (
@@ -49,7 +50,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       run_id TEXT NOT NULL REFERENCES external_tasks(id), expires_ms INTEGER NOT NULL
     ) STRICT;`);
   const callbacks = createExternalCallbackStore(db, { now });
-  // V6 commits callback intent with acceptance and terminal notification with the result.
+  // V7 pins execution permissions; older executors must not silently ignore them.
   if (version !== externalTaskSchemaVersion) db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(externalTaskSchemaVersion);
   const get = db.prepare("SELECT id, record, state, owner, owner_pid, epoch FROM external_tasks WHERE id=?");
   const save = db.prepare("UPDATE external_tasks SET record=?, state=?, execution=CASE WHEN ?='terminal' THEN '{}' ELSE execution END WHERE id=?");
@@ -122,6 +123,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
       return transaction(() => {
         const existing = lookup(keyHash, requestHash);
         if (existing) return { run: existing, deduplicated: true };
+        assertExecutionProfile(run.executionProfile, execution?.options?.executionProfile);
         if (!run.id || run.status !== "queued" || !Number.isFinite(Date.parse(run.startedAt))) throw failure(400, "Invalid queued task");
         if (!Number.isSafeInteger(maxQueued) || maxQueued < 1 || !Number.isSafeInteger(ttlMs) || ttlMs < 1) throw new Error("Invalid queue limits");
         if (keyHash && (!/^[a-f0-9]{64}$/.test(keyHash) || !/^[a-f0-9]{64}$/.test(requestHash || ""))) throw failure(400, "Invalid idempotency digest");
@@ -155,8 +157,9 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
           const maximum = clientLimits.get(record.clientId) ?? maxPerClient;
           if (!Number.isSafeInteger(maximum) || maximum < 1) throw new Error("Invalid client concurrency limit");
           if (blockedClients.has(record.clientId) || running.filter((run) => run.clientId === record.clientId).length >= Math.min(maxPerClient, maximum)) continue;
+          const execution = JSON.parse(db.prepare("SELECT execution FROM external_tasks WHERE id=?").get(row.id).execution);
           db.prepare("UPDATE external_tasks SET state='running', owner=?, owner_pid=?, epoch=epoch+1 WHERE id=?").run(owner, pid, row.id);
-          return { run: record, execution: JSON.parse(db.prepare("SELECT execution FROM external_tasks WHERE id=?").get(row.id).execution), claim: { owner, epoch: row.epoch + 1 } };
+          return { run: record, execution, claim: { owner, epoch: row.epoch + 1 } };
         }
         return null;
       });
@@ -166,6 +169,7 @@ export function createExternalTaskStore(db, { now = () => Date.now(), ownerAlive
         const row = get.get(record.id);
         assertClaim(row, claim);
         const current = decode(row);
+        assertExecutionProfile(current.executionProfile, record.executionProfile);
         for (const field of ["id", "clientId", "automationId", "repoId", "startedAt", "triggerIdempotencyHash", "triggerRequestHash"]) {
           if ((current[field] || null) !== (record[field] || null)) throw failure(409, "任务归属或请求摘要不能更改");
         }

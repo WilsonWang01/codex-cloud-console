@@ -3,6 +3,7 @@ import { clientCanReadRun } from "./external-automation.mjs";
 import { structuredOutputLimits } from "./structured-output.mjs";
 import { inlineInputLimits, pdfInputLimits } from "./inline-inputs.mjs";
 import { inputBufferLimits } from "./external-input-body.mjs";
+import { executionProfileView } from "./automation-execution-profile.mjs";
 
 const failure = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 const timestamp = (value) => Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
@@ -31,13 +32,14 @@ export function discoveryCapabilities({ automationId, defaults, catalog, cli, id
   return {
     object: "codex_cloud.capabilities", version: "2026-10-23", automation_id: automationId,
     defaults: { model: defaults.model, reasoning: defaults.reasoning },
+    execution: executionProfileView(defaults.executionProfile),
     runtime: { cli_version: cli.version, probed_at: cli.probedAt, protocol: "codex-app-server-v2" },
     catalog: { status: catalog?.ok === true ? (catalog.stale || catalog.refreshError ? "stale" : "available") : "unavailable",
       observed_at: timestamp(catalog?.cachedAt), inference_verified: false },
     protocols: { openai_chat_completions: "subset", openai_responses: "subset", openai_images_generations: "subset", anthropic_messages: "subset", models: "openai_list_subset" },
     features: {
       text: true, image_input: { supported: true, encoding: "inline_base64", mime_types: ["image/png", "image/jpeg", "image/webp"], max_images: 8, max_bytes_each: 4 * 1024 * 1024, max_bytes_total: 8 * 1024 * 1024 },
-      image_output: { supported: true, conditional: "Requires a successful native imageGeneration item in the exact turn", encoding: "base64", max_images: 4, max_bytes_total: 8 * 1024 * 1024 },
+      image_output: { supported: !defaults.executionProfile, conditional: defaults.executionProfile ? "Unavailable under workspace-restricted-v1" : "Requires a successful native imageGeneration item in the exact turn", encoding: "base64", max_images: 4, max_bytes_total: 8 * 1024 * 1024 },
       structured_output: true, artifact_download: Boolean(resultStorage), result_manifest: Boolean(resultStorage), sse: true, async_runs: true, durable_async_queue: true, cancellation: true,
       file_input: { supported: true, mode: "inline_task_material", text_formats: ["txt", "md"], image_formats: ["png", "jpeg", "webp"],
         pdf: { supported: cli.pdfInput?.ok === true, mode: "server_text_and_page_images", runtime: cli.pdfInput || null, requires_vision_model: true },
