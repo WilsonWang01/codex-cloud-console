@@ -6,11 +6,20 @@ import path from "node:path";
 import vm from "node:vm";
 import ts from "typescript";
 import { chromium } from "playwright";
-import { mailWindow } from "../server/personal-mail.mjs";
+import { createPersonalMailSource, mailWindow } from "../server/personal-mail.mjs";
 import { calendarDayWindow } from "../server/personal-calendar.mjs";
 import { buildPersonalBrief } from "../server/personal-brief.mjs";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
+const observedPath = process.env.CODEX_CLOUD_MAIL_UI_SNAPSHOT;
+if (observedPath && !process.argv.includes("--serve-fixture")) throw new Error("Observed metadata is only allowed in the read-only preview mode");
+let observed = null;
+if (observedPath) {
+  if ((await fs.stat(observedPath)).size > 1024 * 1024) throw new Error("Observed metadata exceeds limit");
+  const snapshot = JSON.parse(await fs.readFile(observedPath, "utf8"));
+  observed = await createPersonalMailSource({ read: async () => ({ version: 1, snapshot, lastAttempt: { at: snapshot.fetchedAt, accountId: snapshot.account.id, status: "success", code: null, error: null } }),
+    write: async () => { throw new Error("Read-only preview"); }, request: async () => { throw new Error("No connector access in preview"); }, context: () => { throw new Error("No runtime access in preview"); } }).snapshot(snapshot.window.timeZone);
+}
 const dist = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-mail-ui-")));
 await fs.cp(path.join(root, "dist"), dist, { recursive: true });
 const source = await fs.readFile(path.join(root, "src/App.tsx"), "utf8"), fixture = { Date };
@@ -21,7 +30,7 @@ status.health.ok = true; status.health.layers.appServer = { ok: true, running: t
 status.repos.push({ id: "_personal", name: "个人助理", kind: "personal", runtimeMode: "shared", executionAvailable: true, path: "/fixture/personal", remote: "", present: true, accent: "teal" });
 const accounts = [{ id: "account-one", email: "personal@example.test", label: "个人" }, { id: "account-two", email: "daily@example.test", label: "日常" }];
 const sessions = [{ id: "mail-source-session", repoId: "_personal", title: "原个人对话", messageCount: 0, model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only", approval: "on-request", search: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), draft: { input: "", attachments: [], revision: 0 } }];
-let mail = null, mode = "success", accountReads = 0, mailReads = 0, modelCalls = 0;
+let mail = observed, mode = "success", accountReads = 0, mailReads = 0, modelCalls = 0;
 const makeMail = (zone, accountId) => {
   const window = mailWindow(zone), account = accounts.find(item => item.id === accountId);
   return { window, stale: false, reading: false, lastAttempt: { at: new Date().toISOString(), accountId, status: "success", error: null }, snapshot: {
@@ -46,8 +55,9 @@ const server = http.createServer(async (req, res) => {
         if (mode === "stale" && view.snapshot) { view.stale = true; view.snapshot.expiresAt = new Date(Date.now() - 1000).toISOString(); }
         return json(res, { ok: true, mail: view });
       }
-      if (url.pathname === "/api/personal/mail/accounts") { accountReads++; return json(res, { ok: true, accounts }); }
+      if (url.pathname === "/api/personal/mail/accounts") { if (observed) return json(res, { error: "只读验收页不再访问邮箱" }, 403); accountReads++; return json(res, { ok: true, accounts }); }
       if (url.pathname === "/api/personal/mail/refresh") {
+        if (observed) return json(res, { error: "只显示已取得的元信息，不再读取邮箱" }, 403);
         mailReads++;
         if (!accounts.some(account => account.id === body.accountId)) return json(res, { error: "请选择已连接邮箱" }, 409);
         mail = mode === "denied" ? { ...mail, stale: true, lastAttempt: { accountId: body.accountId, status: "error", error: "所选邮箱读取被拒绝，请核对授权" } } : makeMail(body.timeZone, body.accountId);

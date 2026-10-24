@@ -118,6 +118,21 @@ test("message identity, date, state and header changes never silently produce mi
   assert.equal(self.id, "self");
 });
 
+test("实际连接器的 snake_case 元信息与原生格式一致，不保存预览/正文且拒绝别名冲突", async () => {
+  const original = message(), { threadId, labelIds, internalDate, ...rest } = original;
+  const actual = { ...rest, thread_id: threadId, label_ids: labelIds, internal_date: internalDate, history_id: "not-for-storage", classification_label_values: {}, raw: null };
+  const account = { email: "selected@example.test" };
+  assert.deepEqual(normalizeMailMessage(actual, account), normalizeMailMessage(original, account));
+  assert.doesNotMatch(JSON.stringify(normalizeMailMessage(actual, account)), /private-body|private-snippet|history_id|classification/);
+  for (const conflict of [{ threadId: "other" }, { labelIds: ["SENT"] }, { internalDate: "1" }, { internalDate: null }]) {
+    assert.throws(() => normalizeMailMessage({ ...actual, ...conflict }, account), { code: "mail_shape_changed" });
+  }
+  const f = fixture(); f.messages.set("message-1", actual);
+  const result = await f.source.refresh("UTC", "link-work");
+  assert.equal(result.lastAttempt.status, "success"); assert.equal(result.snapshot.items.length, 1);
+  assert.doesNotMatch(JSON.stringify(f.value), /private-body|private-snippet|classification/);
+});
+
 test("failed refresh and new account failures preserve the prior source, invalidate freshness and redact internal errors", async () => {
   const f = fixture(), old = await f.source.refresh("UTC", "link-personal"); f.advance(31000);
   f.fail({ isError: true, content: [{ type: "text", text: "FORBIDDEN PRIVATE_BACKEND" }] });

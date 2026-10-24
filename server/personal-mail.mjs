@@ -35,18 +35,23 @@ export function mailAccounts(tools) {
 }
 
 export function normalizeMailMessage(raw, account) {
-  if (!identifier(raw?.id) || !identifier(raw.threadId) || !Array.isArray(raw.labelIds) ||
-      !raw.labelIds.includes("INBOX") || !raw.labelIds.includes("UNREAD") || raw.labelIds.some(label => ["SPAM", "TRASH", "DRAFT"].includes(label))) throw fail("mail_changed_during_read", "邮件状态或来源已变化，请刷新核对；未将读取视为完整");
-  const milliseconds = typeof raw.internalDate === "string" && /^\d{1,16}$/.test(raw.internalDate) ? Number(raw.internalDate) : NaN;
-  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 || !Array.isArray(raw.payload?.headers)) throw fail("mail_shape_changed", "邮件时间或标头格式无法确认，未更新原记录");
+  const field = (camel, snake) => {
+    if (raw?.[camel] !== undefined && raw?.[snake] !== undefined && !isDeepStrictEqual(raw[camel], raw[snake])) throw fail("mail_shape_changed", "邮件来源字段相互冲突，未更新原记录");
+    return raw?.[camel] === undefined ? raw?.[snake] : raw[camel];
+  };
+  const threadId = field("threadId", "thread_id"), labelIds = field("labelIds", "label_ids"), internalDate = field("internalDate", "internal_date");
+  if (!identifier(raw?.id) || !identifier(threadId) || !Array.isArray(labelIds) || labelIds.some(label => typeof label !== "string")) throw fail("mail_shape_changed", "邮件标识或状态格式无法确认，未更新原记录");
+  if (!labelIds.includes("INBOX") || !labelIds.includes("UNREAD") || labelIds.some(label => ["SPAM", "TRASH", "DRAFT"].includes(label))) throw fail("mail_changed_during_read", "邮件状态或来源已变化，请刷新核对；未将读取视为完整");
+  const milliseconds = typeof internalDate === "string" && /^\d{1,16}$/.test(internalDate) ? Number(internalDate) : NaN;
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 || milliseconds > 8_640_000_000_000_000 || !Array.isArray(raw.payload?.headers)) throw fail("mail_shape_changed", "邮件时间或标头格式无法确认，未更新原记录");
   const header = name => {
     const values = raw.payload.headers.filter(item => typeof item?.name === "string" && item.name.toLowerCase() === name);
     if (values.length > 1 || values.some(item => typeof item.value !== "string")) throw fail("mail_shape_changed", "邮件标头重复或格式变化，未更新原记录");
     return values[0]?.value || "";
   };
-  const item = { id: raw.id, threadId: raw.threadId, title: text(header("subject"), 300) || "无主题邮件", from: text(header("from"), 300),
+  const item = { id: raw.id, threadId, title: text(header("subject"), 300) || "无主题邮件", from: text(header("from"), 300),
     receivedAt: new Date(milliseconds).toISOString(), dateHeader: text(header("date"), 256),
-    url: `https://mail.google.com/mail/?authuser=${encodeURIComponent(account.email)}#inbox/${encodeURIComponent(raw.threadId)}` };
+    url: `https://mail.google.com/mail/?authuser=${encodeURIComponent(account.email)}#inbox/${encodeURIComponent(threadId)}` };
   if (!item.from) throw fail("mail_shape_changed", "邮件缺少发件人，未更新原记录");
   return { ...item, version: digest(item) };
 }
