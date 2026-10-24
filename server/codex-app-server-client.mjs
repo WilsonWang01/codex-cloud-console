@@ -291,7 +291,7 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   handleMessage(message, child, generation) {
-    if (message.id && this.pending.has(message.id)) {
+    if (message.id != null && !message.method && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       if (pending.child !== child || pending.generation !== generation) return;
       this.pending.delete(message.id);
@@ -307,7 +307,7 @@ export class CodexAppServerClient extends EventEmitter {
       return;
     }
 
-    if (message.id) {
+    if (message.id != null && !message.method) {
       const orphan = this.orphanedRequests.find((item) => item.id === message.id && item.status === "timedOut");
       if (orphan) {
         orphan.status = message.error ? "lateError" : "lateResult";
@@ -317,7 +317,7 @@ export class CodexAppServerClient extends EventEmitter {
       }
     }
 
-    if (message.id && message.method) {
+    if (message.id != null && message.method) {
       if (this.isCurrent(child, generation)) this.handleServerRequest(message, child, generation);
       return;
     }
