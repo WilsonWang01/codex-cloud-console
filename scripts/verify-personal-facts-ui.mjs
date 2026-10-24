@@ -33,6 +33,10 @@ await fs.writeFile(path.join(state, "personal-facts.json"), JSON.stringify({ ver
 const factStore = createPersonalFactsStore(path.join(state, "personal-facts.json"));
 const largeDirectory = process.argv.includes("--large-directory");
 const references = process.argv.includes("--references");
+const calendarActions = process.argv.includes("--calendar-actions");
+const calendarEvents = path.join(root, "calendar-events.json");
+const calendarControl = path.join(root, "calendar-control.json");
+if (calendarActions) { await fs.writeFile(calendarEvents, "[]"); await fs.writeFile(calendarControl, JSON.stringify({ mode: "ok" })); }
 const directoryControl = path.join(root, "directory-count.json");
 if (largeDirectory) await fs.writeFile(directoryControl, "2013");
 const memoryOrigin = { sessionId: source.id, threadId: source.codexSessionId, turnId: "synthetic-turn", callId: "synthetic-call" };
@@ -42,11 +46,13 @@ if (process.argv.includes("--serve") && process.argv.includes("--memory")) {
 const capture = path.join(root, "rpc.jsonl");
 await fs.writeFile(path.join(bin, "codex"), `#!/usr/bin/env node
 import fs from 'node:fs'; import readline from 'node:readline';
+${calendarActions ? `import { createCalendarActionFixture } from ${JSON.stringify(new URL("./fixtures/calendar-action-runtime.mjs", import.meta.url).href)};
+const calendarRuntime=createCalendarActionFixture({readEvents:()=>JSON.parse(fs.readFileSync(${JSON.stringify(calendarEvents)},'utf8')),writeEvents:events=>fs.writeFileSync(${JSON.stringify(calendarEvents)},JSON.stringify(events))});` : ""}
 const fixtureThreads=[], referenceTurns=[];
 let referenceCall=null;
 if (process.argv.includes('--version')) { console.log('codex-cli 0.162.1'); process.exit(0); }
 if (process.argv.includes('login')) { console.error('Logged in using ChatGPT'); process.exit(0); }
-readline.createInterface({input:process.stdin}).on('line', line => {
+readline.createInterface({input:process.stdin}).on('line', async line => {
   const m=JSON.parse(line); fs.appendFileSync(${JSON.stringify(capture)}, JSON.stringify(m)+'\\n'); if (m.id==null) return;
   if (${references} && m.id===0 && m.result && referenceCall) {
     const item={...referenceCall,status:'completed',...m.result};referenceTurns[0].items.push(item,{id:'reference-answer',type:'agentMessage',phase:'final_answer',text:'合成建议：结合你确认的偏好安排。'});referenceTurns[0].status='completed';
@@ -66,6 +72,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   if(m.method==='app/list') { const count=${largeDirectory} ? Number(fs.readFileSync(${JSON.stringify(directoryControl)},'utf8')) : 0; const offset=Number(m.params.cursor||0),end=Math.min(count,offset+100);result={data:Array.from({length:Math.max(0,end-offset)},(_,i)=>catalogApp(offset+i)),nextCursor:end<count?String(end):null}; }
   if(m.method==='app/installed') result={apps:${largeDirectory} ? Array.from({length:13},(_,n)=>({id:'service-'+n,runtimeName:catalogApp(n).name,enabled:true,callable:true})) : []};
   if(m.method==='mcpServerStatus/list') result={data:[],nextCursor:null};
+  ${calendarActions ? `if ((m.method==='thread/start' && m.params?.serviceName==='codex_cloud_calendar_proposal') || ['mcpServerStatus/list','app/installed','mcpServer/tool/call','thread/unsubscribe'].includes(m.method)) {
+    const control=JSON.parse(fs.readFileSync(${JSON.stringify(calendarControl)},'utf8'));calendarRuntime.setMode(control.mode||'ok');if(control.email)calendarRuntime.setAccount(control.email,control.linkId||'fixture-link');
+    try{result=await calendarRuntime.request(m.method,m.params);}catch(e){return process.stdout.write(JSON.stringify({id:m.id,error:{code:-32000,message:e.message}})+'\\n');}
+  }` : ""}
   if (${references} && m.method==='turn/start' && m.params.threadId==='reference-runtime-thread' && m.params.input.some(item=>item.type==='text'&&item.text==='合成引用验收')) {
     referenceTurns.push({id:'reference-runtime-turn',status:'inProgress',items:[{id:'reference-user',type:'userMessage',content:[{type:'text',text:'合成引用验收'}]}]});
     process.stdout.write(JSON.stringify({id:m.id,result:{turn:{id:'reference-runtime-turn'}}})+'\\n');
@@ -110,7 +120,7 @@ try {
     assert.equal(response.status, 404); assert.equal((await response.json()).ok, false);
   }
   if (process.argv.includes("--serve")) {
-    console.log(JSON.stringify({ url: `${base}#/project/_personal/${progress ? "today" : "thread/facts-source"}`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused", ...(largeDirectory ? { directoryControl } : {}), ...(largeDirectory || references || progress ? { rpcCapture: capture } : {}) }));
+    console.log(JSON.stringify({ url: `${base}#/project/_personal/${progress || calendarActions ? "today" : "thread/facts-source"}`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused", ...(largeDirectory ? { directoryControl } : {}), ...(calendarActions ? { calendarControl, calendarEvents, stateRoot: state } : {}), ...(largeDirectory || references || progress || calendarActions ? { rpcCapture: capture } : {}) }));
     await new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
   } else {
     browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });

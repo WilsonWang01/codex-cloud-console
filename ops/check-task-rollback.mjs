@@ -6,6 +6,16 @@ import { pathToFileURL } from "node:url";
 
 const [stateRoot, previousRelease] = process.argv.slice(2);
 if (!stateRoot || !previousRelease) throw new Error("Usage: check-task-rollback.mjs STATE_ROOT PREVIOUS_RELEASE");
+const calendarFile = path.join(stateRoot, "personal-calendar-proposals.json");
+if (fs.existsSync(calendarFile)) {
+  const calendar = JSON.parse(fs.readFileSync(calendarFile, "utf8"));
+  if (calendar?.version !== 1 || !Array.isArray(calendar.proposals)) throw new Error("日程提案格式未知，不能自动回退；原数据已保留。");
+  if (calendar.proposals.length) {
+    const modulePath = path.join(previousRelease, "server/personal-calendar-proposals.mjs");
+    const previous = fs.existsSync(modulePath) ? (await import(pathToFileURL(modulePath))).calendarProposalFormatVersion : null;
+    if (previous !== calendar.version) throw new Error("旧版本不支持已保存的日程提案和执行回执，不能自动回退；原数据和当前版本已保留，请使用兼容版本。");
+  }
+}
 const factsFile = path.join(stateRoot, "personal-facts.json");
 if (fs.existsSync(factsFile)) {
   const facts = JSON.parse(fs.readFileSync(factsFile, "utf8"));

@@ -54,7 +54,7 @@ export function normalizeCalendarEvent(value) {
   return { ...event, version: digest(event) };
 }
 
-function toolData(result) {
+export function calendarToolData(result) {
   if (!result || Buffer.byteLength(JSON.stringify(result)) > calendarSourceLimits.resultBytes) throw fail("calendar_result_invalid", "日历返回过大或格式无法确认");
   const raw = JSON.stringify(result);
   if (result.isError === true) {
@@ -114,7 +114,7 @@ export async function readTodayCalendar({ request, cwd, model = "gpt-6-sol", win
     do {
       const input = { ...args, ...(next ? { next_page_token: next } : {}) };
       if (!validate(input)) throw fail("calendar_contract_changed", "日历工具参数已变化，需要重新核对接入，未调用工具");
-      const data = toolData(await call("mcpServer/tool/call", { threadId, server: server.name, tool: tool.name, arguments: input }, 20000));
+      const data = calendarToolData(await call("mcpServer/tool/call", { threadId, server: server.name, tool: tool.name, arguments: input }, 20000));
       if (!Array.isArray(data?.events) || data.events.length > calendarSourceLimits.pageSize ||
           (data.next_page_token != null && (typeof data.next_page_token !== "string" || data.next_page_token.length > 4096))) throw fail("calendar_shape_changed", "日历返回格式无法确认，未将读取视为完整");
       for (const raw of data.events) {
