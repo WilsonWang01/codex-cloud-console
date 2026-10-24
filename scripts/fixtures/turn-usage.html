@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>用量核对隔离验收</title></head>
+<body><div id="root"></div><script type="module">
+import React from "react";
+import { createRoot } from "react-dom/client";
+import UsageView from "/src/UsageView.tsx";
+import "/src/styles.css";
+const now = new Date().toISOString();
+const reasons = [null, "存在独立协作或后续回合，用量尚未完整归集；父回合快照不代表全部消耗", "历史快照只记录末次模型请求，不能证明完整回合消耗"];
+if (new URLSearchParams(location.search).has("long")) reasons[2] = "模拟核对标识_" + "x".repeat(300);
+const runs = reasons.map((reason, index) => ({ id: "synthetic-run-" + index, clientId: "synthetic-client", automationId: "synthetic-task", status: "completed", startedAt: now, finishedAt: now, model: "gpt-6-sol", reasoning: "medium",
+  usage: reason ? { status: "unknown", reason } : { status: "complete", inputTokens: 20, outputTokens: 20, totalTokens: 40 } }));
+const usage = { buckets: [{ hour: now.slice(0, 13) + ":00:00Z", clientId: "synthetic-client", requests: 3, accepted: 3, errors: 0, replayed: 0 }],
+  runBuckets: [{ hour: now.slice(0, 13) + ":00:00Z", clientId: "synthetic-client", runs: 3, completed: 3, failed: 0, knownRuns: 1, unknownRuns: 2, inputTokens: 20, outputTokens: 20, totalTokens: 40 }],
+  requests: runs.map((run, index) => ({ id: "synthetic-request-" + index, clientId: run.clientId, automationId: run.automationId, trigger: "webhook", status: 200, runId: run.id, deduplicated: false, durationMs: 1, time: now })), runs, droppedRequests: 0 };
+const apiRequest = async (url, options = {}) => {
+  if (options.method && options.method !== "GET") throw new Error("隔离验收不执行写入");
+  if (url.startsWith("/api/clients/usage")) return structuredClone({ ok: true, ...usage });
+  if (url === "/api/clients") return { ok: true, clients: [{ id: "synthetic-client", name: "隔离验收调用方", automationIds: [], createdAt: now, expiresAt: null, revokedAt: null, lastUsedAt: now }], limits: { maxConcurrent: 2, dailyBudgetTimezone: "UTC", budgetMode: "known_usage_soft_limit" } };
+  throw new Error("隔离验收不访问其他接口");
+};
+createRoot(document.getElementById("root")).render(React.createElement("main", { style: { maxWidth: 1200, margin: "24px auto", padding: "0 16px" } },
+  React.createElement("p", null, "本机隔离验收：以下为合成记录，不调用生产服务或模型。"),
+  React.createElement(UsageView, { automations: [], automationsReady: true, apiRequest })));
+</script></body></html>

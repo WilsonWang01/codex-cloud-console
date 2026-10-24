@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { normalizeRunUsage } from "./run-usage.mjs";
 
 const terminal = new Set(["completed", "failed", "interrupted", "needs_reconciliation", "canceled", "cancelled"]);
 const dayMs = 86_400_000;
@@ -9,9 +10,10 @@ const tokenFields = ["inputTokens", "outputTokens", "totalTokens", "cachedInputT
 const safeTokens = (value) => Number.isSafeInteger(value) && value >= 0;
 
 function usageSnapshot(run) {
-  const usage = run.usage;
+  const usage = normalizeRunUsage(run.usage);
   if (usage?.status !== "complete" || !tokenFields.slice(0, 3).every((field) => safeTokens(usage[field]))) {
-    return { status: "unknown", reason: String(usage?.reason || "Missing or invalid per-turn token usage").slice(0, 320) };
+    return { status: "unknown", reason: String(usage?.reason || "Missing or invalid per-turn token usage").slice(0, 320),
+      ...(usage?.reportedLastRequest ? { reportedLastRequest: usage.reportedLastRequest } : {}) };
   }
   return Object.fromEntries([
     ["status", "complete"], ["source", String(usage.source || "retained-run").slice(0, 80)],
@@ -33,11 +35,11 @@ function snapshot(run) {
 }
 
 export function mergeUsageRuns(runs, ledgerRows) {
-  const merged = new Map(ledgerRows.map((run) => [run.id, run]));
+  const merged = new Map(ledgerRows.map(run => [run.id, { ...run, usage: usageSnapshot(run) }]));
   for (const run of runs) {
     const saved = merged.get(run.id);
-    const usage = usageSnapshot(run);
-    merged.set(run.id, { ...saved, ...run, usage: usage.status === "complete" ? usage : saved?.usage || usage });
+    const usage = usageSnapshot(run), savedUsage = saved ? usageSnapshot(saved) : null;
+    merged.set(run.id, { ...saved, ...run, usage: usage.status === "complete" ? usage : savedUsage?.status === "complete" ? savedUsage : usage });
   }
   return [...merged.values()];
 }
@@ -110,7 +112,10 @@ export function openRunUsageLedger(filePath, { now = () => Date.now() } = {}) {
       db.exec("PRAGMA incremental_vacuum(32)");
     },
     rows({ from, to }) {
-      return db.prepare("SELECT snapshot FROM usage_runs WHERE started_ms >= ? AND started_ms < ? ORDER BY started_ms").all(from, to).map((row) => JSON.parse(row.snapshot));
+      return db.prepare("SELECT snapshot FROM usage_runs WHERE started_ms >= ? AND started_ms < ? ORDER BY started_ms").all(from, to).map((row) => {
+        const run = JSON.parse(row.snapshot);
+        return { ...run, usage: normalizeRunUsage(run.usage) };
+      });
     },
     info() {
       const values = Object.fromEntries(db.prepare("SELECT key, value FROM usage_meta").all().map((row) => [row.key, row.value]));

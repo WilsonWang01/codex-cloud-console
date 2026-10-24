@@ -358,7 +358,14 @@ input.on("line", (line) => {
       const complete = () => {
         if (requestText.includes("approval ownership") && !acceptedApprovals.has("own-approval-" + id)) return setTimeout(complete, 20);
         if (requestText.includes("held ownership") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".release")) return setTimeout(complete, 20);
-        send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } } } });
+        if (requestText.includes("orphan ownership") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".orphan-release")) return setTimeout(complete, 20);
+        if (requestText.includes("delegated usage")) send({ method: "item/started", params: { threadId: message.params.threadId, turnId: id,
+          item: { type: "subAgentActivity", id: "delegate-item-" + id, kind: "started", agentThreadId: "child-" + id, agentPath: "/root/fixture" } } });
+        if (requestText.includes("multi usage")) {
+          send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id, tokenUsage: { total: { inputTokens: 1000, outputTokens: 300 }, last: { inputTokens: 100, outputTokens: 30 } } } });
+          for (let duplicate = 0; duplicate < 2; duplicate++) send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id,
+            tokenUsage: { total: { inputTokens: 1100, outputTokens: 330 }, last: { inputTokens: 100, outputTokens: 30 } } } });
+        } else send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } } } });
         send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id, status: "completed" } } }, 10);
       };
       setTimeout(complete, 60); return;
@@ -379,7 +386,7 @@ input.on("line", (line) => {
       send({ id: message.id, result: { turn: { id: modelApiTurnId } } });
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(0, 2) } }, 40);
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(2) } }, 150);
-      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: modelApiTurnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
+      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: modelApiTurnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30, totalTokens: 130 }, last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
       send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: modelApiTurnId, status: "completed" } } }, 300);
       return;
     }
@@ -404,7 +411,7 @@ input.on("line", (line) => {
       if (!isTimeout) {
         send({ method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed" } } }, 65);
         send({ method: "thread/tokenUsage/updated", params: {
-          threadId: message.params?.threadId, turnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+          threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } },
         } }, 75);
         send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: "completed" } } }, 90);
       }
@@ -474,14 +481,14 @@ input.on("line", (line) => {
         threadId: message.params?.threadId, turnId, delta: "模拟试运行结果：已核对资料，无外部写入",
       } }, 40);
       send({ method: "thread/tokenUsage/updated", params: {
-        threadId: message.params?.threadId, turnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+        threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } },
       } }, 60);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
       } }, 80);
     } else if (personalEmptyTestRegression) {
       send({ method: "thread/tokenUsage/updated", params: {
-        threadId: message.params?.threadId, turnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 1 } },
+        threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 1 }, last: { inputTokens: 100, outputTokens: 1 } },
       } }, 60);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
@@ -878,7 +885,12 @@ await check("old turn notifications and approvals cannot complete, charge or cor
     const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "ownership fixture", automationIds: ["sample-research"] }) });
     const auth = { ...headers, "x-codex-cloud-token": client.data.token };
     const submit = (key, prompt, trigger = "heartbeat") => jsonRequest(base, `/api/automations/sample-research/${trigger}`, { method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt }) });
-    const read = run => jsonRequest(base, run.resultPath, { headers: auth }).then(result => result.data.run);
+    const read = async run => {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const result = await jsonRequest(base, run.resultPath, { headers: auth });
+      assert.equal(result.response.status, 200, String(result.data.error || "Result polling failed"));
+      return result.data.run;
+    };
     const completed = run => wait(async () => { const value = await read(run); return value.status === "completed" ? value : null; });
     const first = await submit("owned-first-0001", "first ownership", "webhook");
     const one = await completed(first.data.run); assert.equal(one.usage.totalTokens, 130);
@@ -903,6 +915,7 @@ await check("old turn notifications and approvals cannot complete, charge or cor
     assert.equal(stale.length, 3); assert.equal(stale.every(row => row.result?.decision === "decline" || row.error), true);
     const orphan = await submit("owned-orphan-0005", "orphan ownership");
     const orphanApproval = await wait(async () => { const value = await jsonRequest(base, "/api/approvals", { headers }); return value.data.pending.find(item => item.params.command === "synthetic-orphan"); });
+    await fs.writeFile(capture + ".orphan-release", "finish");
     assert.equal((await completed(orphan.data.run)).usage.totalTokens, 130);
     assert.equal((await jsonRequest(base, "/api/approvals", { headers })).data.pending.length, 0);
     const expired = await jsonRequest(base, `/api/approvals/${orphanApproval.id}/decision`, { method: "POST", headers, body: JSON.stringify({ decision: "accept", digest: orphanApproval.digest }) });
@@ -932,6 +945,17 @@ await check("old turn notifications and approvals cannot complete, charge or cor
     const unknown = await wait(async () => { const run = await read(uncertain.data.run); return run.status === "needs_reconciliation" ? run : null; });
     assert.equal(unknown.usage.status, "unknown");
     assert.equal((await submit("owned-uncertain-0007", "uncertain ownership")).data.run.id, unknown.id);
+    const multi = await submit("owned-multi-usage-0008", "multi usage ownership", "webhook");
+    const multiDone = await completed(multi.data.run);
+    assert.equal(multiDone.usage.totalTokens, 260);
+    assert.equal(multiDone.usage.source, "app-server:turn-counter-delta");
+    const delegated = await submit("owned-delegated-usage-0009", "delegated usage ownership", "webhook");
+    const delegatedDone = await completed(delegated.data.run);
+    assert.equal(delegatedDone.usage.status, "unknown");
+    assert.match(delegatedDone.usage.reason, /独立协作/);
+    const usageDetails = await jsonRequest(base, "/api/clients/usage", { headers });
+    assert.equal(usageDetails.response.status, 200);
+    assert.match(usageDetails.data.runs.find(run => run.id === delegatedDone.id).usage.reason, /独立协作/);
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 

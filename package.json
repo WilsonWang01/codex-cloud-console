@@ -37,6 +37,8 @@
     "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
     "verify:command-isolation:codex": "node scripts/verify-native-command-isolation.mjs",
     "verify:turn-events:codex": "node scripts/verify-turn-events-codex.mjs",
+    "verify:delegation:codex": "node scripts/verify-native-delegation.mjs",
+    "verify:turn-usage:ui": "node scripts/verify-turn-usage-ui.mjs",
     "verify:automation-events": "node --test scripts/verify-automation-events.mjs scripts/verify-external-callbacks.mjs",
     "verify:usage": "node --test scripts/verify-run-usage.mjs scripts/verify-run-usage-ledger.mjs",
     "verify:admission": "node --test scripts/verify-run-admission.mjs scripts/verify-run-budget.mjs scripts/verify-external-task-store.mjs scripts/verify-external-results.mjs scripts/verify-external-result-api.mjs scripts/verify-automation-execution-profile.mjs",

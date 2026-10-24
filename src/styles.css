@@ -7107,9 +7107,9 @@ pre {
 .usage-token button { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); cursor: pointer; }
 .usage-token button[aria-label] { width: 36px; padding: 0; }
 .usage-header-actions { display: flex; gap: 6px; }
-.usage-request { font-size: 12px; }
+.usage-request { display: block; font-size: 12px; }
 .usage-request summary { display: grid; grid-template-columns: 160px 140px minmax(110px, 1fr) 90px minmax(100px, 1fr); gap: 8px; align-items: center; cursor: pointer; }
-.usage-request-expanded { display: flex; align-items: center; gap: 8px 20px; flex-wrap: wrap; padding: 12px 0 0; color: var(--muted-strong); }
+.usage-request-expanded { display: flex; align-items: center; gap: 8px 20px; flex-wrap: wrap; min-width: 0; overflow-wrap: anywhere; padding: 12px 0 0; color: var(--muted-strong); }
 .usage-request-expanded code { overflow-wrap: anywhere; }
 .usage-request-expanded button { min-height: 40px; }
 .usage-delivery-details > summary { min-height: 44px; padding: 12px 0; cursor: pointer; }

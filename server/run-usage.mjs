@@ -9,27 +9,71 @@ export const runInUsageRange = (run, { from, to, clientId = "" }) => {
 
 function field(value, camel, snake) {
   const raw = value?.[camel] ?? value?.[snake];
-  return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  return Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
 }
 
-export function runUsageFromProtocol(value) {
+function requestUsageFromProtocol(value) {
   const last = value?.last || value?.last_turn || value?.lastTurn;
-  if (!last || typeof last !== "object") return { status: "unknown", reason: "No per-turn usage snapshot" };
+  if (!last || typeof last !== "object") return { status: "unknown", reason: "No request usage snapshot" };
   const inputTokens = field(last, "inputTokens", "input_tokens");
   const outputTokens = field(last, "outputTokens", "output_tokens");
   if (inputTokens === null || outputTokens === null) {
-    return { status: "unknown", reason: "Per-turn input or output tokens are missing" };
+    return { status: "unknown", reason: "Request input or output tokens are missing" };
   }
   const reportedTotal = field(last, "totalTokens", "total_tokens");
+  if ((last.totalTokens != null || last.total_tokens != null) && reportedTotal === null) return { status: "unknown", reason: "原生总用量无效" };
+  if (reportedTotal !== null && reportedTotal !== inputTokens + outputTokens) return { status: "unknown", reason: "原生输入、输出和总用量不一致" };
   return {
     status: "complete",
-    source: "app-server:last-turn",
+    source: "app-server:last-request",
     inputTokens,
     outputTokens,
     totalTokens: reportedTotal ?? inputTokens + outputTokens,
     cachedInputTokens: field(last, "cachedInputTokens", "cached_input_tokens"),
     reasoningOutputTokens: field(last, "reasoningOutputTokens", "reasoning_output_tokens"),
   };
+}
+
+const tokenFields = ["inputTokens", "outputTokens", "totalTokens", "cachedInputTokens", "reasoningOutputTokens"];
+
+export function createTurnUsageMeter() {
+  let counter, accumulated, failure;
+  const unknown = reason => { failure ||= reason; };
+  return {
+    observe(value) {
+      if (!value || failure) return;
+      const last = requestUsageFromProtocol(value), total = requestUsageFromProtocol({ last: value.total });
+      if (last.status !== "complete" || total.status !== "complete" || tokenFields.some(key => last[key] !== null && total[key] !== null && last[key] > total[key])) {
+        unknown("原生用量缺少完整请求或累计计数，无法确认本回合用量"); return;
+      }
+      if (counter && tokenFields.some(key => total[key] !== null && counter[key] !== null && total[key] < counter[key])) {
+        unknown("原生累计用量倒退，未将不可靠的计数标为完整"); return;
+      }
+      // `last` is one provider request; later cumulative deltas include tool-loop requests without counting duplicate notifications twice.
+      const next = Object.fromEntries(tokenFields.map(key => [key, !counter ? last[key]
+        : accumulated[key] === null || total[key] === null || counter[key] === null ? null : accumulated[key] + (total[key] - counter[key])]));
+      if (tokenFields.some(key => next[key] !== null && (!Number.isSafeInteger(next[key]) || next[key] < 0))) {
+        unknown("本回合用量超出可可靠计量的范围"); return;
+      }
+      accumulated = next; counter = total;
+    },
+    observeItem(item) {
+      if (["subAgentActivity", "collabAgentToolCall"].includes(item?.type)) unknown("存在独立协作或后续回合，用量尚未完整归集；父回合快照不代表全部消耗");
+    },
+    snapshot() {
+      if (failure || !accumulated) return { status: "unknown", reason: failure || "没有本回合的可靠用量通知" };
+      return { status: "complete", source: "app-server:turn-counter-delta", ...accumulated };
+    },
+  };
+}
+
+export function normalizeRunUsage(usage) {
+  if (usage?.status === "complete" && ["app-server:last-turn", "app-server:last-request"].includes(usage.source)) {
+    return { status: "unknown", reason: "历史快照只记录末次模型请求，不能证明完整回合消耗", reportedLastRequest: {
+      source: usage.source, ...Object.fromEntries(tokenFields.filter(key => usage[key] !== undefined).map(key => [key, usage[key]])),
+    } };
+  }
+  return usage || { status: "unknown", reason: "没有本回合的可靠用量记录" };
 }
 
 export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
@@ -53,13 +97,14 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
       buckets.set(key, bucket);
       continue;
     }
-    if (run.usage?.status === "complete") {
+    const usage = normalizeRunUsage(run.usage);
+    if (usage.status === "complete") {
       bucket.knownRuns += 1;
-      bucket.inputTokens += run.usage.inputTokens;
-      bucket.outputTokens += run.usage.outputTokens;
-      bucket.totalTokens += run.usage.totalTokens;
-      bucket.cachedInputTokens += run.usage.cachedInputTokens || 0;
-      bucket.reasoningOutputTokens += run.usage.reasoningOutputTokens || 0;
+      bucket.inputTokens += usage.inputTokens;
+      bucket.outputTokens += usage.outputTokens;
+      bucket.totalTokens += usage.totalTokens;
+      bucket.cachedInputTokens += usage.cachedInputTokens || 0;
+      bucket.reasoningOutputTokens += usage.reasoningOutputTokens || 0;
     } else {
       bucket.unknownRuns += 1;
     }
@@ -69,24 +114,18 @@ export function aggregateRunUsage(runs, { from, to, clientId = "" }) {
 }
 
 export function runUsageDetails(runs, { from, to, clientId = "", limit = 200 }) {
-  return runs.filter(run => runInUsageRange(run, { from, to, clientId })).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map((run) => ({
-    id: run.id,
-    clientId: run.clientId,
-    automationId: run.automationId,
-    status: run.status,
-    startedAt: run.startedAt,
-    executionStartedAt: run.executionStartedAt || null,
-    finishedAt: run.finishedAt || null,
-    model: run.model || null,
-    reasoning: run.reasoning || null,
-    usage: run.usage?.status === "complete" ? {
-      status: "complete",
-      inputTokens: run.usage.inputTokens,
-      outputTokens: run.usage.outputTokens,
-      totalTokens: run.usage.totalTokens,
-      cachedInputTokens: run.usage.cachedInputTokens,
-    } : { status: "unknown" },
-  }));
+  return runs.filter(run => runInUsageRange(run, { from, to, clientId })).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, limit).map(run => {
+    const usage = normalizeRunUsage(run.usage);
+    return {
+      id: run.id, clientId: run.clientId, automationId: run.automationId, status: run.status,
+      startedAt: run.startedAt, executionStartedAt: run.executionStartedAt || null, finishedAt: run.finishedAt || null,
+      model: run.model || null, reasoning: run.reasoning || null,
+      usage: usage.status === "complete" ? {
+        status: "complete", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens, cachedInputTokens: usage.cachedInputTokens,
+      } : { status: "unknown", reason: String(usage.reason || "没有本回合的可靠用量记录").slice(0, 320) },
+    };
+  });
 }
 export function summarizeRunUsage(runs, range) {
   const counts = { tasks: 0, completed: 0, failed: 0, canceled: 0, unresolved: 0, active: 0, unclassified: 0, knownUsage: 0, unknownUsage: 0 };
@@ -101,7 +140,7 @@ export function summarizeRunUsage(runs, range) {
     else if (["queued", "running", "canceling"].includes(run.status)) counts.active++;
     else counts.unclassified++;
     if (terminalStatuses.has(run.status)) {
-      if (run.usage?.status === "complete") counts.knownUsage++;
+      if (normalizeRunUsage(run.usage).status === "complete") counts.knownUsage++;
       else counts.unknownUsage++;
     }
     if (run.threadId && run.turnId) turns.add(JSON.stringify([run.threadId, run.turnId]));

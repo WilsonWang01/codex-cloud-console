@@ -26,7 +26,7 @@ import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
-import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol, summarizeRunUsage } from "./run-usage.mjs";
+import { aggregateRunUsage, createTurnUsageMeter, normalizeRunUsage, runUsageDetails, summarizeRunUsage } from "./run-usage.mjs";
 import { summarizeDeliveryUsage } from "./delivery-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner, executionPayloadLimits } from "./external-task-store.mjs";
@@ -3161,7 +3161,7 @@ function createServerJob(kind, repo, session, runtime) {
     output: "",
     stderr: "",
     latestTokenUsage: session.tokenUsage || null,
-    rawTurnUsage: null,
+    turnUsage: kind === "turn" ? createTurnUsageMeter() : null,
     latestGoal: session.goal || null,
     completed: false,
     finishing: false,
@@ -3637,7 +3637,7 @@ function handleAppServerNotification(rpcMessage) {
   if (rpcMessage.method === "thread/tokenUsage/updated") {
     if (!owner.turnId) return;
     if (job) {
-      if (job.kind === "turn" && params.tokenUsage) job.rawTurnUsage = params.tokenUsage;
+      if (job.kind === "turn") job.turnUsage.observe(params.tokenUsage);
       job.latestTokenUsage = normalizeTokenUsage(params.tokenUsage) || job.latestTokenUsage;
       emitJobEvent(job, "tokenUsage", { tokenUsage: job.latestTokenUsage });
     }
@@ -3703,6 +3703,7 @@ function handleAppServerNotification(rpcMessage) {
     }
     auditAppServerItem(params.item || {}, job, owner);
     if (turnJob) {
+      turnJob.turnUsage.observeItem(params.item);
       const attempt = externalWriteAttempt(params.item, { includeUnverified: turnJob.reviewUnverifiedMcpCalls });
       if (attempt && !turnJob.externalWriteItems.has(attempt.id)) {
         turnJob.externalWriteItems.set(attempt.id, { ...attempt, startedAt: Date.now() });
@@ -3742,6 +3743,7 @@ function handleAppServerNotification(rpcMessage) {
   }
   if (rpcMessage.method === "item/completed") {
     const item = params.item || {};
+    if (turnJob) turnJob.turnUsage.observeItem(item);
     if (turnJob && turnJob.externalWriteItems.has(item.id)) {
       const attempt = turnJob.externalWriteItems.get(item.id);
       attempt.status = item.status === "completed" && !item.error ? "completed" : "failed";
@@ -4111,7 +4113,7 @@ function handleAppServerNotification(rpcMessage) {
       return;
     }
     if (turnJob) {
-      turnJob.rawTurnUsage = params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage || turnJob.rawTurnUsage;
+      turnJob.turnUsage.observe(params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage);
       turnJob.latestTokenUsage =
         normalizeTokenUsage(params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage) || turnJob.latestTokenUsage;
       const status = params.turn?.status || "unknown";
@@ -5414,7 +5416,7 @@ function normalizeAutomationRun(run = {}) {
     reasoning: run.reasoning ? String(run.reasoning) : null,
     ...(run.executionProfile != null ? { executionProfile: normalizeExecutionProfile(run.executionProfile) } : {}),
     prompt: redactAutomationPrompt(run.prompt),
-    usage: run.usage && typeof run.usage === "object" ? run.usage : { status: "unknown", reason: "No per-turn usage snapshot" },
+    usage: normalizeRunUsage(run.usage),
     summary: run.summary ? String(run.summary).slice(0, 4000) : "",
     diffStat: run.diffStat ? String(run.diffStat).slice(0, 4000) : "",
     error: run.error ? String(run.error).slice(0, 2000) : null,
@@ -7309,7 +7311,9 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           threadId: job.threadId,
           turnId: job.turnId,
           summary: job.output || "",
-          usage: job.modelStartAttempted ? runUsageFromProtocol(job.rawTurnUsage) : { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          usage: job.modelStartAttempted ? result.ok && !job.startConfirmationFailed ? job.turnUsage.snapshot()
+            : { status: "unknown", reason: "回合未确认正常结束，已观察到的请求不能证明全部消耗" }
+            : { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
           ...(structuredOutput ? { structuredOutput } : {}),
           ...(keepResult ? { delivery: delivery || { status: "failed", error: deliveryError || { code: "run_not_completed", message: error || "任务未成功完成，未交付结果" } } } : {}),
           error,
