@@ -18,6 +18,41 @@ function noteValue(value) {
   return note;
 }
 
+function waitingValue(value = "") {
+  if (typeof value !== "string" || value.trim().length > 300) throw inputError("等待原因需为不超过 300 个字符的文字");
+  return value.trim();
+}
+
+export function personalCommitmentLinks(value = []) {
+  if (!Array.isArray(value) || value.length > 8 || new Set(value).size !== value.length
+    || value.some(id => typeof id !== "string" || !id || id.length > 128)) throw inputError("最多关联 8 个不重复的个人对话");
+  return [...value];
+}
+
+function milestoneValues(value = [], previous = []) {
+  if (!Array.isArray(value) || value.length > 12) throw inputError("最多记录 12 个步骤");
+  const seen = new Set();
+  return value.map(step => {
+    if (!step || typeof step !== "object" || Array.isArray(step) || Object.keys(step).some(key => !["id", "title", "done"].includes(key))
+      || typeof step.title !== "string" || typeof step.done !== "boolean") throw inputError("步骤需包含名称与完成状态");
+    const existing = step.id === undefined ? null : previous.find(item => item.id === step.id);
+    if ((step.id !== undefined && !existing) || seen.has(step.id)) throw inputError("步骤编号无效或重复");
+    if (step.id !== undefined) seen.add(step.id);
+    return { id: existing?.id || crypto.randomUUID(), title: titleValue(step.title), done: step.done };
+  });
+}
+
+export function personalCommitmentDraft(item) {
+  return [
+    `请帮我推进这项个人事项：${item.title}`,
+    item.nextStep ? `当前下一步：${item.nextStep}` : "",
+    item.waitingReason ? `我记录的等待原因：${item.waitingReason}` : "",
+    ...(item.milestones || []).map(step => `我记录的步骤（${step.done ? "已完成" : "未完成"}）：${step.title}`),
+    item.dueAt ? `我记录的到期时间（UTC）：${item.dueAt}` : "",
+    "这些步骤与等待原因是我维护的记录，不是外部操作成功的证明。请先核对现状，给出下一步并执行你当前有权限完成的部分。对外发送、修改日历、删除数据或产生费用前，先展示具体动作并征得我确认。",
+  ].filter(Boolean).join("\n");
+}
+
 function dueValue(value) {
   if (value == null || value === "") return null;
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(value)) throw inputError("到期时间格式无效");
@@ -32,6 +67,16 @@ export function createPersonalCommitmentsStore(filePath) {
     try {
       const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
       if (parsed?.version !== 1 || !Array.isArray(parsed.commitments)) throw inputError("个人事项数据格式无效", 500);
+      try {
+        for (const item of parsed.commitments) {
+          if (item.milestones !== undefined) {
+            if (!Array.isArray(item.milestones) || item.milestones.some(step => typeof step?.id !== "string" || !step.id || step.id.length > 128)) throw inputError("步骤编号无效");
+            milestoneValues(item.milestones, item.milestones);
+          }
+          if (item.waitingReason !== undefined) waitingValue(item.waitingReason);
+          if (item.relatedSessionIds !== undefined) personalCommitmentLinks(item.relatedSessionIds);
+        }
+      } catch { throw inputError("个人事项进度数据格式无效，原记录未改写", 500); }
       return parsed.commitments;
     } catch (error) {
       if (error?.code === "ENOENT") return [];
@@ -70,6 +115,8 @@ export function createPersonalCommitmentsStore(filePath) {
       const item = {
         id: crypto.randomUUID(), title: titleValue(payload?.title), nextStep: noteValue(payload?.nextStep),
         dueAt: dueValue(payload?.dueAt), status: "active", sessionId: null,
+        milestones: milestoneValues(payload?.milestones), waitingReason: waitingValue(payload?.waitingReason),
+        relatedSessionIds: personalCommitmentLinks(payload?.relatedSessionIds),
         source: "user", revision: 1, createdAt: now, updatedAt: now, completedAt: null,
       };
       commitments.push(item);
@@ -80,6 +127,9 @@ export function createPersonalCommitmentsStore(filePath) {
       if (payload?.title !== undefined) item.title = titleValue(payload.title);
       if (payload?.nextStep !== undefined) item.nextStep = noteValue(payload.nextStep);
       if (payload?.dueAt !== undefined) item.dueAt = dueValue(payload.dueAt);
+      if (payload?.milestones !== undefined) item.milestones = milestoneValues(payload.milestones, item.milestones);
+      if (payload?.waitingReason !== undefined) item.waitingReason = waitingValue(payload.waitingReason);
+      if (payload?.relatedSessionIds !== undefined) item.relatedSessionIds = personalCommitmentLinks(payload.relatedSessionIds);
       if (payload?.status !== undefined) {
         if (!["active", "done"].includes(payload.status)) throw inputError("事项状态无效");
         item.status = payload.status;

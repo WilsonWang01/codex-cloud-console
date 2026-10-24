@@ -201,11 +201,11 @@ await context.route("**/api/**", async (route) => {
     if (oldCommitmentApi) return send({ ok: false, error: "Unknown API route: GET /personal/commitments" }, 404);
     if (req.method() === "POST") {
       const now = new Date().toISOString();
-      const commitment = { id: `commitment-${personalCommitments.length + 1}`, title: body.title, nextStep: body.nextStep || "", dueAt: body.dueAt || null, status: "active", sessionId: null, source: "user", revision: 1, createdAt: now, updatedAt: now, completedAt: null };
+      const commitment = { id: `commitment-${personalCommitments.length + 1}`, title: body.title, nextStep: body.nextStep || "", dueAt: body.dueAt || null, milestones: body.milestones || [], waitingReason: body.waitingReason || "", relatedSessionIds: body.relatedSessionIds || [], status: "active", sessionId: null, source: "user", revision: 1, createdAt: now, updatedAt: now, completedAt: null };
       personalCommitments.push(commitment);
       return send({ ok: true, commitment }, 201);
     }
-    return send({ ok: true, commitments: personalCommitments });
+    return send({ ok: true, progressVersion: 1, commitments: personalCommitments });
   }
   const commitmentDraft = url.pathname.match(/^\/api\/personal\/commitments\/([^/]+)\/draft$/);
   if (commitmentDraft && req.method() === "POST") {
@@ -232,7 +232,7 @@ await context.route("**/api/**", async (route) => {
     if (item.revision !== body.revision) return send({ ok: false, error: "stale" }, 409);
     if (req.method() === "DELETE") { personalCommitments = personalCommitments.filter((entry) => entry.id !== id); return send({ ok: true, commitment: item }); }
     if (body.sessionId && !sessions.some((session) => session.id === body.sessionId && session.repoId === "_personal")) return send({ ok: false, error: "个人对话不存在" }, 404);
-    Object.assign(item, Object.fromEntries(Object.entries(body).filter(([key]) => ["title", "nextStep", "dueAt", "status", "sessionId"].includes(key))));
+    Object.assign(item, Object.fromEntries(Object.entries(body).filter(([key]) => ["title", "nextStep", "dueAt", "status", "sessionId", "milestones", "waitingReason", "relatedSessionIds"].includes(key))));
     item.revision += 1;
     item.updatedAt = new Date().toISOString();
     item.completedAt = item.status === "done" ? item.updatedAt : null;
@@ -978,7 +978,7 @@ try {
   await page.getByRole("button", { name: "完成 周末前整理行程" }).click();
   await page.getByText("已完成 1 项").waitFor();
   assert.equal(personalCommitments[0].status, "done");
-  await page.locator(".personal-completed summary").click();
+  await page.locator(".personal-completed > summary").click();
   personalCommitments[0].revision += 1;
   await page.getByRole("button", { name: "重新跟进 周末前整理行程" }).click();
   await page.getByText("stale", { exact: true }).waitFor();

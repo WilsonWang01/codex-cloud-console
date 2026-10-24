@@ -7272,13 +7272,34 @@ pre {
 .personal-commitment-actions button { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
 .personal-commitment-actions button:hover { background: var(--surface); }
 .personal-commitment-actions button:disabled { opacity: .5; cursor: default; }
-.personal-commitment-editor { display: grid; gap: 10px; padding: 12px 0; }
+.personal-commitment-editor { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 12px 0; border: 0; }
 .personal-commitment-editor input, .personal-commitment-editor textarea { width: 100%; min-height: 44px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font: inherit; }
 .personal-commitment-editor label { display: grid; gap: 5px; color: var(--muted-strong); font-size: 12px; }
 .personal-commitment-editor small { color: var(--muted); font-size: 12px; }
 .personal-commitment-editor > div { display: flex; gap: 8px; }
 .personal-commitment-editor > div button { min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
 .personal-commitment-editor > div button:disabled { opacity: .5; cursor: default; }
+.personal-commitment-progress { grid-column: 1 / -1; min-width: 0; font-size: 13px; }
+.personal-commitment-progress > summary { min-height: 44px; padding: 12px 0; cursor: pointer; color: var(--muted-strong); }
+.personal-commitment-progress > ul { list-style: none; margin: 0 0 8px; padding: 0; }
+.personal-commitment-progress li > label { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 44px; overflow-wrap: anywhere; cursor: pointer; }
+.personal-commitment-progress input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--teal); }
+.personal-commitment-progress small { color: var(--muted); font-size: 12px; }
+.personal-commitment-source { display: grid; grid-template-columns: minmax(0, 1fr) 16px; align-items: center; gap: 8px; width: 100%; min-height: 48px; padding: 8px 0; border: 0; border-bottom: 1px solid var(--border); background: transparent; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.personal-commitment-source > span { display: grid; gap: 4px; min-width: 0; }
+.personal-commitment-source:hover { background: var(--surface); }
+.personal-commitment-copy .personal-commitment-waiting { color: var(--muted-strong); }
+.personal-commitment-steps, .personal-commitment-links { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.personal-commitment-editor legend { padding: 0 0 8px; color: var(--muted-strong); font-size: 12px; }
+.personal-commitment-steps > div { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 6px; }
+.personal-commitment-editor .personal-commitment-step-toggle { min-height: 44px; justify-items: center; align-items: center; cursor: pointer; }
+.personal-commitment-editor input[type="checkbox"] { width: 18px; min-height: 18px; height: 18px; padding: 0; accent-color: var(--teal); }
+.personal-commitment-links > div { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.personal-commitment-editor select { width: 100%; min-width: 0; min-height: 44px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+.personal-commitment-steps button, .personal-commitment-links button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; justify-self: start; min-width: 44px; min-height: 44px; padding: 8px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
+.personal-commitment-steps > div button, .personal-commitment-links > div button { justify-self: stretch; }
+.personal-commitment-steps button:hover, .personal-commitment-links button:hover { background: var(--surface); }
+.personal-commitment-editor button:disabled { opacity: .5; cursor: default; }
 .personal-completed { margin-top: 12px; color: var(--muted-strong); font-size: 13px; }
 .personal-completed summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
 .personal-list-section p { margin: 0 0 12px; color: var(--muted-strong); line-height: 1.5; }

@@ -46,7 +46,7 @@ import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPat
 import { createPersonalFactsStore, normalizePersonalFactContext, personalFactContextIssue } from "./personal-facts.mjs";
 import { handlePersonalFactReferenceCall, personalFactReferenceTool, personalFactReferenceMessages } from "./personal-fact-references.mjs";
 import { personalMemoryTool, handlePersonalMemoryCall } from "./personal-memory.mjs";
-import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
+import { createPersonalCommitmentsStore, personalCommitmentDraft, personalCommitmentLinks } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
@@ -11005,7 +11005,7 @@ app.delete("/api/personal/facts/:id", async (req, res) => {
 });
 
 app.get("/api/personal/commitments", async (_req, res) => {
-  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, commitments: await personalCommitmentsStore.list() }); }
+  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, progressVersion: 1, commitments: await personalCommitmentsStore.list() }); }
   catch (error) { sendRouteError(res, error); }
 });
 
@@ -11134,8 +11134,19 @@ app.post("/api/personal/routines/:id/restore", async (req, res) => {
   } catch (error) { sendRouteError(res, error); }
 });
 
+async function checkPersonalCommitmentSessions(payload) {
+  const ids = payload?.relatedSessionIds === undefined ? [] : personalCommitmentLinks(payload.relatedSessionIds);
+  if (payload?.sessionId != null) ids.push(...personalCommitmentLinks([payload.sessionId]));
+  if (!ids.length) return;
+  const { sessions } = await readChatStore();
+  if (ids.some(id => !sessions[id] || sessions[id].repoId !== personalRepoId)) throw Object.assign(new Error("个人对话不存在"), { statusCode: 404 });
+}
+
 app.post("/api/personal/commitments", async (req, res) => {
-  try { res.status(201).json({ ok: true, commitment: await personalCommitmentsStore.create(req.body) }); }
+  try {
+    await checkPersonalCommitmentSessions(req.body);
+    res.status(201).json({ ok: true, commitment: await personalCommitmentsStore.create(req.body) });
+  }
   catch (error) { sendRouteError(res, error); }
 });
 
@@ -11154,12 +11165,7 @@ app.post("/api/personal/commitments/:id/draft", async (req, res) => {
           if (existing.repoId !== personalRepoId) throw Object.assign(new Error("个人对话不存在"), { statusCode: 404 });
           return existing;
         }
-        const input = [
-          `请帮我推进这项个人事项：${item.title}`,
-          item.nextStep ? `当前下一步：${item.nextStep}` : "",
-          item.dueAt ? `我记录的到期时间（UTC）：${item.dueAt}` : "",
-          "请先核对现状，给出下一步并执行你当前有权限完成的部分。对外发送、修改日历、删除数据或产生费用前，先展示具体动作并征得我确认。",
-        ].filter(Boolean).join("\n");
+        const input = personalCommitmentDraft(item);
         const session = normalizeSession({ id, repoId: personalRepoId, title: item.title, messages: [], draft: { input, attachments: [], revision: 1, updatedAt: new Date().toISOString() } }, personalRepoId);
         store.sessions[id] = session;
         return session;
@@ -11177,10 +11183,7 @@ app.post("/api/personal/commitments/:id/draft", async (req, res) => {
 
 app.patch("/api/personal/commitments/:id", async (req, res) => {
   try {
-    if (req.body?.sessionId !== undefined && req.body.sessionId !== null) {
-      const session = (await readChatStore()).sessions[req.body.sessionId];
-      if (!session || session.repoId !== personalRepoId) return res.status(404).json({ ok: false, error: "个人对话不存在" });
-    }
+    await checkPersonalCommitmentSessions(req.body);
     res.json({ ok: true, commitment: await personalCommitmentsStore.update(req.params.id, req.body) });
   } catch (error) { sendRouteError(res, error); }
 });

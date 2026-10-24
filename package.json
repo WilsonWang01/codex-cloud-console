@@ -49,6 +49,7 @@
     "verify:personal-references:codex": "node scripts/verify-personal-memory-codex.mjs --references",
     "verify:personal-references:ui": "node scripts/verify-personal-fact-references-ui.mjs",
     "verify:personal-commitments": "node --test scripts/verify-personal-commitments.mjs scripts/verify-personal-commitments-api.mjs",
+    "verify:personal-goal-progress-ui": "node scripts/verify-personal-goal-progress-ui.mjs",
     "verify:personal-routines": "node --test scripts/verify-personal-routines.mjs",
     "verify:personal-schedule": "node --test scripts/verify-personal-schedule.mjs",
     "verify:personal-brief": "node --test scripts/verify-personal-brief.mjs scripts/verify-personal-calendar.mjs",
