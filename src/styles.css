@@ -1966,7 +1966,7 @@ h3 {
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .chat-bubble .timeline-details {
+  .chat-bubble .timeline-details:not(.personal-reference-details) {
     max-height: 0;
     margin-top: 0;
     overflow: hidden;
@@ -1977,9 +1977,9 @@ h3 {
       opacity 0.16s ease;
   }
 
-  .chat-bubble:hover .timeline-details,
-  .chat-bubble:focus-within .timeline-details,
-  .chat-bubble .timeline-details[open] {
+  .chat-bubble:hover .timeline-details:not(.personal-reference-details),
+  .chat-bubble:focus-within .timeline-details:not(.personal-reference-details),
+  .chat-bubble .timeline-details[open]:not(.personal-reference-details) {
     max-height: 2000px;
     margin-top: 6px;
     overflow: visible;
@@ -7350,6 +7350,16 @@ pre {
 .personal-context-dialog p { font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
 .personal-context-dialog > div { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 .personal-context-dialog button { min-height: 44px; }
+.personal-fact-references { padding: 8px 0; font-size: 13px; overflow-wrap: anywhere; }
+.personal-fact-references p { color: var(--muted); margin: 0 0 12px; }
+.personal-fact-references dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; }
+.personal-fact-references dt { color: var(--muted); }
+.personal-fact-references dd { margin: 0; min-width: 0; }
+.personal-fact-references ul { list-style: none; padding: 0; margin: 12px 0 0; }
+.personal-fact-references li { padding: 8px 0; border-top: 1px solid var(--border); display: grid; gap: 4px; }
+.personal-fact-references li span { color: var(--muted); }
+.personal-fact-references li p { margin: 0; color: var(--text); line-height: 1.5; }
+.personal-reference-details > summary { min-height: 44px; align-content: center; }
 .composer-shell { position: relative; }
 .external-review-banner { display: flex; align-items: flex-start; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid #e9c993; border-bottom: 0; border-radius: 6px 6px 0 0; background: #fff8e9; color: var(--text); }
 .external-review-banner > svg { flex: 0 0 auto; margin-top: 2px; color: #a36212; }
@@ -7414,6 +7424,9 @@ pre {
   .composer-notices:has(> .external-review-banner) { min-height: 64px; }
   .composer-notices:has(> .queued-turn-banner):not(:has(> .external-review-banner)) { min-height: 44px; }
   .composer-shell > .composer, .composer-shell > .composer-footer, .composer-shell > .attachment-strip, .composer-shell > .composer-busy-actions { flex-shrink: 0; }
+  /* Preserve the personal composer's controls; auxiliary content may scroll instead. */
+  .session-content-grid:has(.personal-scope-notice) .composer-shell { flex-shrink: 0; }
+  .session-content-grid:has(.personal-scope-notice) .composer-shell > :is(.composer-notices, .attachment-strip) { max-height: min(calc(var(--app-visual-height, 100dvh) * .15), 96px); overflow-y: auto; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer button { min-height: 44px; height: auto; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer .footer-save-routine { width: 44px; min-width: 44px; }

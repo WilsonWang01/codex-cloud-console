@@ -54,12 +54,16 @@ export function activePersonalFacts(facts, now = Date.now()) {
     && (fact.expiresAt == null || Date.parse(fact.expiresAt) > now));
 }
 
+export function personalFactDigest({ id, label, value }) {
+  return crypto.createHash("sha256").update(JSON.stringify([id, label, value])).digest("hex");
+}
+
 export function personalFactSnapshot(facts, now = Date.now()) {
   const active = activePersonalFacts(facts, now);
   return {
     facts: active,
-    context: { version: 1, providedAt: new Date(now).toISOString(), facts: active.map(({ id, revision, label, value }) => ({
-      id, revision, digest: crypto.createHash("sha256").update(JSON.stringify([id, label, value])).digest("hex"),
+    context: { version: 1, providedAt: new Date(now).toISOString(), facts: active.map((fact) => ({
+      id: fact.id, revision: fact.revision, digest: personalFactDigest(fact),
     })) },
   };
 }

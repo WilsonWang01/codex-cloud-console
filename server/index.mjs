@@ -44,6 +44,7 @@ import { listPersonalFiles, resolvePersonalFile, sendPersonalFile } from "./pers
 import { readRootedFile } from "./safe-file-read.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
 import { createPersonalFactsStore, normalizePersonalFactContext, personalFactContextIssue } from "./personal-facts.mjs";
+import { handlePersonalFactReferenceCall, personalFactReferenceTool, personalFactReferenceMessages } from "./personal-fact-references.mjs";
 import { personalMemoryTool, handlePersonalMemoryCall } from "./personal-memory.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
@@ -1812,7 +1813,12 @@ async function getAppServerThreadMessages(session, repo = null, options = {}) {
   );
   if (!response.ok) return { ok: false, error: response.error || "thread/read failed", messages: [], thread: null };
   const thread = response.result?.thread || null;
-  return { ok: true, messages: normalizeAppServerThreadMessages(thread || {}, appServerNormalizerOptions(repo)), thread };
+  let messages = normalizeAppServerThreadMessages(thread || {}, appServerNormalizerOptions(repo));
+  if (repo?.kind === "personal" && messages.some(message => message.messageType === "dynamicToolCall" && message.details?.tool === personalFactReferenceTool.name)) {
+    const facts = await personalFactsStore.list().catch(() => null);
+    messages = personalFactReferenceMessages(messages, session.codexSessionId, facts);
+  }
+  return { ok: true, messages, thread };
 }
 
 async function updateStoredSessionFromOfficialThread(session, repo, official = {}, options = {}) {
@@ -2062,7 +2068,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null, sta
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
-    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool] } : {}),
+    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool] } : {}),
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
       ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, personalSnapshot.facts, await personalCommitmentsStore.list())] : []),
@@ -2593,6 +2599,7 @@ async function appServerRequestResult(method, params = {}) {
   if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const job = findTurnJob(params) || findCompactJob(params);
   if (method === "item/tool/call") {
+    if (params.tool === personalFactReferenceTool.name) return handlePersonalFactReferenceCall(params, job);
     const result = await handlePersonalMemoryCall(params, job, personalFactsStore);
     if (result.success && job) emitJobEvent(job, "status", { text: "个人记忆候选已保存，等待你在个人设置中核对；尚未成为事实" });
     return result;
