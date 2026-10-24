@@ -101,6 +101,7 @@ test("unattended personal schedules decline approvals before they enter the pend
   const context = vm.createContext({
     personalCalendarSource: { ownsThread: () => false },
     findTurnJob: () => job,
+    ownerFromParams: params => ({ turnId: params.turnId }),
     findCompactJob: () => null,
     personalRepoId: "_personal",
     recordAppServerRequestDecision: (_method, _params, decision) => decisions.push(decision),
@@ -111,17 +112,17 @@ test("unattended personal schedules decline approvals before they enter the pend
   vm.runInContext(`${source.slice(start, end)}\nglobalThis.handlers = { appServerRequestResult, personalAppServerRequestResult };`, context);
   const { appServerRequestResult, personalAppServerRequestResult } = context.handlers;
   for (const handler of [appServerRequestResult, personalAppServerRequestResult]) {
-    const answer = await handler("item/commandExecution/requestApproval", { threadId: "personal-thread" });
+    const answer = await handler("item/commandExecution/requestApproval", { threadId: "personal-thread", turnId: "personal-turn" });
     assert.equal(answer.decision, "decline");
   }
   assert.equal(job.unattendedApprovalDenied, true);
   assert.equal(brokerCalls, 0);
   assert.deepEqual(decisions, ["declined-unattended", "declined-unattended"]);
   assert.equal(events.length, 2);
-  await assert.rejects(appServerRequestResult("item/tool/requestUserInput", { threadId: "personal-thread" }), /无人值守/);
+  await assert.rejects(appServerRequestResult("item/tool/requestUserInput", { threadId: "personal-thread", turnId: "personal-turn" }), /无人值守/);
   assert.equal(brokerCalls, 0);
   job.unattendedPersonalSchedule = false;
-  const interactive = await appServerRequestResult("item/commandExecution/requestApproval", { threadId: "personal-thread" });
+  const interactive = await appServerRequestResult("item/commandExecution/requestApproval", { threadId: "personal-thread", turnId: "personal-turn" });
   assert.equal(interactive.decision, "accept");
   assert.equal(brokerCalls, 1);
   context.personalCalendarSource.ownsThread = id => id === "source-thread";
@@ -130,6 +131,27 @@ test("unattended personal schedules decline approvals before they enter the pend
     await assert.rejects(handler("mcpServer/elicitation/request", { threadId: "source-thread" }), /既定只读/);
   }
   assert.equal(brokerCalls, 1, "calendar refresh never prompts the user to grant runtime permissions");
+});
+
+test("回合结束只关闭本次审批，旧审批和取消竞态不能继续批准权限", async () => {
+  const broker = createApprovalBroker();
+  const owner = { repoId: "repo", sessionId: "session", turnId: "old" };
+  const old = broker.request("item/commandExecution/requestApproval", {}, owner);
+  const current = broker.request("item/commandExecution/requestApproval", {}, { ...owner, turnId: "new" });
+  const other = broker.request("item/commandExecution/requestApproval", {}, { ...owner, sessionId: "other" });
+  const original = broker.list().find(item => item.owner.turnId === "old" && item.owner.sessionId === "session");
+  broker.closeForTurn(owner);
+  assert.equal((await old).decision, "decline"); assert.equal(broker.list().length, 2);
+  assert.throws(() => broker.decide(original.id, { decision: "accept", digest: original.digest }), { statusCode: 410 });
+  broker.closeAll(); await current; await other;
+  const source = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8");
+  const job = { repoId: "repo", sessionId: "s", turnId: "turn" };
+  const context = vm.createContext({ personalCalendarSource: { ownsThread: () => false }, ownerFromParams: () => ({ turnId: "turn" }),
+    findTurnJob: () => job, findCompactJob: () => null, recordAppServerRequestDecision: () => {}, declineAppServerRequest,
+    approvalBroker: { request: async () => { job.cancelRequested = true; return { decision: "accept" }; } },
+  });
+  vm.runInContext(source.slice(source.indexOf("async function appServerRequestResult("), source.indexOf("\nfunction personalAppServerRequestResult(")), context);
+  assert.equal((await context.appServerRequestResult("item/commandExecution/requestApproval", {})).decision, "decline");
 });
 
 test("immediate decline follows each supported app-server response shape", () => {

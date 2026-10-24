@@ -22,6 +22,72 @@ const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
 
+test("原生回合归属同时核对线程、回合和已知条目，旧编号不能匹配新任务或压缩", () => {
+  const job = { repoId: "repo", sessionId: "session", threadId: "thread", turnId: "new", itemIds: new Set(["new-item"]) };
+  const context = vm.createContext({
+    activeTurns: new Map([["repo:session", job]]), activeCompactions: new Map(),
+    threadOwners: new Map([["thread", job]]), turnOwners: new Map([["old", { ...job, turnId: "old" }]]),
+    itemOwners: new Map([["old-item", { ...job, turnId: "old" }], ["new-item", job]]), makeSessionKey: (repo, session) => repo + ":" + session,
+  });
+  vm.runInContext(section(source, "function ownerFromParams(", "function commandToolRecord("), context);
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "new" }), job);
+  assert.equal(context.findTurnJob({ itemId: "new-item" }), job);
+  for (const params of [{ threadId: "thread", turnId: "old" }, { itemId: "old-item" }, { threadId: "other", turnId: "new" }, { threadId: "thread", itemId: "unknown" }]) assert.equal(context.findTurnJob(params), null);
+  job.turnId = null;
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "old" }, true), null);
+  job.startRequestPending = true;
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "candidate" }, true), job);
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "candidate" }), null);
+  job.turnId = "new";
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "old" }, true), null);
+  job.startRequestPending = false;
+  context.activeCompactions.set("repo:session", job);
+  assert.equal(context.findCompactJob({ threadId: "thread", turnId: "old" }), null);
+  assert.equal(context.findCompactJob({ threadId: "thread", turnId: "new" }), job);
+  job.finishing = true;
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "new" }), null);
+});
+
+test("启动回执前的通知有界且按原顺序重放，失败或缺失编号不会绑定替代回合", async () => {
+  const gate = deferred(), observed = [], failures = [];
+  const context = vm.createContext({ Buffer, Date, Promise, appServerClientForJob: () => ({ request: () => gate.promise }),
+    ownerFromParams: params => params, jobMatchesOwner: () => true,
+    rememberOwner: (owner) => observed.push(owner.turnId), handleAppServerNotification: message => observed.push(message.params.sequence),
+    interruptTimedOutTurn: (job, reason) => failures.push({ job, reason }), finishCompactJob: () => {},
+  });
+  vm.runInContext(section(source, "function bufferStartNotification(", "function commandToolRecord("), context);
+  const job = { threadId: "thread", repoId: "repo", sessionId: "s" };
+  const started = context.requestJobStart(job, "turn/start", {});
+  context.bufferStartNotification(job, { params: { sequence: 1 } });
+  context.bufferStartNotification(job, { params: { sequence: 2 } });
+  gate.resolve({ turn: { id: "actual" } }); await started;
+  assert.deepEqual(observed, ["actual", 1, 2]); assert.equal(job.startNotifications.length, 0); assert.equal(job.startNotificationBytes, 0);
+  await job.startReady.promise;
+  const failedGate = Promise.withResolvers(); context.appServerClientForJob = () => ({ request: () => failedGate.promise });
+  const failedJob = { threadId: "same" }, failed = context.requestJobStart(failedJob, "turn/start", {});
+  context.bufferStartNotification(failedJob, { params: { sequence: "must-not-replay" } });
+  failedGate.reject(new Error("uncertain RPC")); await assert.rejects(failed, /uncertain RPC/);
+  assert.equal(failedJob.startConfirmationFailed, true); assert.equal(failedJob.cancelRequested, true);
+  await failedJob.startReady.promise; assert.equal(failedJob.startNotifications.length, 0); assert.equal(observed.includes("must-not-replay"), false);
+  context.appServerClientForJob = () => ({ request: async () => ({}) });
+  await assert.rejects(context.requestJobStart({}, "turn/start", {}), /没有返回本次回合编号/);
+  const bounded = { startNotifications: [], startNotificationBytes: 0 };
+  for (let index = 0; index < 130; index++) context.bufferStartNotification(bounded, { params: { index } });
+  assert.equal(bounded.startNotifications.length, 128); assert.equal(failures.length, 1); assert.equal(bounded.startConfirmationFailed, true);
+  const oversized = { startNotifications: [], startNotificationBytes: 0 };
+  context.bufferStartNotification(oversized, { text: "x".repeat(2 * 1024 * 1024) });
+  assert.equal(oversized.startNotifications.length, 0); assert.equal(failures.length, 2);
+  const reviewGate = deferred(); context.appServerClientForJob = () => ({ request: () => reviewGate.promise });
+  context.ownerFromParams = params => ({ threadId: params.threadId, turnId: params.turnId });
+  context.jobMatchesOwner = (job, owner) => owner.threadId === job.reviewThreadId && owner.turnId === job.turnId;
+  const review = { threadId: "source", repoId: "repo", sessionId: "s" };
+  const reviewing = context.requestJobStart(review, "review/start", {});
+  context.bufferStartNotification(review, { params: { threadId: "other-review", turnId: "other", sequence: "foreign-must-not-requeue" } });
+  context.bufferStartNotification(review, { params: { threadId: "own-review", turnId: "own", sequence: "owned-review" } });
+  reviewGate.resolve({ turn: { id: "own" }, reviewThreadId: "own-review" }); await reviewing;
+  assert.equal(observed.includes("foreign-must-not-requeue"), false); assert.equal(observed.includes("owned-review"), true);
+});
+
 test("个人和工作列表保留非当前文字或附件草稿，仅隐藏空白草稿", () => {
   const context = vm.createContext({});
   const functions = section(frontend, "function persistedDraftInput(", "function draftPayload(")

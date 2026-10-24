@@ -2600,7 +2600,13 @@ const approvalBroker = createApprovalBroker({
 
 async function appServerRequestResult(method, params = {}) {
   if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
-  const job = findTurnJob(params) || findCompactJob(params);
+  const waiting = findTurnJob(params, true) || findCompactJob(params, true);
+  if (waiting?.startRequestPending) await waiting.startReady.promise;
+  const job = ownerFromParams(params).turnId ? findTurnJob(params) || findCompactJob(params) : null;
+  if (!job || job.cancelRequested) {
+    recordAppServerRequestDecision(method, params, "declined-unowned");
+    return declineAppServerRequest(method, "请求不属于当前已确认的回合，未申请额外权限");
+  }
   if (job?.executionProfile) {
     job.profileApprovalDenied = true;
     recordAppServerRequestDecision(method, params, "declined-execution-profile");
@@ -2621,7 +2627,8 @@ async function appServerRequestResult(method, params = {}) {
   }
   recordAppServerRequestDecision(method, params, "pending");
   try {
-    const result = await approvalBroker.request(method, params, { repoId: job?.repoId, sessionId: job?.sessionId });
+    let result = await approvalBroker.request(method, params, { repoId: job.repoId, sessionId: job.sessionId, turnId: job.turnId });
+    if (job.cancelRequested || (findTurnJob(params) !== job && findCompactJob(params) !== job)) result = declineAppServerRequest(method, "原回合已经结束或取消，审批不再生效");
     const declined = result.decision === "decline" || Boolean(result.decision?.denied) || result.action === "decline";
     recordAppServerRequestDecision(method, params, declined ? "declined" : "accepted");
     return result;
@@ -2632,7 +2639,7 @@ async function appServerRequestResult(method, params = {}) {
 }
 
 function personalAppServerRequestResult(method, params = {}) {
-  const job = findTurnJob(params) || findCompactJob(params);
+  const job = findTurnJob(params, true) || findCompactJob(params, true);
   if (!job || job.repoId !== personalRepoId) throw new Error("Personal worker request has no active personal turn");
   return appServerRequestResult(method, params);
 }
@@ -2643,8 +2650,9 @@ function personalAppServerNotification(message) {
     completeAccountLoginFlow(message.params || {}, personalRepoId);
     return;
   }
-  const job = findTurnJob(message.params || {}) || findCompactJob(message.params || {});
-  if (job?.repoId !== personalRepoId) return;
+  const job = findTurnJob(message.params || {}, true) || findCompactJob(message.params || {}, true);
+  const owner = ownerFromParams(message.params || {});
+  if (job?.repoId !== personalRepoId && threadOwners.get(owner.threadId)?.repoId !== personalRepoId) return;
   handleAppServerNotification(message);
 }
 
@@ -2893,7 +2901,7 @@ function reqSafeClose(res, cleanup) {
 function ownerFromParams(params = {}) {
   const item = params.item || {};
   const itemId = params.itemId || item.id || null;
-  const turnId = params.turnId || params.turn?.id || item.turnId || null;
+  const turnId = params.turnId || params.turn?.id || item.turnId || (itemId && itemOwners.get(itemId)?.turnId) || null;
   const threadId =
     params.threadId ||
     params.thread?.id ||
@@ -2925,39 +2933,98 @@ function clearJobOwners(job) {
   }
 }
 
-function findTurnJob(params = {}) {
+function jobMatchesOwner(job, owner, pending = false) {
+  if (!job || job.completed || job.finishing) return false;
+  if (owner.threadId && owner.threadId !== job.threadId && owner.threadId !== job.reviewThreadId) return false;
+  if (owner.turnId && owner.turnId !== job.turnId && !(pending && job.startRequestPending && !job.turnId)) return false;
+  if (owner.itemId && !owner.turnId && !job.itemIds.has(owner.itemId) && !(pending && job.startRequestPending)) return false;
+  return true;
+}
+
+function findTurnJob(params = {}, pending = false) {
   const owner = ownerFromParams(params);
   if (owner.itemId && itemOwners.has(owner.itemId)) {
     const itemOwner = itemOwners.get(owner.itemId);
     const job = activeTurns.get(makeSessionKey(itemOwner.repoId, itemOwner.sessionId));
-    if (job) return job;
+    if (jobMatchesOwner(job, owner, pending)) return job;
   }
   if (owner.turnId && turnOwners.has(owner.turnId)) {
     const turnOwner = turnOwners.get(owner.turnId);
     const job = activeTurns.get(makeSessionKey(turnOwner.repoId, turnOwner.sessionId));
-    if (job) return job;
+    if (jobMatchesOwner(job, owner, pending)) return job;
   }
   if (owner.threadId && threadOwners.has(owner.threadId)) {
     const threadOwner = threadOwners.get(owner.threadId);
     const job = activeTurns.get(makeSessionKey(threadOwner.repoId, threadOwner.sessionId));
-    if (job) return job;
+    if (jobMatchesOwner(job, owner, pending)) return job;
   }
   return null;
 }
 
-function findCompactJob(params = {}) {
+function findCompactJob(params = {}, pending = false) {
   const owner = ownerFromParams(params);
   if (owner.threadId) {
     for (const job of activeCompactions.values()) {
-      if (job.threadId === owner.threadId) return job;
+      if (job.threadId === owner.threadId && jobMatchesOwner(job, owner, pending)) return job;
     }
   }
   if (owner.itemId && itemOwners.has(owner.itemId)) {
     const itemOwner = itemOwners.get(owner.itemId);
     const key = makeSessionKey(itemOwner.repoId, itemOwner.sessionId);
-    return activeCompactions.get(key) || null;
+    const job = activeCompactions.get(key);
+    return jobMatchesOwner(job, owner, pending) ? job : null;
   }
   return null;
+}
+
+function bufferStartNotification(job, message) {
+  if (job.completed || job.finishing || job.startConfirmationFailed) return;
+  const bytes = Buffer.byteLength(JSON.stringify(message));
+  if (job.startNotifications.length >= 128 || job.startNotificationBytes + bytes > 2 * 1024 * 1024) {
+    job.startConfirmationFailed = true;
+    if (job.kind === "compact") void finishCompactJob(job, false, "启动回执前通知超限，无法核对压缩结果，未重试");
+    else interruptTimedOutTurn(job, "启动回执前通知超限，任务结果需核对；未自动重试");
+    return;
+  }
+  job.startNotifications.push(message);
+  job.startNotificationBytes += bytes;
+}
+
+async function requestJobStart(job, method, params) {
+  // Only the RPC receipt binds a turn; earlier notifications wait in a bounded buffer.
+  job.startReady = Promise.withResolvers();
+  job.startRequestPending = true;
+  job.startNotifications = [];
+  job.startNotificationBytes = 0;
+  job.startMethod = method;
+  job.operationStartedAt = Date.now();
+  try {
+    const result = await appServerClientForJob(job).request(method, params, 30_000);
+    if (method !== "thread/compact/start") {
+      job.turnId = result?.turn?.id || result?.reviewTurnId || null;
+      if (!job.turnId) throw new Error("Codex 没有返回本次回合编号，未复用其他回合");
+      if (result.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
+      rememberOwner({ threadId: job.reviewThreadId || job.threadId, turnId: job.turnId }, { repoId: job.repoId, sessionId: job.sessionId });
+    }
+    job.startRequestPending = false;
+    const pending = job.startNotifications;
+    job.startNotifications = [];
+    for (const notification of pending) {
+      const owner = ownerFromParams(notification.params);
+      if (jobMatchesOwner(job, owner) || (job.kind === "compact" && owner.threadId === job.threadId)) handleAppServerNotification(notification);
+    }
+    return result;
+  } catch (error) {
+    job.startConfirmationFailed = true;
+    job.cancelRequested = true;
+    if (job.turnId) void appServerClientForJob(job).request("turn/interrupt", { threadId: job.reviewThreadId || job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+    throw new Error(`启动回执未能确认，请核对原任务；未自动重试：${error.message || error}`);
+  } finally {
+    job.startRequestPending = false;
+    job.startNotifications = [];
+    job.startNotificationBytes = 0;
+    job.startReady.resolve();
+  }
 }
 
 function commandToolRecord(job, itemOrId = {}) {
@@ -3260,9 +3327,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
         if (job.personalFactSnapshot) await preparePersonalFactContext(repo, { ...session, codexSessionId: job.threadId, personalFactContext: { ...job.personalFactSnapshot.context, threadId: job.threadId } });
         if (options.outputSchema) params.outputSchema = options.outputSchema;
         job.modelStartAttempted = true;
-        const result = await appServerClientForJob(job).request("turn/start", params, 30_000);
-        job.turnId = result?.turn?.id || null;
-        if (job.completed) {
+        await requestJobStart(job, "turn/start", params);
+        if (job.completed || job.finishing) {
           if (job.threadId && job.turnId) {
             await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
           }
@@ -3316,17 +3382,15 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
       try {
         await resolveThreadForJob(job);
         if (job.completed) return;
-        const result = await appServerClientForJob(job).request(
+        const result = await requestJobStart(job,
           "review/start",
           {
             threadId: job.threadId,
             target,
             delivery,
           },
-          30_000,
         );
-        job.turnId = result?.turn?.id || result?.reviewTurnId || null;
-        if (job.completed) {
+        if (job.completed || job.finishing) {
           if (job.threadId && job.turnId) {
             await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
           }
@@ -3346,6 +3410,7 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
 async function finishTurnJob(job, ok, code = 0, error = null) {
   if (job.completed || job.finishing) return;
   job.finishing = true;
+  approvalBroker.closeForTurn(job, "原回合已结束，未保留可继续批准的请求");
   if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
   if (job.maxRuntimeTimer) clearTimeout(job.maxRuntimeTimer);
   if (job.externalWriteTimer) clearTimeout(job.externalWriteTimer);
@@ -3436,7 +3501,7 @@ async function startCompactJob(repo, session, runtime) {
         if (!job.threadId) throw new Error("先发送一条消息建立 app-server thread，再压缩上下文。");
         await resolveThreadForJob(job);
         emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}，正在启动上下文压缩...` });
-        await appServerClientForJob(job).request("thread/compact/start", { threadId: job.threadId }, 30_000);
+        await requestJobStart(job, "thread/compact/start", { threadId: job.threadId });
         emitJobEvent(job, "status", { text: "正在压缩上下文..." });
       } catch (error) {
         await finishCompactJob(job, false, error.message || "主动压缩失败");
@@ -3449,6 +3514,7 @@ async function startCompactJob(repo, session, runtime) {
 async function finishCompactJob(job, ok, error = null) {
   if (job.completed) return;
   job.completed = true;
+  approvalBroker.closeForTurn(job, "原压缩任务已结束，未保留可继续批准的请求");
   if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
   activeCompactions.delete(job.key);
   const compactedAt = ok ? new Date().toISOString() : null;
@@ -3491,6 +3557,23 @@ function handleAppServerNotification(rpcMessage) {
   const params = rpcMessage.params || {};
   if (rpcMessage.method === "thread/closed") personalCalendarSource.closedThread(params.threadId);
   const owner = ownerFromParams(params);
+  const starting = findTurnJob(params, true) || findCompactJob(params, true);
+  if (starting?.startRequestPending && (owner.turnId || owner.itemId)) {
+    bufferStartNotification(starting, rpcMessage);
+    return;
+  }
+  // Detached review notifications may arrive before its new thread is acknowledged.
+  if (!starting && (owner.turnId || owner.itemId)) {
+    const pendingReviews = [...activeTurns.values()].filter(job => job.startRequestPending && job.startMethod === "review/start");
+    if (pendingReviews.length) {
+      for (const job of pendingReviews) bufferStartNotification(job, rpcMessage);
+      return;
+    }
+  }
+  if (owner.turnId && rpcMessage.method === "item/started" && params.item?.type === "contextCompaction") {
+    const compact = [...activeCompactions.values()].find(job => job.threadId === owner.threadId && job.startMethod === "thread/compact/start" && !job.startRequestPending && !job.turnId);
+    if (compact && Number.isFinite(params.startedAtMs) && params.startedAtMs >= compact.operationStartedAt) compact.turnId = owner.turnId;
+  }
   const turnJob = findTurnJob(params);
   const compactJob = findCompactJob(params);
   const job = compactJob || turnJob;
@@ -3552,6 +3635,7 @@ function handleAppServerNotification(rpcMessage) {
     return;
   }
   if (rpcMessage.method === "thread/tokenUsage/updated") {
+    if (!owner.turnId) return;
     if (job) {
       if (job.kind === "turn" && params.tokenUsage) job.rawTurnUsage = params.tokenUsage;
       job.latestTokenUsage = normalizeTokenUsage(params.tokenUsage) || job.latestTokenUsage;
@@ -3599,17 +3683,14 @@ function handleAppServerNotification(rpcMessage) {
   if (rpcMessage.method === "thread/compacted") {
     if (compactJob) {
       emitJobEvent(compactJob, "compacted", { text: "上下文已压缩" });
-      finishCompactJob(compactJob, true).catch((error) => {
-        emitJobEvent(compactJob, "error", { message: error.message || "主动压缩完成状态保存失败" });
-      });
     } else if (turnJob) {
       emitJobEvent(turnJob, "status", { text: "上下文已自动压缩" });
     }
     return;
   }
   if (rpcMessage.method === "turn/started") {
+    if (!owner.turnId) return;
     if (turnJob) {
-      turnJob.turnId = params.turn?.id || turnJob.turnId;
       rememberOwner({ threadId: turnJob.threadId, turnId: turnJob.turnId }, { repoId: turnJob.repoId, sessionId: turnJob.sessionId });
       emitJobEvent(turnJob, "status", { text: "Codex 正在运行 turn..." });
     }
@@ -3674,9 +3755,6 @@ function handleAppServerNotification(rpcMessage) {
     if (item.type === "contextCompaction") {
       const target = compactJob || turnJob;
       if (target) emitJobEvent(target, "status", { text: "压缩摘要已生成，正在写回会话..." });
-      if (compactJob) finishCompactJob(compactJob, true).catch((error) => {
-        emitJobEvent(compactJob, "error", { message: error.message || "主动压缩完成状态保存失败" });
-      });
       return;
     }
     if (item.type === "commandExecution" && job) {
@@ -4024,8 +4102,10 @@ function handleAppServerNotification(rpcMessage) {
     return;
   }
   if (rpcMessage.method === "turn/completed") {
+    if (!owner.turnId) return;
     if (compactJob) {
-      finishCompactJob(compactJob, true).catch((error) => {
+      const completed = params.turn?.status === "completed";
+      finishCompactJob(compactJob, completed, completed ? null : params.turn?.error?.message || "原生压缩回合未成功完成").catch((error) => {
         emitJobEvent(compactJob, "error", { message: error.message || "主动压缩完成状态保存失败" });
       });
       return;
@@ -4034,7 +4114,7 @@ function handleAppServerNotification(rpcMessage) {
       turnJob.rawTurnUsage = params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage || turnJob.rawTurnUsage;
       turnJob.latestTokenUsage =
         normalizeTokenUsage(params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage) || turnJob.latestTokenUsage;
-      const status = params.turn?.status || "completed";
+      const status = params.turn?.status || "unknown";
       finishTurnJob(turnJob, status === "completed", status === "completed" ? 0 : 1, status === "completed" ? null : status);
     }
     return;
@@ -7224,7 +7304,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       await settleRun(
         runId,
         {
-          status: needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
+          status: job.startConfirmationFailed || needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           turnId: job.turnId,
