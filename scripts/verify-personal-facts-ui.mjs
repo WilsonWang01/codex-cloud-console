@@ -15,11 +15,16 @@ await fs.mkdir(state); await fs.mkdir(bin); await fs.mkdir(path.join(personal, "
 await fs.chmod(personal, 0o700);
 await fs.mkdir(path.join(root, "work"));
 await fs.writeFile(path.join(personal, ".codex-cloud/uploads/note.txt"), "synthetic attachment\n");
+await fs.mkdir(path.join(root, "work/.codex-cloud/uploads"), { recursive: true });
+await fs.writeFile(path.join(root, "work/.codex-cloud/uploads/note.txt"), "synthetic attachment\n");
 const source = { id: "facts-source", repoId: "_personal", title: "合成验收旧会话", codexSessionId: "legacy-facts-thread", messageCount: 1,
   model: "gpt-6-astra", reasoning: "ultra", sandbox: "workspace-write", approval: "on-request", search: false,
   messages: [{ id: "fixture-message", role: "user", text: "合成旧历史，不复制到新上下文", time: new Date().toISOString() }],
   draft: { input: "合成待发送草稿", revision: 1, attachments: [{ name: "note.txt", path: ".codex-cloud/uploads/note.txt", mimeType: "text/plain", kind: "file", size: 21 }] } };
-await fs.writeFile(path.join(state, "chat-history.json"), JSON.stringify({ version: 2, activeByRepo: { _personal: source.id }, sessions: { [source.id]: source } }));
+const workHistory = { id: "work-history", repoId: "sample-app", title: "合成工作历史", codexSessionId: "work-thread", messages: [], draft: { input: "", attachments: [], revision: 1 } };
+const workText = { id: "work-text", repoId: "sample-app", title: "新会话", messages: [], draft: { input: "合成工作文字草稿", attachments: [], revision: 1 } };
+const workFile = { id: "work-file", repoId: "sample-app", title: "新会话", messages: [], draft: { input: "", attachments: source.draft.attachments, revision: 1 } };
+await fs.writeFile(path.join(state, "chat-history.json"), JSON.stringify({ version: 2, activeByRepo: { _personal: source.id, "sample-app": workHistory.id }, sessions: Object.fromEntries([source, workHistory, workText, workFile].map(session => [session.id, session])) }));
 await fs.writeFile(path.join(state, "personal-facts.json"), JSON.stringify({ version: 1, facts: [{ id: "fixture-fact", label: "合成称呼", value: "本机验收示例", source: "user", revision: 1, createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" }] }));
 const capture = path.join(root, "rpc.jsonl");
 await fs.writeFile(path.join(bin, "codex"), `#!/usr/bin/env node
@@ -31,8 +36,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   let result={};
   if(m.method==='account/read') result={account:{type:'chatgpt',email:'fixture@example.test',planType:'plus'},requiresOpenaiAuth:false};
   if(m.method==='model/list') result={data:[{id:'gpt-6-sol',model:'gpt-6-sol',displayName:'GPT-6 Sol',defaultReasoningEffort:'medium',supportedReasoningEfforts:[{reasoningEffort:'medium'}]},{id:'gpt-6-astra',model:'gpt-6-astra',displayName:'GPT-6 Astra',defaultReasoningEffort:'ultra',supportedReasoningEfforts:[{reasoningEffort:'ultra'}]}],nextCursor:null};
-  if(m.method==='thread/list') result={data:[{id:'legacy-facts-thread',cwd:${JSON.stringify(personal)},name:'合成验收旧会话',createdAt:1790000000,updatedAt:1790000000}],nextCursor:null};
-  if(m.method==='thread/read') result={thread:{id:'legacy-facts-thread',cwd:${JSON.stringify(personal)},turns:[{id:'fixture-turn',status:'completed',items:[{type:'userMessage',content:[{type:'text',text:'合成旧历史，不复制到新上下文'}]}]}]}};
+  const threads=[{id:'legacy-facts-thread',cwd:${JSON.stringify(personal)},name:'合成验收旧会话',createdAt:1790000000,updatedAt:1790000000},{id:'work-thread',cwd:${JSON.stringify(path.join(root, "work"))},name:'合成工作历史',createdAt:1790000000,updatedAt:1790000000}];
+  if(m.method==='thread/list') result={data:threads.filter(thread=>!m.params.cwd||m.params.cwd.includes(thread.cwd)),nextCursor:null};
+  if(m.method==='thread/read') {const thread=threads.find(thread=>thread.id===m.params.threadId);result={thread:{...thread,turns:[{id:'fixture-turn',status:'completed',items:[{type:'userMessage',content:[{type:'text',text:thread?.id==='work-thread'?'合成工作历史':'合成旧历史，不复制到新上下文'}]}]}]}};}
   if(m.method==='app/list') result={data:[],nextCursor:null};
   if(m.method==='app/installed') result={apps:[]};
   if(m.method==='mcpServerStatus/list') result={data:[],nextCursor:null};
@@ -64,6 +70,15 @@ try {
   }
   assert.match(logs, /listening on/);
   assert.equal((await fetch(base)).status, 200);
+  for (const [repoId, threadId] of [["_personal", "work-thread"], ["sample-app", "legacy-facts-thread"]]) {
+    const rejected = await (await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId, sessionId: "app-" + threadId }))).json();
+    assert.equal(rejected.ok, true); assert.equal(rejected.activeSessionId, null); assert.deepEqual(rejected.messages, []);
+    assert.equal(rejected.sessions.some(session => session.codexSessionId === threadId), false);
+  }
+  for (const sessionId of [workHistory.id, "app-work-thread", "unknown-session"]) {
+    const response = await fetch(base + "api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sessionId, message: "合成跨空间拒绝验收" }) });
+    assert.equal(response.status, 404); assert.equal((await response.json()).ok, false);
+  }
   if (process.argv.includes("--serve")) {
     console.log(JSON.stringify({ url: `${base}#/project/_personal/thread/facts-source`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused" }));
     await new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
@@ -76,17 +91,40 @@ try {
     await page.getByRole("button", { name: "开启新上下文", exact: true }).waitFor();
     assert.equal(await page.getByRole("textbox", { name: "向个人助理发送消息" }).inputValue(), source.draft.input);
     for (const width of [1280, 768, 390, 320]) {
-      await page.setViewportSize({ width, height: 900 });
+      const height = width <= 390 ? 480 : 900;
+      await page.setViewportSize({ width, height });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      try { await page.waitForFunction(() => document.querySelector(".composer-shell")?.getBoundingClientRect().bottom <= innerHeight + 1, undefined, { timeout: 3000 }); }
+      catch (error) {
+        const layout = await page.evaluate(() => ({ viewport: { width: innerWidth, height: innerHeight }, elements: [".workspace", ".workspace-header", ".session-content-grid", ".chat-panel", ".app-session-strip", ".personal-scope-notice", ".chat-window", ".composer-shell", ".personal-context-notice", ".composer", ".composer-footer"].map(selector => {
+          const element = document.querySelector(selector); if (!element) return { selector, absent: true };
+          const box = element.getBoundingClientRect(), style = getComputedStyle(element);
+          return { selector, top: box.top, bottom: box.bottom, height: box.height, flex: style.flex, minHeight: style.minHeight, padding: style.padding, margin: style.margin };
+        }) }));
+        await fs.writeFile(path.join(out, `layout-${width}-${height}.json`), JSON.stringify(layout, null, 2)); throw error;
+      }
       await page.screenshot({ path: path.join(out, `context-${width}.png`), fullPage: true });
+      const before = page.url();
+      await page.getByRole("button", { name: "开启新上下文", exact: true }).click();
+      const dialog = page.getByRole("dialog", { name: "开启新上下文？", exact: true });
+      await dialog.waitFor();
+      const box = await dialog.boundingBox();
+      assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1 && box.y >= 0 && box.y + box.height <= height + 1);
+      assert.equal(await page.evaluate(() => document.activeElement?.textContent), "取消");
+      await page.screenshot({ path: path.join(out, `confirmation-${width}.png`), fullPage: true });
+      await dialog.getByRole("button", { name: "取消", exact: true }).click();
+      await dialog.waitFor({ state: "hidden" });
+      assert.equal(page.url(), before);
     }
     await page.setViewportSize({ width: 1280, height: 900 });
     const beforeCancel = page.url();
-    page.once("dialog", dialog => dialog.dismiss());
     await page.getByRole("button", { name: "开启新上下文", exact: true }).click();
+    await page.getByRole("dialog", { name: "开启新上下文？", exact: true }).waitFor();
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog", { name: "开启新上下文？", exact: true }).waitFor({ state: "hidden" });
     assert.equal(page.url(), beforeCancel);
-    page.once("dialog", dialog => dialog.accept());
     await page.getByRole("button", { name: "开启新上下文", exact: true }).click();
+    await page.getByRole("dialog", { name: "开启新上下文？", exact: true }).getByRole("button", { name: "确认开启", exact: true }).click();
     await page.waitForURL(url => !url.hash.includes("facts-source") && !url.hash.includes("legacy-facts-thread"));
     assert.equal(await page.getByRole("textbox", { name: "向个人助理发送消息" }).inputValue(), source.draft.input);
     assert.equal(await page.getByText("note.txt", { exact: true }).count() > 0, true);
@@ -95,6 +133,17 @@ try {
     assert.equal(copied.codexSessionId, null); assert.deepEqual(copied.messages, []);
     assert.equal(copied.model, "gpt-6-astra"); assert.equal(copied.reasoning, "ultra"); assert.equal(copied.sandbox, "workspace-write");
     assert.equal(chat.sessions[source.id].draft.input, source.draft.input);
+    const newContextUrl = page.url();
+    await page.locator(".sidebar").getByRole("button", { name: /^合成验收旧会话/ }).click();
+    await page.waitForURL(url => url.hash.includes("legacy-facts-thread"));
+    await page.getByText("合成旧历史，不复制到新上下文", { exact: true }).waitFor();
+    await page.locator(".sidebar").getByRole("button", { name: /新对话.*草稿.*1 附件/ }).click();
+    await page.waitForURL(newContextUrl);
+    assert.equal(await page.getByRole("textbox", { name: "向个人助理发送消息" }).inputValue(), source.draft.input);
+    await page.reload();
+    await page.getByRole("textbox", { name: "向个人助理发送消息" }).waitFor();
+    await page.waitForFunction(expected => document.querySelector('textarea[placeholder="向个人助理发送消息"]')?.value === expected, source.draft.input);
+    assert.equal(await page.getByText("note.txt", { exact: true }).count() > 0, true);
     await page.getByRole("button", { name: "设置", exact: true }).click();
     await page.getByRole("button", { name: "编辑 合成称呼", exact: true }).click();
     assert.equal(await page.getByLabel("在后续个人任务中使用").isChecked(), true);
@@ -114,9 +163,24 @@ try {
     }
     const facts = JSON.parse(await fs.readFile(path.join(state, "personal-facts.json"), "utf8"));
     assert.equal(facts.version, 2); assert.equal(facts.facts[0].enabled, false); assert.ok(facts.facts[0].confirmedAt);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.getByRole("button", { name: "工作", exact: true }).click();
+    await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).waitFor();
+    await page.locator(".sidebar").getByRole("button", { name: /^合成工作历史/ }).waitFor();
+    await page.locator(".sidebar button.session-state-draft").nth(1).waitFor();
+    assert.equal(await page.locator(".sidebar").getByRole("button", { name: /^合成验收旧会话/ }).count(), 0);
+    assert.equal(await page.locator(".sidebar button.session-state-draft").count(), 2);
+    await page.locator(".sidebar").getByRole("button", { name: /新对话.*草稿.*1 附件/ }).click();
+    await page.waitForURL(url => url.hash.includes("work-file"));
+    assert.equal(await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).inputValue(), "");
+    assert.equal(await page.getByText("note.txt", { exact: true }).count() > 0, true);
+    await page.locator(".sidebar button.session-state-draft").click();
+    await page.waitForURL(url => url.hash.includes("work-text"));
+    assert.equal(await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).inputValue(), workText.draft.input);
     const rpc = (await fs.readFile(capture, "utf8")).trim().split("\n").map(JSON.parse);
     assert.equal(rpc.some(message => ["turn/start", "turn/steer", "thread/compact/start", "thread/fork", "mcpServer/tool/call"].includes(message.method)), false);
+    assert.equal(rpc.some(message => message.method === "thread/resume"), false, "拒绝跨空间导入不能先恢复或改写原线程");
     assert.deepEqual(errors, []);
-    console.log("PASS actual isolated backend/UI: four widths, explicit fresh context, preserved original draft/attachment/runtime, expiry/disable; zero model or connector writes");
+    console.log("PASS actual isolated backend/UI: cross-space thread import rejected before resume, four widths, inline confirmation/cancel/Escape, personal draft navigation/reload, work text/file drafts, preserved history/runtime, expiry/disable; zero model or connector writes");
   }
 } finally { await stop(); }

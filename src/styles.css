@@ -7324,7 +7324,16 @@ pre {
 .personal-fact-settings input[type="checkbox"] { flex: 0 0 18px; width: 18px; height: 18px; }
 .personal-fact-settings .personal-fact-expiry { display: grid; width: 100%; min-width: 0; }
 .personal-fact-expiry input { min-width: 0; max-width: 100%; box-sizing: border-box; }
-.personal-context-notice .mini-action { min-height: 44px; }
+.external-review-banner.personal-context-notice { display: flex; flex-wrap: nowrap; align-items: center; }
+.external-review-banner.personal-context-notice .mini-action { min-height: 44px; margin-left: 0; }
+.personal-context-details { display: inline-flex; align-items: center; gap: 4px; min-width: 0; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; }
+.personal-context-details svg { flex-shrink: 0; }
+.personal-context-dialog { width: min(440px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
+.personal-context-dialog::backdrop { background: rgb(0 0 0 / 35%); }
+.personal-context-dialog h3 { margin: 0; font-size: 17px; }
+.personal-context-dialog p { font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.personal-context-dialog > div { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.personal-context-dialog button { min-height: 44px; }
 .composer-shell { position: relative; }
 .external-review-banner { display: flex; align-items: flex-start; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid #e9c993; border-bottom: 0; border-radius: 6px 6px 0 0; background: #fff8e9; color: var(--text); }
 .external-review-banner > svg { flex: 0 0 auto; margin-top: 2px; color: #a36212; }
@@ -7384,6 +7393,11 @@ pre {
   .queued-turn-banner .mini-action, .composer-busy-actions .mini-action { min-height: 44px; }
   .external-review-banner { flex-wrap: wrap; }
   .external-review-banner .mini-action { min-height: 44px; margin-left: 28px; }
+  .session-content-grid .composer-shell { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
+  .composer-notices { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .composer-notices:has(> .external-review-banner) { min-height: 64px; }
+  .composer-notices:has(> .queued-turn-banner):not(:has(> .external-review-banner)) { min-height: 44px; }
+  .composer-shell > .composer, .composer-shell > .composer-footer, .composer-shell > .attachment-strip, .composer-shell > .composer-busy-actions { flex-shrink: 0; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer button { min-height: 44px; height: auto; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer .footer-save-routine { width: 44px; min-width: 44px; }
@@ -7403,6 +7417,7 @@ pre {
 }
 
 @media (max-width: 820px) and (max-height: 600px) {
+  .session-content-grid .chat-window { padding-block: 0; }
   .workspace:has(.personal-scope-notice) .pending-approvals { max-height: min(18dvh, 75px); }
   .session-content-grid .personal-scope-notice { min-height: 30px; padding-block: 2px; }
   .session-content-grid .personal-scope-actions, .session-content-grid .personal-connection-brief { display: none; }

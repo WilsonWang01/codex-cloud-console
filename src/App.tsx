@@ -1465,7 +1465,8 @@ function isVerificationChatSession(session: ChatSession) {
 }
 
 function visibleSessionList(sessions: ChatSession[], activeSessionId: string) {
-  return sessions.filter((session) => !isDraftChatSession(session) || session.id === activeSessionId);
+  return sessions.filter((session) => !isDraftChatSession(session) || session.id === activeSessionId
+    || Boolean(persistedDraftInput(session.draft?.input || "").trim() || session.draft?.attachments?.length));
 }
 
 function attentionMatchesSession(item: AttentionItem, session: ChatSession) {
@@ -10187,8 +10188,7 @@ function CloudChat({
         onDragOver={handleComposerDragOver}
         onDrop={handleComposerDrop}
       >
-        {repo.kind === "personal" && activeSessionId && <PersonalContextNotice key={`${activeSessionId}:${activeSession?.messageCount || 0}`} sessionId={activeSessionId}
-          disabled={busy || Boolean(busyAction) || uploadingAttachments || Boolean(queuedTurn) || Boolean(activeSession?.externalActionReview)} onContinue={onContinuePersonalContext} />}
+        <div className="composer-notices">
         {activeSession?.externalActionReview && <div className="external-review-banner" role="alert" data-testid="external-action-review">
           <TriangleAlert size={18} aria-hidden="true" />
           <span>
@@ -10215,6 +10215,9 @@ function CloudChat({
           </span>
           {queuedTurn.status !== "dispatching" && <button type="button" className="mini-action" onClick={onRestoreQueued} disabled={queueRestoreBusy}>{queueRestoreBusy ? "撤回中…" : "撤回到草稿"}</button>}
         </div>}
+        {repo.kind === "personal" && activeSessionId && <PersonalContextNotice key={`${activeSessionId}:${activeSession?.messageCount || 0}`} sessionId={activeSessionId}
+          disabled={busy || Boolean(busyAction) || uploadingAttachments || Boolean(queuedTurn) || Boolean(activeSession?.externalActionReview)} onContinue={onContinuePersonalContext} />}
+        </div>
         {newProgress && <button className="chat-new-progress" type="button" onClick={() => {
           followChatRef.current = true;
           if (chatWindowRef.current) chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;

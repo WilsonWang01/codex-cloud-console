@@ -1215,6 +1215,7 @@ async function ensureChatSession(repoId, sessionHint, title = "新会话") {
     const imported = await importAppServerThreadSession(repo, appThreadIdFromSessionHint(sessionHint), title).catch(() => null);
     if (imported) return imported;
   }
+  if (String(sessionHint || "").trim()) throw Object.assign(new Error("会话不属于当前项目或无法核对归属；未创建新会话或启动任务。"), { statusCode: 404, code: "session_not_found" });
 
   const chosenActiveId = chooseRepoActiveSessionId(store, repoId);
   const active = chosenActiveId && store.sessions[chosenActiveId]?.repoId === repoId
@@ -1495,6 +1496,10 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
 
 async function importAppServerThreadSession(repo, threadId, title = "新会话") {
   if (!threadId) return null;
+  const inspected = await codexAppServerRequest("thread/read", { threadId, includeTurns: false }, 20_000);
+  const original = inspected.result?.thread;
+  if (!inspected.ok || original?.id !== threadId || typeof original.cwd !== "string" || !path.isAbsolute(original.cwd)
+    || !repoMatchesThreadPath(repo, path.resolve(original.cwd))) return null;
   const response = await codexAppServerRequest("thread/resume", {
     threadId, cwd: repo.path,
     ...(repo.kind === "personal" ? { sandbox: "read-only", approvalPolicy: "on-request" } : {}),
