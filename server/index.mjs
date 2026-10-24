@@ -43,7 +43,7 @@ import { readConnectedApps } from "./connected-apps.mjs";
 import { listPersonalFiles, resolvePersonalFile, sendPersonalFile } from "./personal-files.mjs";
 import { readRootedFile } from "./safe-file-read.mjs";
 import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPath } from "./personal-file-bridge.mjs";
-import { createPersonalFactsStore } from "./personal-facts.mjs";
+import { createPersonalFactsStore, normalizePersonalFactContext, personalFactContextIssue } from "./personal-facts.mjs";
 import { createPersonalCommitmentsStore } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
@@ -731,6 +731,8 @@ function normalizeSession(item, repoId) {
     draft: normalizeChatDraft(item?.draft),
     queuedTurn: normalizeQueuedTurn(item?.queuedTurn),
     externalActionReview: normalizeExternalActionReview(item?.externalActionReview),
+    personalFactContext: repoId === personalRepoId ? normalizePersonalFactContext(item?.personalFactContext) : null,
+    personalContextParentId: repoId === personalRepoId && typeof item?.personalContextParentId === "string" ? item.personalContextParentId.slice(0, 120) : null,
   };
 }
 
@@ -1213,6 +1215,7 @@ async function ensureChatSession(repoId, sessionHint, title = "新会话") {
     const imported = await importAppServerThreadSession(repo, appThreadIdFromSessionHint(sessionHint), title).catch(() => null);
     if (imported) return imported;
   }
+  if (String(sessionHint || "").trim()) throw Object.assign(new Error("会话不属于当前项目或无法核对归属；未创建新会话或启动任务。"), { statusCode: 404, code: "session_not_found" });
 
   const chosenActiveId = chooseRepoActiveSessionId(store, repoId);
   const active = chosenActiveId && store.sessions[chosenActiveId]?.repoId === repoId
@@ -1493,6 +1496,10 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
 
 async function importAppServerThreadSession(repo, threadId, title = "新会话") {
   if (!threadId) return null;
+  const inspected = await codexAppServerRequest("thread/read", { threadId, includeTurns: false }, 20_000);
+  const original = inspected.result?.thread;
+  if (!inspected.ok || original?.id !== threadId || typeof original.cwd !== "string" || !path.isAbsolute(original.cwd)
+    || !repoMatchesThreadPath(repo, path.resolve(original.cwd))) return null;
   const response = await codexAppServerRequest("thread/resume", {
     threadId, cwd: repo.path,
     ...(repo.kind === "personal" ? { sandbox: "read-only", approvalPolicy: "on-request" } : {}),
@@ -2037,7 +2044,16 @@ function cloudRuntimeDeveloperInstructions(runtime) {
   ].join("\n");
 }
 
-async function appServerThreadParams(repo, runtime) {
+async function preparePersonalFactContext(repo, session) {
+  if (repo.kind !== "personal") return null;
+  const snapshot = await personalFactsStore.snapshot();
+  const issue = personalFactContextIssue(session, snapshot);
+  if (issue) throw Object.assign(new Error(issue), { statusCode: 409, code: "personal_context_changed" });
+  return snapshot;
+}
+
+async function appServerThreadParams(repo, runtime, personalSnapshot = null) {
+  if (repo.kind === "personal" && !personalSnapshot) throw new Error("个人资料上下文尚未核对");
   return {
     cwd: repo.path,
     model: runtime.model,
@@ -2047,7 +2063,7 @@ async function appServerThreadParams(repo, runtime) {
     personality: "pragmatic",
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
-      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, await personalFactsStore.list(), await personalCommitmentsStore.list())] : []),
+      ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, personalSnapshot.facts, await personalCommitmentsStore.list())] : []),
     ].join("\n"),
     config: {
       model_reasoning_effort: runtime.reasoning,
@@ -3137,9 +3153,13 @@ function armTurnJobTimeout(job) {
 
 async function resolveThreadForJob(job) {
   const client = appServerClientForJob(job);
+  const snapshot = job.personalFactSnapshot || await preparePersonalFactContext(job.repo, job.session);
+  job.personalFactSnapshot = snapshot;
+  const context = (threadId) => snapshot ? { personalFactContext: { ...snapshot.context, threadId } } : {};
   if (job.threadId) {
+    if (snapshot) await updateSessionRuntime(job.repoId, job.sessionId, context(job.threadId), { makeActive: false });
     try {
-      await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime) }, 30_000);
+      await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime, snapshot) }, 30_000);
       emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}` });
       rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
       return job.threadId;
@@ -3147,11 +3167,11 @@ async function resolveThreadForJob(job) {
       throw new Error(`原 app-server thread 无法恢复，已保留原会话，请重试：${error.message || error}`);
     }
   }
-  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime), 30_000);
+  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot), 30_000);
   job.threadId = started?.thread?.id;
   if (!job.threadId) throw new Error("Codex app-server did not return a thread id");
   rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
-  await updateSessionRuntime(job.repoId, job.sessionId, (current) => ({ codexSessionId: job.threadId, ...jobRuntimePatch(job, current) }), { makeActive: job.makeSessionActive !== false });
+  await updateSessionRuntime(job.repoId, job.sessionId, (current) => ({ codexSessionId: job.threadId, ...jobRuntimePatch(job, current), ...context(job.threadId) }), { makeActive: job.makeSessionActive !== false });
   emitJobEvent(job, "session", { codexSessionId: job.threadId, threadId: job.threadId });
   emitJobEvent(job, "status", { text: `已创建 app-server thread ${job.threadId.slice(0, 8)}` });
   return job.threadId;
@@ -3179,7 +3199,9 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
     const compact = activeCompactions.get(key);
     if (compact && !compact.completed) throw Object.assign(new Error("当前会话正在压缩上下文"), { statusCode: 409 });
 
+    const personalFactSnapshot = await preparePersonalFactContext(repo, session);
     const job = createServerJob("turn", repo, session, runtime);
+    job.personalFactSnapshot = personalFactSnapshot;
     job.maxRuntimeMs = options.maxRuntimeMs;
     job.automationRunId = options.automationRunId || null;
     job.unattendedPersonalSchedule = options.unattendedPersonalSchedule === true;
@@ -3206,6 +3228,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
           return;
         }
         const params = await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs);
+        if (job.personalFactSnapshot) await preparePersonalFactContext(repo, { ...session, codexSessionId: job.threadId, personalFactContext: { ...job.personalFactSnapshot.context, threadId: job.threadId } });
         if (options.outputSchema) params.outputSchema = options.outputSchema;
         const result = await appServerClientForJob(job).request("turn/start", params, 30_000);
         job.turnId = result?.turn?.id || null;
@@ -3365,7 +3388,9 @@ async function startCompactJob(repo, session, runtime) {
     if (activeTurns.get(key) && !activeTurns.get(key).completed) {
       throw Object.assign(new Error("当前会话仍在回复，请先等待或停止"), { statusCode: 409 });
     }
+    const personalFactSnapshot = await preparePersonalFactContext(repo, session);
     const job = createServerJob("compact", repo, session, runtime);
+    job.personalFactSnapshot = personalFactSnapshot;
     activeCompactions.set(key, job);
     job.timeoutTimer = setTimeout(() => {
       finishCompactJob(job, false, `主动压缩超过 ${Math.round(codexCompactTimeoutMs / 1000)} 秒未完成，已标记为失败。`).catch((error) => {
@@ -9190,7 +9215,10 @@ app.get("/healthz", async (_req, res) => {
   let clientsHealth;
   try { await apiClientStore.list(); clientsHealth = { ok: true }; }
   catch { clientsHealth = { ok: false, error: "调用方权限或限制记录不可用" }; }
-  const strictOk = Boolean(health.ok && ledgerHealth.ok && clientsHealth.ok);
+  let personalFactsHealth;
+  try { await personalFactsStore.list(); personalFactsHealth = { ok: true, readableFormats: [1, 2], writeFormat: 2 }; }
+  catch { personalFactsHealth = { ok: false, error: "个人资料格式或存储不可用，请勿以旧备份覆盖" }; }
+  const strictOk = Boolean(health.ok && ledgerHealth.ok && clientsHealth.ok && personalFactsHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
   const reachable =
@@ -9199,7 +9227,7 @@ app.get("/healthz", async (_req, res) => {
   const responseHealth =
     {
       ...health,
-      layers: { ...health.layers, usageLedger: ledgerHealth, apiClients: clientsHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
+      layers: { ...health.layers, usageLedger: ledgerHealth, apiClients: clientsHealth, personalFacts: personalFactsHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
       ok: strictOk,
       strictOk,
       partial: !strictOk && reachable,
@@ -9917,6 +9945,7 @@ app.post("/api/codex/thread-fork", async (req, res) => {
   const repo = getRepoById(req.body?.repoId);
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
   if (!session.codexSessionId) return res.status(400).json({ ok: false, error: "当前会话还没有 app-server thread。" });
+  await preparePersonalFactContext(repo, session);
   const response = await codexAppServerRequest("thread/fork", { threadId: session.codexSessionId, cwd: repo.path }, 30_000);
   if (!response.ok) return res.status(500).json({ ok: false, error: response.error });
   const thread = response.result?.thread || response.result?.data || response.result || {};
@@ -9929,6 +9958,7 @@ app.post("/api/codex/thread-fork", async (req, res) => {
       title: `${session.title || "会话"} 分支`,
       messages: [],
       codexSessionId: String(threadId),
+      personalFactContext: session.personalFactContext ? { ...session.personalFactContext, threadId: String(threadId) } : null,
       model: session.model,
       reasoning: session.reasoning,
       sandbox: session.sandbox,
@@ -10073,6 +10103,7 @@ app.post("/api/codex/turn-steer", async (req, res) => {
   if (!message) return res.status(400).json({ ok: false, error: "Message is required" });
   const active = activeTurns.get(`${repo.id}:${session.id}`);
   if (!active || !active.turnId) return res.status(409).json({ ok: false, error: "当前 turn 尚未准备好接收补充指令。" });
+  await preparePersonalFactContext(repo, await readStoredSessionForJob(repo.id, session.id));
   await appServerClientForRepo(repo).request("turn/steer", {
     threadId: active.threadId,
     expectedTurnId: active.turnId,
@@ -10344,6 +10375,48 @@ app.post("/api/chat/sessions/:id/select", async (req, res) => {
   res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages });
 });
 
+app.get("/api/chat/sessions/:id/personal-context", async (req, res) => {
+  const repo = getRepoById(req.query.repoId);
+  if (repo.kind !== "personal") return res.status(400).json({ ok: false, error: "仅适用于个人空间" });
+  const store = await readChatStore();
+  const session = store.sessions[req.params.id];
+  if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "会话不存在" });
+  const snapshot = await personalFactsStore.snapshot();
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ok: true, issue: personalFactContextIssue(session, snapshot), providedAt: session.personalFactContext?.providedAt || null,
+    providedCount: session.personalFactContext?.facts.length ?? null, activeCount: snapshot.facts.length });
+});
+
+app.post("/api/chat/sessions/:id/personal-context", async (req, res) => {
+  const repo = getRepoById(req.body?.repoId);
+  if (repo.kind !== "personal") return res.status(400).json({ ok: false, error: "仅适用于个人空间" });
+  const pendingId = req.body?.pendingSessionId;
+  if (typeof pendingId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(pendingId)) return res.status(400).json({ ok: false, error: "缺少有效的新上下文请求标识" });
+  const key = makeSessionKey(repo.id, req.params.id);
+  const created = await serializeSessionTransition(key, () => mutateChatStore((store) => {
+    const source = store.sessions[req.params.id];
+    if (!source || source.repoId !== repo.id) throw Object.assign(new Error("原会话不存在"), { statusCode: 404 });
+    if (source.externalActionReview || source.queuedTurn || activeTurns.has(key) || activeCompactions.has(key) || removingSessions.has(key)) {
+      throw Object.assign(new Error("请先等待任务结束，核对外部操作或撤回排队消息；原会话未改变"), { statusCode: 409 });
+    }
+    const existing = store.sessions[pendingId];
+    if (existing) {
+      if (existing.repoId !== repo.id || existing.personalContextParentId !== source.id) throw Object.assign(new Error("请求标识已被其他会话使用"), { statusCode: 409 });
+      store.activeByRepo[repo.id] = existing.id;
+      return existing;
+    }
+    const draft = normalizeChatDraft(source.draft);
+    if (req.body.expectedDraftRevision !== draft.revision) throw Object.assign(new Error("原草稿已变化，请核对后重试；输入未删除"), { statusCode: 409 });
+    const session = normalizeSession({ id: pendingId, repoId: repo.id, title: "新会话", ...runtimeForRepo(repo, normalizeRuntime({}, source)),
+      runtimeSelectionId: crypto.randomUUID(), personalContextParentId: source.id, draft: { ...draft, revision: 1 }, messages: [] }, repo.id);
+    store.sessions[session.id] = session;
+    store.activeByRepo[repo.id] = session.id;
+    return session;
+  }));
+  const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: true });
+  res.json({ ok: true, repoId: repo.id, activeSessionId: created.id, sessions: summary.sessions, messages: [] });
+});
+
 app.post("/api/chat/sessions/:id/external-action-review/acknowledge", async (req, res) => {
   const repo = getRepoById(req.body?.repoId);
   const reviewId = String(req.body?.reviewId || "");
@@ -10406,9 +10479,11 @@ app.patch("/api/chat/sessions/:id/runtime", async (req, res) => {
       pendingTurnRuntime = { model: requestedRuntime.model, reasoning: requestedRuntime.reasoning, updatedAt: new Date().toISOString() };
     }
     if (session.codexSessionId && !active) {
+      const snapshot = await preparePersonalFactContext(repo, session);
+      if (snapshot) await updateSessionRuntime(repo.id, session.id, { personalFactContext: { ...snapshot.context, threadId: session.codexSessionId } }, { makeActive: false });
       const response = await codexAppServerRequest(
         "thread/resume",
-        { threadId: session.codexSessionId, ...await appServerThreadParams(repo, requestedRuntime) },
+        { threadId: session.codexSessionId, ...await appServerThreadParams(repo, requestedRuntime, snapshot) },
         20_000,
       );
       if (!response.ok) {
@@ -10886,7 +10961,7 @@ app.get("/api/personal/files", async (_req, res) => {
 });
 
 app.get("/api/personal/facts", async (_req, res) => {
-  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, facts: await personalFactsStore.list() }); }
+  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, governanceVersion: 1, facts: await personalFactsStore.list() }); }
   catch (error) { sendRouteError(res, error); }
 });
 
@@ -11303,7 +11378,7 @@ app.post("/api/chat/stream", async (req, res) => {
     subscribeJobEvents(job, res);
     await job.promise;
   } catch (error) {
-    writeSse(res, "error", { message: error.message || "云端 Codex 对话失败" });
+    writeSse(res, "error", { message: error.message || "云端 Codex 对话失败", code: error.code });
     writeSse(res, "done", { ok: false, code: 1, sessionId: session.id, codexSessionId: session.codexSessionId || null, error: error.message || "云端 Codex 对话失败" });
   } finally {
     if (!res.writableEnded && !res.destroyed) res.end();

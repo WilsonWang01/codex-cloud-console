@@ -22,6 +22,25 @@ const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
 
+test("个人和工作列表保留非当前文字或附件草稿，仅隐藏空白草稿", () => {
+  const context = vm.createContext({});
+  const functions = section(frontend, "function persistedDraftInput(", "function draftPayload(")
+    + section(frontend, "function isDraftChatSession(", "function attentionMatchesSession(");
+  vm.runInContext(ts.transpileModule(functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  for (const repoId of ["_personal", "work"]) {
+    const rows = [
+      { id: "active", isDraft: true },
+      { id: "empty", isDraft: true, draft: { input: "  " } },
+      { id: "command", isDraft: true, draft: { input: "/help" } },
+      { id: "text", isDraft: true, draft: { input: "需要找回的草稿" } },
+      { id: "file", isDraft: true, draft: { input: "", attachments: [{ name: "note.txt" }] } },
+      { id: "native", isDraft: false, codexSessionId: "thread" },
+    ].map(row => ({ ...row, repoId }));
+    assert.deepEqual(Array.from(context.visibleSessionList(rows, "active"), row => row.id), ["active", "text", "file", "native"]);
+    assert.deepEqual(Array.from(context.visibleSessionList(rows, "native"), row => row.id), ["text", "file", "native"]);
+  }
+});
+
 test("代理来源仅信任回环，映射 IPv6 子网不能错误信任任意 IPv4", () => {
   const require = createRequire(import.meta.url);
   const proxyAddr = createRequire(require.resolve("express"))("proxy-addr");
@@ -440,6 +459,58 @@ test("官方会话活动采用 recencyAt，不把恢复或元数据写入当作�
   ]) assert.match(code, /appThreadActivityTime\(thread/);
 });
 
+test("导入线程先只读核对归属，不能通过手动线程编号迁移其他空间的上下文", async () => {
+  const repo = { id: "_personal", kind: "personal", path: "/cloud/personal" };
+  let thread = { id: "thread-one", cwd: "/cloud/work" }, mutations = 0;
+  const calls = [];
+  const context = vm.createContext({
+    path, codexAppServerRequest: async (method, params) => { calls.push({ method, params }); return { ok: true, result: { thread } }; },
+    runtimeFromAppServerSettings: () => ({}), normalizeSession: session => session,
+    appThreadSessionId: id => "app-" + id, appThreadTitle: () => "合成线程", appThreadTime: () => "", appThreadActivityTime: () => "",
+    findStoredSessionByHint: () => null,
+    mutateChatStore: async mutate => { mutations++; return mutate({ sessions: {}, activeByRepo: {} }); },
+  });
+  vm.runInContext(section(source, "function normalizedPathPrefix(", "function repoForThreadNotification("), context);
+  vm.runInContext(section(source, "async function importAppServerThreadSession(", "async function listAppServerThreads("), context);
+  for (const candidate of [
+    { id: "thread-one", cwd: "/cloud/work" }, { id: "thread-one", cwd: "/cloud/personal-other" },
+    { id: "thread-one", cwd: "/cloud/personal/../work" }, { id: "thread-one", cwd: "relative" },
+    { id: "thread-one" }, { id: "different", cwd: repo.path },
+  ]) {
+    thread = candidate; calls.length = 0;
+    assert.equal(await context.importAppServerThreadSession(repo, "thread-one"), null);
+    assert.deepEqual(calls.map(call => call.method), ["thread/read"]);
+    assert.equal(mutations, 0);
+  }
+  thread = { id: "thread-one", cwd: repo.path + "/notes" }; calls.length = 0;
+  const imported = await context.importAppServerThreadSession(repo, "thread-one");
+  assert.equal(imported.repoId, repo.id); assert.equal(imported.codexSessionId, thread.id);
+  assert.deepEqual(calls.map(call => call.method), ["thread/read", "thread/resume"]);
+  assert.equal(mutations, 1);
+});
+
+test("显式未知或其他项目会话不静默创建替代会话，省略编号仍可正常新建", async () => {
+  const store = { sessions: { foreign: { id: "foreign", repoId: "work" }, own: { id: "own", repoId: "personal" } }, activeByRepo: {} };
+  let writes = 0;
+  const context = vm.createContext({
+    readChatStore: async () => store,
+    findStoredSessionByHint: (data, repoId, id) => data.sessions[id]?.repoId === repoId ? data.sessions[id] : null,
+    activateStoredSession: async (_repo, id) => store.sessions[id], isEmptyDraftSession: () => false,
+    shouldResolveAppThreadHint: hint => String(hint || "").startsWith("app-"),
+    getRepoById: id => ({ id }), importAppServerThreadSession: async () => null, appThreadIdFromSessionHint: hint => hint.slice(4),
+    chooseRepoActiveSessionId: () => "", sessionId: () => "fresh", normalizeSession: session => session,
+    mutateChatStore: async mutate => { writes++; return mutate(store); }, compactEmptyDraftSessions: () => {},
+  });
+  vm.runInContext(section(source, "async function ensureChatSession(", "async function resolveChatSessionForRead("), context);
+  for (const id of ["foreign", "missing", "app-foreign"]) {
+    await assert.rejects(context.ensureChatSession("personal", id), error => error.statusCode === 404 && error.code === "session_not_found");
+  }
+  assert.equal(writes, 0);
+  assert.equal((await context.ensureChatSession("personal", "own")).id, "own");
+  assert.equal((await context.ensureChatSession("personal", "")).id, "fresh");
+  assert.equal(writes, 1); assert.equal(store.sessions.foreign.repoId, "work");
+});
+
 test("迟到的官方只读响应不覆盖写入队列中的较新活动时间", async () => {
   const current = { id: "one", repoId: "personal", codexSessionId: "thread-one", updatedAt: "2026-10-05T12:00:00.000Z" };
   const store = { activeByRepo: {}, sessions: { one: current } };
@@ -577,7 +648,7 @@ test("恢复原 worktree，缺失或越界目录不会回退主仓库", async ()
 
 test("恢复超时保留原线程且不会新建线程", async () => {
   const calls = [];
-  const context = { appServerClientForJob: () => ({ request: async (method) => { calls.push(method); throw new Error("timeout"); } }), appServerThreadParams: () => ({}), emitJobEvent() {}, rememberOwner() {}, updateSessionRuntime: async () => assert.fail("must not replace thread") };
+  const context = { preparePersonalFactContext: async () => null, appServerClientForJob: () => ({ request: async (method) => { calls.push(method); throw new Error("timeout"); } }), appServerThreadParams: () => ({}), emitJobEvent() {}, rememberOwner() {}, updateSessionRuntime: async () => assert.fail("must not replace thread") };
   vm.createContext(context);
   vm.runInContext(section(source, "async function resolveThreadForJob(", "async function startTurnJob("), context);
   const job = { threadId: "original", repo: {}, runtime: {} };
