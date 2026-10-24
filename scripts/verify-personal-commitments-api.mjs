@@ -56,7 +56,7 @@ test("personal draft HTTP retries, restart and legacy migration preserve one uns
   };
   try {
     await start();
-    const created = await request("/api/personal/commitments", "POST", { title: "旅行准备", nextStep: "核对车次" });
+    const created = await request("/api/personal/commitments", "POST", { title: "旅行准备", nextStep: "核对车次", waitingReason: "等日期确认", milestones: [{ title: "查路线", done: true }, { title: "预订车票", done: false }] });
     const item = created.body.commitment;
     const route = `/api/personal/commitments/${item.id}/draft`;
     const replies = await Promise.all(Array.from({ length: 3 }, () => request(route, "POST", { revision: item.revision })));
@@ -64,6 +64,7 @@ test("personal draft HTTP retries, restart and legacy migration preserve one uns
     const id = replies[0].body.activeSessionId;
     assert.equal(new Set(replies.map((reply) => reply.body.activeSessionId)).size, 1);
     assert.match(replies[0].body.sessions.find((session) => session.id === id).draft.input, /旅行准备[\s\S]*核对车次/);
+    assert.match(replies[0].body.sessions.find((session) => session.id === id).draft.input, /我记录的等待原因：等日期确认[\s\S]*我记录的步骤（已完成）：查路线/);
     const saved = await request(`/api/chat/sessions/${id}/draft`, "PATCH", { repoId: "_personal", input: "用户修改的旅行草稿", attachments: [], expectedRevision: 1 });
     assert.equal(saved.status, 200);
     await stop();
@@ -76,12 +77,34 @@ test("personal draft HTTP retries, restart and legacy migration preserve one uns
     assert.equal(Object.keys(chat.sessions).length, 1);
     assert.equal(chat.sessions[id].codexSessionId, null);
     assert.deepEqual(chat.sessions[id].messages, []);
+    const progressRead = await request("/api/personal/commitments"); assert.equal(progressRead.body.progressVersion, 1);
+    assert.deepEqual(progressRead.body.commitments[0].milestones, item.milestones);
 
     const legacy = (await request("/api/personal/commitments", "POST", { title: "迁移旧关联" })).body.commitment;
     const migrated = await request(`/api/personal/commitments/${legacy.id}/draft`, "POST", { revision: legacy.revision, pendingSessionId: id });
     assert.equal(migrated.body.activeSessionId, id);
     assert.equal(migrated.body.sessions.find((session) => session.id === id).draft.input, "用户修改的旅行草稿");
     const work = (await request("/api/chat/sessions", "POST", { repoId: "work" })).body.activeSessionId;
+    const otherPersonal = (await request("/api/chat/sessions", "POST", { repoId: "_personal", title: "另一段个人跟进" })).body.activeSessionId;
+    const current = progressRead.body.commitments[0];
+    const progressRoute = `/api/personal/commitments/${item.id}`;
+    const preserved = await fs.readFile(path.join(stateRoot, "personal-commitments.json"), "utf8");
+    for (const [method, target] of [["POST", "/api/personal/commitments"], ["PATCH", progressRoute]]) {
+      for (const ids of [[work], [otherPersonal, work], ["unknown-personal"]]) {
+        const rejected = await request(target, method, { title: "禁止串入工作", revision: current.revision, relatedSessionIds: ids });
+        assert.equal(rejected.status, 404); assert.equal(await fs.readFile(path.join(stateRoot, "personal-commitments.json"), "utf8"), preserved);
+      }
+    }
+    const linkedProgress = await request(progressRoute, "PATCH", { revision: current.revision, relatedSessionIds: [otherPersonal], waitingReason: "等家人确认" });
+    assert.equal(linkedProgress.status, 200); assert.equal(linkedProgress.body.commitment.sessionId, id);
+    for (const invalid of [{ sessionId: [otherPersonal] }, { relatedSessionIds: [otherPersonal, otherPersonal] }, { milestones: [{ id: "foreign-step", title: "不能绑定其他目标的步骤", done: true }] }]) {
+      assert.equal((await request(progressRoute, "PATCH", { revision: linkedProgress.body.commitment.revision, ...invalid })).status, 400);
+    }
+    const stale = await request(progressRoute, "PATCH", { revision: current.revision, nextStep: "过时编辑不能覆盖" }); assert.equal(stale.status, 409);
+    await stop(); await start();
+    const continued = (await request("/api/personal/commitments")).body.commitments.find(entry => entry.id === item.id);
+    assert.deepEqual(continued.relatedSessionIds, [otherPersonal]); assert.equal(continued.waitingReason, "等家人确认");
+    assert.deepEqual(continued.milestones, item.milestones);
     const separate = (await request("/api/personal/commitments", "POST", { title: "工作空间候选不能复用" })).body.commitment;
     const isolated = await request(`/api/personal/commitments/${separate.id}/draft`, "POST", { revision: separate.revision, pendingSessionId: work });
     assert.equal(isolated.status, 200);

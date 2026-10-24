@@ -26,7 +26,9 @@ const source = { id: "facts-source", repoId: "_personal", title: "合成验收�
 const workHistory = { id: "work-history", repoId: "sample-app", title: "合成工作历史", codexSessionId: "work-thread", messages: [], draft: { input: "", attachments: [], revision: 1 } };
 const workText = { id: "work-text", repoId: "sample-app", title: "新会话", messages: [], draft: { input: "合成工作文字草稿", attachments: [], revision: 1 } };
 const workFile = { id: "work-file", repoId: "sample-app", title: "新会话", messages: [], draft: { input: "", attachments: source.draft.attachments, revision: 1 } };
-await fs.writeFile(path.join(state, "chat-history.json"), JSON.stringify({ version: 2, activeByRepo: { _personal: source.id, "sample-app": workHistory.id }, sessions: Object.fromEntries([source, workHistory, workText, workFile].map(session => [session.id, session])) }));
+const progress = process.argv.includes("--goal-progress");
+const goalResult = { id: "goal-result", repoId: "_personal", title: "合成昨日车次结果", codexSessionId: "goal-result-thread", messageCount: 2, messages: [], draft: { input: "", attachments: [], revision: 0 } };
+await fs.writeFile(path.join(state, "chat-history.json"), JSON.stringify({ version: 2, activeByRepo: { _personal: source.id, "sample-app": workHistory.id }, sessions: Object.fromEntries([source, workHistory, workText, workFile, ...(progress ? [goalResult] : [])].map(session => [session.id, session])) }));
 await fs.writeFile(path.join(state, "personal-facts.json"), JSON.stringify({ version: 1, facts: [{ id: "fixture-fact", label: "合成称呼", value: "本机验收示例", source: "user", revision: 1, createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" }] }));
 const factStore = createPersonalFactsStore(path.join(state, "personal-facts.json"));
 const largeDirectory = process.argv.includes("--large-directory");
@@ -54,10 +56,11 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   let result={};
   if(m.method==='account/read') result={account:{type:'chatgpt',email:'fixture@example.test',planType:'plus'},requiresOpenaiAuth:false};
   if(m.method==='model/list') result={data:[{id:'gpt-6-sol',model:'gpt-6-sol',displayName:'GPT-6 Sol',defaultReasoningEffort:'medium',supportedReasoningEfforts:[{reasoningEffort:'medium'}]},{id:'gpt-6-astra',model:'gpt-6-astra',displayName:'GPT-6 Astra',defaultReasoningEffort:'ultra',supportedReasoningEfforts:[{reasoningEffort:'ultra'}]}],nextCursor:null};
-  const threads=[{id:'legacy-facts-thread',cwd:${JSON.stringify(personal)},name:'合成验收旧会话',createdAt:1790000000,updatedAt:1790000000},{id:'work-thread',cwd:${JSON.stringify(path.join(root, "work"))},name:'合成工作历史',createdAt:1790000000,updatedAt:1790000000},...fixtureThreads];
+  const threads=[{id:'legacy-facts-thread',cwd:${JSON.stringify(personal)},name:'合成验收旧会话',createdAt:1790000000,updatedAt:1790000000},{id:'work-thread',cwd:${JSON.stringify(path.join(root, "work"))},name:'合成工作历史',createdAt:1790000000,updatedAt:1790000000},...(${progress}?[{id:'goal-result-thread',cwd:${JSON.stringify(personal)},name:'合成昨日车次结果',createdAt:Math.floor(Date.now()/1000)-86400,updatedAt:Math.floor(Date.now()/1000)-86400}]:[]),...fixtureThreads];
   if (${references} && m.method==='thread/start') {const stamp=Math.floor(Date.now()/1000),thread={id:'reference-runtime-thread',cwd:m.params.cwd,name:'合成引用验收',createdAt:stamp,updatedAt:stamp};fixtureThreads.push(thread);result={thread};}
   if(m.method==='thread/list') result={data:threads.filter(thread=>!m.params.cwd||m.params.cwd.includes(thread.cwd)),nextCursor:null};
   if(m.method==='thread/read') {const thread=threads.find(thread=>thread.id===m.params.threadId);result={thread:{...thread,turns:[{id:'fixture-turn',status:'completed',items:[{type:'userMessage',content:[{type:'text',text:thread?.id==='work-thread'?'合成工作历史':'合成旧历史，不复制到新上下文'}]}]}]}};}
+  if(${progress} && m.method==='thread/read' && m.params.threadId==='goal-result-thread') result={thread:{...threads.find(thread=>thread.id==='goal-result-thread'),turns:[{id:'goal-result-turn',status:'completed',items:[{id:'result-user',type:'userMessage',content:[{type:'text',text:'合成：核对车次'}]},{id:'result-answer',type:'agentMessage',phase:'final_answer',text:'合成昨日结果：已整理可选车次，等待确认出行日期；没有预订或付款。'}]}]}};
   if (${references} && m.method==='thread/read' && m.params.threadId==='reference-runtime-thread') result={thread:{...fixtureThreads[0],turns:referenceTurns}};
   const catalogApp=n=>({id:'service-'+n,name:['Gmail','Google Calendar','Google Drive','GitHub'][n]||(n<13?'已连接服务 '+String(n).padStart(4,'0'):'合成目录 '+String(n).padStart(4,'0')),description:n===0?'合成服务说明，仅用于目录验收。'.repeat(15):'合成目录说明',installUrl:n===1998?'javascript:alert(1)':'https://chatgpt.com/apps/fixture/service-'+n,isAccessible:n<13,isEnabled:n<13});
   if(m.method==='app/list') { const count=${largeDirectory} ? Number(fs.readFileSync(${JSON.stringify(directoryControl)},'utf8')) : 0; const offset=Number(m.params.cursor||0),end=Math.min(count,offset+100);result={data:Array.from({length:Math.max(0,end-offset)},(_,i)=>catalogApp(offset+i)),nextCursor:end<count?String(end):null}; }
@@ -107,7 +110,7 @@ try {
     assert.equal(response.status, 404); assert.equal((await response.json()).ok, false);
   }
   if (process.argv.includes("--serve")) {
-    console.log(JSON.stringify({ url: `${base}#/project/_personal/thread/facts-source`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused", ...(largeDirectory ? { directoryControl } : {}), ...(largeDirectory || references ? { rpcCapture: capture } : {}) }));
+    console.log(JSON.stringify({ url: `${base}#/project/_personal/${progress ? "today" : "thread/facts-source"}`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused", ...(largeDirectory ? { directoryControl } : {}), ...(largeDirectory || references || progress ? { rpcCapture: capture } : {}) }));
     await new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
   } else {
     browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
