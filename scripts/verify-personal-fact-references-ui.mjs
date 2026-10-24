@@ -46,12 +46,22 @@ try {
   assert.match(await panel.innerText(), /不等同于内部推理证明或任务成功回执/);
   assert.equal(await page.locator(".personal-reference-details").evaluate(element => getComputedStyle(element).maxHeight), "none");
   const out = path.join(project, "docs/research/acceptance/p033-references-20261024"); await fs.mkdir(out, { recursive: true });
-  for (const width of [1280, 768, 390, 320]) {
-    await page.setViewportSize({ width, height: width <= 390 ? 640 : 900 });
+  for (const [width, height] of [[1280, 900], [768, 900], [390, 640], [320, 640], [390, 480], [320, 480]]) {
+    await page.setViewportSize({ width, height });
     await panel.scrollIntoViewIfNeeded();
+    try { await page.waitForFunction(() => [".composer-shell", ".composer-shell .send-button", ".composer-shell .attach-button", ".composer-footer"].every(selector => {
+      const box = document.querySelector(selector)?.getBoundingClientRect(); return box && box.height > 0 && box.top >= 0 && box.bottom <= innerHeight + 1;
+    }), undefined, { timeout: 3000 }); }
+    catch (error) {
+      const layout = await page.evaluate(() => ({ height: innerHeight, scrollY, elements: [".workspace", ".chat-panel", ".chat-window", ".composer-shell", ".composer-shell .send-button", ".composer-shell .attach-button", ".composer-footer"].map(selector => {
+        const element = document.querySelector(selector), box = element?.getBoundingClientRect();
+        return { selector, top: box?.top, bottom: box?.bottom, height: box?.height, minHeight: element && getComputedStyle(element).minHeight };
+      }) }));
+      await fs.writeFile(path.join(out, `layout-${width}.json`), JSON.stringify(layout, null, 2)); throw error;
+    }
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
     const control = await page.locator(".personal-reference-details > summary").boundingBox(); assert.ok(control && control.height >= 44);
-    await page.screenshot({ path: path.join(out, `reference-${width}.png`), fullPage: true });
+    await page.screenshot({ path: path.join(out, `reference-${width}-${height}.png`), fullPage: true });
   }
   await page.setViewportSize({ width: 1280, height: 900 });
   let fact = (await request("/api/personal/facts")).facts[0];

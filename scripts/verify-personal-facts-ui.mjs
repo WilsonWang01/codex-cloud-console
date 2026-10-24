@@ -121,7 +121,9 @@ try {
       const height = width <= 390 ? 480 : 900;
       await page.setViewportSize({ width, height });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
-      try { await page.waitForFunction(() => document.querySelector(".composer-shell")?.getBoundingClientRect().bottom <= innerHeight + 1, undefined, { timeout: 3000 }); }
+      try { await page.waitForFunction(() => [".composer-shell", ".composer-shell .send-button", ".composer-shell .attach-button", ".composer-footer"].every(selector => {
+        const box = document.querySelector(selector)?.getBoundingClientRect(); return box && box.height > 0 && box.top >= 0 && box.bottom <= innerHeight + 1;
+      }), undefined, { timeout: 3000 }); }
       catch (error) {
         const layout = await page.evaluate(() => ({ viewport: { width: innerWidth, height: innerHeight }, elements: [".workspace", ".workspace-header", ".session-content-grid", ".chat-panel", ".app-session-strip", ".personal-scope-notice", ".chat-window", ".composer-shell", ".personal-context-notice", ".composer", ".composer-footer"].map(selector => {
           const element = document.querySelector(selector); if (!element) return { selector, absent: true };
