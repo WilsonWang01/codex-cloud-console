@@ -28,7 +28,7 @@
     "verify:normalizers": "node scripts/smoke-normalizers.mjs",
     "verify:runtime-probe": "node scripts/verify-runtime-probe.mjs",
     "verify:regressions": "node --test scripts/verify-release-info.mjs scripts/verify-proxy-transport.mjs && node scripts/verify-regressions.mjs",
-    "verify:safety": "node --test scripts/verify-safety.mjs",
+    "verify:safety": "node --test scripts/verify-safety.mjs scripts/verify-body-parser.mjs",
     "verify:approvals": "node --test scripts/verify-approvals.mjs",
     "verify:clients": "node --test scripts/verify-api-clients.mjs",
     "verify:external-client": "node --test scripts/verify-external-client-example.mjs",
