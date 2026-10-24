@@ -28,6 +28,9 @@ const workFile = { id: "work-file", repoId: "sample-app", title: "新会话", me
 await fs.writeFile(path.join(state, "chat-history.json"), JSON.stringify({ version: 2, activeByRepo: { _personal: source.id, "sample-app": workHistory.id }, sessions: Object.fromEntries([source, workHistory, workText, workFile].map(session => [session.id, session])) }));
 await fs.writeFile(path.join(state, "personal-facts.json"), JSON.stringify({ version: 1, facts: [{ id: "fixture-fact", label: "合成称呼", value: "本机验收示例", source: "user", revision: 1, createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" }] }));
 const factStore = createPersonalFactsStore(path.join(state, "personal-facts.json"));
+const largeDirectory = process.argv.includes("--large-directory");
+const directoryControl = path.join(root, "directory-count.json");
+if (largeDirectory) await fs.writeFile(directoryControl, "2013");
 const memoryOrigin = { sessionId: source.id, threadId: source.codexSessionId, turnId: "synthetic-turn", callId: "synthetic-call" };
 if (process.argv.includes("--serve") && process.argv.includes("--memory")) {
   await factStore.propose({ label: "合成出行偏好", value: "合成资料：偏好火车", reason: "本轮合成对话明确提到" }, memoryOrigin);
@@ -45,8 +48,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const threads=[{id:'legacy-facts-thread',cwd:${JSON.stringify(personal)},name:'合成验收旧会话',createdAt:1790000000,updatedAt:1790000000},{id:'work-thread',cwd:${JSON.stringify(path.join(root, "work"))},name:'合成工作历史',createdAt:1790000000,updatedAt:1790000000}];
   if(m.method==='thread/list') result={data:threads.filter(thread=>!m.params.cwd||m.params.cwd.includes(thread.cwd)),nextCursor:null};
   if(m.method==='thread/read') {const thread=threads.find(thread=>thread.id===m.params.threadId);result={thread:{...thread,turns:[{id:'fixture-turn',status:'completed',items:[{type:'userMessage',content:[{type:'text',text:thread?.id==='work-thread'?'合成工作历史':'合成旧历史，不复制到新上下文'}]}]}]}};}
-  if(m.method==='app/list') result={data:[],nextCursor:null};
-  if(m.method==='app/installed') result={apps:[]};
+  const catalogApp=n=>({id:'service-'+n,name:['Gmail','Google Calendar','Google Drive','GitHub'][n]||(n<13?'已连接服务 '+String(n).padStart(4,'0'):'合成目录 '+String(n).padStart(4,'0')),description:n===0?'合成服务说明，仅用于目录验收。'.repeat(15):'合成目录说明',installUrl:n===1998?'javascript:alert(1)':'https://chatgpt.com/apps/fixture/service-'+n,isAccessible:n<13,isEnabled:n<13});
+  if(m.method==='app/list') { const count=${largeDirectory} ? Number(fs.readFileSync(${JSON.stringify(directoryControl)},'utf8')) : 0; const offset=Number(m.params.cursor||0),end=Math.min(count,offset+100);result={data:Array.from({length:Math.max(0,end-offset)},(_,i)=>catalogApp(offset+i)),nextCursor:end<count?String(end):null}; }
+  if(m.method==='app/installed') result={apps:${largeDirectory} ? Array.from({length:13},(_,n)=>({id:'service-'+n,runtimeName:catalogApp(n).name,enabled:true,callable:true})) : []};
   if(m.method==='mcpServerStatus/list') result={data:[],nextCursor:null};
   if(['turn/start','turn/steer','thread/compact/start','thread/fork'].includes(m.method)) return process.stdout.write(JSON.stringify({id:m.id,error:{code:-32000,message:'Test fixture refuses model execution'}})+'\\n');
   process.stdout.write(JSON.stringify({id:m.id,result})+'\\n');
@@ -86,7 +90,7 @@ try {
     assert.equal(response.status, 404); assert.equal((await response.json()).ok, false);
   }
   if (process.argv.includes("--serve")) {
-    console.log(JSON.stringify({ url: `${base}#/project/_personal/thread/facts-source`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused" }));
+    console.log(JSON.stringify({ url: `${base}#/project/_personal/thread/facts-source`, state: "isolated synthetic", stop: "SIGTERM this process", model: "refused", ...(largeDirectory ? { directoryControl, rpcCapture: capture } : {}) }));
     await new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
   } else {
     browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });

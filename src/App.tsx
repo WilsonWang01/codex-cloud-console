@@ -6696,8 +6696,8 @@ function PersonalSettings({ repo, appStatus, browserPushEndpoint, pushReadiness,
   return <div className="personal-page personal-settings">
     <header className="personal-page-header"><div><p className="eyebrow">个人助理</p><h1>设置</h1></div></header>
     <section className="personal-list-section"><h2>账号与空间</h2><p>{authenticated ? `${appStatus.account?.email || "Codex 账号"} · ${repo.runtimeMode === "shared" ? "与工作空间共用登录" : "独立执行器"}` : appStatus.auth?.issue || "Codex 账号待确认"}</p><p>个人会话与工作项目的上下文分开；共用登录不代表第三方服务授权也分开。</p><button type="button" className="mini-action" onClick={onCodexLogin}><RefreshCw size={15} />重新登录 Codex</button>{login && codexVerificationUrl(login) && <a href={codexVerificationUrl(login)} target="_blank" rel="noopener noreferrer">打开授权页 · {login.userCode || "继续登录"}</a>}</section>
-    <section className="personal-list-section"><h2>连接服务</h2><Suspense fallback={<p className="personal-empty">正在读取连接服务…</p>}><LazyConnectedServices repoId={repo.id} onPrepare={onPrepareService} /></Suspense></section>
     <section className="personal-list-section"><h2>偏好与事实</h2><Suspense fallback={<p className="personal-empty">正在读取个人事实…</p>}><LazyPersonalFacts /></Suspense></section>
+    <section className="personal-list-section"><h2>连接服务</h2><Suspense fallback={<p className="personal-empty">正在读取连接服务…</p>}><LazyConnectedServices repoId={repo.id} onPrepare={onPrepareService} /></Suspense></section>
     <section className="personal-list-section"><h2>通知</h2><p>{browserPushEndpoint ? "本机浏览器已订阅待处理通知。" : pushReadiness.supported ? "可订阅本机待处理通知。" : "当前浏览器不支持后台通知或尚未满足安全入口条件。"}</p><button type="button" className="mini-action" disabled={!browserPushEndpoint && !pushReadiness.supported} onClick={browserPushEndpoint ? onPushUnsubscribe : onPushSubscribe}><Bell size={15} />{browserPushEndpoint ? "取消本机订阅" : "订阅本机通知"}</button><Suspense fallback={<p className="personal-empty">正在读取个人提醒…</p>}><LazyPersonalReminders endpoint={browserPushEndpoint} /></Suspense></section>
     <button type="button" className="personal-secondary-link" onClick={onOpenAdvanced}><Settings2 size={16} />服务器与高级诊断<ChevronRight size={16} /></button>
   </div>;
@@ -10351,7 +10351,7 @@ function CloudChat({
               <button type="button" onClick={() => setActivePanel("reasoning")}><SlidersHorizontal size={18} /><span><strong>推理深度</strong><small>{reasoningLabel(runtime.reasoning)}</small></span><ChevronRight size={16} /></button>
             </div>}
             {activePanel === "connections" && <>
-              <Suspense fallback={<p role="status">正在加载服务…</p>}><LazyConnectedServices key={repo.id} repoId={repo.id} /></Suspense>
+              <Suspense fallback={<p role="status">正在加载服务…</p>}><LazyConnectedServices key={repo.id} repoId={repo.id} initialScope="all" /></Suspense>
               <button className="mini-action" type="button" onClick={() => setActivePanel("capabilities")}><SlidersHorizontal size={14} />MCP 与其他工具</button>
             </>}
 
