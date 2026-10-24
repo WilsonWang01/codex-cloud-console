@@ -3,6 +3,26 @@ import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { approvalDigest, createApprovalBroker, declineAppServerRequest } from "../server/approval-broker.mjs";
+import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
+
+test("双向协议保留零编号请求，服务器同号请求不能吞掉客户端等待的响应", async () => {
+  const seen = [], writes = [];
+  const child = {};
+  const client = new CodexAppServerClient({ cwd: "/tmp", onServerRequest: async (method, params, message) => { seen.push({ method, params, id: message.id }); return { decision: "decline" }; } });
+  client.child = child; client.generation = 1;
+  client.write = message => writes.push(message);
+  let resolved = false;
+  client.pending.set(7, { child, generation: 1, resolve: () => { resolved = true; }, reject: assert.fail });
+  client.handleMessage({ id: 0, method: "item/tool/call", params: { tool: "candidate" } }, child, 1);
+  client.handleMessage({ id: 7, method: "item/fileChange/requestApproval", params: { reason: "synthetic" } }, child, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(resolved, false); assert.equal(client.pending.has(7), true);
+  assert.deepEqual(seen.map(item => item.id), [0, 7]);
+  assert.deepEqual(writes, [{ id: 0, result: { decision: "decline" } }, { id: 7, result: { decision: "decline" } }]);
+  client.handleMessage({ id: 7, result: { ok: true } }, child, 1);
+  assert.equal(resolved, true); assert.equal(client.pending.size, 0);
+  client.child = null;
+});
 
 test("approval is bound to exact request and can only be decided once", async () => {
   const broker = createApprovalBroker();

@@ -7318,6 +7318,16 @@ pre {
 .personal-fact-conflict p { margin: 6px 0; }
 .personal-fact-editor button { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
 .personal-fact-editor button:disabled { opacity: .5; cursor: default; }
+.personal-memory-candidates { margin: 12px 0 20px; min-width: 0; }
+.personal-memory-candidates h3 { font-size: 15px; }
+.personal-memory-candidates h3 small { margin-left: 6px; color: var(--muted); }
+.personal-memory-candidate { display: grid; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.personal-memory-candidate p { margin: 0; }
+.personal-memory-candidate small { color: var(--muted); }
+.personal-memory-candidate > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.personal-memory-candidate button { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; max-width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; overflow-wrap: anywhere; cursor: pointer; }
+.personal-memory-candidates summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
+.personal-memory-candidates .personal-fact-row { grid-template-columns: minmax(0, 1fr) 44px; }
 .personal-fact-settings { display: flex; flex-wrap: wrap; gap: 8px 20px; min-width: 0; margin: 0; padding: 8px 0; border: 0; }
 .personal-fact-settings legend { color: var(--muted); font-size: 12px; }
 .personal-fact-settings label { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 13px; }

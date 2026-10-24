@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { createPersonalFactsStore } from "../server/personal-facts.mjs";
 
 // The actual console backend and built UI run against disposable local state. No real model or connector is reachable.
 const project = fileURLToPath(new URL("../", import.meta.url));
@@ -26,6 +27,11 @@ const workText = { id: "work-text", repoId: "sample-app", title: "新会话", me
 const workFile = { id: "work-file", repoId: "sample-app", title: "新会话", messages: [], draft: { input: "", attachments: source.draft.attachments, revision: 1 } };
 await fs.writeFile(path.join(state, "chat-history.json"), JSON.stringify({ version: 2, activeByRepo: { _personal: source.id, "sample-app": workHistory.id }, sessions: Object.fromEntries([source, workHistory, workText, workFile].map(session => [session.id, session])) }));
 await fs.writeFile(path.join(state, "personal-facts.json"), JSON.stringify({ version: 1, facts: [{ id: "fixture-fact", label: "合成称呼", value: "本机验收示例", source: "user", revision: 1, createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" }] }));
+const factStore = createPersonalFactsStore(path.join(state, "personal-facts.json"));
+const memoryOrigin = { sessionId: source.id, threadId: source.codexSessionId, turnId: "synthetic-turn", callId: "synthetic-call" };
+if (process.argv.includes("--serve") && process.argv.includes("--memory")) {
+  await factStore.propose({ label: "合成出行偏好", value: "合成资料：偏好火车", reason: "本轮合成对话明确提到" }, memoryOrigin);
+}
 const capture = path.join(root, "rpc.jsonl");
 await fs.writeFile(path.join(bin, "codex"), `#!/usr/bin/env node
 import fs from 'node:fs'; import readline from 'node:readline';
@@ -163,6 +169,55 @@ try {
     }
     const facts = JSON.parse(await fs.readFile(path.join(state, "personal-facts.json"), "utf8"));
     assert.equal(facts.version, 2); assert.equal(facts.facts[0].enabled, false); assert.ok(facts.facts[0].confirmedAt);
+    // Seed only synthetic suggestions; the UI still uses the actual versioned HTTP review endpoints.
+    const proposed = await factStore.propose({ label: "合成出行偏好", value: "合成资料：偏好火车", reason: "本轮合成对话明确提到" }, memoryOrigin);
+    await factStore.propose({ label: "合成待拒绝资料", value: "不应成为事实", reason: "待用户核对的合成建议" }, { ...memoryOrigin, callId: "reject" });
+    await page.getByRole("button", { name: "刷新个人事实", exact: true }).click();
+    await page.getByRole("button", { name: "核对 合成出行偏好", exact: true }).waitFor();
+    const memoryOut = path.join(project, "docs/research/acceptance/p032-memory-20261024"); await fs.mkdir(memoryOut, { recursive: true });
+    for (const width of [1280, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: width <= 390 ? 640 : 900 });
+      await page.locator(".personal-memory-candidates").scrollIntoViewIfNeeded();
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      await page.screenshot({ path: path.join(memoryOut, `pending-${width}.png`), fullPage: true });
+    }
+    assert.equal((await factStore.snapshot()).facts.length, 0, "pending suggestions must not enter task context");
+    await page.getByRole("button", { name: "核对 合成出行偏好", exact: true }).click();
+    await page.getByLabel("事实内容", { exact: true }).fill("用户核对后的合成出行偏好");
+    await page.getByRole("button", { name: "接受并记住", exact: true }).click();
+    await page.getByRole("button", { name: "核对 合成出行偏好", exact: true }).waitFor({ state: "hidden" });
+    await page.getByText(/^助理建议，你已确认/).waitFor();
+    assert.equal((await factStore.snapshot()).facts[0].value, "用户核对后的合成出行偏好");
+    await page.getByRole("button", { name: "不记住 合成待拒绝资料", exact: true }).click();
+    await page.getByRole("button", { name: "不记住 合成待拒绝资料", exact: true }).waitFor({ state: "hidden" });
+    assert.equal((await factStore.snapshot()).facts.length, 1);
+    const concurrent = await factStore.propose({ label: "合成并行核对", value: "原始候选", reason: "跨页面冲突检查" }, { ...memoryOrigin, callId: "concurrent" });
+    await page.getByRole("button", { name: "刷新个人事实", exact: true }).click();
+    await page.getByRole("button", { name: "核对 合成并行核对", exact: true }).click();
+    await page.getByLabel("事实内容", { exact: true }).fill("冲突时应保留的输入");
+    const rejected = await fetch(`${base}api/personal/memory-candidates/${concurrent.id}/review`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, decision: "reject" }) });
+    assert.equal(rejected.status, 200);
+    await page.getByRole("button", { name: "接受并记住", exact: true }).click();
+    await page.getByText("这条候选状态已变化。你的输入仍保留，尚未接受；请核对已处理记录后取消此次核对。", { exact: true }).waitFor();
+    assert.equal(await page.getByLabel("事实内容", { exact: true }).inputValue(), "冲突时应保留的输入");
+    assert.equal(await page.getByRole("button", { name: "接受并记住", exact: true }).isDisabled(), true);
+    await page.getByRole("button", { name: "取消核对", exact: true }).click();
+    await page.getByText("已处理记录", { exact: true }).click();
+    const beforeCleanup = await fs.readFile(path.join(state, "personal-facts.json"), "utf8");
+    await page.getByRole("button", { name: "清理候选 合成出行偏好", exact: true }).click();
+    const cleanup = page.getByRole("dialog", { name: "清理记忆候选记录", exact: true });
+    await cleanup.waitFor();
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "取消");
+    await cleanup.getByRole("button", { name: "取消", exact: true }).click();
+    assert.equal(await fs.readFile(path.join(state, "personal-facts.json"), "utf8"), beforeCleanup);
+    await page.getByRole("button", { name: "清理候选 合成出行偏好", exact: true }).click();
+    await cleanup.getByRole("button", { name: "确认清理", exact: true }).click();
+    await page.getByRole("button", { name: "清理候选 合成出行偏好", exact: true }).waitFor({ state: "hidden" });
+    assert.equal((await factStore.overview()).candidates.some(item => item.id === proposed.id), false);
+    assert.equal((await factStore.snapshot()).facts[0].value, "用户核对后的合成出行偏好");
+    await page.reload();
+    await page.getByText("用户核对后的合成出行偏好", { exact: true }).waitFor();
+    await page.locator(".personal-facts").screenshot({ path: path.join(memoryOut, "accepted-after-reload.png") });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.getByRole("button", { name: "工作", exact: true }).click();
     await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).waitFor();
@@ -181,6 +236,6 @@ try {
     assert.equal(rpc.some(message => ["turn/start", "turn/steer", "thread/compact/start", "thread/fork", "mcpServer/tool/call"].includes(message.method)), false);
     assert.equal(rpc.some(message => message.method === "thread/resume"), false, "拒绝跨空间导入不能先恢复或改写原线程");
     assert.deepEqual(errors, []);
-    console.log("PASS actual isolated backend/UI: cross-space thread import rejected before resume, four widths, inline confirmation/cancel/Escape, personal draft navigation/reload, work text/file drafts, preserved history/runtime, expiry/disable; zero model or connector writes");
+    console.log("PASS actual isolated backend/UI: context and drafts, four widths/short screens, memory candidate edit/accept/reject/reload, stale review preserves input, cleanup confirmation keeps accepted fact; zero model or connector writes (candidates synthetically seeded)");
   }
 } finally { await stop(); }
