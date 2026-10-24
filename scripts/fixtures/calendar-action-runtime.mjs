@@ -31,6 +31,11 @@ export function createCalendarActionFixture({ now = () => Date.now(), readEvents
       const event = events.find(item => item.id === args.event_id);
       if (!event || mode === "fetch-failed") throw new Error("Synthetic fetch unavailable");
       data = mode === "mismatch" ? { ...event, summary: "第三方已修改" } : event;
+      if (mode === "connector-partial") {
+        const { guestsCanModify, transparency, htmlLink, ...rest } = event;
+        data = { ...rest, description: event.description || "\n\n", location: event.location || null, guests_can_modify: null,
+          web_link: htmlLink, hangout_link: "", recurrence: null, reminders: { use_default: false, overrides: [] } };
+      }
     } else throw new Error("Synthetic calendar fixture refuses tool " + params.tool);
     return { content: [{ type: "text", text: "Synthetic action result" }], structuredContent: data, isError: false };
   };

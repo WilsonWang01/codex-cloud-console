@@ -61,6 +61,7 @@ export default function PersonalCalendarActions({ onContinue, onDraft, onPending
   const [note, setNote] = useState<Record<string, string>>({});
   const [modelSupported, setModelSupported] = useState(false);
   const [listAvailable, setListAvailable] = useState(false);
+  const pendingCount = items.filter(item => ["draft", "needs_reconciliation"].includes(item.status)).length;
   const lock = useRef(false), mounted = useRef(true);
   const refresh = async () => {
     try {
@@ -69,13 +70,13 @@ export default function PersonalCalendarActions({ onContinue, onDraft, onPending
       if (mounted.current) { setItems(data.proposals); setModelSupported(data.version === 2); setListAvailable(true); }
     } catch (cause) { if (mounted.current) setListAvailable(false); throw cause; }
   };
-  useEffect(() => { onPendingCountChange(listAvailable ? items.filter(item => ["draft", "needs_reconciliation"].includes(item.status)).length : null); }, [items, listAvailable, onPendingCountChange]);
+  useEffect(() => { onPendingCountChange(listAvailable ? pendingCount : null); }, [pendingCount, listAvailable, onPendingCountChange]);
   useEffect(() => { mounted.current = true; void refresh().catch(cause => { if (mounted.current) setError(cause instanceof Error ? cause.message : "日程草稿读取失败"); }).finally(() => { if (mounted.current) setLoading(false); }); const timer = setInterval(() => setClock(Date.now()), 10_000); return () => { mounted.current = false; clearInterval(timer); }; }, []);
   useEffect(() => { try { if (editor) sessionStorage.setItem(editorKey, JSON.stringify(editor)); else sessionStorage.removeItem(editorKey); } catch { setError("浏览器未能保留本机输入，离开页面前请保存草稿。"); } }, [editor]);
   const run = async (operation: () => Promise<void>) => {
     if (lock.current) return; lock.current = true; setBusy(true); setError("");
     try { await operation(); }
-    catch (cause) { if (mounted.current) { setError(cause instanceof Error ? cause.message : "结果未确认，请刷新核对；未自动重试"); setOffsets((cause as { details?: typeof offsets }).details || null); setListAvailable(false); } }
+    catch (cause) { if (mounted.current) { setError(cause instanceof Error ? cause.message : "结果未确认，请刷新核对；未自动重试"); setOffsets((cause as { details?: typeof offsets }).details || null); await refresh().catch(() => null); } }
     finally { lock.current = false; if (mounted.current) { setBusy(false); setClock(Date.now()); } }
   };
   const action = (item: Proposal, name: string, extra: object = {}) => run(async () => { const data = await request(`/${item.id}/${name}`, "POST", { revision: item.revision, ...extra }); if (data.proposal && mounted.current) { setItems(previous => previous.map(value => value.id === item.id ? data.proposal! : value)); if (name === "preview") setReviewing(item.id); } });
@@ -103,7 +104,7 @@ export default function PersonalCalendarActions({ onContinue, onDraft, onPending
     {item.reconciliation && <p>你的核对：{item.reconciliation.note}</p>}
   </article>);
   return <section className="personal-list-section calendar-actions" aria-label="日程提案">
-    <div className="personal-section-heading"><h2><CalendarPlus size={17} />日程提案 <small>{items.filter(item => !item.attempted && item.status === "draft").length}</small></h2><div className="personal-section-actions"><button type="button" aria-label="刷新日程提案" title="读取已保存的提案，不重试创建" disabled={busy} onClick={() => void run(refresh)}><RefreshCw size={16} /></button><button type="button" className="mini-action" disabled={busy || loading || Boolean(editor) || !modelSupported} onClick={() => onDraft("请帮我起草一条新日程。先询问我标题、完整日期和起止时间、时区、参与者；缺失的信息不要猜。信息齐全后请保存待核对的日程提案，不创建或修改日历、不发送邀请。我会到今日页面核对具体账号、内容和冲突后，再单独确认。") }><MessageSquare size={16} />让助理起草</button><button type="button" className="mini-action" disabled={busy || loading || Boolean(editor)} onClick={() => setEditor(empty())}><Plus size={16} />新增草稿</button></div></div>
+    <div className="personal-section-heading"><h2><CalendarPlus size={17} />日程提案 <small>{pendingCount}</small></h2><div className="personal-section-actions"><button type="button" aria-label="刷新日程提案" title="读取已保存的提案，不重试创建" disabled={busy} onClick={() => void run(refresh)}><RefreshCw size={16} /></button><button type="button" className="mini-action" disabled={busy || loading || Boolean(editor) || !modelSupported} onClick={() => onDraft("请帮我起草一条新日程。先询问我标题、完整日期和起止时间、时区、参与者；缺失的信息不要猜。信息齐全后请保存待核对的日程提案，不创建或修改日历、不发送邀请。我会到今日页面核对具体账号、内容和冲突后，再单独确认。") }><MessageSquare size={16} />让助理起草</button><button type="button" className="mini-action" disabled={busy || loading || Boolean(editor)} onClick={() => setEditor(empty())}><Plus size={16} />新增草稿</button></div></div>
     {error && <p className="warn-text" role="alert">{error}</p>}{busy && <p role="status">正在核对或保存，请勿重复操作。离开页面不会自动重试。</p>}
     {editor && <fieldset className="personal-commitment-editor" disabled={busy}><legend>{editor.id ? "编辑日程草稿" : "新日程草稿"} · 保存不会创建日程</legend>
       <label>日程标题<input value={editor.form.title} maxLength={200} onChange={e => formChange({ title: e.target.value })} /></label>

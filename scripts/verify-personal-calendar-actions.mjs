@@ -72,6 +72,27 @@ test("editing, account changes, expired preview and changed conflicts all invali
   }
 });
 
+test("connector receipt aliases are supported without treating absent settings as verified defaults", async () => {
+  const f = fixture(), item = await draft(f), preview = await f.actions.preview(item.id, item.revision), input = confirmation(preview);
+  f.runtime.setMode("connector-partial");
+  const result = await f.actions.execute(item.id, input);
+  assert.equal(result.status, "needs_reconciliation"); assert.equal(result.receipt, null); assert.equal(f.runtime.writes(), 1);
+  assert.match(result.error, /内容匹配.*未返回忙闲设置、来宾修改权限/);
+  assert.equal(f.actions.jobs().length, 1);
+  await f.actions.execute(item.id, input); assert.equal(f.runtime.writes(), 1);
+  await assert.rejects(f.actions.check(item.id, result.revision), /未返回忙闲设置、来宾修改权限/);
+  assert.equal(f.runtime.writes(), 1);
+  const event = f.runtime.events()[0];
+  const { guestsCanModify, ...rest } = event;
+  const snake = { ...rest, guests_can_modify: guestsCanModify, description: "\n\n", location: null, hangout_link: "", conference_id: null, reminders: { use_default: false, overrides: [] } };
+  assert.equal(verifiedCalendarReceipt(snake, item.payload, event.id).eventId, event.id);
+  for (const patch of [{ guestsCanModify: true }, { reminders: { use_default: false, useDefault: true, overrides: [] } }, { hangout_link: "https://meet.google.com/synthetic" }, { conference_id: "synthetic-meet" }, { transparency: "transparent" }, { recurrence: {} }, { attendees: undefined }, { attendees: [{ email: "unapproved@example.test", self: true }] }, { summary: item.payload.title + " " }]) {
+    assert.throws(() => verifiedCalendarReceipt({ ...snake, ...patch }, item.payload, event.id), { code: "calendar_receipt_unverified" });
+  }
+  f.runtime.setMode("ok"); assert.equal((await f.actions.check(item.id, result.revision)).status, "succeeded");
+  assert.equal(f.runtime.writes(), 1);
+});
+
 test("conflicts require their own explicit approval; defer/reject/rebind clear previews", async () => {
   const f = fixture(); f.runtime.setMode("conflict");
   const item = await draft(f), preview = await f.actions.preview(item.id, item.revision);

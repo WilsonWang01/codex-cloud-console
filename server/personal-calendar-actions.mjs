@@ -92,13 +92,26 @@ export async function calendarProposalAvailability(connection, payload, now = ()
 
 export function verifiedCalendarReceipt(data, payload, eventId, now = () => Date.now()) {
   const raw = eventData(data), event = normalizeCalendarEvent(raw);
-  const attendees = Array.isArray(raw?.attendees) ? raw.attendees.filter(item => !item?.self).map(item => typeof item === "string" ? item : item?.email) : [];
-  const actual = event && { title: event.title, description: raw.description || "", location: raw.location || "", attendees: attendees.map(email => String(email).toLowerCase()).sort(),
+  const unverified = () => fail("calendar_receipt_unverified", "日程内容或副作用无法完全核验，请到原日历核对；不会自动再创建", 409);
+  const alias = (value, camel, snake) => {
+    if (value?.[camel] != null && value?.[snake] != null && value[camel] !== value[snake]) throw unverified();
+    return value?.[camel] ?? value?.[snake];
+  };
+  // The connector uses snake_case and may format an empty description as blank lines.
+  const optionalText = value => typeof value === "string" && !value.trim() ? "" : value ?? "";
+  const guestsCanModify = alias(raw, "guestsCanModify", "guests_can_modify");
+  const remindersDefault = alias(raw?.reminders, "useDefault", "use_default");
+  const attendees = Array.isArray(raw?.attendees) ? raw.attendees.map(item => typeof item === "string" ? item : item?.email) : [];
+  const actual = event && { title: event.title, description: optionalText(raw.description), location: optionalText(raw.location), attendees: attendees.map(email => String(email).toLowerCase()).sort(),
     timeZone: payload.timeZone, allDay: Boolean(event.start.date), start: event.start.date || new Date(event.start.dateTime).toISOString(), end: event.end.date || new Date(event.end.dateTime).toISOString() };
   const expected = { ...payload, attendees: [...payload.attendees].sort() };
-  if (!event || event.id !== eventId || event.status !== "confirmed" || calendarContentDigest(actual) !== calendarContentDigest(expected) || raw.visibility !== "private" || raw.transparency !== "opaque" || raw.guestsCanModify !== false || raw.recurrence?.length ||
+  if (!event || event.id !== eventId || event.status !== "confirmed" || raw.summary !== payload.title || !Array.isArray(raw.attendees) || calendarContentDigest(actual) !== calendarContentDigest(expected) || raw.visibility !== "private" ||
+      (raw.transparency != null && raw.transparency !== "opaque") || (guestsCanModify != null && guestsCanModify !== false) || (raw.recurrence != null && (!Array.isArray(raw.recurrence) || raw.recurrence.length)) ||
       payload.allDay && (event.start.timeZone !== payload.timeZone || event.end.timeZone !== payload.timeZone) ||
-      raw.conferenceData || raw.hangoutLink || raw.reminders?.useDefault !== false || !Array.isArray(raw.reminders.overrides) || raw.reminders.overrides.length) throw fail("calendar_receipt_unverified", "日程内容或副作用无法完全核验，请到原日历核对；不会自动再创建", 409);
+      raw.conferenceData || raw.conference_data || raw.hangoutLink || raw.hangout_link || raw.conference_id || raw.conference_status || raw.conference_solution_type ||
+      remindersDefault !== false || !Array.isArray(raw.reminders.overrides) || raw.reminders.overrides.length) throw unverified();
+  const missing = [raw.transparency == null && "忙闲设置", guestsCanModify == null && "来宾修改权限"].filter(Boolean);
+  if (missing.length) throw fail("calendar_receipt_unverified", `已读取到内容匹配的日程；连接器未返回${missing.join("、")}，尚不能确认全部设置。请到原日历核对；不会自动再创建。`, 409);
   return { eventId, url: event.url, checkedAt: new Date(now()).toISOString(), source: "google_calendar.fetch", contentDigest: calendarContentDigest(payload) };
 }
 
@@ -155,7 +168,7 @@ export function createPersonalCalendarActions({ store, request, context, closeAp
           eventId = rawId;
           const receipt = verifiedCalendarReceipt(await connection.invoke("fetch", { calendar_id: "primary", event_id: eventId }), item.payload, eventId, now);
           return await store.settle(id, { receipt });
-        } catch { return store.settle(id, { eventId, error: "执行已尝试，但完整结果尚未核验。请在原日历核对；不要重复创建。" }); }
+        } catch (error) { return store.settle(id, { eventId, error: error?.code === "calendar_receipt_unverified" ? error.message : "执行已尝试，但完整结果尚未核验。请在原日历核对；不要重复创建。" }); }
       })));
       return operation;
     },

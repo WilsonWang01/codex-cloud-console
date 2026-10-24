@@ -117,7 +117,7 @@ try {
   assert.equal((await fetch(base)).status, 200);
   for (const [repoId, threadId] of [["_personal", "work-thread"], ["sample-app", "legacy-facts-thread"]]) {
     const rejected = await (await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId, sessionId: "app-" + threadId }))).json();
-    assert.equal(rejected.ok, true); assert.equal(rejected.activeSessionId, null); assert.deepEqual(rejected.messages, []);
+    assert.equal(rejected.ok, true, JSON.stringify({ repoId, error: rejected.error, code: rejected.code })); assert.equal(rejected.activeSessionId, null); assert.deepEqual(rejected.messages, []);
     assert.equal(rejected.sessions.some(session => session.codexSessionId === threadId), false);
   }
   for (const sessionId of [workHistory.id, "app-work-thread", "unknown-session"]) {

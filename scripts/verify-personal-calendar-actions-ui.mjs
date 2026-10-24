@@ -145,10 +145,34 @@ try {
   items = (await request()).data.proposals; assert.equal(items.find(item => item.id === checked.id).status, "reconciled");
   assert.equal((await request("/api/codex/app-host/status")).data.activeJobs.some(job => job.id === `calendar:${checked.id}`), false);
   assert.equal(JSON.parse(await fs.readFile(ready.calendarEvents, "utf8")).length, 2);
+  await control({ email: "changed@example.test", mode: "connector-partial" });
+  await request(route, "POST", { clientKey: crypto.randomUUID(), form: { title: "合成连接器缺少设置", timeZone: "Asia/Shanghai", startLocal: date + "T12:00", endLocal: date + "T12:30" } });
+  await section.getByRole("button", { name: "刷新日程提案", exact: true }).click();
+  const partial = section.locator("article.calendar-action-row").filter({ has: page.getByText("合成连接器缺少设置", { exact: true }) });
+  await partial.getByRole("button", { name: "核对并预览", exact: true }).click();
+  const partialConfirm = partial.getByRole("region", { name: "确认日程 合成连接器缺少设置", exact: true });
+  await partialConfirm.getByRole("checkbox", { name: "我确认以上账号、内容和影响，允许创建这一条日程", exact: true }).check();
+  await partialConfirm.getByRole("button", { name: "确认并创建", exact: true }).click();
+  await partial.getByText(/内容匹配.*未返回忙闲设置、来宾修改权限/).waitFor();
+  await page.reload(); await partial.getByText(/内容匹配.*未返回忙闲设置、来宾修改权限/).waitFor();
+  assert.match(await section.getByRole("heading", { name: /日程提案/ }).innerText(), /日程提案\s+1/);
+  for (const width of [1280, 390, 320]) {
+    await page.setViewportSize({ width, height: width < 400 ? 640 : 900 }); await partial.scrollIntoViewIfNeeded();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    await partial.screenshot({ path: path.join(out, `partial-receipt-${width}.png`) });
+  }
+  await partial.getByRole("button", { name: "只读核验回执", exact: true }).click();
+  await section.getByRole("alert").getByText(/内容匹配.*未返回忙闲设置、来宾修改权限/).waitFor();
+  await page.getByRole("button", { name: /1 条日程提案待核对/ }).waitFor();
+  await page.getByText("1 项需要你处理", { exact: true }).waitFor();
+  const partialItem = (await request()).data.proposals.find(item => item.payload.title === "合成连接器缺少设置");
+  assert.equal(partialItem.status, "needs_reconciliation"); assert.equal(partialItem.receipt, null);
+  assert.equal((await request("/api/codex/app-host/status")).data.activeJobs.some(job => job.id === `calendar:${partialItem.id}`), true);
+  assert.equal(JSON.parse(await fs.readFile(ready.calendarEvents, "utf8")).length, 3);
   const rpc = (await fs.readFile(ready.rpcCapture, "utf8")).trim().split("\n").map(JSON.parse);
   assert.equal(rpc.some(item => ["turn/start", "account/login/start"].includes(item.method)), false);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, backend: "actual isolated console and native RPC fixture", realModelCalls: 0, realThirdPartyWrites: 0, syntheticCreates: 2, checks: ["草稿刷新找回", "四宽度编辑和确认", "账号变化拒绝", "冲突单独确认", "实际RPC单次执行与重复确认", "丢失回执阻止发布/人工核对", "请求边界"] }));
+  console.log(JSON.stringify({ ok: true, backend: "actual isolated console and native RPC fixture", realModelCalls: 0, realThirdPartyWrites: 0, syntheticCreates: 3, checks: ["草稿刷新找回", "四宽度编辑和确认", "账号变化拒绝", "冲突单独确认", "实际RPC单次执行与重复确认", "丢失回执阻止发布/人工核对", "缺少设置不冒充成功且只读核验不重复写入", "请求边界"] }));
   }
 } finally {
   await browser?.close();
