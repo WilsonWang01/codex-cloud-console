@@ -27,6 +27,7 @@ test("引用只接受当前个人回合的已提供 ID，不修改事实、不�
   assert.equal(JSON.stringify(job), before);
   const accepted = view(); assert.match(accepted.text, /模型报告引用了 1 条/);
   assert.equal(accepted.details.personalFactReferences.references[0].label, facts[0].label);
+  assert.equal(accepted.details.personalFactReferences.references[0].value, facts[0].value);
   assert.equal(accepted.details.personalFactReferences.references[0].state, "active");
   assert.equal(accepted.details.personalFactReferences.checkedAt, new Date(now).toISOString());
   const prompt = personalDeveloperInstructions({ sandbox: "read-only" }, facts);
@@ -57,7 +58,7 @@ test("更正、停用、到期、删除、再次确认及存储不可读均按�
     const reference = view(current).details.personalFactReferences.references[0];
     assert.equal(reference.state, state); assert.equal(reference.revision, 1);
     assert.equal(reference.label, ["changed", "removed", "unavailable"].includes(state) ? undefined : facts[0].label);
-    assert.equal(reference.value, undefined);
+    assert.equal(reference.value, ["changed", "removed", "unavailable"].includes(state) ? undefined : facts[0].value);
   }
 });
 

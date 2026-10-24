@@ -41,6 +41,7 @@ try {
   };
   const panel = await open();
   await panel.getByText("合成称呼", { exact: true }).waitFor();
+  await panel.getByText("本机验收示例", { exact: true }).waitFor();
   assert.match(await panel.innerText(), /引用版本 1.*当前有效/);
   assert.match(await panel.innerText(), /不等同于内部推理证明或任务成功回执/);
   assert.equal(await page.locator(".personal-reference-details").evaluate(element => getComputedStyle(element).maxHeight), "none");

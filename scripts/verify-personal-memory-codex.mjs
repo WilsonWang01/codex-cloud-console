@@ -87,6 +87,7 @@ try {
     assert.equal(source.turnId, job.turnId);
     assert.equal(source.details.personalFactReferences.references[0].id, fact.id);
     assert.equal(source.details.personalFactReferences.references[0].state, "active");
+    assert.equal(source.details.personalFactReferences.references[0].value, fact.value);
     assert.deepEqual((await fs.readdir(root)).filter(name => name.includes("reference")), []);
     assert.equal(requests, 2, "history read and resume cannot start inference");
   }

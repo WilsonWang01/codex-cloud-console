@@ -1,4 +1,4 @@
-type Reference = { id: string; revision: number; state: string; label?: string };
+type Reference = { id: string; revision: number; state: string; label?: string; value?: string };
 export type PersonalFactReferenceData = { source: string; recordedAt: string; checkedAt: string; turnId: string; references: Reference[] };
 
 export function personalFactReferenceData(value: unknown): PersonalFactReferenceData | null {
@@ -7,7 +7,8 @@ export function personalFactReferenceData(value: unknown): PersonalFactReference
   return record.source === "model_report" && typeof record.turnId === "string" && typeof record.recordedAt === "string" && typeof record.checkedAt === "string"
     && Array.isArray(record.references) && record.references.length > 0 && record.references.length <= 50
     && record.references.every(reference => reference && typeof reference.id === "string" && Number.isSafeInteger(reference.revision)
-      && (reference.label === undefined || typeof reference.label === "string") && typeof reference.state === "string") ? record : null;
+      && (reference.label === undefined || typeof reference.label === "string") && (reference.value === undefined || typeof reference.value === "string")
+      && typeof reference.state === "string") ? record : null;
 }
 
 const states: Record<string, string> = {
@@ -26,6 +27,7 @@ export default function PersonalFactReferences({ record }: { record: PersonalFac
     </dl>
     <ul>{record.references.map(reference => <li key={reference.id}>
       <strong>{reference.label || `个人资料 ${reference.id.slice(0, 8)}`}</strong>
+      {reference.value && <p>{reference.value}</p>}
       <span>引用版本 {reference.revision} · {Object.hasOwn(states, reference.state) ? states[reference.state] : "状态待核对"}</span>
     </li>)}</ul>
   </section>;

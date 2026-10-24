@@ -58,7 +58,7 @@ export function personalFactReferenceMessages(messages, threadId, facts, now = D
         : fact.source !== "user" ? "unconfirmed" : fact.enabled === false ? "disabled" : fact.expiresAt && Date.parse(fact.expiresAt) <= now ? "expired"
           : fact.revision !== reference.revision ? "reconfirmed" : "active";
       return { id: reference.id, revision: reference.revision, state,
-        ...(fact && !["changed", "removed", "unavailable"].includes(state) ? { label: fact.label } : {}) };
+        ...(fact && !["changed", "removed", "unavailable"].includes(state) ? { label: fact.label, value: fact.value } : {}) };
     });
     return { ...message, text: `模型报告引用了 ${references.length} 条个人资料`,
       details: { ...message.details, personalFactReferences: { source: "model_report", recordedAt: receipt.recordedAt, checkedAt: new Date(now).toISOString(), turnId: receipt.turnId, references } } };
