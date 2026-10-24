@@ -46,6 +46,7 @@ import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPat
 import { createPersonalFactsStore, normalizePersonalFactContext, personalFactContextIssue } from "./personal-facts.mjs";
 import { handlePersonalFactReferenceCall, personalFactReferenceTool, personalFactReferenceMessages } from "./personal-fact-references.mjs";
 import { personalMemoryTool, handlePersonalMemoryCall } from "./personal-memory.mjs";
+import { personalCalendarTool, handlePersonalCalendarCall, personalCalendarProposalMessages } from "./personal-calendar-tool.mjs";
 import { createPersonalCommitmentsStore, personalCommitmentDraft, personalCommitmentLinks } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
@@ -1840,6 +1841,9 @@ async function getAppServerThreadMessages(session, repo = null, options = {}) {
     const facts = await personalFactsStore.list().catch(() => null);
     messages = personalFactReferenceMessages(messages, session.codexSessionId, facts);
   }
+  if (repo?.kind === "personal" && messages.some(message => message.messageType === "dynamicToolCall" && message.details?.tool === personalCalendarTool.name)) {
+    messages = personalCalendarProposalMessages(messages, session.codexSessionId, await personalCalendarActions.list().catch(() => null));
+  }
   return { ok: true, messages, thread };
 }
 
@@ -2090,7 +2094,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null, sta
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
-    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool] } : {}),
+    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool, personalCalendarTool] } : {}),
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
       ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, personalSnapshot.facts, await personalCommitmentsStore.list())] : []),
@@ -2625,6 +2629,11 @@ async function appServerRequestResult(method, params = {}) {
   if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const job = findTurnJob(params) || findCompactJob(params);
   if (method === "item/tool/call") {
+    if (params.tool === personalCalendarTool.name) {
+      const result = await handlePersonalCalendarCall(params, job, personalCalendarActions);
+      if (result.success && job) emitJobEvent(job, "status", { text: "日程提案已保存，等待你在今日核对并确认；尚未创建日程" });
+      return result;
+    }
     if (params.tool === personalFactReferenceTool.name) return handlePersonalFactReferenceCall(params, job);
     const result = await handlePersonalMemoryCall(params, job, personalFactsStore);
     if (result.success && job) emitJobEvent(job, "status", { text: "个人记忆候选已保存，等待你在个人设置中核对；尚未成为事实" });

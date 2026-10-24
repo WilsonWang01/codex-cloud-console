@@ -5,7 +5,7 @@ import { approvalDigest } from "./approval-broker.mjs";
 import { createKeyedQueue } from "./run-safety.mjs";
 
 export const calendarProposalLimits = Object.freeze({ count: 100, bytes: 2 * 1024 * 1024, previewMs: 5 * 60_000, conflicts: 20 });
-export const calendarProposalFormatVersion = 1;
+export const calendarProposalFormatVersion = 2;
 export const calendarProposalError = (code, message, statusCode = 400, details) => Object.assign(new Error(message), { code, statusCode, ...(details ? { details } : {}) });
 const invalid = () => calendarProposalError("calendar_proposal_invalid", "日程提案数据无效，原记录未改写", 503);
 const instant = z.string().datetime({ offset: true }).max(40);
@@ -22,6 +22,14 @@ const payloadSchema = z.object({ title: text(200).min(1), description: text(2000
 const targetSchema = z.object({ connectorId: z.string().min(1).max(200), linkId: z.string().min(1).max(200), email: z.string().email().max(254),
   calendarId: z.literal("primary"), contract: hash,
 }).strict();
+const originId = z.string().min(1).max(200).refine(value => value === value.trim() && !/[\x00-\x1f\x7f]/.test(value));
+const originSchema = z.object({ sessionId: originId, threadId: originId, turnId: originId, callId: originId, reason: text(300).min(1), contentDigest: hash }).strict();
+export function calendarModelClientKey(origin) {
+  const parsed = originSchema.safeParse(origin);
+  if (!parsed.success) throw calendarProposalError("calendar_form_invalid", "提案来源无法核对");
+  const value = approvalDigest("calendar-model-call", { sessionId: origin.sessionId, threadId: origin.threadId, turnId: origin.turnId, callId: origin.callId });
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-8${value.slice(13, 16)}-8${value.slice(17, 20)}-${value.slice(20, 32)}`;
+}
 const calendarUrl = z.string().max(2048).refine(value => {
   try { const url = new URL(value); return url.protocol === "https:" && !url.username && !url.password && !url.port && (url.hostname === "calendar.google.com" || url.hostname === "www.google.com" && url.pathname.startsWith("/calendar/")); }
   catch { return false; }
@@ -34,7 +42,7 @@ const receiptSchema = z.object({ eventId: z.string().min(1).max(1024), url: cale
   source: z.literal("google_calendar.fetch"), contentDigest: hash,
 }).strict();
 const itemSchema = z.object({ id: z.string().uuid(), clientKey: z.string().uuid(), inputDigest: hash, revision: z.number().int().positive(),
-  payload: payloadSchema, target: targetSchema, source: z.literal("user"), createdAt: instant, updatedAt: instant,
+  payload: payloadSchema, target: targetSchema, source: z.enum(["user", "assistant"]), origin: originSchema.optional(), createdAt: instant, updatedAt: instant,
   status: z.enum(["draft", "deferred", "rejected", "executing", "succeeded", "needs_reconciliation", "reconciled"]),
   attempted: z.boolean(), preview: previewSchema.nullable(), confirmation: z.object({ digest: hash, revision: z.number().int().positive(), at: instant }).strict().nullable(),
   receipt: receiptSchema.nullable(), eventId: z.string().min(1).max(1024).nullable(), error: text(500).nullable(),
@@ -116,10 +124,12 @@ export function createCalendarProposalStore({ read, write, now = () => Date.now(
   let initialized = false;
   const load = async () => {
     const state = await read() ?? { version: 1, proposals: [] };
-    const parsed = z.object({ version: z.literal(1), proposals: z.array(itemSchema).max(calendarProposalLimits.count) }).strict().safeParse(state);
+    const parsed = z.object({ version: z.union([z.literal(1), z.literal(2)]), proposals: z.array(itemSchema).max(calendarProposalLimits.count) }).strict().safeParse(state);
     if (!parsed.success || Buffer.byteLength(JSON.stringify(state)) > calendarProposalLimits.bytes || new Set(state.proposals.map(item => item.id)).size !== state.proposals.length || new Set(state.proposals.map(item => item.clientKey)).size !== state.proposals.length) throw invalid();
     try { for (const item of state.proposals) {
       if (calendarContentDigest(calendarProposalPayload(calendarProposalForm(item.payload))) !== calendarContentDigest(item.payload)
+        || (item.source === "assistant") !== Boolean(item.origin)
+        || item.origin && (state.version !== 2 || item.clientKey !== calendarModelClientKey(item.origin))
         || item.preview && item.preview.digest !== proposalDigest(item, item.preview)
         || item.preview && calendarAvailabilityDigest(item.target, item.payload, item.preview.availability.conflicts) !== item.preview.availability.version
         || item.attempted !== Boolean(item.confirmation) || ["executing", "succeeded", "needs_reconciliation", "reconciled"].includes(item.status) !== item.attempted
@@ -152,15 +162,18 @@ export function createCalendarProposalStore({ read, write, now = () => Date.now(
   return {
     list: () => mutate(state => state.proposals),
     get: id => mutate(state => find(state, id)),
-    create: (clientKey, payload, target) => mutate(async state => {
+    create: (clientKey, payload, target, { origin = null, authorize = () => true } = {}) => mutate(async state => {
       payload = payloadValue(payload);
       if (!z.string().uuid().safeParse(clientKey).success || !targetSchema.safeParse(target).success) throw calendarProposalError("calendar_form_invalid", "提案编号或目标账号无效");
-      const inputDigest = approvalDigest("calendar-proposal-input", payload), previous = state.proposals.find(item => item.clientKey === clientKey);
+      if (origin && (!originSchema.safeParse(origin).success || clientKey !== calendarModelClientKey(origin) || origin.contentDigest !== calendarContentDigest(payload))) throw calendarProposalError("calendar_form_invalid", "提案来源或原始内容无法核对");
+      if (authorize() !== true) throw calendarProposalError("calendar_turn_changed", "原个人回合已结束或取消，未保存新提案", 409);
+      const inputDigest = approvalDigest("calendar-proposal-input", origin ? { payload, origin } : payload), previous = state.proposals.find(item => item.clientKey === clientKey);
       if (previous) { if (previous.inputDigest !== inputDigest) throw calendarProposalError("calendar_proposal_conflict", "同一草稿编号的内容已变化，请刷新核对", 409); return previous; }
+      if (origin && state.proposals.filter(item => item.origin?.threadId === origin.threadId && item.origin.turnId === origin.turnId).length >= 3) throw calendarProposalError("calendar_proposal_capacity", "本回合最多提出 3 条日程草稿，请先核对已有提案", 409);
       if (state.proposals.length >= calendarProposalLimits.count) throw calendarProposalError("calendar_proposal_capacity", "日程提案达到 100 条上限，请先清理未执行草稿", 409);
-      const at = new Date(now()).toISOString(), item = { id: crypto.randomUUID(), clientKey, inputDigest, revision: 1, payload, target, source: "user", createdAt: at, updatedAt: at,
+      const at = new Date(now()).toISOString(), item = { id: crypto.randomUUID(), clientKey, inputDigest, revision: 1, payload, target, source: origin ? "assistant" : "user", ...(origin ? { origin } : {}), createdAt: at, updatedAt: at,
         status: "draft", attempted: false, preview: null, confirmation: null, receipt: null, eventId: null, error: null, reconciliation: null };
-      state.proposals.push(item); await save(state); return item;
+      state.proposals.push(item); if (origin) state.version = 2; await save(state); return item;
     }),
     edit: (id, revision, payload) => mutate(async state => { const item = find(state, id, revision); editable(item); item.payload = payloadValue(payload); item.status = "draft"; item.preview = null; item.error = null; touch(item); await save(state); return item; }),
     defer: (id, revision, status) => mutate(async state => { const item = find(state, id, revision); editable(item); if (!["deferred", "rejected", "draft"].includes(status)) throw calendarProposalError("calendar_form_invalid", "提案状态无效"); item.status = status; item.preview = null; touch(item); await save(state); return item; }),

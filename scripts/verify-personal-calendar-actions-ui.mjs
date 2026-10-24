@@ -5,7 +5,8 @@ import { spawn } from "node:child_process";
 import { chromium } from "playwright";
 
 const project = new URL("../", import.meta.url).pathname;
-const fixture = spawn(process.execPath, ["scripts/verify-personal-facts-ui.mjs", "--serve", "--calendar-actions"], { cwd: project, stdio: ["ignore", "pipe", "pipe"] });
+const model = process.argv.includes("--model-proposals");
+const fixture = spawn(process.execPath, ["scripts/verify-personal-facts-ui.mjs", "--serve", model ? "--calendar-model" : "--calendar-actions"], { cwd: project, stdio: ["ignore", "pipe", "pipe"] });
 let output = "", browser;
 fixture.stdout.on("data", chunk => { output += chunk; }); fixture.stderr.on("data", chunk => { output += chunk; });
 try {
@@ -27,6 +28,52 @@ try {
   browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   const errors = []; page.on("pageerror", error => errors.push(error.message));
+  if (model) {
+    await page.goto(ready.url);
+    await page.getByRole("region", { name: "日程提案", exact: true }).getByRole("button", { name: "让助理起草", exact: true }).click();
+    const composer = page.getByRole("textbox", { name: "向个人助理发送消息", exact: true });
+    await composer.waitFor(); assert.match(await composer.inputValue(), /不创建或修改日历/);
+    assert.equal((await fs.readFile(ready.rpcCapture, "utf8")).includes('"method":"turn/start"'), false);
+    await composer.fill("合成日程起草验收"); await page.getByRole("button", { name: "发送消息", exact: true }).click();
+    const link = page.getByRole("link", { name: "查看日程提案", exact: true }); await link.waitFor();
+    let item = (await request()).data.proposals[0]; assert.equal(item.source, "assistant"); assert.equal(item.attempted, false); assert.equal(item.preview, null);
+    assert.equal(JSON.parse(await fs.readFile(ready.calendarEvents, "utf8")).length, 0);
+    const out = path.join(project, "docs/research/acceptance/p022-model-proposals-20261024"); await fs.mkdir(out, { recursive: true });
+    for (const [width, height] of [[1280, 900], [768, 900], [390, 640], [320, 480]]) {
+      await page.setViewportSize({ width, height }); await link.scrollIntoViewIfNeeded();
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      const box = await link.boundingBox(); assert.ok(box && box.height >= 44 && box.x >= 0 && box.x + box.width <= width + 1);
+      await page.screenshot({ path: path.join(out, `chat-${width}.png`), fullPage: true });
+    }
+    await link.click(); const section = page.getByRole("region", { name: "日程提案", exact: true });
+    await section.getByText("合成对话日程提案", { exact: true }).waitFor();
+    await page.getByText("1 项需要你处理", { exact: true }).waitFor();
+    await page.getByRole("button", { name: /1 条日程提案待核对/ }).waitFor();
+    await section.getByText("初始提案来源", { exact: true }).click();
+    await section.getByText("助理说明：合成用户在当前个人对话中明确要求起草", { exact: true }).waitFor();
+    for (const width of [1280, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: width < 400 ? 640 : 900 }); await section.scrollIntoViewIfNeeded();
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      await section.screenshot({ path: path.join(out, `source-${width}.png`) });
+    }
+    await section.getByRole("button", { name: "查看来源对话", exact: true }).click(); await link.waitFor();
+    await page.reload(); await link.waitFor(); await link.click();
+    await section.getByRole("button", { name: "编辑日程 合成对话日程提案", exact: true }).click();
+    await section.getByLabel("日程标题", { exact: true }).fill("用户更正后的日程草稿"); await section.getByRole("button", { name: "保存草稿", exact: true }).click();
+    await section.getByText("用户更正后的日程草稿", { exact: true }).waitFor();
+    item = (await request()).data.proposals[0]; assert.equal(item.origin.callId, "reference-runtime-call");
+    await section.getByRole("button", { name: "拒绝日程 用户更正后的日程草稿", exact: true }).click();
+    await page.reload(); await section.locator("details.personal-completed > summary").click(); await section.getByText("初始提案来源", { exact: true }).click();
+    await section.getByRole("button", { name: "查看来源对话", exact: true }).click(); await link.waitFor();
+    assert.match(await page.locator(".chat-window").innerText(), /日程提案已保存：用户更正后的日程草稿/);
+    const current = (await request()).data.proposals[0]; assert.equal(current.status, "rejected"); assert.equal(current.attempted, false);
+    await link.click(); await page.getByText("1 项需要你处理", { exact: true }).waitFor({ state: "detached" });
+    const rpc = (await fs.readFile(ready.rpcCapture, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(rpc.filter(item => item.method === "turn/start").length, 1); assert.equal(rpc.some(item => ["google_calendar.search", "google_calendar.fetch", "google_calendar.create_event"].includes(item.params?.tool)), false);
+    assert.ok(rpc.find(item => item.method === "thread/start" && item.params?.serviceName === "codex_cloud_console").params.dynamicTools.some(tool => tool.name === "personal_calendar_propose"));
+    assert.deepEqual(errors, []);
+    console.log(JSON.stringify({ ok: true, backend: "actual isolated console", syntheticTurns: 1, realModelCalls: 0, realCalendarWrites: 0, checks: ["今日入口仅准备消息", "原生工具到持久草稿", "聊天到提案及回源", "四宽度短屏", "重载不重复运行", "编辑拒绝保留来源"] }));
+  } else {
   await page.goto(ready.url);
   const section = page.getByRole("region", { name: "日程提案", exact: true });
   await section.getByRole("button", { name: "新增草稿", exact: true }).click();
@@ -102,6 +149,7 @@ try {
   assert.equal(rpc.some(item => ["turn/start", "account/login/start"].includes(item.method)), false);
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ ok: true, backend: "actual isolated console and native RPC fixture", realModelCalls: 0, realThirdPartyWrites: 0, syntheticCreates: 2, checks: ["草稿刷新找回", "四宽度编辑和确认", "账号变化拒绝", "冲突单独确认", "实际RPC单次执行与重复确认", "丢失回执阻止发布/人工核对", "请求边界"] }));
+  }
 } finally {
   await browser?.close();
   if (fixture.exitCode === null) { const closed = new Promise(resolve => fixture.once("close", resolve)); fixture.kill("SIGTERM"); await closed; }

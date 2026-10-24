@@ -23,7 +23,7 @@ try {
     await fs.copyFile(path.join(projectRoot, name), path.join(root, name));
   }
   await fs.mkdir(path.join(root, "server"));
-  for (const name of ["pdf-inputs.mjs", "pdf-input-worker.mjs", "inline-inputs.mjs", "run-admission.mjs", "external-automation.mjs", "structured-output.mjs", "external-results.mjs", "safe-file-read.mjs", "personal-calendar.mjs", "personal-calendar-actions.mjs", "personal-calendar-proposals.mjs", "approval-broker.mjs", "run-safety.mjs", "run-budget.mjs"]) await fs.copyFile(path.join(projectRoot, "server", name), path.join(root, "server", name));
+  for (const name of ["pdf-inputs.mjs", "pdf-input-worker.mjs", "inline-inputs.mjs", "run-admission.mjs", "external-automation.mjs", "structured-output.mjs", "external-results.mjs", "safe-file-read.mjs", "personal-calendar.mjs", "personal-calendar-actions.mjs", "personal-calendar-proposals.mjs", "personal-calendar-tool.mjs", "personal-memory.mjs", "approval-broker.mjs", "run-safety.mjs", "run-budget.mjs"]) await fs.copyFile(path.join(projectRoot, "server", name), path.join(root, "server", name));
   await fs.mkdir(path.join(root, "scripts"));
   for (const name of ["codex-cloud-mcp.mjs", "external-client-example.mjs"]) await fs.copyFile(path.join(projectRoot, "scripts", name), path.join(root, "scripts", name));
   execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
@@ -62,6 +62,8 @@ try {
     await mcp.close();
     const {calendarProposalPayload} = await import("./server/personal-calendar-proposals.mjs");
     const {calendarActionRouter} = await import("./server/personal-calendar-actions.mjs");
+    const {personalCalendarTool} = await import("./server/personal-calendar-tool.mjs");
+    assert.equal(personalCalendarTool.name,"personal_calendar_propose");
     assert.equal(typeof calendarActionRouter({}).get,"function");
     assert.equal(calendarProposalPayload({title:"Synthetic runtime",timeZone:"UTC",startLocal:"2026-10-25T10:00",endLocal:"2026-10-25T10:30"}).start,"2026-10-25T10:00:00.000Z");
   `], { cwd: root, stdio: "pipe", timeout: 30_000 });

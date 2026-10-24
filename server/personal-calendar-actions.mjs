@@ -4,7 +4,7 @@ import { z } from "zod";
 import { DateTime } from "luxon";
 import { approvalDigest } from "./approval-broker.mjs";
 import { calendarToolData, normalizeCalendarEvent } from "./personal-calendar.mjs";
-import { calendarProposalError as fail, calendarProposalLimits, calendarAvailabilityDigest, calendarContentDigest, calendarCreateArguments, calendarProposalPayload, requireFutureCalendarProposal } from "./personal-calendar-proposals.mjs";
+import { calendarProposalError as fail, calendarProposalLimits, calendarProposalFormatVersion, calendarAvailabilityDigest, calendarContentDigest, calendarCreateArguments, calendarProposalPayload, requireFutureCalendarProposal } from "./personal-calendar-proposals.mjs";
 
 const methods = ["get_profile", "search", "fetch", "create_event"];
 const targetDigest = value => approvalDigest("calendar-target", value);
@@ -118,7 +118,7 @@ export function createPersonalCalendarActions({ store, request, context, closeAp
   const sameTarget = (proposal, target) => { if (targetDigest(proposal.target) !== targetDigest(target)) throw fail("calendar_connection_changed", "目标账号或工具已变化，请重新绑定并核对", 409); };
   return {
     list,
-    health: async () => { await list(); return { ok: true, writeFormat: 1 }; },
+    health: async () => { await list(); return { ok: true, writeFormat: calendarProposalFormatVersion, readableFormats: [1, 2] }; },
     ownsThread: id => threads.has(id),
     canApprove: (method, params) => threads.get(params.threadId) === "write" && method === "mcpServer/elicitation/request" && params.serverName === "codex_apps" && ["form", "openai/form", "openaiForm"].includes(params.mode),
     jobs: () => {
@@ -127,7 +127,11 @@ export function createPersonalCalendarActions({ store, request, context, closeAp
         ...(active && !items.length ? [{ id: "calendar:checking", kind: "calendar-action", repoId: "_personal", title: "正在核对日历提案", startedAt: active, status: "running", completed: false }] : []),
         ...(invalid ? [{ id: "calendar:invalid", kind: "calendar-action", repoId: "_personal", title: "日历提案存储需要核对", status: "running", completed: false }] : [])];
     },
-    async create(clientKey, payload) { return operate(() => connection(async ({ target }) => store.create(clientKey, payload, target))); },
+    async create(clientKey, payload, options = {}) {
+      const previous = (await list()).find(item => item.clientKey === clientKey);
+      if (previous) return store.create(clientKey, payload, previous.target, options);
+      return operate(() => connection(({ target }) => store.create(clientKey, payload, target, options)));
+    },
     async update(id, input) {
       const result = input.payload ? await store.edit(id, input.revision, input.payload) : await store.defer(id, input.revision, input.status);
       await list(); return result;
@@ -182,7 +186,7 @@ export function calendarActionRouter(actions) {
       });
     }
   });
-  route("get", "/", null, async () => ({ version: 1, proposals: await actions.list() }));
+  route("get", "/", null, async () => ({ version: calendarProposalFormatVersion, proposals: await actions.list() }));
   route("post", "/", z.object({ clientKey: z.string().uuid(), form: z.unknown() }).strict(), async (_, input) => ({ proposal: await actions.create(input.clientKey, calendarProposalPayload(input.form)) }));
   route("patch", "/:id", z.union([z.object({ revision, form: z.unknown() }).strict(), z.object({ revision, status: z.enum(["draft", "deferred", "rejected"]) }).strict()]), async (id, input) => ({ proposal: await actions.update(id, { revision: input.revision, ...("form" in input ? { payload: calendarProposalPayload(input.form) } : { status: input.status }) }) }));
   for (const name of ["preview", "rebind", "check"]) route("post", `/:id/${name}`, z.object({ revision }).strict(), async (id, input) => ({ proposal: await actions[name](id, input.revision) }));
