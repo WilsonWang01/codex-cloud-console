@@ -4396,7 +4396,7 @@ export function App() {
     if (externalRoute) {
       if (activeView !== externalRoute.view || (externalRoute.repoId && selectedRepoId !== externalRoute.repoId)) return;
       if (externalRoute.view === "automations" && selectedAutomationId !== (externalRoute.automationId || "")) return;
-      if (externalRoute.view === "cli" && externalRoute.sessionId && activeRouteSessionId !== externalRoute.sessionId) return;
+      if (externalRoute.view === "cli" && externalRoute.sessionId && ![activeRouteSessionId, activeSessionId].includes(externalRoute.sessionId)) return;
       pendingHashNavigationRef.current = null;
     }
     const pendingTarget = pendingRouteSession || pendingRouteSessionRef.current;
@@ -4404,7 +4404,7 @@ export function App() {
       activeView === "cli" &&
       pendingTarget?.repoId === selectedRepoId &&
       pendingTarget.sessionId &&
-      pendingTarget.sessionId !== activeRouteSessionId
+      ![activeRouteSessionId, activeSessionId].includes(pendingTarget.sessionId)
     ) {
       return;
     }
@@ -4414,7 +4414,7 @@ export function App() {
       sessionId: activeView === "cli" ? activeRouteSessionId || undefined : undefined,
       automationId: activeView === "automations" ? selectedAutomationId : undefined,
     });
-  }, [activeRouteSessionId, activeView, pendingRouteSession, selectedAutomationId, selectedRepoId, writeAppHash]);
+  }, [activeRouteSessionId, activeSessionId, activeView, pendingRouteSession, selectedAutomationId, selectedRepoId, writeAppHash]);
 
   useEffect(() => {
     const onHashChange = () => {
