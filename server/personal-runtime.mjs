@@ -1,4 +1,5 @@
 import path from "node:path";
+import { activePersonalFacts } from "./personal-facts.mjs";
 
 const defaultPersonalHome = "/var/lib/codex-personal";
 const defaultSocket = "/run/codex-personal/worker.sock";
@@ -8,6 +9,7 @@ export function personalSessionRuntime(runtime) {
 }
 
 export function personalDeveloperInstructions(runtime, facts = [], commitments = []) {
+  facts = activePersonalFacts(facts);
   const activeCommitments = commitments.filter((item) => item.status === "active").sort((a, b) => {
     const aDue = a.dueAt ? Date.parse(a.dueAt) : Number.POSITIVE_INFINITY;
     const bDue = b.dueAt ? Date.parse(b.dueAt) : Number.POSITIVE_INFINITY;

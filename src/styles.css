@@ -7318,6 +7318,13 @@ pre {
 .personal-fact-conflict p { margin: 6px 0; }
 .personal-fact-editor button { display: inline-flex; align-items: center; gap: 5px; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
 .personal-fact-editor button:disabled { opacity: .5; cursor: default; }
+.personal-fact-settings { display: flex; flex-wrap: wrap; gap: 8px 20px; min-width: 0; margin: 0; padding: 8px 0; border: 0; }
+.personal-fact-settings legend { color: var(--muted); font-size: 12px; }
+.personal-fact-settings label { display: flex; align-items: center; gap: 8px; min-height: 44px; font-size: 13px; }
+.personal-fact-settings input[type="checkbox"] { flex: 0 0 18px; width: 18px; height: 18px; }
+.personal-fact-settings .personal-fact-expiry { display: grid; width: 100%; min-width: 0; }
+.personal-fact-expiry input { min-width: 0; max-width: 100%; box-sizing: border-box; }
+.personal-context-notice .mini-action { min-height: 44px; }
 .composer-shell { position: relative; }
 .external-review-banner { display: flex; align-items: flex-start; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid #e9c993; border-bottom: 0; border-radius: 6px 6px 0 0; background: #fff8e9; color: var(--text); }
 .external-review-banner > svg { flex: 0 0 auto; margin-top: 2px; color: #a36212; }

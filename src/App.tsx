@@ -55,6 +55,7 @@ import {
 } from "lucide-react";
 import { Suspense, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
+import PersonalContextNotice from "./PersonalContextNotice";
 
 const LazyChatMarkdown = recoverableLazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = recoverableLazy(() => import("./CodexPluginManager"));
@@ -4683,6 +4684,29 @@ export function App() {
   };
   const newChatSession = () => { void createChatSession(); };
 
+  const continuePersonalContext = async (pendingSessionId: string) => {
+    if (busyAction || isLoadingChatHistory || uploadingAttachments || selectedRepo.kind !== "personal" || !activeSessionId) return false;
+    const repo = selectedRepo;
+    const sourceId = activeSessionId;
+    const snapshot = draftSnapshot(chatInput, chatAttachments);
+    const requestSeq = ++chatLoadSeq.current;
+    setBusyAction("personal-context");
+    try {
+      const saved = await saveComposerDraft(repo.id, sourceId, chatInput, chatAttachments);
+      if (!saved || selectedRepoIdRef.current !== repo.id || activeSessionIdRef.current !== sourceId
+        || snapshot !== draftSnapshot(chatInputRef.current, chatAttachmentsRef.current)) throw new Error("草稿或当前会话已变化，输入已保留，请核对后重试。");
+      const result = await api<ChatHistoryResponse>(`/api/chat/sessions/${encodeURIComponent(sourceId)}/personal-context`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoId: repo.id, pendingSessionId, expectedDraftRevision: saved.draft.revision }),
+      });
+      if (snapshot !== draftSnapshot(chatInputRef.current, chatAttachmentsRef.current)) throw new Error("新上下文已创建，但你又修改了原草稿，因此没有自动切换。输入仍保留在原会话。");
+      return applyChatHistory(result, repo, requestSeq);
+    } catch (error) {
+      pushEvent({ tone: "warn", title: "新上下文", body: error instanceof Error ? error.message : "尚未完成，原会话与输入保留" });
+      return false;
+    } finally { setBusyAction(null); }
+  };
+
   const preparePersonalCommitment = async (item: PersonalCommitment, pendingSessionId?: string) => {
     if (busyAction || isLoadingChatHistory || selectedRepo.kind !== "personal") return null;
     const repo = selectedRepo;
@@ -5513,6 +5537,7 @@ export function App() {
       let mocked = false;
       let collected = "";
       let stderr = "";
+      let turnError = "";
       let streamSessionId = activeSessionId;
       let terminalEventReceived = false;
       let submissionAccepted = false;
@@ -5613,6 +5638,7 @@ export function App() {
           return;
         }
         if (event === "error") {
+          turnError = String(payload.message || "云端 Codex 对话失败");
           patchResponse({ text: String(payload.message || "云端 Codex 对话失败"), messageType: "error", streaming: false, status: "失败" });
           return;
         }
@@ -5627,7 +5653,7 @@ export function App() {
             setChatSessions((current) => current.map((session) => session.id === streamSessionId ? { ...session, externalActionReview } : session));
           }
           patchResponse({
-            text: `${collected || stderr || (ok ? "Codex 已完成但没有返回内容。" : "云端 Codex 没有返回内容。")}${externalActionReview ? `\n\n${externalActionReview.reason}` : ""}`,
+            text: `${collected || String(payload.error || turnError || "") || stderr || (ok ? "Codex 已完成但没有返回内容。" : "云端 Codex 没有返回内容。")}${externalActionReview ? `\n\n${externalActionReview.reason}` : ""}`,
             mocked,
             streaming: false,
             status: ok ? "完成" : `退出码 ${payload.code ?? "未知"}`,
@@ -6345,6 +6371,7 @@ export function App() {
               sessions={chatSessions}
               activeSessionId={activeSessionId}
               onNewSession={newChatSession}
+              onContinuePersonalContext={continuePersonalContext}
               onNewProject={() => setProjectDialogOpen(true)}
               onSelectSession={selectChatSession}
               onOpenThread={openAttentionThread}
@@ -9090,6 +9117,7 @@ function CloudChat({
   sessions,
   activeSessionId,
   onNewSession,
+  onContinuePersonalContext,
   onNewProject,
   onSelectSession,
   onOpenThread,
@@ -9163,6 +9191,7 @@ function CloudChat({
   sessions: ChatSession[];
   activeSessionId: string;
   onNewSession: () => void;
+  onContinuePersonalContext: (pendingId: string) => Promise<boolean>;
   onNewProject: () => void;
   onSelectSession: (id: string) => void;
   onOpenThread: (repoId: string, sessionId: string) => void;
@@ -10158,6 +10187,8 @@ function CloudChat({
         onDragOver={handleComposerDragOver}
         onDrop={handleComposerDrop}
       >
+        {repo.kind === "personal" && activeSessionId && <PersonalContextNotice key={`${activeSessionId}:${activeSession?.messageCount || 0}`} sessionId={activeSessionId}
+          disabled={busy || Boolean(busyAction) || uploadingAttachments || Boolean(queuedTurn) || Boolean(activeSession?.externalActionReview)} onContinue={onContinuePersonalContext} />}
         {activeSession?.externalActionReview && <div className="external-review-banner" role="alert" data-testid="external-action-review">
           <TriangleAlert size={18} aria-hidden="true" />
           <span>

@@ -577,7 +577,7 @@ test("恢复原 worktree，缺失或越界目录不会回退主仓库", async ()
 
 test("恢复超时保留原线程且不会新建线程", async () => {
   const calls = [];
-  const context = { appServerClientForJob: () => ({ request: async (method) => { calls.push(method); throw new Error("timeout"); } }), appServerThreadParams: () => ({}), emitJobEvent() {}, rememberOwner() {}, updateSessionRuntime: async () => assert.fail("must not replace thread") };
+  const context = { preparePersonalFactContext: async () => null, appServerClientForJob: () => ({ request: async (method) => { calls.push(method); throw new Error("timeout"); } }), appServerThreadParams: () => ({}), emitJobEvent() {}, rememberOwner() {}, updateSessionRuntime: async () => assert.fail("must not replace thread") };
   vm.createContext(context);
   vm.runInContext(section(source, "async function resolveThreadForJob(", "async function startTurnJob("), context);
   const job = { threadId: "original", repo: {}, runtime: {} };

@@ -1885,7 +1885,7 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(linkedCommitment.response.status, 200);
     const withFact = await jsonRequest(base, "/api/chat", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "outcome contract regression with fact" }),
+      body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "outcome contract regression with fact", model: "gpt-6-astra", reasoning: "ultra" }),
     });
     assert.equal(withFact.data.ok, true);
     const factStarts = (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter((request) => request.method === "thread/start" && request.params.cwd === path.join(cloudRoot, "personal"));
@@ -1902,6 +1902,23 @@ await check("personal and work reuse authentication without sharing threads or s
       method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: createdFact.data.fact.revision }),
     });
     assert.equal(deletedFact.response.status, 200);
+    const rpcBeforeBlock = await fs.readFile(capturePath, "utf8");
+    for (const [route, body] of [
+      ["/api/chat", { message: "must not reuse removed fact" }],
+      ["/api/codex/thread-fork", {}],
+      [`/api/chat/sessions/${factSession.data.activeSessionId}/runtime`, { model: "gpt-6-sol", reasoning: "medium" }],
+    ]) {
+      const blocked = await jsonRequest(base, route, { method: route.endsWith("/runtime") ? "PATCH" : "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, ...body }) });
+      assert.equal(blocked.response.status, 409, JSON.stringify(blocked.data));
+      assert.match(blocked.data.error, /新上下文/);
+    }
+    const blockedStream = await fetch(`${base}/api/chat/stream`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "must not run stream" }) });
+    assert.match(await blockedStream.text(), /personal_context_changed/);
+    const rpcAfterBlock = await fs.readFile(capturePath, "utf8");
+    const executionMethods = (capture) => capture.trim().split("\n").map(JSON.parse).filter((request) => ["thread/resume", "thread/start", "thread/fork", "turn/start", "thread/compact/start"].includes(request.method));
+    assert.equal(executionMethods(rpcAfterBlock).length, executionMethods(rpcBeforeBlock).length, "rejected requests must not resume, fork or run a model");
+    const contextCheck = await jsonRequest(base, `/api/chat/sessions/${factSession.data.activeSessionId}/personal-context?repoId=_personal`);
+    assert.match(contextCheck.data.issue, /新上下文/); assert.equal(contextCheck.data.providedCount, 1);
     const removedFactSession = await jsonRequest(base, "/api/chat/sessions", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "Removed fact test" }),
     });
@@ -1923,6 +1940,24 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(uploaded.data.files.length, 1);
     assert.equal(uploaded.data.files[0].source, "personal-upload");
     const uploadPath = uploaded.data.files[0].path;
+    const draftCopy = { input: "保留原未发送输入", attachments: [{ name: "notes.txt", path: uploadPath, mimeType: "text/plain", size: attachmentBytes.length, kind: "file" }] };
+    const savedCopy = await jsonRequest(base, `/api/chat/sessions/${factSession.data.activeSessionId}/draft`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", ...draftCopy }) });
+    const pendingSessionId = crypto.randomUUID(), contextRoute = `/api/chat/sessions/${factSession.data.activeSessionId}/personal-context`;
+    const copyOptions = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", pendingSessionId, expectedDraftRevision: savedCopy.data.draft.revision }) };
+    const copied = await jsonRequest(base, contextRoute, copyOptions);
+    assert.equal(copied.response.status, 200, JSON.stringify(copied.data));
+    const newContext = copied.data.sessions.find((session) => session.id === pendingSessionId);
+    assert.equal(newContext.codexSessionId, null); assert.equal(newContext.model, "gpt-6-astra"); assert.equal(newContext.reasoning, "ultra");
+    assert.equal(newContext.draft.input, draftCopy.input); assert.equal(newContext.draft.attachments[0].path, uploadPath);
+    assert.deepEqual(copied.data.messages, []);
+    const oldDraft = await jsonRequest(base, `/api/chat/sessions/${factSession.data.activeSessionId}/draft?repoId=_personal`);
+    assert.deepEqual(oldDraft.data.draft, savedCopy.data.draft);
+    const contextReplay = await jsonRequest(base, contextRoute, copyOptions);
+    assert.equal(contextReplay.data.activeSessionId, pendingSessionId);
+    assert.equal(contextReplay.data.sessions.filter((session) => session.id === pendingSessionId).length, 1);
+    assert.equal((await jsonRequest(base, contextRoute, { ...copyOptions, body: JSON.stringify({ repoId: "sample-app", pendingSessionId }) })).response.status, 400);
+    await jsonRequest(base, `/api/chat/sessions/${pendingSessionId}?repoId=_personal`, { method: "DELETE" });
+    await jsonRequest(base, `/api/chat/sessions/${factSession.data.activeSessionId}/draft`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", input: "", attachments: [] }) });
     assert.match(uploadPath, /^\.codex-cloud\/uploads\//);
     assert.deepEqual(await fs.readFile(path.join(cloudRoot, "personal", uploadPath)), attachmentBytes);
     const preview = await fetch(`${base}/api/files/blob?repoId=_personal&path=${encodeURIComponent(uploadPath)}`);
@@ -1974,7 +2009,7 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.deepEqual(await fs.readFile(path.join(cloudRoot, "personal", uploadPath)), attachmentBytes);
     const activePersonalTurn = await fetch(`${base}/api/chat/stream`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repoId: "_personal", sessionId: factSession.data.activeSessionId, message: "personal deletion regression" }),
+      body: JSON.stringify({ repoId: "_personal", sessionId: removedFactSession.data.activeSessionId, message: "personal deletion regression" }),
     });
     assert.equal(activePersonalTurn.status, 200);
     let personalTurnStarted = false;
