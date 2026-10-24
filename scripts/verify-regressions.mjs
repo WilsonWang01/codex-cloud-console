@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn as spawnChild } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -21,6 +21,14 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 const results = [];
+const fixtureClosures = new WeakMap();
+const isolatedProcessGroups = process.platform === "linux";
+
+function spawn(command, args, options) {
+  const child = spawnChild(command, args, { ...options, detached: isolatedProcessGroups });
+  fixtureClosures.set(child, new Promise((resolve) => child.once("close", resolve)));
+  return child;
+}
 
 async function check(name, task) {
   const startedAt = Date.now();
@@ -61,11 +69,21 @@ function waitForOutput(child, pattern, timeoutMs = 10_000) {
 }
 
 async function stopProcess(child) {
-  if (!child || child.exitCode !== null) return;
-  const closed = new Promise((resolve) => child.once("close", resolve));
-  child.kill("SIGTERM");
-  await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-  if (child.exitCode === null) { child.kill("SIGKILL"); await closed; }
+  if (!child) return;
+  const signal = (name) => {
+    try {
+      if (isolatedProcessGroups) process.kill(-child.pid, name);
+      else child.kill(name);
+    } catch (error) { if (error.code !== "ESRCH") throw error; }
+  };
+  const closed = fixtureClosures.get(child);
+  let timer;
+  signal("SIGTERM");
+  try { await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(resolve, 2_000); })]); }
+  finally { clearTimeout(timer); }
+  // A server exit does not mean its simulated Codex children have stopped writing.
+  signal("SIGKILL");
+  await closed;
 }
 
 async function runCaptured(command, args, options = {}) {
@@ -455,6 +473,21 @@ input.on("line", (line) => {
   );
   return fakePath;
 }
+
+if (isolatedProcessGroups) await check("fixture shutdown stops descendants even after the parent has exited", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-process-stop-"));
+  const marker = path.join(root, "late-write");
+  const writer = `process.on('SIGTERM',()=>{});setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'must not survive'),300);console.log('writer-ready');setInterval(()=>{},1000);`;
+  const parent = spawn(process.execPath, ["-e", `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(writer)}],{stdio:['ignore','pipe','ignore']});child.stdout.once('data',()=>{console.log('parent-ready');process.exit(0)});`], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    await waitForOutput(parent, /parent-ready/);
+    await fixtureClosures.get(parent);
+    await stopProcess(parent);
+    await stopProcess(parent);
+    await new Promise(resolve => setTimeout(resolve, 450));
+    assert.equal(await fs.stat(marker).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; }), false);
+  } finally { await stopProcess(parent); await fs.rm(root, { recursive: true, force: true }); }
+});
 
 await check("client limits preserve budget accounting, replay, policy conflicts and execution checks", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-client-policy-"));
