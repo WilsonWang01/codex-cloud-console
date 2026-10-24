@@ -122,6 +122,28 @@ test("Python CLI prints recovery IDs on the final timeout line and never sends c
   assert.equal(calls[0].key, "python-cli-timeout-001");
 });
 
+test("Python recovery never logs invalid input IDs or accepts malformed returned run IDs", async t => {
+  const privateInput = "PRIVATE_RECOVERY_INPUT\nnot-an-id";
+  let malformed = false;
+  const { origin, calls } = await fixture(t, (_req, res) => {
+    res.statusCode = malformed ? 200 : 404;
+    res.end(JSON.stringify(malformed ? reply("running", { id: privateInput }) : { ok: false }));
+  });
+  for (const command of ["submit", "heartbeat", "status"]) {
+    const result = await pythonClient(origin, command, "research", privateInput);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr.includes("PRIVATE_RECOVERY_INPUT"), false, command);
+  }
+  assert.equal(calls.length, 1, "invalid event IDs are rejected before HTTP submission");
+  assert.equal(calls[0].method, "GET");
+  malformed = true;
+  const result = await pythonClient(origin, "submit", "research", "python-invalid-receipt-001");
+  assert.equal(result.code, 1);
+  assert.equal(result.stderr.includes("PRIVATE_RECOVERY_INPUT"), false);
+  assert.match(result.stderr, /\(event-id: python-invalid-receipt-001\)/);
+  assert.equal(calls.filter(call => call.method === "POST").length, 1);
+});
+
 test("standalone Node and Python CLIs load explicit request JSON and bounded local attachments", async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "external-client-inputs-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
