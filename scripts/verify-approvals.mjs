@@ -100,6 +100,7 @@ test("unattended personal schedules decline approvals before they enter the pend
   let brokerCalls = 0;
   const context = vm.createContext({
     personalCalendarSource: { ownsThread: () => false },
+    personalCalendarActions: { ownsThread: () => false },
     findTurnJob: () => job,
     findCompactJob: () => null,
     personalRepoId: "_personal",

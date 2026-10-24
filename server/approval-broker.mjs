@@ -146,5 +146,8 @@ export function createApprovalBroker({ timeoutMs = 5 * 60_000, onChange = () => 
         }
       }
     },
+    closeForThread(threadId, reason = "Calendar operation ended") {
+      for (const item of [...pending.values()].filter(entry => (entry.params.threadId || entry.params.thread_id) === threadId)) settle(item, { decision: "decline" }, reason);
+    },
   };
 }
