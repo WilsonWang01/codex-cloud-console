@@ -538,6 +538,7 @@ try {
   assert.equal(uploadedCount, 1);
   await page.getByRole("button", { name: "移除附件 notes.txt" }).click();
   await page.getByRole("button", { name: "连接邮箱" }).click();
+  assert.equal(await page.getByRole("button", { name: "服务目录", exact: true }).getAttribute("aria-pressed"), "true");
   await page.getByRole("link", { name: "连接Gmail" }).waitFor();
   await page.locator(".command-panel").getByRole("button", { name: "关闭面板" }).click();
   await page.getByRole("button", { name: /整理邮件待办/ }).click();

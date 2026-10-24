@@ -7204,9 +7204,15 @@ pre {
 .connected-directory-warning { color: var(--warn); }
 .connected-all-apps { margin-top: 12px; }
 .personal-permission-note { font-size: 12px; color: var(--muted); line-height: 1.6; margin: 12px 0; }
-.connected-service-list { display: grid; }
+.connected-service-list { display: grid; scroll-margin-top: 80px; outline-offset: 4px; }
+.connected-service-scope { margin: 10px 0; width: fit-content; max-width: 100%; }
+.connected-service-scope button { min-height: 44px; }
+.connected-service-pagination { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; }
+.connected-service-pagination > span { flex: 1; min-width: 0; color: var(--muted); }
+.connected-service-pagination button { width: 44px; min-height: 44px; padding: 0; justify-content: center; }
 .connected-service-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--border); }
-.connected-service-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.connected-service-content { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.connected-service-description summary { min-height: 44px; padding: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.5; cursor: pointer; }
 .connected-service-actions { display: flex; justify-self: end; flex-wrap: wrap; gap: 6px; }
 .connected-service-actions .mini-action { white-space: nowrap; }
 .connected-service-row strong { font-size: 14px; }
