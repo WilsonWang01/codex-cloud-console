@@ -149,6 +149,7 @@ let modelApiStructured = false;
 let turnSequence = 0;
 const fixtureTurns = new Map();
 const fixtureCwds = new Map();
+const acceptedApprovals = new Set();
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
@@ -156,6 +157,7 @@ input.on("line", (line) => {
   const message = JSON.parse(line);
   if (process.env.FAKE_CAPTURE_PATH) fsSync.appendFileSync(process.env.FAKE_CAPTURE_PATH, JSON.stringify(message) + "\\n");
   if (!message.id) return;
+  if (!message.method) { if (message.result?.decision === "accept") acceptedApprovals.add(message.id); return; }
   const send = (payload, delay = 0) => setTimeout(() => {
     if (payload.method === "item/agentMessage/delta") {
       const turn = fixtureTurns.get(payload.params.threadId)?.find(turn => turn.id === payload.params.turnId);
@@ -178,9 +180,6 @@ input.on("line", (line) => {
     }
     if (message.method === "mcpServerStatus/list" && message.params.threadId?.startsWith("thread-profile-")) {
       return send({ id: message.id, result: { data: [{ name: "fixture", runtimeStatus: fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".unsafe-mcp") ? "connected" : "disabled", tools: {} }], nextCursor: null } });
-    }
-    if (message.method === "turn/start" && JSON.stringify(message.params).includes("profile approval denied")) {
-      send({ id: "profile-request-extra", method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, command: "must-not-run" } }, 30);
     }
   }
   if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: "calendar-ephemeral", ephemeral: true } } });
@@ -309,6 +308,13 @@ input.on("line", (line) => {
     return reply();
   }
   if (message.method === "thread/resume") {
+    if (process.env.FAKE_TURN_OWNERSHIP === "1" && fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".preflight")) {
+      const previous = fixtureTurns.get(message.params.threadId)?.at(-1)?.id;
+      if (previous) {
+        send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: previous, tokenUsage: { last: { inputTokens: 999999, outputTokens: 1 } } } });
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: previous, status: "completed" } } });
+      }
+    }
     if (message.params?.threadId === "thread-settings-race" && message.params?.model === "gpt-6-sol") {
       const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".runtime-patch-release")
         ? send({ id: message.id, result: { thread: { id: message.params.threadId } } }) : setTimeout(reply, 10);
@@ -333,6 +339,30 @@ input.on("line", (line) => {
     const uniqueTurn = process.pid + "-" + (++turnSequence);
     const turns = fixtureTurns.get(message.params.threadId) || [];
     fixtureTurns.set(message.params.threadId, turns);
+    if (process.env.FAKE_TURN_OWNERSHIP === "1") {
+      if (requestText.includes("uncertain ownership")) return send({ id: message.id, error: { code: -32000, message: "synthetic uncertain start receipt" } });
+      const id = "owned-turn-" + uniqueTurn, old = turns.at(-1)?.id, early = requestText.includes("early ownership");
+      turns.push({ id, nativeKnown: true, items: [{ type: "agentMessage", phase: "final_answer", text: "owned output" }] });
+      send({ id: message.id, result: { turn: { id } } }, early ? 150 : 0);
+      send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id, status: "inProgress" } } }, 10);
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: id, delta: "owned output" } }, 20);
+      if (requestText.includes("approval ownership")) send({ id: "own-approval-" + id, method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: id, itemId: "new-command", command: "synthetic-only" } }, 20);
+      if (requestText.includes("orphan ownership")) send({ id: "orphan-approval-" + id, method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: id, itemId: "orphan-command", command: "synthetic-orphan" } }, 20);
+      if (old) {
+        send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id: old, status: "inProgress" } } }, 25);
+        send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: old, tokenUsage: { last: { inputTokens: 999999, outputTokens: 1 } } } }, 30);
+        send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: old, delta: "STALE OUTPUT MUST NOT APPEAR" } }, 35);
+        send({ id: "stale-approval-" + id, method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: old, itemId: "old-command", command: "must-not-run" } }, 40);
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: old, status: "completed" } } }, 45);
+      }
+      const complete = () => {
+        if (requestText.includes("approval ownership") && !acceptedApprovals.has("own-approval-" + id)) return setTimeout(complete, 20);
+        if (requestText.includes("held ownership") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".release")) return setTimeout(complete, 20);
+        send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } } } });
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id, status: "completed" } } }, 10);
+      };
+      setTimeout(complete, 60); return;
+    }
     if (requestText.includes("artifact delivery fixture")) {
       const cwd = fixtureCwds.get(message.params.threadId);
       fsSync.mkdirSync(cwd + "/results", { recursive: true });
@@ -345,10 +375,11 @@ input.on("line", (line) => {
       modelApiImages = requestText.includes("generated output") ? [{ id: "ig-fixture", type: "imageGeneration", status: "completed", failure: null, result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", revisedPrompt: "图片输出验收" }] : [];
       turns.push({ id: modelApiTurnId, nativeKnown: true, items: [...(modelApiStructured ? [{ type: "agentMessage", phase: "commentary", text: "private non-JSON progress" }] : []),
         { type: "agentMessage", text: modelApiText, ...(modelApiStructured ? { phase: "final_answer" } : {}) }, ...modelApiImages] });
+      if (requestText.includes("profile approval denied")) send({ id: "profile-request-extra", method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: modelApiTurnId, command: "must-not-run" } }, 30);
       send({ id: message.id, result: { turn: { id: modelApiTurnId } } });
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(0, 2) } }, 40);
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(2) } }, 150);
-      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
+      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: modelApiTurnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
       send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: modelApiTurnId, status: "completed" } } }, 300);
       return;
     }
@@ -373,7 +404,7 @@ input.on("line", (line) => {
       if (!isTimeout) {
         send({ method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed" } } }, 65);
         send({ method: "thread/tokenUsage/updated", params: {
-          threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+          threadId: message.params?.threadId, turnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
         } }, 75);
         send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: "completed" } } }, 90);
       }
@@ -443,14 +474,14 @@ input.on("line", (line) => {
         threadId: message.params?.threadId, turnId, delta: "模拟试运行结果：已核对资料，无外部写入",
       } }, 40);
       send({ method: "thread/tokenUsage/updated", params: {
-        threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+        threadId: message.params?.threadId, turnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
       } }, 60);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
       } }, 80);
     } else if (personalEmptyTestRegression) {
       send({ method: "thread/tokenUsage/updated", params: {
-        threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 1 } },
+        threadId: message.params?.threadId, turnId, tokenUsage: { last: { inputTokens: 100, outputTokens: 1 } },
       } }, 60);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
@@ -470,6 +501,27 @@ input.on("line", (line) => {
       } }, 80);
     }
     return;
+  }
+  if (process.env.FAKE_TURN_OWNERSHIP === "1" && message.method === "review/start") {
+    const threadId = message.params.delivery === "detached" ? "detached-review-" + (++turnSequence) : message.params.threadId;
+    const id = "review-owned-" + turnSequence;
+    send({ method: "turn/started", params: { threadId, turn: { id, status: "inProgress" } } });
+    send({ method: "item/agentMessage/delta", params: { threadId, turnId: id, delta: "owned review" } }, 10);
+    send({ method: "turn/completed", params: { threadId, turn: { id, status: "completed" } } }, 20);
+    return send({ id: message.id, result: { turn: { id }, reviewThreadId: threadId } }, 80);
+  }
+  if (process.env.FAKE_TURN_OWNERSHIP === "1" && message.method === "thread/compact/start") {
+    const id = "compact-owned-" + (++turnSequence), threadId = message.params.threadId;
+    const old = fixtureTurns.get(threadId)?.at(-1)?.id;
+    if (old) send({ method: "turn/completed", params: { threadId, turn: { id: old, status: "completed" } } });
+    send({ method: "item/started", params: { threadId, turnId: id, startedAtMs: Date.now(), item: { type: "contextCompaction", id: "compact-item" } } }, 10);
+    send({ id: message.id, result: {} }, 80);
+    const finish = () => {
+      if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".compact-release")) return setTimeout(finish, 20);
+      send({ method: "item/completed", params: { threadId, turnId: id, item: { type: "contextCompaction", id: "compact-item" } } });
+      send({ method: "turn/completed", params: { threadId, turn: { id, status: fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".compact-fail") ? "failed" : "completed" } } }, 20);
+    };
+    setTimeout(finish, 100); return;
   }
   if (message.method === "turn/interrupt") {
     send({ id: message.id, result: {} });
@@ -797,6 +849,89 @@ await check("durable API queue survives lost responses and restart without repea
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id=?").get(fourth.data.run.id).execution, "{}");
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
     } finally { checked.close(); }
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("old turn notifications and approvals cannot complete, charge or corrupt a new API heartbeat before or after its start receipt", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-turn-ownership-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "ownership-fixture-token-123456" };
+  const server = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    FAKE_CAPTURE_PATH: capture, FAKE_TURN_OWNERSHIP: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const wait = async callback => {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 30)); }
+    throw new Error("Turn ownership fixture timed out");
+  };
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  try {
+    await waitForOutput(server, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "ownership fixture", automationIds: ["sample-research"] }) });
+    const auth = { ...headers, "x-codex-cloud-token": client.data.token };
+    const submit = (key, prompt, trigger = "heartbeat") => jsonRequest(base, `/api/automations/sample-research/${trigger}`, { method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt }) });
+    const read = run => jsonRequest(base, run.resultPath, { headers: auth }).then(result => result.data.run);
+    const completed = run => wait(async () => { const value = await read(run); return value.status === "completed" ? value : null; });
+    const first = await submit("owned-first-0001", "first ownership", "webhook");
+    const one = await completed(first.data.run); assert.equal(one.usage.totalTokens, 130);
+    for (const [index, prompt] of ["held ownership", "early ownership", "preflight ownership"].entries()) {
+      if (prompt.startsWith("preflight")) await fs.writeFile(capture + ".preflight", "inject");
+      const next = await submit("owned-next-000" + (index + 2), prompt);
+      assert.equal(next.response.status, 200);
+      await wait(async () => (await rpc()).filter(row => row.method === "turn/start").length === index + 2);
+      if (prompt.startsWith("held")) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        assert.equal((await read(next.data.run)).status, "running", "old completion must not terminate the new turn");
+        const approvals = await jsonRequest(base, "/api/approvals", { headers });
+        assert.equal(approvals.data.pending.length, 0, "stale permissions must never enter human approval");
+        await fs.writeFile(capture + ".release", "finish");
+      }
+      const done = await completed(next.data.run);
+      assert.equal(done.usage.totalTokens, 130); assert.equal(done.summary, "owned output");
+      assert.equal((await rpc()).filter(row => row.method === "turn/start").length, index + 2, "no alternate thread or model replay");
+    }
+    const requests = await rpc();
+    const stale = requests.filter(row => String(row.id).startsWith("stale-approval-") && !row.method);
+    assert.equal(stale.length, 3); assert.equal(stale.every(row => row.result?.decision === "decline" || row.error), true);
+    const orphan = await submit("owned-orphan-0005", "orphan ownership");
+    const orphanApproval = await wait(async () => { const value = await jsonRequest(base, "/api/approvals", { headers }); return value.data.pending.find(item => item.params.command === "synthetic-orphan"); });
+    assert.equal((await completed(orphan.data.run)).usage.totalTokens, 130);
+    assert.equal((await jsonRequest(base, "/api/approvals", { headers })).data.pending.length, 0);
+    const expired = await jsonRequest(base, `/api/approvals/${orphanApproval.id}/decision`, { method: "POST", headers, body: JSON.stringify({ decision: "accept", digest: orphanApproval.digest }) });
+    assert.equal(expired.response.status, 410);
+    const approval = await submit("owned-approval-0006", "early approval ownership");
+    const pending = await wait(async () => { const value = await jsonRequest(base, "/api/approvals", { headers }); return value.data.pending.find(item => String(item.params.command) === "synthetic-only"); });
+    assert.equal(pending.owner.repoId, "sample-app");
+    const accepted = await jsonRequest(base, `/api/approvals/${pending.id}/decision`, { method: "POST", headers, body: JSON.stringify({ decision: "accept", digest: pending.digest }) });
+    assert.equal(accepted.response.status, 200);
+    assert.equal((await completed(approval.data.run)).usage.totalTokens, 130);
+    const sessionId = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs.find(run => run.id === approval.data.run.id).sessionId;
+    let compactSettled = false;
+    const compact = jsonRequest(base, "/api/codex/thread-compact", { method: "POST", headers, body: JSON.stringify({ repoId: "sample-app", sessionId }) }).then(result => { compactSettled = true; return result; });
+    await wait(async () => (await rpc()).some(row => row.method === "thread/compact/start"));
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(compactSettled, false, "old turn completion must not finish a new compaction");
+    await fs.writeFile(capture + ".compact-release", "finish");
+    assert.equal((await compact).response.status, 200);
+    await fs.writeFile(capture + ".compact-fail", "failed");
+    assert.equal((await jsonRequest(base, "/api/codex/thread-compact", { method: "POST", headers, body: JSON.stringify({ repoId: "sample-app", sessionId }) })).response.status, 500);
+    for (const delivery of ["inline", "detached"]) {
+      const review = await fetch(base + "/api/codex/review/stream", { method: "POST", headers, body: JSON.stringify({ repoId: "sample-app", sessionId, delivery }), signal: AbortSignal.timeout(5000) });
+      const events = await review.text();
+      assert.match(events, /owned review/); assert.match(events, /"ok":true/);
+    }
+    const uncertain = await submit("owned-uncertain-0007", "uncertain ownership");
+    const unknown = await wait(async () => { const run = await read(uncertain.data.run); return run.status === "needs_reconciliation" ? run : null; });
+    assert.equal(unknown.usage.status, "unknown");
+    assert.equal((await submit("owned-uncertain-0007", "uncertain ownership")).data.run.id, unknown.id);
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 
