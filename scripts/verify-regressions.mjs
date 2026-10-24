@@ -69,7 +69,7 @@ function waitForOutput(child, pattern, timeoutMs = 10_000) {
 }
 
 async function stopProcess(child) {
-  if (!child) return;
+  if (!child || !fixtureClosures.has(child)) return;
   const signal = (name) => {
     try {
       if (isolatedProcessGroups) process.kill(-child.pid, name);
@@ -84,6 +84,7 @@ async function stopProcess(child) {
   // A server exit does not mean its simulated Codex children have stopped writing.
   signal("SIGKILL");
   await closed;
+  fixtureClosures.delete(child);
 }
 
 async function runCaptured(command, args, options = {}) {
