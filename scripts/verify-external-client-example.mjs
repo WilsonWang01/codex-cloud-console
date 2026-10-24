@@ -16,7 +16,7 @@ const options = { command: "submit", automationId: "research", eventId: "busines
 
 function cliClient(origin, runtime, script, ...args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(runtime, [fileURLToPath(new URL(script, import.meta.url)), ...args], {
+    const child = spawn(runtime, [script === "-c" ? script : fileURLToPath(new URL(script, import.meta.url)), ...args], {
       env: { ...process.env, CODEX_CLOUD_URL: origin, CODEX_CLOUD_API_TOKEN: "test-secret" },
     });
     let stdout = "", stderr = "";
@@ -28,6 +28,99 @@ function cliClient(origin, runtime, script, ...args) {
 }
 const pythonClient = (origin, ...args) => cliClient(origin, "python3", "./external-client-example.py", ...args);
 const nodeClient = (origin, ...args) => cliClient(origin, process.execPath, "./external-client-example.mjs", ...args);
+
+const pythonRecovery = (origin, command, value, fault) => cliClient(origin, "python3", "-c", `
+import importlib.util, json, os, sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("external_client", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+client = module.Client(os.environ["CODEX_CLOUD_URL"], os.environ["CODEX_CLOUD_API_TOKEN"], "research")
+def delay(_):
+    if sys.argv[4] in ("timeout", "reset"):
+        raise TimeoutError("Local deadline expired")
+    if sys.argv[4] == "interrupt":
+        raise KeyboardInterrupt()
+client.sleep = delay
+def describe(error):
+    return {"type": type(error).__name__, "runId": getattr(error, "run_id", None), "eventId": getattr(error, "event_id", None)}
+try:
+    client.execute(sys.argv[2], sys.argv[3], wait=True)
+except (RuntimeError, TimeoutError, ValueError, KeyboardInterrupt) as error:
+    result = describe(error)
+else:
+    raise AssertionError("Expected a recoverable failure")
+if sys.argv[4] == "reset":
+    result = [result]
+    for command, value in (("status", "other-run"), ("capabilities", None)):
+        try:
+            client.execute(command, value)
+        except (RuntimeError, TimeoutError, ValueError) as error:
+            result.append(describe(error))
+        else:
+            raise AssertionError("Expected an independent failure")
+print(json.dumps(result))
+`, fileURLToPath(new URL("./external-client-example.py", import.meta.url)), command, value, fault);
+
+test("Python library errors preserve accepted run and original event IDs without canceling or resubmitting", async t => {
+  for (const command of ["submit", "heartbeat"]) for (const fault of ["timeout", "interrupt", "network", "rejected", "mismatch"]) {
+    const { origin, calls } = await fixture(t, (req, res) => {
+      if (req.url.endsWith("/webhook") || req.url.endsWith("/heartbeat")) return res.end(JSON.stringify(reply("running")));
+      if (fault === "network") return req.socket.destroy();
+      if (fault === "rejected") { res.statusCode = 403; return res.end("{}"); }
+      res.end(JSON.stringify(reply("completed", { id: "wrong-run" })));
+    });
+    const result = await pythonRecovery(origin, command, "python-recovery-001", fault);
+    assert.equal(result.code, 0, result.stderr);
+    const error = JSON.parse(result.stdout);
+    assert.equal(error.runId, "run-1", fault);
+    assert.equal(error.eventId, "python-recovery-001", fault);
+    assert.equal(calls.filter(call => call.method === "POST").length, 1, "only the original submission may write");
+    assert.ok(calls.every(call => !call.url.endsWith("/cancel")));
+  }
+});
+
+test("Python recovery keeps unknown submissions keyed and preserves explicitly requested status IDs", async t => {
+  const { origin, calls } = await fixture(t, (req, res) => {
+    if (req.url.endsWith("/webhook")) return req.socket.destroy();
+    res.statusCode = 404; res.end("{}");
+  });
+  const lost = await pythonRecovery(origin, "submit", "python-lost-event-001", "network");
+  assert.equal(lost.code, 0, lost.stderr);
+  assert.deepEqual(JSON.parse(lost.stdout), { type: "RuntimeError", runId: null, eventId: "python-lost-event-001" });
+  const posts = calls.filter(call => call.method === "POST");
+  assert.equal(posts.length, 3);
+  assert.ok(posts.every(call => call.key === "python-lost-event-001" && call.body === posts[0].body));
+  const status = await pythonRecovery(origin, "status", "known-run", "rejected");
+  assert.equal(status.code, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout), { type: "RuntimeError", runId: "known-run", eventId: null });
+  assert.equal(calls.at(-1).url, "/api/automations/research/runs/known-run");
+});
+
+test("Python recovery context is per operation, not stale state from an earlier run on the same client", async t => {
+  const { origin, calls } = await fixture(t, (req, res) => {
+    if (req.url.endsWith("/webhook")) return res.end(JSON.stringify(reply("running")));
+    res.statusCode = 404; res.end("{}");
+  });
+  const result = await pythonRecovery(origin, "submit", "python-first-event-001", "reset");
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), [
+    { type: "TimeoutError", runId: "run-1", eventId: "python-first-event-001" },
+    { type: "RuntimeError", runId: "other-run", eventId: null },
+    { type: "RuntimeError", runId: null, eventId: null },
+  ]);
+  assert.equal(calls.length, 3);
+  assert.equal(calls.filter(call => call.method === "POST").length, 1);
+});
+
+test("Python CLI prints recovery IDs on the final timeout line and never sends cancellation", async t => {
+  const { origin, calls } = await fixture(t, (_req, res) => res.end(JSON.stringify(reply("running"))));
+  const result = await pythonClient(origin, "submit", "research", "python-cli-timeout-001", "--wait", "--timeout", "1");
+  assert.equal(result.code, 1);
+  assert.match(result.stderr.trim().split("\n").at(-1), /\(run-id: run-1\).*\(event-id: python-cli-timeout-001\)/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].key, "python-cli-timeout-001");
+});
 
 test("standalone Node and Python CLIs load explicit request JSON and bounded local attachments", async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "external-client-inputs-"));

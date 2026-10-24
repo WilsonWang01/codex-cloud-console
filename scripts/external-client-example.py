@@ -88,6 +88,18 @@ class Client:
             self.sleep(delay)
 
     def execute(self, command, value=None, wait=False, prompt=None, file_id=None, input_body=None):
+        recovery = {
+            "run_id": value if command in ("status", "cancel", "output", "download") else None,
+            "event_id": value if command in ("submit", "heartbeat") else None,
+        }
+        try:
+            return self._execute(command, value, wait, prompt, file_id, input_body, recovery)
+        except (ValueError, RuntimeError, OSError, http.client.HTTPException, KeyboardInterrupt) as error:
+            error.run_id = recovery["run_id"]
+            error.event_id = recovery["event_id"]
+            raise
+
+    def _execute(self, command, value, wait, prompt, file_id, input_body, recovery):
         if command in ("models", "capabilities"):
             data = self.request("/v1/" + command, discovery=True)
             if (command == "models" and (data.get("object") != "list" or not isinstance(data.get("data"), list))
@@ -143,6 +155,7 @@ class Client:
                     or status not in ("queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation")):
                 raise ValueError("Invalid or mismatched run response")
             known_id = run["id"]
+            recovery["run_id"] = known_id
             print(f"run-id: {known_id}; status: {status}", file=sys.stderr)
             if not wait or command == "cancel" or status not in ("queued", "running", "canceling"):
                 return run
@@ -204,5 +217,10 @@ if __name__ == "__main__":
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(1 if result.get("status") in ("failed", "canceled", "cancelled", "interrupted", "needs_reconciliation") else 0)
     except (ValueError, RuntimeError, TimeoutError, KeyboardInterrupt, OSError) as error:
-        print(str(error) or "Local wait interrupted; no cancellation sent", file=sys.stderr)
+        message = str(error) or "Local wait interrupted; no cancellation sent"
+        if getattr(error, "run_id", None):
+            message += f" (run-id: {error.run_id})"
+        if getattr(error, "event_id", None):
+            message += f" (event-id: {error.event_id})"
+        print(message, file=sys.stderr)
         sys.exit(1)
