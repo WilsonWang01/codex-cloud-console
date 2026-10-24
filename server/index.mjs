@@ -49,6 +49,7 @@ import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutine
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { calendarSourceLimits, createPersonalCalendarSource } from "./personal-calendar.mjs";
+import { mailSourceLimits, createPersonalMailSource } from "./personal-mail.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 import { readReleaseInfo } from "./release-info.mjs";
 
@@ -102,6 +103,23 @@ const personalCalendarSource = createPersonalCalendarSource({
     return { cwd: getRepoById(personalRepoId).path, model: defaultRuntime.model };
   },
 });
+const personalMailPath = path.join(stateRoot, "personal-mail-source.json");
+const personalMailSource = createPersonalMailSource({
+  read: async () => {
+    try { return JSON.parse((await readRootedFile(stateRoot, path.basename(personalMailPath), mailSourceLimits.resultBytes)).buffer.toString("utf8")); }
+    catch (error) {
+      if (error.code === "file_not_found") return { version: 1, snapshot: null, lastAttempt: null };
+      throw Object.assign(new Error("邮件缓存无法安全读取，未覆盖原记录"), { code: "mail_cache_invalid", statusCode: 503 });
+    }
+  },
+  write: value => atomicWriteJson(personalMailPath, value),
+  request: (method, params, timeout) => getPersonalAppServerClient().request(method, params, timeout),
+  context: () => {
+    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行不可用"), { statusCode: 503 });
+    return { cwd: getRepoById(personalRepoId).path, model: defaultRuntime.model };
+  },
+});
+const personalSources = [personalCalendarSource, personalMailSource];
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
 let runUsageLedger;
@@ -2572,7 +2590,7 @@ const approvalBroker = createApprovalBroker({
 });
 
 async function appServerRequestResult(method, params = {}) {
-  if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
+  if (personalSources.some(source => source.ownsThread(params.threadId || params.thread_id))) throw new Error("个人来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const job = findTurnJob(params) || findCompactJob(params);
   if (job?.unattendedPersonalSchedule) {
     job.unattendedApprovalDenied = true;
@@ -2599,7 +2617,7 @@ function personalAppServerRequestResult(method, params = {}) {
 }
 
 function personalAppServerNotification(message) {
-  if (message.method === "thread/closed") personalCalendarSource.closedThread(message.params?.threadId);
+  if (message.method === "thread/closed") personalSources.forEach(source => source.closedThread(message.params?.threadId));
   if (message.method === "account/login/completed") {
     completeAccountLoginFlow(message.params || {}, personalRepoId);
     return;
@@ -2689,7 +2707,7 @@ function getAppServerClient() {
     });
   });
   appServerClient.on("exit", ({ message }) => {
-    if (!personalRuntime.enabled) personalCalendarSource.resetRuntime();
+    if (!personalRuntime.enabled) personalSources.forEach(source => source.resetRuntime());
     if (personalRuntime.enabled) {
       for (const repo of repos.filter((item) => item.kind !== "personal")) {
         approvalBroker.closeForRepo(repo.id, message || "Codex app-server stopped");
@@ -2718,7 +2736,7 @@ function getPersonalAppServerClient() {
   });
   personalAppServerClient.on("notification", personalAppServerNotification);
   personalAppServerClient.on("exit", ({ message }) => {
-    personalCalendarSource.resetRuntime();
+    personalSources.forEach(source => source.resetRuntime());
     approvalBroker.closeForRepo(personalRepoId, message || "Personal app-server stopped");
     for (const job of [...activeTurns.values()].filter((item) => item.repoId === personalRepoId)) {
       finishTurnJob(job, false, 1, message || "Personal app-server stopped");
@@ -3434,7 +3452,7 @@ async function finishCompactJob(job, ok, error = null) {
 
 function handleAppServerNotification(rpcMessage) {
   const params = rpcMessage.params || {};
-  if (rpcMessage.method === "thread/closed") personalCalendarSource.closedThread(params.threadId);
+  if (rpcMessage.method === "thread/closed") personalSources.forEach(source => source.closedThread(params.threadId));
   const owner = ownerFromParams(params);
   const turnJob = findTurnJob(params);
   const compactJob = findCompactJob(params);
@@ -9717,7 +9735,7 @@ app.get("/api/codex/app-host/status", (req, res) => {
     appHost: client.status(),
     activeTurns: activeTurns.size,
     activeCompactions: activeCompactions.size,
-    activeSourceReads: personalCalendarSource.activeCount(),
+    activeSourceReads: personalSources.reduce((total, source) => total + source.activeCount(), 0),
     activeJobs: activeJobSummaries({ includeEvents: true }),
   });
 });
@@ -11101,6 +11119,26 @@ app.post("/api/personal/calendar/refresh", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   if (!req.body || Object.keys(req.body).some(key => key !== "timeZone")) return res.status(400).json({ ok: false, error: "只接受当前时区，不允许指定工具、账号或任意日历查询" });
   try { res.json({ ok: true, calendar: await personalCalendarSource.refresh(req.body.timeZone) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.get("/api/personal/mail", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ ok: true, mail: await personalMailSource.snapshot(req.query.timeZone) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/mail/accounts", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).length) return res.status(400).json({ ok: false, error: "账号列表不接受查询或工具参数" });
+  try { res.json({ ok: true, accounts: await personalMailSource.accounts() }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/mail/refresh", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).some(key => !["timeZone", "accountId"].includes(key))) return res.status(400).json({ ok: false, error: "只接受当前时区和已连接邮箱标识，不允许指定工具或任意邮件查询" });
+  try { res.json({ ok: true, mail: await personalMailSource.refresh(req.body.timeZone, req.body.accountId) }); }
   catch (error) { sendRouteError(res, error); }
 });
 

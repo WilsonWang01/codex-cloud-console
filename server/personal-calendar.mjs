@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { CronDate } from "cron-parser";
-import Ajv from "ajv";
+import { withPersonalSource } from "./personal-source.mjs";
 
 const minute = 60_000;
 export const calendarSourceLimits = Object.freeze({ freshMs: 5 * minute, refreshMs: 30_000, timeoutMs: 45_000, pageSize: 50, pages: 2, resultBytes: 1024 * 1024 });
@@ -54,21 +54,6 @@ export function normalizeCalendarEvent(value) {
   return { ...event, version: digest(event) };
 }
 
-function toolData(result) {
-  if (!result || Buffer.byteLength(JSON.stringify(result)) > calendarSourceLimits.resultBytes) throw fail("calendar_result_invalid", "日历返回过大或格式无法确认");
-  const raw = JSON.stringify(result);
-  if (result.isError === true) {
-    if (/forbidden|unauthorized|invalid_grant|permission|authentication|not.authenticated/i.test(raw)) throw fail("calendar_authorization_required", "日历读取被拒绝，请在连接服务中核对授权", 403);
-    throw fail("calendar_read_failed", "日历读取失败，不能据此判断没有日程");
-  }
-  if (result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
-  const content = result.content?.filter(item => item.type === "text");
-  if (content?.length === 1) {
-    try { return JSON.parse(content[0].text); } catch { /* A prose response is not a complete calendar. */ }
-  }
-  throw fail("calendar_shape_changed", "日历返回格式发生变化，未将结果当作空日程");
-}
-
 function inWindow(event, window) {
   return event.start.date
     ? event.start.date < calendarDayWindow(window.timeZone, Date.parse(window.to)).date && event.end.date > window.date
@@ -76,45 +61,17 @@ function inWindow(event, window) {
 }
 
 export async function readTodayCalendar({ request, cwd, model = "gpt-6-sol", window, onThread = () => {}, now = () => Date.now() }) {
-  const deadline = now() + calendarSourceLimits.timeoutMs;
-  const call = (method, params, maximum = 15000) => {
-    const timeout = Math.min(maximum, deadline - now());
-    if (timeout <= 0) throw fail("calendar_timeout", "日历读取超时，旧数据未更新");
-    return request(method, params, timeout);
-  };
-  let threadId;
-  try {
-    const started = await call("thread/start", { cwd, model, sandbox: "read-only", approvalPolicy: "on-request", ephemeral: true, serviceName: "codex_cloud_calendar_source" });
-    threadId = started?.thread?.id;
-    if (!threadId || started.thread.ephemeral !== true) throw fail("calendar_runtime_unsupported", "当前运行时不能建立临时只读上下文，未读取日历");
-    onThread(threadId);
-    const servers = [];
-    const cursors = new Set();
-    let cursor = null;
-    do {
-      const catalog = await call("mcpServerStatus/list", { threadId, cursor, limit: 100, detail: "toolsAndAuthOnly" });
-      if (!Array.isArray(catalog?.data)) throw fail("calendar_catalog_unavailable", "无法核对日历工具，未读取日历");
-      servers.push(...catalog.data);
-      cursor = catalog.nextCursor || null;
-      if (cursor && (cursors.has(cursor) || cursors.size >= 4)) throw fail("calendar_catalog_unavailable", "日历工具目录不完整，未读取日历");
-      if (cursor) cursors.add(cursor);
-    } while (cursor);
-    const server = servers.find(item => item.name === "codex_apps" && item.httpOrigin === "https://chatgpt.com");
-    const tool = server?.tools?.["google_calendar.search"];
-    if (!tool || tool.name !== "google_calendar.search" || tool.annotations?.readOnlyHint !== true || tool.annotations.destructiveHint !== false ||
-        !tool._meta?.connector_id || text(tool._meta.connector_id, 200) !== tool._meta.connector_id || !tool._meta.link_id || text(tool._meta.link_id, 200) !== tool._meta.link_id) throw fail("calendar_not_connected", "未找到已确认只读的 Google Calendar 工具，请核对连接服务", 409);
+  return withPersonalSource({ request, cwd, model, prefix: "calendar", label: "日历", toolNames: ["google_calendar.search"],
+    timeoutMs: calendarSourceLimits.timeoutMs, resultBytes: calendarSourceLimits.resultBytes, onThread, now }, async ({ server, tools, invoke }) => {
+    const tool = tools["google_calendar.search"];
     const accounts = new Set(Object.values(server.tools).filter(item => item._meta?.connector_id === tool._meta.connector_id).map(item => item._meta?.link_id));
-    if (accounts.size !== 1) throw fail("calendar_account_ambiguous", "连接了多个日历账号，尚未选择来源，未自动读取任一账号", 409);
-    const installed = await call("app/installed", { threadId });
-    if (!installed?.apps?.some(app => app.id === tool._meta.connector_id && app.enabled === true && app.callable === true)) throw fail("calendar_not_connected", "当前 Google Calendar 连接不可调用，未读取日历", 409);
-    const validate = new Ajv({ strict: false, allErrors: false }).compile(tool.inputSchema);
+    if (accounts.size !== 1 || tool._meta.link_accounts != null && (!Array.isArray(tool._meta.link_accounts) || tool._meta.link_accounts.length !== 1 || tool._meta.link_accounts[0]?.link_id !== tool._meta.link_id)) throw fail("calendar_account_ambiguous", "连接了多个日历账号或来源无法确认，尚未选择来源，未自动读取任一账号", 409);
     const args = { calendar_id: "primary", time_min: window.from, time_max: window.to, max_results: calendarSourceLimits.pageSize };
     const events = new Map(), seen = new Set();
     let next = null, pages = 0;
     do {
       const input = { ...args, ...(next ? { next_page_token: next } : {}) };
-      if (!validate(input)) throw fail("calendar_contract_changed", "日历工具参数已变化，需要重新核对接入，未调用工具");
-      const data = toolData(await call("mcpServer/tool/call", { threadId, server: server.name, tool: tool.name, arguments: input }, 20000));
+      const data = await invoke(tool.name, input);
       if (!Array.isArray(data?.events) || data.events.length > calendarSourceLimits.pageSize ||
           (data.next_page_token != null && (typeof data.next_page_token !== "string" || data.next_page_token.length > 4096))) throw fail("calendar_shape_changed", "日历返回格式无法确认，未将读取视为完整");
       for (const raw of data.events) {
@@ -138,12 +95,7 @@ export async function readTodayCalendar({ request, cwd, model = "gpt-6-sol", win
     const account = { id: text(tool._meta.link_id, 200), label: text(tool._meta.link_owner_profile?.email || tool._meta.link_owner_profile?.name, 160) || "当前 Google Calendar 账号" };
     return { provider: "google-calendar", calendarId: "primary", account, window, fetchedAt, expiresAt: new Date(now() + calendarSourceLimits.freshMs).toISOString(),
       complete: !next, items, version: digest({ account: account.id, window, items, complete: !next }) };
-  } catch (error) {
-    if (error.code?.startsWith("calendar_")) throw error;
-    throw fail("calendar_read_failed", "日历读取暂不可用，旧数据未更新；请稍后刷新或核对连接服务");
-  } finally {
-    if (threadId) await request("thread/unsubscribe", { threadId }, 3000).catch(() => null);
-  }
+  });
 }
 
 export function createPersonalCalendarSource({ read, write, request, context, now = () => Date.now() }) {
