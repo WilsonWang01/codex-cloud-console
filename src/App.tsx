@@ -1,4 +1,5 @@
 import { DraftPersistence } from "./draft-persistence";
+import { useChatReadingPosition } from "./chat-reading-position";
 import { PageReloadContext, recoverableLazy } from "./lazy-recovery";
 import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
 import PersonalAssistantGuide from "./PersonalAssistantGuide";
@@ -7011,7 +7012,7 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo, f
   const attachments = messageTimelineAttachments(message, repo);
   const status = timelineStatusLabel(message.status);
   return (
-    <article className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
+    <article data-chat-message-id={message.id} className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
       <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
       <div>
         <strong>
@@ -9290,11 +9291,7 @@ function CloudChat({
   runtimeReady: boolean;
   historyError: string;
 }) {
-  const endRef = useRef<HTMLDivElement | null>(null);
   const chatWindowRef = useRef<HTMLDivElement | null>(null);
-  const followChatRef = useRef(true);
-  const lastProgressRef = useRef("");
-  const [newProgress, setNewProgress] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [commandIndex, setCommandIndex] = useState(0);
   const [draggingAttachments, setDraggingAttachments] = useState(false);
@@ -9365,6 +9362,10 @@ function CloudChat({
   const [renamingSessionId, setRenamingSessionId] = useState("");
   const [renameDraft, setRenameDraft] = useState("");
   const activeSession = sessions.find((session) => session.id === activeSessionId);
+  const lastMessage = messages.at(-1);
+  const reading = useChatReadingPosition(chatWindowRef, JSON.stringify([repo.id, activeSession?.codexSessionId || activeSessionId]),
+    !historyLoading && !historyError && messages.length > 0 && activeSession?.repoId === repo.id,
+    JSON.stringify([lastMessage?.id || "", lastMessage?.text.length || 0, busy]));
   const queuedTurn = activeSession?.queuedTurn;
   const displaySessions = useMemo(() => visibleSessionList(sessions, activeSessionId), [activeSessionId, sessions]);
   const activeSessionTitle = sessionDisplayTitle(activeSession);
@@ -10057,19 +10058,6 @@ function CloudChat({
     onFilesSelected(files);
   };
 
-  useEffect(() => { followChatRef.current = true; lastProgressRef.current = ""; setNewProgress(false); }, [activeSessionId]);
-  useEffect(() => {
-    const scroller = chatWindowRef.current;
-    if (!scroller) return;
-    const last = messages.at(-1);
-    const progress = `${last?.id || ""}:${last?.text?.length || 0}:${last?.status || ""}:${busy}`;
-    if (followChatRef.current) {
-      scroller.scrollTop = scroller.scrollHeight;
-      setNewProgress(false);
-    } else if (lastProgressRef.current && progress !== lastProgressRef.current) setNewProgress(true);
-    lastProgressRef.current = progress;
-  }, [messages, busy]);
-
   useEffect(() => {
     setCommandIndex(0);
   }, [commandQuery, inlineTrigger?.prefix, inlineTrigger?.query]);
@@ -10179,11 +10167,8 @@ function CloudChat({
         </div>
       </div>}
 
-      <div className="chat-window" ref={chatWindowRef} aria-busy={historyLoading} onScroll={(event) => {
-        const target = event.currentTarget;
-        followChatRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 96;
-        if (followChatRef.current) setNewProgress(false);
-      }}>
+      <div className="chat-window" ref={chatWindowRef} aria-busy={historyLoading} onScroll={reading.onScroll}
+        onPointerMove={reading.onUserIntent} onPointerDown={reading.onUserIntent} onTouchStart={reading.onUserIntent} onWheel={reading.onUserIntent} onKeyDown={reading.onUserIntent}>
         {repo.kind === "personal" && !historyLoading && !historyError && messages.length === 0 && <PersonalAssistantGuide onChoose={choosePersonalTask} onConnect={() => setActivePanel("connections")} />}
         {historyLoading && messages.length === 0 && (
           <article className="chat-bubble codex compact">
@@ -10208,7 +10193,6 @@ function CloudChat({
             </div>
           </article>
         )}
-        <div ref={endRef} />
       </div>
 
       <div
@@ -10248,11 +10232,7 @@ function CloudChat({
         {repo.kind === "personal" && activeSessionId && <PersonalContextNotice key={`${activeSessionId}:${activeSession?.messageCount || 0}`} sessionId={activeSessionId}
           disabled={busy || Boolean(busyAction) || uploadingAttachments || Boolean(queuedTurn) || Boolean(activeSession?.externalActionReview)} onContinue={onContinuePersonalContext} />}
         </div>
-        {newProgress && <button className="chat-new-progress" type="button" onClick={() => {
-          followChatRef.current = true;
-          if (chatWindowRef.current) chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
-          setNewProgress(false);
-        }}>有新进展 <ChevronRight size={15} /></button>}
+        {reading.newProgress && <button className="chat-new-progress" type="button" onClick={reading.scrollToLatest}>有新进展 <ChevronRight size={15} /></button>}
         {draggingAttachments && (
           <div className="composer-drop-overlay" data-testid="composer-drop-overlay">
             <Paperclip size={18} />

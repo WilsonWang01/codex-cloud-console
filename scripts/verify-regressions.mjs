@@ -768,10 +768,10 @@ await check("durable API queue survives lost responses and restart without repea
     method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}),
       ...(prompt.includes("durable-fourth") ? { attachments: [queuedMaterial, queuedPdf] } : {}) }),
   });
-  const wait = async (callback) => {
+  const wait = async (callback, diagnostics) => {
     const deadline = Date.now() + 7000;
     while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 40)); }
-    throw new Error("Durable API fixture did not reach expected state");
+    throw new Error("Durable API fixture did not reach expected state" + (diagnostics ? ": " + JSON.stringify(diagnostics()) : ""));
   };
   const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse).filter((row) => row.method === "turn/start");
   let server;
@@ -820,10 +820,12 @@ await check("durable API queue survives lost responses and restart without repea
       createExternalTaskStore(queuedLedger.database).accept({ run: { ...JSON.parse(row.record), id: "tampered-input", triggerIdempotencyHash: null, triggerRequestHash: null }, execution, ttlMs: 60000 });
     } finally { queuedLedger.close(); }
     server = start(); await waitForOutput(server, /listening on/);
+    let observed;
     const completed = await wait(async () => {
       const result = await jsonRequest(base, fourth.data.run.resultPath, { headers });
+      observed = { http: result.response.status, status: result.data.run?.status, inputProcessing: result.data.run?.inputProcessing, error: result.data.run?.error };
       return result.data.run?.status === "completed" ? result.data.run : null;
-    });
+    }, () => observed);
     assert.equal(completed.id, fourth.data.run.id);
     const replay = await submit("durable-lost-response-0001", "progress regression queue first durable-one");
     assert.equal(replay.data.run.id, first.data.run.id);
