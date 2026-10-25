@@ -220,6 +220,8 @@ try { if (process.argv.includes("--serve-fixture")) {
     for(const width of [320,390,768,1280]){
       await page.setViewportSize({width,height:900});await editor.scrollIntoViewIfNeeded();
       assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+      assert(await replies.locator(".personal-mail-draft-open strong").evaluate(el=>el.getBoundingClientRect().height<=parseFloat(getComputedStyle(el).lineHeight)*2+1),`reply subject exceeds two lines at ${width}`);
+      assert.equal(await replies.locator(".personal-mail-draft-open strong").getAttribute("title"),serverDraft.form.subject);
       for(const control of await editor.getByRole("button").all())assert(await control.evaluate(el=>el.getBoundingClientRect().height>=44),`reply control too short: ${await control.innerText()} at ${width}`);
       await page.screenshot({path:new URL(`reply-conflict-${width}.png`,out).pathname,fullPage:true});
     }
