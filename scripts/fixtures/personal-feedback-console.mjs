@@ -44,7 +44,7 @@ process.stdout.write(JSON.stringify({id:m.id,result})+'\\n');});
   });
   let server, logs = "";
   const stopServer = async () => {
-    if (!server || server.exitCode !== null) return;
+    if (!server || server.exitCode !== null || server.signalCode) return;
     const closed = new Promise(resolve => server.once("close", resolve));
     server.kill("SIGTERM"); await closed;
   };

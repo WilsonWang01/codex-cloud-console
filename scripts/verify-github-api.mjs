@@ -96,7 +96,7 @@ try {
   assert.equal((await request("/api/github/issues/42?repoId=_personal")).status, 400);
   process.stdout.write("GitHub API integration passed; no model or remote mutation executed.\n");
 } finally {
-  if (server.exitCode === null) {
+  if (server.exitCode === null && !server.signalCode) {
     const stopped = new Promise((resolve) => server.once("close", resolve));
     server.kill("SIGTERM");
     await Promise.race([stopped, new Promise((resolve) => setTimeout(resolve, 2_000))]);
