@@ -226,6 +226,8 @@ async function waitForResearch(runId, signal) {
 
 上线前可以在已有 CLI 环境运行 `npm run verify:command-isolation:codex`，验证明确配置下的工作区写入、命令禁网和虚构 MCP 禁用。它只使用临时无登录目录和本机模拟模型服务，不改变当前执行器的全权限默认值。[后续检查](acceptance/2026-10-26-personal-mail-quality.md)在固定 CLI 0.157.1 上补了 `agents.enabled=false`，新建及 CLI 重启后再次运行，工具目录不再列出派生代理入口；旧 `features.multi_agent=false` 单独使用不足以做到这一点。这不是每次生产请求的完整工具目录检查，也不是禁止所有后续执行、宿主读取或费用硬上限。最初步骤、EC2 实测和原边界见[原生隔离检查](acceptance/2026-10-25-native-command-isolation.md)。
 
+`npm run verify:command-isolation:codex -- --catalog-only` 只检查新建/重启后的工具目录，不启动命令；CI runner 不允许建立隔离网络，因此 CI 显式使用该模式。完整模式不会在沙箱故障时自动退化为目录模式；上线前仍需在目标环境运行默认完整检查。
+
 独立令牌不能读取管理页面、其他服务的结果或批准任务；运行响应不泄漏工作目录、会话 ID 和原始工具内容。用量缺失时为“未知”，token 不是美元账单。
 
 服务器操作者预先登记后，可使用[签名完成回调](callbacks.md)：稳定事件 ID、持久投递、有限重试和轮询兜底。先查 `features.callback.configured`，不要把 Node 客户端本地的 onProgress/onStatus 函数误当成服务器回调。回调不运行新的模型任务、不传正文或令牌，不接受请求中指定任意 URL。
