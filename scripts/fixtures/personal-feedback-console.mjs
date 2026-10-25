@@ -1,10 +1,10 @@
-import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { waitForConsoleReady } from "./console-ready.mjs";
 
 export async function personalFeedbackConsole() {
   const project = fileURLToPath(new URL("../../", import.meta.url));
@@ -56,11 +56,7 @@ process.stdout.write(JSON.stringify({id:m.id,result})+'\\n');});
       CODEX_CLOUD_REPOS_CONFIG_B64: Buffer.from(JSON.stringify([{ id: "work", name: "合成工作项目", path: work }])).toString("base64"),
     } });
     server.stdout.on("data", chunk => { logs += chunk; }); server.stderr.on("data", chunk => { logs += chunk; });
-    for (let n = 0; n < 150 && !logs.includes("listening on"); n++) {
-      if (server.exitCode !== null) throw new Error(logs);
-      await new Promise(resolve => setTimeout(resolve, 30));
-    }
-    assert.match(logs, /listening on/);
+    await waitForConsoleReady({ child: server, baseUrl: `http://127.0.0.1:${port}`, logs: () => logs });
   };
   try { await start(); } catch (error) { await stopServer(); await fs.rm(root, { recursive: true, force: true }); throw error; }
   const base = `http://127.0.0.1:${port}`;

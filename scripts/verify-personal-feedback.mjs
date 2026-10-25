@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createPersonalFeedbackStore, personalFeedbackDigest, personalFeedbackSummary, personalFeedbackTarget } from "../server/personal-feedback.mjs";
+import { waitForConsoleReady } from "./fixtures/console-ready.mjs";
 
 const session = { id: "personal-session", repoId: "_personal", codexSessionId: "personal-thread" };
 const message = { id: "reply-1", turnId: "turn-1", turnStatus: "completed", role: "codex", text: "合成建议：先核对日期，没有预订或付款。", messageType: "agentMessage", details: { phase: "final_answer" } };
@@ -140,4 +143,25 @@ test("an uncertain directory flush can be checked and replayed without creating 
   const [saved] = await f.store.list();
   assert.equal(saved.revision, 1); assert.equal(saved.decision, "helpful");
   assert.deepEqual(await f.store.set(source(), input()), saved);
+});
+
+test("fixture readiness checks a bounded HTTP contract instead of treating early logs as a ready server", async t => {
+  let requests = 0, available = true;
+  const server = http.createServer((req, res) => {
+    const ready = ++requests > 2 && available;
+    res.writeHead(ready ? 200 : 503, { "content-type": "application/json" });
+    res.end(JSON.stringify(ready ? { ok: true, release: { schemaVersion: 1 } } : { ok: false }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const child = new EventEmitter(); child.exitCode = null;
+  const config = { child, baseUrl: `http://127.0.0.1:${server.address().port}`, logs: () => "listening on (not sufficient)", timeoutMs: 500 };
+  await waitForConsoleReady(config); assert.ok(requests >= 3);
+  child.exitCode = 1; await assert.rejects(waitForConsoleReady(config), /已退出/);
+  child.exitCode = null; child.signalCode = "SIGTERM"; await assert.rejects(waitForConsoleReady(config), /已退出/);
+  child.signalCode = null;
+  await assert.rejects(waitForConsoleReady({ ...config, logs: () => "import complete", timeoutMs: 50 }), /未在 50 毫秒内/);
+  child.exitCode = null; available = false;
+  await assert.rejects(waitForConsoleReady({ ...config, timeoutMs: 100 }), /未在 100 毫秒内/);
+  assert.equal(child.listenerCount("error"), 0);
 });

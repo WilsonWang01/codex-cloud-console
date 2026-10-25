@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { waitForConsoleReady } from "./fixtures/console-ready.mjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-github-api-"));
@@ -68,12 +69,8 @@ async function request(route, options = {}) {
 }
 
 try {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (logs.includes("listening on")) break;
-    if (server.exitCode !== null) throw new Error(`Server exited: ${logs}`);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  }
-  assert.match(logs, /listening on/u);
+  const readyMs = await waitForConsoleReady({ child: server, baseUrl: `http://127.0.0.1:${port}`, logs: () => logs });
+  process.stdout.write(`GitHub API fixture ready in ${Math.round(readyMs)}ms.\n`);
   const connected = await request("/api/github/connection?repoId=project");
   assert.equal(connected.status, 200);
   assert.equal(connected.body.connection.account, "alice");
@@ -103,7 +100,7 @@ try {
     const stopped = new Promise((resolve) => server.once("close", resolve));
     server.kill("SIGTERM");
     await Promise.race([stopped, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-    if (server.exitCode === null) server.kill("SIGKILL");
+    if (server.exitCode === null) { server.kill("SIGKILL"); await stopped; }
   }
   await fs.rm(root, { recursive: true, force: true });
 }
