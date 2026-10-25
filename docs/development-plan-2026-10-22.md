@@ -171,6 +171,8 @@ P01.2 邮箱 [PR #1](https://github.com/WilsonWang01/codex-cloud-console/pull/1)
 
 ### P03 记忆治理与持续目标
 
+补充验证：[受限配置兼容与个人记忆真实样例](acceptance/2026-10-25-personal-memory-quality.md)完成本机 3 个真实 `gpt-6-sol / medium` 回合，候选不生效、准确引用和更正后新上下文通过；94,083 tokens、无业务连接器调用或正式资料写入。发现并修复插件标识的受限配置误拒绝，EC2 无模型隔离及原数据核对通过。候选尚未部署，不提前记为 E13/E14、P03 或 M4 整体完成。
+
 P03.1 已发布 `17ec587`：有效期、停用、确认时间、旧线程保护与明确新上下文，见[验收](acceptance/2026-10-24-personal-fact-governance.md)。以下模型候选、实际引用及持续目标仍须开发，不用准备提供的资料指纹冒充实际引用证明。
 
 P03.2 [记忆候选](acceptance/2026-10-24-personal-memory-candidates.md)核心已发布，发现并修复共用零编号请求及双向编号冲突。真实模型质量、实际引用、持续目标仍需单独验收，正式设置的长目录与记忆入口体验优先完善。
