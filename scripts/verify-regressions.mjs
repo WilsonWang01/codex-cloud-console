@@ -155,6 +155,7 @@ let turnSequence = 0;
 let mailSourceSequence = 0;
 const fixtureTurns = new Map();
 const fixtureCwds = new Map();
+const cancelGates = new Map();
 const acceptedApprovals = new Set();
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
@@ -412,6 +413,14 @@ input.on("line", (line) => {
     }
     const turnId = (requestText.includes("cancel regression") ? "turn-cancel-regression-" : "turn-regression-") + uniqueTurn;
     turns.push({ id: turnId, items: [] });
+    if (process.env.FAKE_CANCEL_GATES === "1") {
+      cancelGates.set(turnId, { uncertain: requestText.includes("interrupt uncertain"), waiting: false });
+      const receipt = () => {
+        if (requestText.includes("hold start receipt") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".cancel-start-release")) return setTimeout(receipt, 20);
+        send({ id: message.id, result: { turn: { id: turnId } } });
+      };
+      receipt(); return;
+    }
     const progressRegression = requestText.includes("progress regression");
     const queuedFirstRegression = requestText.includes("progress regression queue first");
     const queueRegressionNext = requestText.includes("queue regression next");
@@ -551,6 +560,19 @@ input.on("line", (line) => {
     setTimeout(finish, 100); return;
   }
   if (message.method === "turn/interrupt") {
+    const gate = cancelGates.get(message.params?.turnId);
+    if (gate) {
+      send(gate.uncertain ? { id: message.id, error: { code: -32000, message: "Synthetic interruption receipt uncertain" } } : { id: message.id, result: {} });
+      if (!gate.waiting) {
+        gate.waiting = true;
+        const complete = () => {
+          if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".cancel-completion-" + message.params.turnId)) return setTimeout(complete, 20);
+          send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: message.params.turnId, status: "interrupted" } } });
+        };
+        complete();
+      }
+      return;
+    }
     send({ id: message.id, result: {} });
     if (String(message.params?.turnId).startsWith("turn-cancel-regression-")) {
       send({ method: "turn/completed", params: {
@@ -896,6 +918,99 @@ await check("durable API queue survives lost responses and restart without repea
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
     } finally { checked.close(); }
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("cancel retries before and after the start receipt never repeat interruption or invent a stopped result", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-cancel-once-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "cancel-once-fixture-token-123456" };
+  const child = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    FAKE_CAPTURE_PATH: capture, FAKE_CANCEL_GATES: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const wait = async callback => {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); }
+    throw new Error("Cancellation fixture did not reach its explicit gate");
+  };
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  try {
+    await waitForOutput(child, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "cancellation owner", automationIds: ["sample-research"] }) });
+    const other = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "other caller", automationIds: ["sample-research"] }) });
+    assert.equal(client.response.status, 201); assert.equal(other.response.status, 201);
+    const auth = { ...headers, "x-codex-cloud-token": client.data.token };
+    for (const [index, mode] of ["hold start receipt", "interrupt uncertain"].entries()) {
+      const start = await jsonRequest(base, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...auth, "idempotency-key": `cancel-once-event-${index}` }, body: JSON.stringify({ prompt: `cancel regression ${mode}` }) });
+      assert.equal(start.response.status, 200);
+      const route = start.data.run.resultPath;
+      const before = await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        assert.equal(result.response.status, 200);
+        return result.data.run.status === "running" && (await rpc()).some(item => item.method === "turn/start" && JSON.stringify(item.params).includes(mode)) ? result.data.run : null;
+      });
+      const nativeStart = (await rpc()).find(item => item.method === "turn/start" && JSON.stringify(item.params).includes(mode));
+      const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
+      const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
+      assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST", headers: { ...headers, "x-codex-cloud-token": other.data.token } })).response.status, 404);
+      assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST" })).response.status, 401);
+      const cancel = () => jsonRequest(base, route + "/cancel", { method: "POST", headers: auth });
+      const first = await cancel();
+      assert.equal(first.response.status, 202); assert.equal(first.data.run.status, "canceling");
+      const db = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+      let sessionId;
+      try { sessionId = JSON.parse(db.prepare("SELECT record FROM external_tasks WHERE id=?").get(before.id).record).sessionId; }
+      finally { db.close(); }
+      assert.ok(sessionId);
+      const consoleStop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId }) });
+      if (index === 0) {
+        const earlyStop = await consoleStop();
+        assert.equal(earlyStop.response.status, 202); assert.equal(earlyStop.data.pending, true);
+        assert.equal((await interrupts()).length, 0, "未绑定回合编号时不能向猜测的回合发送中断");
+        await fs.writeFile(capture + ".cancel-start-release", "release synthetic receipt");
+      }
+      const sent = await wait(async () => (await interrupts())[0]);
+      for (let repeat = 0; repeat < 3; repeat++) {
+        const result = await cancel();
+        assert.equal(result.response.status, 202); assert.equal(result.data.run.status, "canceling");
+        assert.equal(result.data.run.cancelRequestedAt, first.data.run.cancelRequestedAt);
+      }
+      const concurrent = await Promise.all([cancel(), cancel()]);
+      for (const result of concurrent) {
+        assert.equal(result.response.status, 202); assert.equal(result.data.run.status, "canceling");
+        assert.equal(result.data.run.cancelRequestedAt, first.data.run.cancelRequestedAt);
+      }
+      const webStop = await consoleStop();
+      assert.equal(webStop.response.status, index === 0 ? 202 : 500);
+      if (index === 0) assert.equal(webStop.data.pending, true);
+      assert.equal((await interrupts()).length, 1, "原生停止回执尚未到达时，重复取消不能重复发送中断");
+      if (index === 1) await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        return result.data.events?.some(event => event.type === "cancel-warning");
+      });
+      const pending = await jsonRequest(base, route, { headers: auth });
+      assert.equal(pending.data.run.status, "canceling"); assert.equal(pending.data.run.finishedAt, null);
+      assert.equal(pending.data.events.filter(event => event.type === "cancel-requested").length, 1);
+      assert.equal(pending.data.events.filter(event => event.type === "cancel-warning").length, index);
+      await fs.writeFile(capture + ".cancel-completion-" + sent.params.turnId, "release synthetic stop");
+      const stopped = await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        return result.data.run.status === "canceled" ? result.data.run : null;
+      });
+      assert.equal(stopped.id, before.id); assert.equal(stopped.usage.status, "unknown");
+      assert.equal((await cancel()).response.status, 200);
+      assert.equal((await interrupts()).length, 1);
+    }
+    assert.equal((await rpc()).filter(item => item.method === "turn/start").length, 2, "重复取消不能创建新模型回合");
+  } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
 await check("old turn notifications and approvals cannot complete, charge or corrupt a new API heartbeat before or after its start receipt", async () => {
