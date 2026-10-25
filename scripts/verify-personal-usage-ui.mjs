@@ -6,6 +6,7 @@ import { chromium } from "playwright";
 import { nextPersonalOccurrence } from "../server/personal-schedule.mjs";
 import { buildPersonalBrief } from "../server/personal-brief.mjs";
 import { calendarDayWindow } from "../server/personal-calendar.mjs";
+import { mailWindow } from "../server/personal-mail.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -99,6 +100,7 @@ await context.route("**/api/**", async (route) => {
     if (personalContextMode === "malformed") return send({ ok: true });
     return send({ ok: true, issue: null, providedAt: null, providedCount: null, activeCount: personalFacts.length });
   }
+  if (url.pathname === "/api/personal/mail") return send({ ok: true, mail: { window: mailWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
   if (url.pathname === "/api/personal/calendar") return send({ ok: true, calendar: calendarView || { window: calendarDayWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
   if (url.pathname === "/api/personal/calendar/refresh") {
     calendarReads++;
@@ -473,6 +475,15 @@ try {
       await calendarPage.screenshot({ path: new URL(`calendar-${width}.png`, calendarOut).pathname, fullPage: true });
     }
     const sendsBefore = submittedMessages;
+    await calendarPage.clock.setFixedTime(Date.parse(calendarView.snapshot.expiresAt) + 1);
+    assert.equal(await source.getByRole("button", { name: "规划今天" }).isEnabled(), true);
+    await source.getByRole("button", { name: "规划今天" }).click();
+    await calendarPage.waitForFunction(() => location.hash !== "#/project/_personal/today" || [...document.querySelectorAll('[aria-label="今日日程"] button')].some(button => button.textContent.includes("规划今天") && button.disabled), null, { timeout: 5000 });
+    assert.equal(new URL(calendarPage.url()).hash, "#/project/_personal/today");
+    assert.equal(await source.getByRole("button", { name: "规划今天" }).isEnabled(), false);
+    assert.equal(submittedMessages, sendsBefore);
+    await calendarPage.clock.setFixedTime(Date.now()); await calendarPage.reload();
+    await source.getByText("原日程时区：America/New_York").waitFor();
     await source.getByRole("button", { name: "规划今天" }).click();
     const input = calendarPage.getByPlaceholder("向个人助理发送消息");
     await input.waitFor();

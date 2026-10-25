@@ -152,6 +152,7 @@ let modelApiImages = [];
 let modelApiTurnId = null;
 let modelApiStructured = false;
 let turnSequence = 0;
+let mailSourceSequence = 0;
 const fixtureTurns = new Map();
 const fixtureCwds = new Map();
 const acceptedApprovals = new Set();
@@ -187,7 +188,21 @@ input.on("line", (line) => {
       return send({ id: message.id, result: { data: [{ name: "fixture", runtimeStatus: fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".unsafe-mcp") ? "connected" : "disabled", tools: {} }], nextCursor: null } });
     }
   }
-  if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: "calendar-ephemeral", ephemeral: true } } });
+  if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: message.params.serviceName?.includes("mail") ? "mail-ephemeral-" + (++mailSourceSequence) : "calendar-ephemeral", ephemeral: true } } });
+  if (message.method === "mcpServerStatus/list" && String(message.params.threadId || "").startsWith("mail-ephemeral-")) return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: Object.fromEntries(["gmail.search_email_ids", "gmail.read_email"].map(name => [name, {
+    name, annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
+    _meta: { connector_id: "mail", link_id: "mail-one", link_accounts: [{ link_id: "mail-one", profile_email: "one@example.test", link_name: "个人" }, { link_id: "mail-two", profile_email: "two@example.test", link_name: "另一个" }] }
+  }])) }], nextCursor: null } });
+  if (message.method === "mcpServer/tool/call" && String(message.params.threadId || "").startsWith("mail-ephemeral-")) {
+    if (message.params.tool === "gmail.search_email_ids") {
+      send({ id: "mail-unexpected-approval", method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, command: "must-not-run" } });
+      const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".mail-release")
+        ? send({ id: message.id, result: { structuredContent: { message_ids: ["metadata-mail-id"], next_page_token: null } } }) : setTimeout(reply, 10);
+      return reply();
+    }
+    return send({ id: message.id, result: { structuredContent: { id: "metadata-mail-id", threadId: "metadata-thread-id", internalDate: String(Date.now() - 7200000), labelIds: ["INBOX", "UNREAD"],
+      payload: { headers: [{ name: "Subject", value: "HTTP 元信息验收" }, { name: "From", value: "sender@example.test" }], body: { data: "must-not-persist-private-body" } } } } });
+  }
   if (message.method === "mcpServerStatus/list" && message.params.threadId === "calendar-ephemeral") return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: { "google_calendar.search": {
     name: "google_calendar.search", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
     _meta: { connector_id: "calendar", link_id: "synthetic-calendar-account", link_owner_profile: { email: "calendar@example.test" } }
@@ -198,9 +213,9 @@ input.on("line", (line) => {
       ? send({ id: message.id, result: { structuredContent: { events: [], next_page_token: null } } }) : setTimeout(reply, 10);
     return reply();
   }
-  if (message.method === "thread/unsubscribe" && message.params.threadId === "calendar-ephemeral") {
+  if (message.method === "thread/unsubscribe" && (message.params.threadId === "calendar-ephemeral" || String(message.params.threadId || "").startsWith("mail-ephemeral-"))) {
     send({ id: message.id, result: { status: "unsubscribed" } });
-    return send({ method: "thread/closed", params: { threadId: "calendar-ephemeral" } });
+    return send({ method: "thread/closed", params: { threadId: message.params.threadId } });
   }
   if (message.method === "app/list") return send({ id: message.id, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true, installUrl: "https://chatgpt.com/apps/mail/mail" }], nextCursor: null } });
   if (message.method === "app/installed") return send({ id: message.id, result: { apps: [{ id: "mail", enabled: true, callable: true }, { id: "calendar", enabled: true, callable: true }] } });
@@ -1898,7 +1913,7 @@ await check("external automation interrupted by restart waits for reconciliation
   }
 });
 
-await check("calendar source HTTP is explicit, read-only, durable and protected from cross-site requests and approvals", async () => {
+await check("calendar and mail sources are explicit, account-bound, durable and protected from cross-site requests and approvals", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-calendar-"));
   const fake = await writeFakeCodex(root), cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
   const capture = path.join(root, "requests.jsonl"), port = await freePort(), base = `http://127.0.0.1:${port}`;
@@ -1920,6 +1935,16 @@ await check("calendar source HTTP is explicit, read-only, durable and protected 
     assert.equal((await captured().catch(() => [])).filter(item => item.method === "mcpServer/tool/call").length, 0);
     const invalid = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC", tool: "write" }) });
     assert.equal(invalid.response.status, 400);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.snapshot, null);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC")).response.status, 200, "the trusted loopback backend is behind Caddy admin authentication, not a public token endpoint");
+    const accountsRequest = { method: "POST", headers, body: "{}" };
+    assert.equal((await jsonRequest(base, "/api/personal/mail/accounts", { ...accountsRequest, headers: { ...headers, origin: "https://untrusted.example.test" } })).response.status, 403);
+    assert.equal((await jsonRequest(base, "/api/personal/mail/refresh", { ...accountsRequest, headers: { ...headers, "sec-fetch-site": "cross-site" } })).response.status, 403);
+    assert.equal((await jsonRequest(base, "/api/personal/mail/accounts", accountsRequest)).data.accounts.length, 2);
+    assert.equal((await captured()).filter(item => item.method === "mcpServer/tool/call").length, 0, "mail account discovery never reads data");
+    for (const body of [{ timeZone: "UTC" }, { timeZone: "UTC", accountId: "mail-two", query: "anywhere" }, { timeZone: "UTC", accountId: "not/valid" }]) {
+      assert.equal((await jsonRequest(base, "/api/personal/mail/refresh", { method: "POST", headers, body: JSON.stringify(body) })).response.status, 400);
+    }
     const refreshing = jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC" }) });
     refreshing.catch(() => null);
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -1928,21 +1953,41 @@ await check("calendar source HTTP is explicit, read-only, durable and protected 
     }
     const during = await jsonRequest(base, "/api/codex/app-host/status", { headers });
     assert.equal(during.data.activeSourceReads, 1); assert.deepEqual(during.data.activeJobs, []);
+    const mailRefreshing = jsonRequest(base, "/api/personal/mail/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC", accountId: "mail-two" }) });
+    mailRefreshing.catch(() => null);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await captured()).some(item => item.method === "mcpServer/tool/call" && item.params.tool === "gmail.search_email_ids")) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal((await jsonRequest(base, "/api/codex/app-host/status", { headers })).data.activeSourceReads, 2);
     await fs.writeFile(capture + ".calendar-release", "release fixture only");
     const done = await refreshing;
     assert.equal(done.response.status, 200); assert.equal(done.data.calendar.stale, false); assert.deepEqual(done.data.calendar.snapshot.items, []);
     assert.equal(done.response.headers.get("cache-control"), "no-store");
+    await fs.writeFile(capture + ".mail-release", "release fixture only");
+    const mailDone = await mailRefreshing;
+    assert.equal(mailDone.data.mail.snapshot.account.email, "two@example.test");
+    assert.equal(mailDone.data.mail.snapshot.items[0].title, "HTTP 元信息验收");
+    assert.equal((await jsonRequest(base, "/api/codex/app-host/status", { headers })).data.activeSourceReads, 0);
     const native = await captured();
-    assert.equal(native.filter(item => item.method === "mcpServer/tool/call").length, 1);
+    assert.equal(native.filter(item => item.method === "mcpServer/tool/call").length, 3);
+    const mailCalls = native.filter(item => item.method === "mcpServer/tool/call" && item.params.tool.startsWith("gmail."));
+    assert.equal(mailCalls.length, 2); assert.ok(mailCalls.every(item => item.params.arguments.link_id === "mail-two"));
+    assert.equal(mailCalls[1].params.arguments.format, "metadata");
     assert.equal(native.some(item => item.method === "turn/start"), false);
     assert.ok(native.find(item => item.id === "calendar-unexpected-approval")?.error);
+    assert.ok(native.find(item => item.id === "mail-unexpected-approval")?.error);
     const stateFile = path.join(stateRoot, "personal-calendar-source.json"), preserved = await fs.readFile(stateFile, "utf8");
+    const mailStateFile = path.join(stateRoot, "personal-mail-source.json"), mailPreserved = await fs.readFile(mailStateFile, "utf8");
+    assert.equal(mailPreserved.includes("must-not-persist-private-body"), false);
     const history = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8").catch(() => '{"sessions":{}}'));
     assert.equal(Object.keys(history.sessions).length, 0, "ephemeral source is not a console conversation");
     await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
     const restored = await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers });
     assert.equal(restored.data.calendar.snapshot.version, done.data.calendar.snapshot.version);
     assert.equal(await fs.readFile(stateFile, "utf8"), preserved);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.snapshot.version, mailDone.data.mail.snapshot.version);
+    assert.equal(await fs.readFile(mailStateFile, "utf8"), mailPreserved);
     const oversized = "x".repeat(1024 * 1024 + 1);
     await fs.writeFile(stateFile, oversized);
     assert.equal((await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers })).response.status, 503);
@@ -1954,6 +1999,9 @@ await check("calendar source HTTP is explicit, read-only, durable and protected 
     await fs.writeFile(stateFile, '{"version":99,"preserve":"invalid fixture"}');
     const broken = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC" }) });
     assert.equal(broken.response.status, 503); assert.equal(JSON.parse(await fs.readFile(stateFile, "utf8")).preserve, "invalid fixture");
+    await fs.unlink(mailStateFile); await fs.symlink(capture, mailStateFile);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).response.status, 503);
+    assert.equal((await fs.lstat(mailStateFile)).isSymbolicLink(), true);
   } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
