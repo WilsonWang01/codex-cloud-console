@@ -16,7 +16,8 @@ if (live) assert.equal(process.env.CODEX_EXTERNAL_LIVE_APPROVED, "1", "Live infe
 if (live) {
   assert.ok(process.env.CODEX_EXTERNAL_LIVE_HOME, "Live verification requires a dedicated, already authenticated CODEX_EXTERNAL_LIVE_HOME; shared Codex home is not used");
   const dedicated = await fs.realpath(process.env.CODEX_EXTERNAL_LIVE_HOME);
-  const shared = await fs.realpath(process.env.CODEX_HOME || path.join(process.env.HOME, ".codex"));
+  const normalHome = process.env.CODEX_HOME || path.join(process.env.HOME, ".codex");
+  const shared = await fs.realpath(normalHome).catch(error => { if (error.code === "ENOENT") return path.resolve(normalHome); throw error; });
   const stat = await fs.stat(dedicated);
   assert.ok(dedicated !== shared && stat.isDirectory() && (stat.mode & 0o077) === 0, "The dedicated CLI home must be private and separate from the normal Codex home");
 }
@@ -78,13 +79,13 @@ const provider = live ? null : http.createServer(async (req, res) => {
     assert.deepEqual(data.text?.format?.schema, schema, "Native output schema must reach the provider");
     const flatten = (tools, namespace) => tools.flatMap(tool => tool.type === "namespace" ? flatten(tool.tools, tool.name) : [{ ...tool, namespace }]);
     const tools = flatten(data.tools || data.input?.find(item => item.type === "additional_tools")?.tools || [], undefined), exec = tools.find(tool => tool.name === "exec");
-    assert.ok(exec, "Native command tool is required for the report file");
+    assert.ok(exec, "Native tool execution is required for the report file");
     assert.equal(tools.some(tool => /gmail|calendar|web_search|image_generation|browser/i.test(tool.name || tool.type)), false);
-    const q = value => "'" + value.replaceAll("'", "'\\''") + "'";
-    const program = `import fs from 'node:fs';fs.mkdirSync('results',{recursive:true});fs.writeFileSync('results/report.md',${JSON.stringify(reportBody)});console.log('SYNTHETIC_REPORT_WRITTEN');`;
+    // Artifact delivery does not require shell access on restricted CI hosts.
+    const patch = "*** Begin Patch\n*** Add File: results/report.md\n" + reportBody.trimEnd().split("\n").map(line => "+" + line).join("\n") + "\n*** End Patch";
     const output = providerRequests === 1
       ? [{ id: "fc_report", type: "custom_tool_call", call_id: "report-write", name: "exec", namespace: exec.namespace, status: "completed",
-        input: `const result = await tools.exec_command(${JSON.stringify({ cmd: q(process.execPath) + " --input-type=module -e " + q(program), max_output_tokens: 1000, yield_time_ms: 10000 })}); if (result.session_id) throw new Error('Command incomplete'); text(result);` }]
+        input: `text(await tools.apply_patch(${JSON.stringify(patch)})); text("SYNTHETIC_REPORT_WRITTEN");` }]
       : [{ id: "msg_report", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: JSON.stringify(expected), annotations: [] }] }];
     if (providerRequests === 2) assert.match(JSON.stringify(data.input.find(item => item.call_id === "report-write" && item.type === "custom_tool_call_output")), /SYNTHETIC_REPORT_WRITTEN/);
     res.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
@@ -96,6 +97,13 @@ const provider = live ? null : http.createServer(async (req, res) => {
 });
 
 try {
+  if (!live) {
+    for (const [extra, message] of [[{}, "requires explicit quota approval"], [{ CODEX_EXTERNAL_LIVE_APPROVED: "1" }, "requires a dedicated"], [{ CODEX_EXTERNAL_LIVE_APPROVED: "1", CODEX_EXTERNAL_LIVE_HOME: home }, "must be private and separate"]]) {
+      const denied = await captured(process.execPath, [fileURLToPath(import.meta.url), "--live"], { env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, ...extra } });
+      assert.notEqual(denied.code, 0); assert.ok(denied.stderr.includes(message), "Live verification must reject unsafe setup before starting CLI");
+    }
+    summary.liveGuardChecks = 3;
+  }
   await fs.writeFile(path.join(repo, "README.md"), "Synthetic repository. Work only on the supplied request; no connectors, network, delegation or external writes.\n");
   for (const args of [["init", "-q"], ["add", "README.md"], ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Synthetic client fixture"]]) {
     const result = await captured("git", ["-c", "core.hooksPath=/dev/null", "-C", repo, ...args], { env: { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }); assert.equal(result.code, 0, result.stderr);
@@ -182,6 +190,7 @@ child.on('exit',code=>process.exit(code??1));process.stdin.on('end',()=>child.st
   assert.equal(native.thread.turns.length, 1); assert.equal(native.thread.turns[0].status, "completed");
   const itemTypes = native.thread.turns[0].items.map(item => item.type);
   assert.ok(itemTypes.every(type => ["userMessage", "reasoning", "agentMessage", "commandExecution", "fileChange"].includes(type)), "Unexpected native tool activity");
+  assert.ok(itemTypes.some(type => type === "fileChange" || type === "commandExecution"), "Native history must prove the file write");
   summary.nativeItemTypes = [...new Set(itemTypes)];
   summary.observedConnectorCalls = 0;
   await request(`/api/clients/${clientId}/revoke`, { method: "POST", body: "{}" });
