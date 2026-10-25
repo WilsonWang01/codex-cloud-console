@@ -52,6 +52,7 @@ import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutine
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { calendarSourceLimits, createPersonalCalendarSource } from "./personal-calendar.mjs";
+import { createPersonalFeedbackStore, personalFeedbackRouter } from "./personal-feedback.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 import { readReleaseInfo } from "./release-info.mjs";
 
@@ -88,6 +89,7 @@ const chatHistoryPath = path.join(stateRoot, "chat-history.json");
 const personalFactsStore = createPersonalFactsStore(path.join(stateRoot, "personal-facts.json"));
 const personalCommitmentsStore = createPersonalCommitmentsStore(path.join(stateRoot, "personal-commitments.json"));
 const personalRoutinesStore = createPersonalRoutinesStore(path.join(stateRoot, "personal-routines.json"));
+const personalFeedbackStore = createPersonalFeedbackStore(path.join(stateRoot, "personal-message-feedback.json"));
 const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
 const personalCalendarPath = path.join(stateRoot, "personal-calendar-source.json");
 const personalCalendarSource = createPersonalCalendarSource({
@@ -646,6 +648,7 @@ function normalizeChatMessage(item) {
   if (item?.status) normalized.status = String(item.status);
   if (item?.source) normalized.source = String(item.source);
   if (item?.turnId) normalized.turnId = String(item.turnId);
+  if (item?.turnStatus) normalized.turnStatus = String(item.turnStatus);
   if (typeof item?.turnIndex === "number") normalized.turnIndex = item.turnIndex;
   if (item?.details && typeof item.details === "object") normalized.details = item.details;
   if (Array.isArray(item?.attachments)) {
@@ -10506,6 +10509,12 @@ app.post("/api/chat/sessions/:id/select", async (req, res) => {
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: !session.codexSessionId });
   res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages });
 });
+
+app.use("/api/personal", personalFeedbackRouter({
+  store: personalFeedbackStore,
+  resolveSession: async id => findStoredSessionByHint(await readChatStore(), personalRepoId, id),
+  readThread: session => getAppServerThreadMessages(session, getRepoById(personalRepoId), { timeout: appServerFastReadTimeoutMs }),
+}));
 
 app.get("/api/chat/sessions/:id/personal-context", async (req, res) => {
   const repo = getRepoById(req.query.repoId);

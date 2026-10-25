@@ -762,7 +762,7 @@ export function normalizeAppServerThreadMessages(thread = {}, options = {}) {
     const items = Array.isArray(turn.items) ? turn.items : Array.isArray(turn.itemsView?.items) ? turn.itemsView.items : [];
     for (const item of items) {
       for (const itemMessage of itemMessages(item, time, options)) {
-        messages.push({ ...itemMessage, turnId: turn.id || null, turnIndex });
+        messages.push({ ...itemMessage, turnId: turn.id || null, turnIndex, turnStatus: turn.status || null });
       }
     }
     const errorText =

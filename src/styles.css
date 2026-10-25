@@ -7381,6 +7381,15 @@ pre {
 .personal-fact-references li span { color: var(--muted); }
 .personal-fact-references li p { margin: 0; color: var(--text); line-height: 1.5; }
 .personal-reference-details > summary { min-height: 44px; align-content: center; }
+.personal-message-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-height: 44px; margin-top: 6px; color: var(--muted); }
+.personal-message-feedback .icon-command { width: 44px; height: 44px; min-width: 44px; min-height: 44px; padding: 0; color: var(--muted); border: 0; background: transparent; box-shadow: none; }
+.personal-message-feedback .icon-command[aria-pressed="true"] { color: var(--accent); background: var(--surface-muted); }
+.personal-message-feedback .icon-command:hover:not(:disabled) { color: var(--text); background: var(--surface-muted); }
+.personal-feedback-status { display: grid; place-items: center; width: 20px; height: 44px; flex: 0 0 20px; }
+.personal-message-feedback .warn-text { flex-basis: 100%; font-size: 12px; overflow-wrap: anywhere; }
+.personal-feedback-error { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 0; color: var(--muted); font-size: 12px; }
+.personal-feedback-error span { min-width: 0; overflow-wrap: anywhere; }
+.personal-feedback-error .icon-command { width: 44px; height: 44px; min-width: 44px; min-height: 44px; }
 .composer-shell { position: relative; }
 .external-review-banner { display: flex; align-items: flex-start; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid #e9c993; border-bottom: 0; border-radius: 6px 6px 0 0; background: #fff8e9; color: var(--text); }
 .external-review-banner > svg { flex: 0 0 auto; margin-top: 2px; color: #a36212; }
