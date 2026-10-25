@@ -3039,6 +3039,13 @@ function bufferStartNotification(job, message) {
   job.startNotificationBytes += bytes;
 }
 
+function requestJobInterruption(job) {
+  const threadId = job.reviewThreadId || job.threadId, turnId = job.turnId;
+  // A late start receipt must still be interruptible; do not cache an unbound target.
+  if (!threadId || !turnId) return Promise.resolve(false);
+  return job.interruptPromise ||= Promise.resolve().then(() => appServerClientForJob(job).request("turn/interrupt", { threadId, turnId }, 20_000));
+}
+
 async function requestJobStart(job, method, params) {
   // Only the RPC receipt binds a turn; earlier notifications wait in a bounded buffer.
   job.startReady = Promise.withResolvers();
@@ -3066,7 +3073,7 @@ async function requestJobStart(job, method, params) {
   } catch (error) {
     job.startConfirmationFailed = true;
     job.cancelRequested = true;
-    if (job.turnId) void appServerClientForJob(job).request("turn/interrupt", { threadId: job.reviewThreadId || job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+    if (job.turnId) void requestJobInterruption(job).catch(() => null);
     throw new Error(`启动回执未能确认，请核对原任务；未自动重试：${error.message || error}`);
   } finally {
     job.startRequestPending = false;
@@ -3227,6 +3234,7 @@ function createServerJob(kind, repo, session, runtime) {
     }),
     makeSessionActive: true,
     cancelRequested: false,
+    interruptPromise: null,
   };
   job.resolve = resolvePromise;
   return job;
@@ -3235,9 +3243,7 @@ function createServerJob(kind, repo, session, runtime) {
 function interruptTimedOutTurn(job, message) {
   if (job.completed || job.finishing) return;
   job.cancelRequested = true;
-  const interrupt = job.threadId && job.turnId
-    ? appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
-    : Promise.resolve();
+  const interrupt = requestJobInterruption(job).catch(() => null);
   interrupt.finally(() => {
     finishTurnJob(job, false, 124, message).catch((error) => {
       emitJobEvent(job, "error", { message: error.message || "Codex turn timeout cleanup failed" });
@@ -3379,7 +3385,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
         await requestJobStart(job, "turn/start", params);
         if (job.completed || job.finishing) {
           if (job.threadId && job.turnId) {
-            await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+            await requestJobInterruption(job).catch(() => null);
           }
           return;
         }
@@ -3392,7 +3398,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
         );
         rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
         if (job.cancelRequested && job.threadId && job.turnId) {
-          await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+          await requestJobInterruption(job).catch(() => null);
         }
         emitJobEvent(job, "status", { text: job.turnId ? `已启动 turn ${job.turnId.slice(0, 8)}` : "已启动 app-server turn" });
       } catch (error) {
@@ -3431,6 +3437,10 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
       try {
         await resolveThreadForJob(job);
         if (job.completed) return;
+        if (job.cancelRequested) {
+          await finishTurnJob(job, false, 130, "Review cancelled before start");
+          return;
+        }
         const result = await requestJobStart(job,
           "review/start",
           {
@@ -3441,11 +3451,12 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
         );
         if (job.completed || job.finishing) {
           if (job.threadId && job.turnId) {
-            await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+            await requestJobInterruption(job).catch(() => null);
           }
           return;
         }
         if (result?.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
+        if (job.cancelRequested) await requestJobInterruption(job).catch(() => null);
         rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
         emitJobEvent(job, "status", { text: result?.reviewThreadId ? `已启动 detached review ${String(result.reviewThreadId).slice(0, 8)}` : "已启动官方 review" });
       } catch (error) {
@@ -3763,7 +3774,7 @@ function handleAppServerNotification(rpcMessage) {
           turnJob.cancelRequested = true;
           emitJobEvent(turnJob, "status", { text: "个人流程遇到未确认只读的连接服务操作，正在中断并等待核对" });
           if (turnJob.threadId && turnJob.turnId) {
-            appServerClientForJob(turnJob).request("turn/interrupt", { threadId: turnJob.threadId, turnId: turnJob.turnId }, 20_000).catch(() => null);
+            requestJobInterruption(turnJob).catch(() => null);
           }
         }
       }
@@ -7279,7 +7290,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {
       job.cancelRequested = true;
       if (job.threadId && job.turnId) {
-        appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+        requestJobInterruption(job).catch(() => null);
       }
     }
     await updateRun(runId, { threadId: job.threadId, sessionId: session.id }, { type: "thread", text: "Started Codex app-server automation thread" });
@@ -10370,9 +10381,12 @@ app.post("/api/codex/turn-interrupt", async (req, res) => {
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
   const active = activeTurns.get(`${repo.id}:${session.id}`);
   if (!active) return res.status(409).json({ ok: false, error: "当前没有正在运行的 turn。" });
-  await appServerClientForRepo(repo).request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId }, 20_000);
-  emitJobEvent(active, "status", { text: "已请求打断当前 turn" });
-  res.json({ ok: true, sessionId: session.id, threadId: active.threadId, turnId: active.turnId });
+  active.cancelRequested = true;
+  const awaitingStartReceipt = !active.threadId || !active.turnId;
+  await requestJobInterruption(active);
+  const pending = !active.completed;
+  if (pending && !active.finishing) emitJobEvent(active, "status", { text: awaitingStartReceipt ? "已记录取消，等待启动回执后核对停止结果" : "已请求打断当前 turn" });
+  res.status(pending ? 202 : 200).json({ ok: true, pending, sessionId: session.id, threadId: active.threadId, turnId: active.turnId });
 });
 
 app.get("/api/logs/:name", async (req, res) => {
@@ -10810,9 +10824,7 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
       }
       activeTurn.cancelRequested = true;
       if (activeTurn.threadId && activeTurn.turnId) {
-        await appServerClientForRepo(repo)
-          .request("turn/interrupt", { threadId: activeTurn.threadId, turnId: activeTurn.turnId }, 20_000)
-          .catch(() => null);
+        await requestJobInterruption(activeTurn).catch(() => null);
       }
       await Promise.race([activeTurn.promise, new Promise((resolve) => setTimeout(resolve, 10_000))]);
       if (!activeTurn.completed) {
@@ -12128,10 +12140,10 @@ app.post("/api/automations/:id/runs/:runId/cancel", async (req, res) => {
   const { run: updated, pending } = await requestAutomationRunCancellation(run.id, req.params.id, req.apiClient.id);
   if (!pending) return res.json({ ok: true, run: externalRunView(updated, req.params.id) });
   const job = activeAutomationRuns.get(run.id);
-  if (job && !job.completed) {
+  if (job && !job.completed && !job.cancelRequested) {
     job.cancelRequested = true;
     if (job.threadId && job.turnId) {
-      appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000)
+      requestJobInterruption(job)
         .catch((error) => appendAutomationRunEvent(run.id, {}, { type: "cancel-warning", text: `Interrupt request uncertain: ${error.message}` }, { taskClaim: job.externalTaskClaim }).catch(() => null));
     }
   }
