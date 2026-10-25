@@ -1,9 +1,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { personalReplyReferenceList } from "./personal-reply-source.mjs";
 
 function inputError(message, statusCode = 400) {
-  return Object.assign(new Error(message), { statusCode });
+  return Object.assign(new Error(message), { code: "personal_commitment_error", statusCode });
 }
 
 function titleValue(value) {
@@ -75,6 +76,7 @@ export function createPersonalCommitmentsStore(filePath) {
           }
           if (item.waitingReason !== undefined) waitingValue(item.waitingReason);
           if (item.relatedSessionIds !== undefined) personalCommitmentLinks(item.relatedSessionIds);
+          if (item.resultReferences !== undefined) personalReplyReferenceList.parse(item.resultReferences);
         }
       } catch { throw inputError("个人事项进度数据格式无效，原记录未改写", 500); }
       return parsed.commitments;
@@ -104,7 +106,8 @@ export function createPersonalCommitmentsStore(filePath) {
   const find = (commitments, id, revision) => {
     const item = commitments.find((entry) => entry.id === id);
     if (!item) throw inputError("个人事项不存在", 404);
-    if (!Number.isInteger(revision) || revision !== item.revision) throw inputError("事项已在其他页面修改，请刷新后重试", 409);
+    if (!Number.isSafeInteger(revision) || revision !== item.revision) throw inputError("事项已在其他页面修改，请刷新后重试", 409);
+    if (item.revision === Number.MAX_SAFE_INTEGER) throw inputError("事项已达到版本上限，原记录未改写", 503);
     return item;
   };
   return {
@@ -117,12 +120,13 @@ export function createPersonalCommitmentsStore(filePath) {
         dueAt: dueValue(payload?.dueAt), status: "active", sessionId: null,
         milestones: milestoneValues(payload?.milestones), waitingReason: waitingValue(payload?.waitingReason),
         relatedSessionIds: personalCommitmentLinks(payload?.relatedSessionIds),
+        resultReferences: [],
         source: "user", revision: 1, createdAt: now, updatedAt: now, completedAt: null,
       };
       commitments.push(item);
       return item;
     }),
-    update: (id, payload) => mutate((commitments) => {
+    update: (id, payload, authorize = async () => true) => mutate(async (commitments) => {
       const item = find(commitments, id, payload?.revision);
       if (payload?.title !== undefined) item.title = titleValue(payload.title);
       if (payload?.nextStep !== undefined) item.nextStep = noteValue(payload.nextStep);
@@ -130,6 +134,7 @@ export function createPersonalCommitmentsStore(filePath) {
       if (payload?.milestones !== undefined) item.milestones = milestoneValues(payload.milestones, item.milestones);
       if (payload?.waitingReason !== undefined) item.waitingReason = waitingValue(payload.waitingReason);
       if (payload?.relatedSessionIds !== undefined) item.relatedSessionIds = personalCommitmentLinks(payload.relatedSessionIds);
+      if (payload?.resultReferences !== undefined) item.resultReferences = personalReplyReferenceList.parse(payload.resultReferences);
       if (payload?.status !== undefined) {
         if (!["active", "done"].includes(payload.status)) throw inputError("事项状态无效");
         item.status = payload.status;
@@ -139,6 +144,7 @@ export function createPersonalCommitmentsStore(filePath) {
         if (payload.sessionId !== null && (typeof payload.sessionId !== "string" || !payload.sessionId || payload.sessionId.length > 128)) throw inputError("会话 ID 无效");
         item.sessionId = payload.sessionId;
       }
+      if (await authorize() !== true) throw inputError("原个人对话已变化，事项未改写", 409);
       item.revision += 1;
       item.updatedAt = new Date().toISOString();
       return item;

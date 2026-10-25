@@ -7342,6 +7342,17 @@ pre {
 .personal-commitment-steps > div button, .personal-commitment-links > div button { justify-self: stretch; }
 .personal-commitment-steps button:hover, .personal-commitment-links button:hover { background: var(--surface); }
 .personal-commitment-editor button:disabled { opacity: .5; cursor: default; }
+.personal-commitment-results { grid-column: 1 / -1; min-width: 0; font-size: 13px; }
+.personal-commitment-results > summary { min-height: 44px; padding: 12px 0; cursor: pointer; color: var(--muted-strong); }
+.personal-result-toolbar, .personal-result-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.personal-result-toolbar { justify-content: space-between; color: var(--muted); font-size: 12px; }
+.personal-result-reference { display: grid; gap: 8px; min-width: 0; padding: 12px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.personal-result-reference pre { max-height: 240px; min-width: 0; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; color: inherit; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.personal-result-reference small, .personal-result-picker small { color: var(--muted); font-size: 12px; }
+.personal-result-picker { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: end; gap: 8px; min-width: 0; margin: 12px 0 0; padding: 0; border: 0; }
+.personal-result-picker label { display: grid; gap: 5px; min-width: 0; color: var(--muted-strong); font-size: 12px; }
+.personal-result-picker select { width: 100%; min-width: 0; min-height: 44px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+.personal-commitment-results .icon-command { min-width: 44px; min-height: 44px; }
 .personal-completed { margin-top: 12px; color: var(--muted-strong); font-size: 13px; }
 .personal-completed summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
 .personal-list-section p { margin: 0 0 12px; color: var(--muted-strong); line-height: 1.5; }
