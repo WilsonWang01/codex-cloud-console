@@ -148,7 +148,7 @@ API 不允许覆盖 `sandbox`、`approval`、`executionProfile`；它们由控�
 npm run verify:external-client:codex
 ```
 
-此检查用独立 Node 进程提交虚构 Markdown/PDF、校验 JSON 和报告文件，再由独立 Python 进程在服务重启后下载；同时检查原事件恢复、未领取任务取消、调用方用量和撤销拒绝。只监听 `127.0.0.1`，临时令牌限单一验收自动化、一小时到期，结束撤销并停止进程；私有证据路径在输出中给出。它不是生产 HTTPS、EC2 或图片生成验收。
+此检查用独立 Node 进程提交虚构 Markdown/PDF、校验 JSON 和报告文件，再由独立 Python 进程在服务重启后下载；同时检查原事件恢复、未领取任务取消、调用方用量和撤销拒绝。只监听 `127.0.0.1`，临时令牌限单一验收自动化、一小时到期，结束撤销并停止进程；私有证据路径在输出中给出。完整命令已在本机与 EC2 的隔离服务通过，不是生产 HTTPS、真实 EC2 模型或图片生成验收。GitHub 托管主机拒绝原生沙箱写入，CI 因此只运行显式的 `--guards-only`（三个真实模式入口拒绝检查），不宣称 CI 已完成原生文件链路；原有全量回归和运行包门禁保持。
 
 真实模型模式必须另行得到额度授权，并由用户准备一个私有、已登录且不同于正常 Codex 目录的 `CODEX_EXTERNAL_LIVE_HOME`，再设置 `CODEX_EXTERNAL_LIVE_APPROVED=1` 运行 `npm run verify:external-client:codex -- --live`。脚本不会复制登录凭据、重新登录或自动新增模型回合，默认不进入此模式。CLI 会在该专用目录登记本轮虚构仓库的信任项并保留原生测试线程；这不是无状态调用。不得把普通 `~/.codex` 当测试目录，亦不自动恢复旧配置覆盖并行修改。首次共享目录实测和这一限制见[本轮验收](acceptance/2026-10-25-native-client-evidence.md)。
 

@@ -11,7 +11,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { inlinePdf } from "./fixtures/inline-pdf.mjs";
 
 const live = process.argv.includes("--live");
-assert.ok(process.argv.slice(2).every(arg => arg === "--live"), "Only --live is supported");
+const guardsOnly = process.argv.includes("--guards-only");
+assert.ok(process.argv.slice(2).every(arg => ["--live", "--guards-only"].includes(arg)) && !(live && guardsOnly), "Use --live or --guards-only, not both");
 if (live) assert.equal(process.env.CODEX_EXTERNAL_LIVE_APPROVED, "1", "Live inference requires explicit quota approval");
 if (live) {
   assert.ok(process.env.CODEX_EXTERNAL_LIVE_HOME, "Live verification requires a dedicated, already authenticated CODEX_EXTERNAL_LIVE_HOME; shared Codex home is not used");
@@ -20,6 +21,22 @@ if (live) {
   const shared = await fs.realpath(normalHome).catch(error => { if (error.code === "ENOENT") return path.resolve(normalHome); throw error; });
   const stat = await fs.stat(dedicated);
   assert.ok(dedicated !== shared && stat.isDirectory() && (stat.mode & 0o077) === 0, "The dedicated CLI home must be private and separate from the normal Codex home");
+}
+
+function verifyLiveGuards(home) {
+  for (const [extra, message] of [[{}, "requires explicit quota approval"], [{ CODEX_EXTERNAL_LIVE_APPROVED: "1" }, "requires a dedicated"], [{ CODEX_EXTERNAL_LIVE_APPROVED: "1", CODEX_EXTERNAL_LIVE_HOME: home }, "must be private and separate"]]) {
+    let denied;
+    try { execFileSync(process.execPath, [fileURLToPath(import.meta.url), "--live"], { env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, ...extra }, timeout: 10000, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (error) { denied = error; }
+    assert.equal(denied?.status, 1); assert.ok(denied.stderr.toString().includes(message), "Live verification must reject unsafe setup before starting CLI");
+  }
+  return 3;
+}
+if (guardsOnly) {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-client-guards-"));
+  try { console.log(JSON.stringify({ ok: true, mode: "live-guards-only", liveGuardChecks: verifyLiveGuards(home), nativeCliStarted: false, realModelTurns: 0 })); }
+  finally { await fs.rm(home, { recursive: true }); }
+  process.exit(0);
 }
 const project = fileURLToPath(new URL("..", import.meta.url));
 const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", "--package=@openai/codex@0.157.1", "-c", "command -v codex"], { encoding: "utf8" }).trim();
@@ -97,13 +114,7 @@ const provider = live ? null : http.createServer(async (req, res) => {
 });
 
 try {
-  if (!live) {
-    for (const [extra, message] of [[{}, "requires explicit quota approval"], [{ CODEX_EXTERNAL_LIVE_APPROVED: "1" }, "requires a dedicated"], [{ CODEX_EXTERNAL_LIVE_APPROVED: "1", CODEX_EXTERNAL_LIVE_HOME: home }, "must be private and separate"]]) {
-      const denied = await captured(process.execPath, [fileURLToPath(import.meta.url), "--live"], { env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, ...extra } });
-      assert.notEqual(denied.code, 0); assert.ok(denied.stderr.includes(message), "Live verification must reject unsafe setup before starting CLI");
-    }
-    summary.liveGuardChecks = 3;
-  }
+  if (!live) summary.liveGuardChecks = verifyLiveGuards(home);
   await fs.writeFile(path.join(repo, "README.md"), "Synthetic repository. Work only on the supplied request; no connectors, network, delegation or external writes.\n");
   for (const args of [["init", "-q"], ["add", "README.md"], ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Synthetic client fixture"]]) {
     const result = await captured("git", ["-c", "core.hooksPath=/dev/null", "-C", repo, ...args], { env: { PATH: process.env.PATH, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }); assert.equal(result.code, 0, result.stderr);
