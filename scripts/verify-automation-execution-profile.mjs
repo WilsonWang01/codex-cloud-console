@@ -36,7 +36,7 @@ test("only previously restricted detached threads can continue; configuration do
     assert.throws(() => assertProfileSource(profile, { ...source, ...changes }), { statusCode: 409 });
   }
   const effective = { mcp_servers: { fixture: { command: "node", tool_timeout_sec: "" }, "fixture.with.dot": {} },
-    plugins: { "plugin@host": {}, 'quoted"plugin': {} }, apps: { connected: {}, "app.with.dot": {} } };
+    plugins: { "plugin@host": {}, 'quoted"plugin': {} }, apps: { connected: {}, "app.with.dot": {} }, agents: { enabled: true, default_subagent_model: "explicit-model" } };
   const before = structuredClone(effective), config = profileThreadConfig(effective, "/worktree");
   assert.deepEqual(config.mcp_servers, { fixture: { enabled: false }, "fixture.with.dot": { enabled: false } });
   assert.deepEqual(config.plugins, { "plugin@host": { enabled: false }, 'quoted"plugin': { enabled: false } });
@@ -44,6 +44,7 @@ test("only previously restricted detached threads can continue; configuration do
   assert.equal(Object.hasOwn(config, "mcp_servers.fixture.enabled"), false);
   assert.equal(config.features.memories, false);
   assert.equal(config.features.plugins, false);
+  assert.deepEqual(config.agents, { enabled: false });
   assert.equal(config.sandbox_workspace_write.network_access, false);
   assert.deepEqual(effective, before);
   const reserved = profileThreadConfig(JSON.parse('{"plugins":{"__proto__":{},"constructor":{}}}'), "/worktree");

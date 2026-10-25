@@ -224,7 +224,7 @@ async function waitForResearch(runId, signal) {
 
 ## 当前边界
 
-上线前可以在已有 CLI 环境运行 `npm run verify:command-isolation:codex`，验证明确配置下的工作区写入、命令禁网和虚构 MCP 禁用。它只使用临时无登录目录和本机模拟模型服务；不是给生产自动化设置权限的接口，不会改变当前执行器的全权限默认值，也不能证明协作工具被禁用。完整步骤、EC2 实测与未覆盖限制见[原生隔离检查](acceptance/2026-10-25-native-command-isolation.md)。
+上线前可以在已有 CLI 环境运行 `npm run verify:command-isolation:codex`，验证明确配置下的工作区写入、命令禁网和虚构 MCP 禁用。它只使用临时无登录目录和本机模拟模型服务，不改变当前执行器的全权限默认值。[后续检查](acceptance/2026-10-26-personal-mail-quality.md)在固定 CLI 0.157.1 上补了 `agents.enabled=false`，新建及 CLI 重启后再次运行，工具目录不再列出派生代理入口；旧 `features.multi_agent=false` 单独使用不足以做到这一点。这不是每次生产请求的完整工具目录检查，也不是禁止所有后续执行、宿主读取或费用硬上限。最初步骤、EC2 实测和原边界见[原生隔离检查](acceptance/2026-10-25-native-command-isolation.md)。
 
 独立令牌不能读取管理页面、其他服务的结果或批准任务；运行响应不泄漏工作目录、会话 ID 和原始工具内容。用量缺失时为“未知”，token 不是美元账单。
 

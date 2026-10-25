@@ -47,6 +47,7 @@ export function profileThreadConfig(config, cwd) {
   return {
     mcp_servers: disabled("mcp_servers"), plugins: disabled("plugins"), apps: { ...disabled("apps"), _default: { enabled: false } },
     features: { apps: false, plugins: false, remote_plugin: false, multi_agent: false, memories: false },
+    agents: { enabled: false },
     web_search: "disabled", tools: { web_search: false },
     sandbox_workspace_write: { writable_roots: [cwd], network_access: false, exclude_tmpdir_env_var: true, exclude_slash_tmp: true },
   };

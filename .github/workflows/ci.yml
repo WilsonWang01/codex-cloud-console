@@ -22,6 +22,8 @@ jobs:
       - run: npm audit --audit-level=high
       - run: npm run verify:local
       - run: npm run verify:personal-memory:quality
+      - run: npm run verify:command-isolation:codex
+      - run: npm run verify:mail-drafts:quality
       - run: npm run verify:mail-drafts:codex
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only
