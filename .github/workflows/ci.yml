@@ -23,4 +23,5 @@ jobs:
       - run: npm run verify:local
       - run: npm run verify:personal-memory:quality
       - run: npm run verify:external-client:codex -- --guards-only
+      - run: npm run verify:external-client:codex -- --faults-only
       - run: npm run verify:runtime
