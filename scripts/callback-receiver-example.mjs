@@ -18,7 +18,9 @@ export function verifyCallback({ headers, rawBody, secret, now = Date.now() }) {
   const data = event.data;
   if (typeof data.run_id !== "string" || !data.run_id || data.run_id.length > 240 || typeof data.automation_id !== "string" || !data.automation_id || data.automation_id.length > 160 ||
       !["completed","failed","canceled","interrupted","needs_reconciliation"].includes(data.status)) reject();
-  const resultPath = `/api/automations/${encodeURIComponent(data.automation_id)}/runs/${encodeURIComponent(data.run_id)}`;
+  let resultPath;
+  try { resultPath = `/api/automations/${encodeURIComponent(data.automation_id)}/runs/${encodeURIComponent(data.run_id)}`; }
+  catch { reject(); }
   if (data.result_path !== resultPath || data.output_path !== undefined && data.output_path !== resultPath+"/output") reject();
   return event;
 }
