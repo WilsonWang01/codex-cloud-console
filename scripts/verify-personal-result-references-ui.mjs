@@ -125,6 +125,9 @@ try {
     const rpc = (await fs.readFile(fixture.rpcCapture, "utf8")).trim().split("\n").map(JSON.parse);
     assert.equal(rpc.some(entry => ["turn/start", "thread/start", "mcpServer/tool/call", "feedback/upload", "command/exec"].includes(entry.method)), false);
     assert.deepEqual(errors, []);
+    await fs.writeFile(path.join(out, "followup-draft.json"), JSON.stringify({ version: 1, capturedAt: new Date().toISOString(),
+      origin: "actual-isolated-console-ui", prompt: draft.draft.input, source: source.source, reply: source.text,
+      commitment: (await request(route)).body.commitment }, null, 2), { mode: 0o600 });
     console.log(JSON.stringify({ ok: true, backend: "actual isolated console", modelTurns: 0, businessWrites: 0, draftsCreated, referenceReads, screenshots: out,
       checks: ["默认不读取结果", "原生具体回复指纹绑定且不存副本", "选择后变化拒绝且保留选择", "错误回执不冒充保存或自动重试", "四宽度44px且不溢出", "取消移除不改数据，确认移除不删除原回复且可重关联", "读取失败不显示旧结果为新核对", "继续前再次核对且变化时不建草稿", "切到工作后迟到结果不生成工作草稿", "只建立一个未发送跟进草稿并保留原模型和草稿"] }));
   }
