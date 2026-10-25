@@ -40,12 +40,12 @@ export function profileThreadConfig(config, cwd) {
     const entries = config[key] ?? {};
     if (!object(entries) || Object.keys(entries).length > 400) throw fail("连接器或插件配置无法完整核对，未启动受限任务");
     return Object.fromEntries(Object.keys(entries).map(id => {
-      if (!/^[A-Za-z0-9_-]+$/.test(id)) throw fail("连接器或插件名称无法安全覆盖，未启动受限任务");
-      return [`${key}.${id}.enabled`, false];
+      if (!id || id.length > 300 || /[\u0000-\u001f\u007f]/.test(id)) throw fail("连接器或插件名称无法安全覆盖，未启动受限任务");
+      return [id, { enabled: false }];
     }));
   };
   return {
-    ...disabled("mcp_servers"), ...disabled("plugins"), ...disabled("apps"), "apps._default.enabled": false,
+    mcp_servers: disabled("mcp_servers"), plugins: disabled("plugins"), apps: { ...disabled("apps"), _default: { enabled: false } },
     features: { apps: false, plugins: false, remote_plugin: false, multi_agent: false, memories: false },
     web_search: "disabled", tools: { web_search: false },
     sandbox_workspace_write: { writable_roots: [cwd], network_access: false, exclude_tmpdir_env_var: true, exclude_slash_tmp: true },

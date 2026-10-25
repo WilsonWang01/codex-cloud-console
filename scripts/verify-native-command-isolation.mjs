@@ -12,6 +12,7 @@ const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--n
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-offline-policy-"));
 const cwd = path.join(root, "workspace"), home = path.join(root, "codex-home"), tmp = path.join(root, "tmp");
 const outside = path.join(root, "outside.txt"), marker = path.join(root, "mcp-started.txt");
+const fixtureName = "fixture.with.dot";
 const q = value => "'" + value.replaceAll("'", "'\\''") + "'";
 let client, requests = 0, networkReceived = false, providerError = null, advertisedNames = [], execSpec, outcome;
 const provider = http.createServer(async (req, res) => {
@@ -48,11 +49,11 @@ let base;
 try {
   for (const dir of [cwd, home, tmp]) await fs.mkdir(dir);
   await fs.writeFile(path.join(root, "mcp.mjs"), `import fs from 'node:fs';import readline from 'node:readline';fs.appendFileSync(${JSON.stringify(marker)},'started\\n');readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id==null)return;const result=m.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}:m.method==='tools/list'?{tools:[{name:'fixture_canary',description:'Synthetic only',inputSchema:{type:'object',properties:{}}}]}:{};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`);
+  await fs.writeFile(path.join(home, "config.toml"), `[mcp_servers.${JSON.stringify(fixtureName)}]\ncommand=${JSON.stringify(process.execPath)}\nargs=${JSON.stringify([path.join(root, "mcp.mjs")])}\nenabled=true\n[plugins."fixture@host"]\nenabled=false\n`);
   await new Promise(resolve => provider.listen(0, "127.0.0.1", resolve)); base = `http://127.0.0.1:${provider.address().port}`;
   const args = ["app-server", "--listen", "stdio://", "-c", 'model_provider="offline_fixture"', "-c", 'model_providers.offline_fixture.name="Synthetic offline test"',
     "-c", `model_providers.offline_fixture.base_url="${base}/v1"`, "-c", 'model_providers.offline_fixture.wire_api="responses"', "-c", "model_providers.offline_fixture.requires_openai_auth=false", "-c", "model_providers.offline_fixture.supports_websockets=false",
-    "-c", "features.plugins=false", "-c", "features.remote_plugin=false", "-c", "features.apps=false", "-c", 'cli_auth_credentials_store="file"',
-    "-c", `mcp_servers.fixture.command=${JSON.stringify(process.execPath)}`, "-c", `mcp_servers.fixture.args=${JSON.stringify([path.join(root, "mcp.mjs")])}`, "-c", "mcp_servers.fixture.enabled=true"];
+    "-c", "features.plugins=false", "-c", "features.remote_plugin=false", "-c", "features.apps=false", "-c", 'cli_auth_credentials_store="file"'];
   const createClient = () => new CodexAppServerClient({ cwd, command, args, env: { PATH: process.env.PATH, HOME: root, CODEX_HOME: home, TMPDIR: tmp }, onServerRequest: () => { throw new Error("Synthetic offline profile never grants extra permissions"); } });
   client = createClient();
   const baseline = await client.request("thread/start", { cwd, model: "gpt-6-sol", ephemeral: true, approvalPolicy: "never", sandbox: "workspace-write" }, 20000);
@@ -62,10 +63,10 @@ try {
   do {
     const remaining = connectionDeadline - Date.now(); if (remaining <= 0) break;
     before = await client.request("mcpServerStatus/list", { threadId: baseline.thread.id, limit: 100, detail: "toolsAndAuthOnly" }, remaining);
-    if (!["starting", "notStarted"].includes(before.data.find(server => server.name === "fixture")?.runtimeStatus)) break;
+    if (!["starting", "notStarted"].includes(before.data.find(server => server.name === fixtureName)?.runtimeStatus)) break;
     await new Promise(resolve => setTimeout(resolve, Math.min(delay, Math.max(0, connectionDeadline - Date.now())))); delay = Math.min(delay * 2, 1000);
   } while (Date.now() < connectionDeadline);
-  assert.equal(before.data.find(server => server.name === "fixture")?.runtimeStatus, "connected");
+  assert.equal(before.data.find(server => server.name === fixtureName)?.runtimeStatus, "connected");
   assert.equal(requests, 0); await client.stop({ waitForExit: true });
   const startedCount = await fs.readFile(marker, "utf8");
   client = createClient();
@@ -77,7 +78,7 @@ try {
   assert.equal(restricted.approvalPolicy, "never"); assert.equal(restricted.sandbox.type, "workspaceWrite"); assert.equal(restricted.sandbox.networkAccess, false);
   const status = await client.request("mcpServerStatus/list", { threadId: restricted.thread.id, limit: 100, detail: "toolsAndAuthOnly" }, 15000);
   assert.equal(status.nextCursor, null);
-  assert.equal(status.data.find(server => server.name === "fixture")?.runtimeStatus, "disabled");
+  assert.equal(status.data.find(server => server.name === fixtureName)?.runtimeStatus, "disabled");
   assert.equal(status.data.every(server => server.runtimeStatus === "disabled" && Object.keys(server.tools).length === 0), true);
   assert.equal(await fs.readFile(marker, "utf8"), startedCount);
   let timer, listener;

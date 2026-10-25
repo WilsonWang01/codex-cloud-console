@@ -177,7 +177,7 @@ input.on("line", (line) => {
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
   if (process.env.FAKE_EXECUTION_PROFILE === "1") {
     if (message.method === "config/read") return send({ id: message.id, result: { config: { mcp_servers: { fixture: { command: "fixture", tool_timeout_sec: "" } } } } });
-    if (["thread/start", "thread/resume"].includes(message.method) && message.params.config?.["mcp_servers.fixture.enabled"] === false) {
+    if (["thread/start", "thread/resume"].includes(message.method) && message.params.config?.mcp_servers?.fixture?.enabled === false) {
       const id = message.params.threadId || "thread-profile-" + threads.length;
       const thread = { id, cwd: message.params.cwd }; threads.push(thread); fixtureCwds.set(id, message.params.cwd);
       return send({ id: message.id, result: { thread, cwd: message.params.cwd, approvalPolicy: message.params.approvalPolicy,
@@ -1043,7 +1043,7 @@ await check("operator execution policy is pinned through API acceptance, continu
     assert.equal(turn.params.model, "gpt-6-astra"); assert.equal(turn.params.effort, "ultra");
     assert.deepEqual(turn.params.sandboxPolicy, { type: "workspaceWrite", writableRoots: [turn.params.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
     assert.equal(turn.params.approvalPolicy, "never");
-    assert.ok(requests.some(row => row.method === "thread/resume" && row.params.config?.["mcp_servers.fixture.enabled"] === false));
+    assert.ok(requests.some(row => row.method === "thread/resume" && row.params.config?.mcp_servers?.fixture?.enabled === false));
     const beforeUnsafe = requests.filter(row => row.method === "turn/start").length;
     await fs.writeFile(capture + ".unsafe-mcp", "unsafe");
     const unsafe = await submit("profile-unsafe-0003", "must-not-start unsafe connector");

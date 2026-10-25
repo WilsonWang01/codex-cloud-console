@@ -35,16 +35,22 @@ test("only previously restricted detached threads can continue; configuration do
   for (const changes of [{ executionProfile: null }, { threadId: null }, { worktreePolicy: "existing-thread" }, { worktreePath: null }]) {
     assert.throws(() => assertProfileSource(profile, { ...source, ...changes }), { statusCode: 409 });
   }
-  const effective = { mcp_servers: { fixture: { command: "node", tool_timeout_sec: "" } }, plugins: {}, apps: { connected: {} } };
+  const effective = { mcp_servers: { fixture: { command: "node", tool_timeout_sec: "" }, "fixture.with.dot": {} },
+    plugins: { "plugin@host": {}, 'quoted"plugin': {} }, apps: { connected: {}, "app.with.dot": {} } };
   const before = structuredClone(effective), config = profileThreadConfig(effective, "/worktree");
-  assert.equal(config["mcp_servers.fixture.enabled"], false);
-  assert.equal(config["apps.connected.enabled"], false);
-  assert.equal(config["apps._default.enabled"], false);
+  assert.deepEqual(config.mcp_servers, { fixture: { enabled: false }, "fixture.with.dot": { enabled: false } });
+  assert.deepEqual(config.plugins, { "plugin@host": { enabled: false }, 'quoted"plugin': { enabled: false } });
+  assert.deepEqual(config.apps, { connected: { enabled: false }, "app.with.dot": { enabled: false }, _default: { enabled: false } });
+  assert.equal(Object.hasOwn(config, "mcp_servers.fixture.enabled"), false);
   assert.equal(config.features.memories, false);
   assert.equal(config.features.plugins, false);
   assert.equal(config.sandbox_workspace_write.network_access, false);
   assert.deepEqual(effective, before);
-  for (const value of [null, [], { mcp_servers: [] }, { mcp_servers: { "ambiguous.name": {} } }, { plugins: { "plugin@host": {} } }]) {
+  const reserved = profileThreadConfig(JSON.parse('{"plugins":{"__proto__":{},"constructor":{}}}'), "/worktree");
+  assert.deepEqual(JSON.parse(JSON.stringify(reserved.plugins)), JSON.parse('{"__proto__":{"enabled":false},"constructor":{"enabled":false}}'));
+  assert.equal({}.enabled, undefined);
+  for (const value of [null, [], { mcp_servers: [] }, { mcp_servers: { "": {} } }, { plugins: { "bad\nname": {} } },
+    { apps: { ["x".repeat(301)]: {} } }, { plugins: Object.fromEntries(Array.from({ length: 401 }, (_, i) => [String(i), {}])) }]) {
     assert.throws(() => profileThreadConfig(value, "/worktree"), { statusCode: 503 });
   }
 });
