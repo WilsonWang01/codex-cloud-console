@@ -54,6 +54,7 @@
     "verify:connections:ui": "node scripts/verify-connected-services-ui.mjs",
     "verify:personal-memory:codex": "node scripts/verify-personal-memory-codex.mjs",
     "verify:personal-memory:quality": "node scripts/verify-personal-memory-quality.mjs",
+    "verify:mail-drafts:quality": "node scripts/verify-personal-mail-quality.mjs",
     "verify:personal-references:codex": "node scripts/verify-personal-memory-codex.mjs --references",
     "verify:personal-references:ui": "node scripts/verify-personal-fact-references-ui.mjs",
     "verify:personal-commitments": "node --test scripts/verify-personal-commitments.mjs scripts/verify-personal-commitments-api.mjs",
