@@ -54,6 +54,7 @@ import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { calendarSourceLimits, createPersonalCalendarSource } from "./personal-calendar.mjs";
 import { createPersonalFeedbackStore, personalFeedbackRouter } from "./personal-feedback.mjs";
+import { personalResultReferencesRouter } from "./personal-result-references.mjs";
 import { mailSourceLimits, createPersonalMailSource } from "./personal-mail.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 import { readReleaseInfo } from "./release-info.mjs";
@@ -10591,6 +10592,12 @@ app.use("/api/personal", personalFeedbackRouter({
   readThread: session => getAppServerThreadMessages(session, getRepoById(personalRepoId), { timeout: appServerFastReadTimeoutMs }),
 }));
 
+app.use("/api/personal", personalResultReferencesRouter({
+  store: personalCommitmentsStore,
+  resolveSession: async id => findStoredSessionByHint(await readChatStore(), personalRepoId, id),
+  readThread: session => getAppServerThreadMessages(session, getRepoById(personalRepoId), { timeout: appServerFastReadTimeoutMs }),
+}));
+
 app.get("/api/chat/sessions/:id/personal-context", async (req, res) => {
   const repo = getRepoById(req.query.repoId);
   if (repo.kind !== "personal") return res.status(400).json({ ok: false, error: "仅适用于个人空间" });
@@ -11207,7 +11214,7 @@ app.delete("/api/personal/facts/:id", async (req, res) => {
 });
 
 app.get("/api/personal/commitments", async (_req, res) => {
-  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, progressVersion: 1, commitments: await personalCommitmentsStore.list() }); }
+  try { res.setHeader("Cache-Control", "no-store"); res.json({ ok: true, progressVersion: 1, resultsVersion: 1, commitments: await personalCommitmentsStore.list() }); }
   catch (error) { sendRouteError(res, error); }
 });
 
@@ -11337,6 +11344,7 @@ app.post("/api/personal/routines/:id/restore", async (req, res) => {
 });
 
 async function checkPersonalCommitmentSessions(payload) {
+  if (payload?.resultReferences !== undefined) throw Object.assign(new Error("请从原回复结果关联入口核对来源，不接受直接写入结果编号"), { statusCode: 400 });
   const ids = payload?.relatedSessionIds === undefined ? [] : personalCommitmentLinks(payload.relatedSessionIds);
   if (payload?.sessionId != null) ids.push(...personalCommitmentLinks([payload.sessionId]));
   if (!ids.length) return;

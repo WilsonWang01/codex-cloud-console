@@ -1,5 +1,6 @@
 import { Check, ChevronRight, Pencil, Plus, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
+import PersonalCommitmentResults, { type PersonalReplySource } from "./PersonalCommitmentResults";
 
 export type PersonalCommitment = {
   id: string;
@@ -16,6 +17,7 @@ export type PersonalCommitment = {
   waitingReason?: string;
   milestones?: Array<{ id: string; title: string; done: boolean }>;
   relatedSessionIds?: string[];
+  resultReferences?: PersonalReplySource[];
 };
 
 const pendingLinksKey = "codex-cloud:personal-commitment-pending-links";
@@ -65,10 +67,11 @@ function dueLabel(iso: string | null) {
   return `${prefix} · ${date.toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
 }
 
-export default function PersonalCommitments({ sessions, onStart, onContinue, onDueCountChange }: {
+export default function PersonalCommitments({ sessions, onStart, onContinue, onChooseTask, onDueCountChange }: {
   sessions: Array<{ id: string; title?: string; isDraft?: boolean; messageCount?: number }>;
   onStart: (item: PersonalCommitment, pendingSessionId?: string) => Promise<PersonalCommitment | null>;
   onContinue: (sessionId: string) => void;
+  onChooseTask: (prompt: string) => void;
   onDueCountChange: (count: number) => void;
 }) {
   const [items, setItems] = useState<PersonalCommitment[]>([]);
@@ -76,6 +79,7 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
   const [error, setError] = useState("");
   const [unavailable, setUnavailable] = useState(false);
   const [progressSupported, setProgressSupported] = useState(false);
+  const [resultsSupported, setResultsSupported] = useState(false);
   const [busy, setBusy] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [editBase, setEditBase] = useState<PersonalCommitment | null>(null);
@@ -103,8 +107,8 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
     setLoading(true);
     setError("");
     setUnavailable(false);
-    void request<{ commitments: PersonalCommitment[]; progressVersion?: number }>("/api/personal/commitments", { signal: controller.signal })
-      .then((result) => { if (!controller.signal.aborted) { if (!Array.isArray(result.commitments)) throw new Error("事项列表响应无效，未确认当前记录。"); setItems(result.commitments); setProgressSupported(result.progressVersion === 1); } })
+    void request<{ commitments: PersonalCommitment[]; progressVersion?: number; resultsVersion?: number }>("/api/personal/commitments", { signal: controller.signal })
+      .then((result) => { if (!controller.signal.aborted) { if (!Array.isArray(result.commitments)) throw new Error("事项列表响应无效，未确认当前记录。"); setItems(result.commitments); setProgressSupported(result.progressVersion === 1); setResultsSupported(result.resultsVersion === 1); } })
       .catch((cause) => { if (!controller.signal.aborted) { setError(cause instanceof Error ? cause.message : "读取失败"); setUnavailable(cause instanceof Error && cause.message === "服务器尚未更新个人事项功能"); } })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
@@ -199,6 +203,9 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
   useEffect(() => { if (!loading) onDueCountChange(error ? 0 : dueCount); }, [dueCount, error, loading, onDueCountChange]);
   const completed = items.filter((item) => item.status === "done").sort((a, b) => Date.parse(b.completedAt || "") - Date.parse(a.completedAt || ""));
   const visible = showAll ? active : active.slice(0, 5);
+  const results = (item: PersonalCommitment) => resultsSupported ? <PersonalCommitmentResults item={item} sessions={sessions} disabled={Boolean(busy) || editing === item.id}
+    onUpdated={updated => setItems(previous => previous.map(entry => entry.id === updated.id && updated.revision >= entry.revision ? updated : entry))} onContinue={onContinue} onChooseTask={onChooseTask} />
+    : item.resultReferences?.length ? <p className="personal-empty">回复结果关联保留，当前服务器暂不能核对。</p> : null;
   const progress = (item: PersonalCommitment) => {
     const steps = item.milestones || [], links = [...new Set([item.sessionId, ...(item.relatedSessionIds || [])].filter((id): id is string => Boolean(id)))];
     return (steps.length > 0 || links.length > 0) && <details className="personal-commitment-progress">
@@ -227,6 +234,7 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
           <button type="button" title="删除事项" aria-label={`删除 ${item.title}`} disabled={Boolean(busy)} onClick={() => void remove(item)}><Trash2 size={16} /></button>
         </div>
         {progress(item)}
+        {results(item)}
       </div>;
     })}
     {active.length > 5 && <button type="button" className="personal-secondary-link" onClick={() => setShowAll((value) => !value)}>{showAll ? "收起" : `查看全部 ${active.length} 项`}</button>}
@@ -253,6 +261,6 @@ export default function PersonalCommitments({ sessions, onStart, onContinue, onD
       </section>}
       <div><button type="button" disabled={!title.trim() || milestones.some(step => !step.title.trim()) || Boolean(busy) || loading || conflict !== undefined} onClick={() => void save()}>{editing ? "保存" : "添加事项"}</button><button type="button" disabled={Boolean(busy)} onClick={resetEditor}>取消</button></div>
     </fieldset>}
-    {completed.length > 0 && <details className="personal-completed"><summary>已完成 {completed.length} 项</summary>{completed.map((item) => <div className="personal-commitment-row" key={item.id}><span className="personal-commitment-copy"><strong>{item.title}</strong><small>{item.completedAt ? new Date(item.completedAt).toLocaleString() : "已完成"}</small></span><div className="personal-commitment-actions"><button type="button" title="重新跟进" aria-label={`重新跟进 ${item.title}`} disabled={Boolean(busy)} onClick={() => void changeStatus(item)}><RotateCcw size={16} /></button><button type="button" title="编辑事项" aria-label={`编辑 ${item.title}`} disabled={Boolean(busy)} onClick={() => edit(item)}><Pencil size={16} /></button><button type="button" title="删除事项" aria-label={`删除 ${item.title}`} disabled={Boolean(busy)} onClick={() => void remove(item)}><Trash2 size={16} /></button></div>{progress(item)}</div>)}</details>}
+    {completed.length > 0 && <details className="personal-completed"><summary>已完成 {completed.length} 项</summary>{completed.map((item) => <div className="personal-commitment-row" key={item.id}><span className="personal-commitment-copy"><strong>{item.title}</strong><small>{item.completedAt ? new Date(item.completedAt).toLocaleString() : "已完成"}</small></span><div className="personal-commitment-actions"><button type="button" title="重新跟进" aria-label={`重新跟进 ${item.title}`} disabled={Boolean(busy)} onClick={() => void changeStatus(item)}><RotateCcw size={16} /></button><button type="button" title="编辑事项" aria-label={`编辑 ${item.title}`} disabled={Boolean(busy)} onClick={() => edit(item)}><Pencil size={16} /></button><button type="button" title="删除事项" aria-label={`删除 ${item.title}`} disabled={Boolean(busy)} onClick={() => void remove(item)}><Trash2 size={16} /></button></div>{progress(item)}{results(item)}</div>)}</details>}
   </section>;
 }

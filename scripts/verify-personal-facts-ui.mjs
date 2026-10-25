@@ -101,9 +101,10 @@ try {
   assert.match(logs, /listening on/);
   assert.equal((await fetch(base)).status, 200);
   for (const [repoId, threadId] of [["_personal", "work-thread"], ["sample-app", "legacy-facts-thread"]]) {
-    const rejected = await (await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId, sessionId: "app-" + threadId }))).json();
-    assert.equal(rejected.ok, true); assert.equal(rejected.activeSessionId, null); assert.deepEqual(rejected.messages, []);
-    assert.equal(rejected.sessions.some(session => session.codexSessionId === threadId), false);
+    const response = await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId, sessionId: "app-" + threadId }));
+    const rejected = await response.json();
+    assert.equal(response.status, 404); assert.equal(rejected.ok, false);
+    assert.equal(rejected.messages, undefined); assert.equal(rejected.sessions, undefined);
   }
   for (const sessionId of [workHistory.id, "app-work-thread", "unknown-session"]) {
     const response = await fetch(base + "api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sessionId, message: "合成跨空间拒绝验收" }) });

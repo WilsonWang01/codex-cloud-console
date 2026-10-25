@@ -5,6 +5,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { createKeyedQueue } from "./run-safety.mjs";
 import { readRootedFile } from "./safe-file-read.mjs";
+import { personalReplySourceSchema, personalReplyDigest, personalReplyTarget } from "./personal-reply-source.mjs";
 
 const serialize = createKeyedQueue();
 const limits = { entries: 1000, bytes: 1024 * 1024 };
@@ -12,7 +13,7 @@ const id = z.string().min(1).max(200).refine(value => value === value.trim() && 
 const instant = z.string().datetime({ offset: true });
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const decision = z.enum(["helpful", "not_helpful"]).nullable();
-const sourceSchema = z.object({ sessionId: id, threadId: id, turnId: id, messageId: id, contentDigest: digest }).strict();
+const sourceSchema = personalReplySourceSchema;
 const inputSchema = z.object({ turnId: id, messageId: id, contentDigest: digest, decision, expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict();
 const entrySchema = sourceSchema.extend({ key: digest, source: z.literal("user"), decision, revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), createdAt: instant, updatedAt: instant }).strict();
 const stateSchema = z.object({ version: z.literal(1), entries: z.array(entrySchema).max(limits.entries) }).strict();
@@ -20,24 +21,8 @@ const fail = (code, message, statusCode = 409) => Object.assign(new Error(messag
 const hash = value => crypto.createHash("sha256").update(value).digest("hex");
 const sourceKey = value => hash(JSON.stringify([value.threadId, value.turnId]));
 
-export const personalFeedbackDigest = text => hash(text);
-
-export function personalFeedbackTarget(session, snapshot, input) {
-  if (session?.repoId !== "_personal" || !session.codexSessionId) throw fail("session_missing", "未找到可评价的个人会话", 404);
-  const thread = snapshot?.thread;
-  if (snapshot?.ok !== true || thread?.id !== session.codexSessionId || !Array.isArray(thread.turns) || !Array.isArray(snapshot.messages)) {
-    throw fail("source_unavailable", "回复来源暂时无法核对，请稍后重试", 503);
-  }
-  const turns = thread.turns.filter(turn => turn.id === input.turnId);
-  if (turns.length !== 1 || turns[0].status !== "completed") throw fail("source_changed", "这次回复尚未完成或已变化，请刷新后核对");
-  const message = snapshot.messages.filter(item => item.turnId === input.turnId && item.role === "codex" && item.messageType === "agentMessage"
-    && !item.mocked && typeof item.text === "string" && item.text.trim()
-    && (item.details?.phase == null || item.details.phase === "final_answer")).at(-1);
-  if (!message || message.id !== input.messageId || personalFeedbackDigest(message.text) !== input.contentDigest) {
-    throw fail("source_changed", "回复内容已变化，请刷新后重新评价");
-  }
-  return sourceSchema.parse({ sessionId: session.id, threadId: session.codexSessionId, turnId: input.turnId, messageId: message.id, contentDigest: input.contentDigest });
-}
+export const personalFeedbackDigest = personalReplyDigest;
+export const personalFeedbackTarget = personalReplyTarget;
 
 export function personalFeedbackSummary(entries, now = Date.now()) {
   const from = now - 7 * 86400_000;

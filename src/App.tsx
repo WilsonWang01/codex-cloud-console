@@ -6666,7 +6666,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取邮件记录…</p></section>}><LazyPersonalMail refreshKey={status.generatedAt} onChooseTask={onChooseTask} onConnections={onConnections} /></Suspense>
     {guideFirst && guide}
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取关注事项…</p></section>}>
-      <LazyPersonalCommitments sessions={sessions} onStart={onStartCommitment} onContinue={onContinue} onDueCountChange={updateDueCount} />
+      <LazyPersonalCommitments sessions={sessions} onStart={onStartCommitment} onContinue={onContinue} onChooseTask={onChooseTask} onDueCountChange={updateDueCount} />
     </Suspense>
     {running.length > 0 && <section className="personal-list-section">
       <h2>进行中 <small>{running.length}</small></h2>
