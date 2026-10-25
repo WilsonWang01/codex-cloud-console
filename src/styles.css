@@ -1723,6 +1723,14 @@ h3 {
   padding: 10px 13px;
 }
 
+@supports (content-visibility: auto) and (contain-intrinsic-block-size: auto 160px) {
+  .chat-window .chat-bubble:not(.streaming) {
+    flex-shrink: 0;
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 160px;
+  }
+}
+
 .chat-history-window {
   display: flex;
   align-items: center;

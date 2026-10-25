@@ -46,6 +46,7 @@ try {
     });
     await page.goto(`${fixture.base}/#/project/_personal/thread/personal-a`); await ready("a");
     await chat.hover();
+    await page.locator('[data-chat-message-id="reading-a-message-20"]').scrollIntoViewIfNeeded();
     await target.scrollIntoViewIfNeeded();
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     evidence.before = await position();
@@ -71,6 +72,7 @@ try {
     await page.evaluate(() => { location.hash = "/project/_personal/thread/personal-b"; }); await ready("b");
     const bTarget = page.getByText(control.b.history[40].items[0].text, { exact: true });
     await chat.hover();
+    await page.locator('[data-chat-message-id="reading-b-message-40"]').scrollIntoViewIfNeeded();
     await bTarget.scrollIntoViewIfNeeded();
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const bTop = await chat.evaluate(node => node.scrollTop);

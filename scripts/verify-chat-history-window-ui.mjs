@@ -35,6 +35,11 @@ try {
       const coldSorted = [...coldSamples].sort((a, b) => a - b);
       const cold = { samples: coldSamples, p50: coldSorted[14], p95: coldSorted[28], max: coldSorted[29], goalMet: coldSorted[29] <= 2500 };
       const context = await browser.newContext({ viewport }), errors = [];
+      await context.addInitScript(() => {
+        window.__feedbackContentChecks = 0;
+        const digest = crypto.subtle.digest.bind(crypto.subtle);
+        crypto.subtle.digest = (...args) => { window.__feedbackContentChecks++; return digest(...args); };
+      });
       let page = await context.newPage();
       page.on("pageerror", error => errors.push(error.message));
       let chat = page.locator(".chat-window"), composer = page.locator(".composer-shell textarea");
@@ -63,6 +68,7 @@ try {
         }
         assert.equal(await page.getByRole("button", { name: "加载更早的消息", exact: true }).count(), 0);
         await chat.hover();
+        await page.locator(`[data-chat-message-id="window-${name}-message-20"]`).scrollIntoViewIfNeeded();
         await page.getByText(control[name].history[20].items[0].text, { exact: true }).scrollIntoViewIfNeeded();
         await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
         evidence[`anchor-${viewport.width}-${name}`] = await position();
@@ -78,6 +84,7 @@ try {
       assert.equal(await composer.inputValue(), drafts.a);
 
       const samples = [];
+      await page.evaluate(() => { window.__feedbackContentChecks = 0; });
       for (let index = 0; index < 32; index++) {
         const name = index % 2 ? "a" : "b";
         const ms = await page.evaluate(({ name, text }) => new Promise((resolve, reject) => {
@@ -95,7 +102,9 @@ try {
         if (index >= 2) samples.push(ms);
       }
       const sorted = [...samples].sort((a, b) => a - b);
-      const measured = { viewport, cold, samples, p50: sorted[14], p95: sorted[28], max: sorted[29], warmGoalMet: sorted[28] <= 200 };
+      const contentChecks = await page.evaluate(() => window.__feedbackContentChecks);
+      assert.ok(contentChecks < 640, `screen-off feedback must not hash all 500 replies on each switch: ${contentChecks}`);
+      const measured = { viewport, cold, samples, contentChecks, p50: sorted[14], p95: sorted[28], max: sorted[29], warmGoalMet: sorted[28] <= 200 };
       evidence.viewports.push(measured);
       await fs.writeFile(path.join(out, "in-progress.json"), JSON.stringify(evidence, null, 2));
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
@@ -142,6 +151,35 @@ try {
       assert.equal(await page.locator('.chat-bubble').count(), 80);
       assert.equal(await page.locator('.chat-degraded-banner').count(), 0);
       await context.unroute("**/api/chat/sessions?*", latePage);
+      const saved = structuredClone(control.a.history[20]);
+      control.a.history[20].items[0].text = "长消息验收。".repeat(250) + "\n\n```js\nconst preview = 'synthetic';\n```\n\n| 项目 | 状态 |\n| --- | --- |\n| 历史 | 已保留 |";
+      control.a.history[20].items.push({ id: "perf-image", type: "imageView", path: "perf-preview.png" });
+      await fs.writeFile(fixture.control, JSON.stringify(control));
+      const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64");
+      await context.route("**/api/files/blob?*", async route => {
+        const url = new URL(route.request().url());
+        assert.equal(url.searchParams.get("repoId"), "_personal"); assert.equal(url.searchParams.get("path"), "perf-preview.png");
+        await route.fulfill({ contentType: "image/png", body: png });
+      });
+      await route("a"); await ready("a", 80);
+      for (const count of [160, 240, 320, 400, 480, 501]) {
+        await page.getByRole("button", { name: "加载更早的消息", exact: true }).click(); await ready("a", count);
+      }
+      const long = page.locator('[data-chat-message-id="window-a-message-20"]');
+      await long.scrollIntoViewIfNeeded();
+      await long.getByRole("button", { name: "展开全文", exact: true }).click();
+      assert.match(await long.locator(".markdown-code-block code").textContent(), /const preview = 'synthetic'/);
+      assert.equal(await long.locator("table").count(), 1);
+      await long.getByRole("button", { name: "收起", exact: true }).click();
+      const imageItem = page.locator('[data-chat-message-id="perf-image"]');
+      await imageItem.scrollIntoViewIfNeeded();
+      await page.waitForFunction(() => { const img = document.querySelector('[data-chat-message-id="perf-image"] img'); return img?.complete && img.naturalWidth === 1; });
+      assert.equal(await page.locator('.chat-bubble').count(), 501);
+      assert.equal(await composer.inputValue(), drafts.a);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      await page.screenshot({ path: path.join(out, `rich-history-${viewport.width}.png`), fullPage: true });
+      control.a.history[20] = saved; await fs.writeFile(fixture.control, JSON.stringify(control));
+      Object.assign(measured, { longMessageCodeAndImageVisible: true });
       assert.deepEqual(errors, []);
       Object.assign(measured, { failedLoadPreservedDraft: true, obsoletePageIgnored: true });
       await context.close();
