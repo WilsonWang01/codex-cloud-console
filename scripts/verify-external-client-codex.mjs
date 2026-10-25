@@ -25,7 +25,7 @@ const project = fileURLToPath(new URL("..", import.meta.url));
 const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", "--package=@openai/codex@0.157.1", "-c", "command -v codex"], { encoding: "utf8" }).trim();
 const version = execFileSync(command, ["--version"], { encoding: "utf8" }).trim();
 assert.match(version, /^codex-cli 0\.157\.1$/);
-const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-external-native-")));
+const root = await fs.realpath(await fs.mkdtemp(path.join(process.env.RUNNER_TEMP || os.tmpdir(), "codex-external-native-")));
 await fs.chmod(root, 0o700);
 const cloud = path.join(root, "cloud"), state = path.join(root, "state"), bin = path.join(root, "bin"), home = path.join(root, "home");
 const repo = path.join(cloud, "workspace/research"), gate = path.join(root, "release-turn"), journal = path.join(root, "turns.jsonl");
