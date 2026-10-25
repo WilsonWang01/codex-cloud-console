@@ -1,11 +1,12 @@
 import { useCallback, useLayoutEffect, useRef, useState, type RefObject } from "react";
 
-type Position = { anchor: string | null; offset: number; top: number; follow: boolean; seen: string };
+type Position = { anchor: string | null; offset: number; top: number; follow: boolean; seen: string; count?: number };
 const storageKey = "codex-cloud-chat-reading-v1";
 const validText = (value: unknown, limit: number): value is string => typeof value === "string" && value.length <= limit;
 const validPosition = (value: Position) => value && (value.anchor === null || validText(value.anchor, 512))
   && Number.isFinite(value.offset) && Math.abs(value.offset) <= 1e8 && Number.isFinite(value.top) && value.top >= 0 && value.top <= 1e8
-  && typeof value.follow === "boolean" && validText(value.seen, 1024);
+  && typeof value.follow === "boolean" && validText(value.seen, 1024)
+  && (value.count === undefined || (Number.isInteger(value.count) && value.count >= 1 && value.count <= 2000));
 
 export class ChatReadingPositions {
   private entries = new Map<string, Position>();
@@ -30,7 +31,8 @@ export class ChatReadingPositions {
   set(key: string, position: Position) {
     this.load();
     if (!validText(key, 1024) || !key || !validPosition(position)) return;
-    this.entries.delete(key); this.entries.set(key, { anchor: position.anchor, offset: position.offset, top: position.top, follow: position.follow, seen: position.seen });
+    this.entries.delete(key); this.entries.set(key, { anchor: position.anchor, offset: position.offset, top: position.top, follow: position.follow, seen: position.seen,
+      ...(position.count === undefined ? {} : { count: position.count }) });
     // ponytail: a tab-local UI cache, not a second history or draft store.
     if (this.entries.size > 40) this.entries.delete(this.entries.keys().next().value!);
     if (this.writable) try {
@@ -42,9 +44,16 @@ export class ChatReadingPositions {
 }
 
 const positions = new ChatReadingPositions(() => window.sessionStorage);
+export function chatReadingHistoryLimit(repoId: string, sessionId: string) {
+  return Math.max(80, positions.get(JSON.stringify([repoId, sessionId]))?.count || 80);
+}
+export function chatReadingHistoryAnchor(repoId: string, sessionId: string) {
+  const position = positions.get(JSON.stringify([repoId, sessionId]));
+  return position?.follow ? null : position?.anchor || null;
+}
 type View = { key: string; position: Position; latest: string; ignoreTop: number | null; restoring: boolean; width: number; height: number; flush: () => void; schedule: () => void };
 
-export function useChatReadingPosition(scroller: RefObject<HTMLDivElement | null>, key: string, ready: boolean, seen: string) {
+export function useChatReadingPosition(scroller: RefObject<HTMLDivElement | null>, key: string, ready: boolean, seen: string, messageCount = 80) {
   const view = useRef<View | null>(null);
   const [newProgress, setNewProgress] = useState(false);
   const capture = useCallback(() => {
@@ -54,7 +63,7 @@ export function useChatReadingPosition(scroller: RefObject<HTMLDivElement | null
     const top = node.getBoundingClientRect().top;
     const anchor = follow ? null : [...node.querySelectorAll<HTMLElement>("[data-chat-message-id]")].find(item => item.getBoundingClientRect().bottom > top + 1);
     current.position = { anchor: anchor?.dataset.chatMessageId || null, offset: anchor ? anchor.getBoundingClientRect().top - top : 0,
-      top: node.scrollTop, follow, seen: follow ? current.latest : current.position.seen };
+      top: node.scrollTop, follow, seen: follow ? current.latest : current.position.seen, count: current.position.count };
     current.schedule();
     if (follow) setNewProgress(false);
   }, [scroller]);
@@ -65,7 +74,7 @@ export function useChatReadingPosition(scroller: RefObject<HTMLDivElement | null
     if (!ready || !key || !node) { setNewProgress(false); return; }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const saved = positions.get(key);
-    const current: View = { key, position: saved || { anchor: null, offset: 0, top: 0, follow: true, seen }, latest: seen,
+    const current: View = { key, position: { ...(saved || { anchor: null, offset: 0, top: 0, follow: true, seen }), count: Math.min(2000, messageCount) }, latest: seen,
       ignoreTop: null, restoring: true, width: node.clientWidth, height: node.clientHeight,
       flush: () => { clearTimeout(timer); positions.set(key, current.position); },
       schedule: () => { clearTimeout(timer); timer = setTimeout(() => current.flush(), 200); } };
@@ -113,12 +122,13 @@ export function useChatReadingPosition(scroller: RefObject<HTMLDivElement | null
     const current = view.current, node = scroller.current;
     if (!current || current.key !== key || !node) return;
     current.latest = seen;
+    current.position.count = Math.min(2000, messageCount);
     if (current.position.follow) {
       current.position.seen = seen;
       node.scrollTop = node.scrollHeight; current.ignoreTop = node.scrollTop;
       setNewProgress(false);
     } else if (current.position.seen !== seen) setNewProgress(true);
-  }, [key, ready, seen, scroller]);
+  }, [key, ready, seen, scroller, messageCount]);
 
   const onScroll = useCallback(() => {
     const current = view.current, node = scroller.current;
@@ -135,7 +145,7 @@ export function useChatReadingPosition(scroller: RefObject<HTMLDivElement | null
   const scrollToLatest = useCallback(() => {
     const current = view.current, node = scroller.current;
     if (!current || !node) return;
-    current.restoring = true; current.position = { anchor: null, offset: 0, top: node.scrollHeight, follow: true, seen: current.latest };
+    current.restoring = true; current.position = { anchor: null, offset: 0, top: node.scrollHeight, follow: true, seen: current.latest, count: current.position.count };
     node.scrollTop = node.scrollHeight; current.ignoreTop = node.scrollTop; current.flush(); setNewProgress(false);
   }, [scroller]);
   return { onScroll, onUserIntent, scrollToLatest, newProgress };

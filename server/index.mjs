@@ -1887,7 +1887,21 @@ function scheduleThreadSummaryRefresh(repo, session) {
   threadSummaryRefreshByKey.set(key, task);
 }
 
-async function getChatMessages(repoId, sessionHint, options = {}) {
+function chatHistoryLimit(value) {
+  if (value === undefined) return maxStoredChatMessages;
+  if (!["string", "number"].includes(typeof value) || !/^[1-9]\d{0,3}$/.test(String(value)) || Number(value) > 2000) {
+    throw Object.assign(new Error("历史显示数量须为 1–2000 的整数"), { statusCode: 400 });
+  }
+  return Number(value);
+}
+
+function chatHistoryAnchor(value) {
+  if (value === undefined) return "";
+  if (typeof value !== "string" || !value || value.length > 512) throw Object.assign(new Error("历史阅读位置无效"), { statusCode: 400 });
+  return value;
+}
+
+async function getChatTimelineMessages(repoId, sessionHint, options = {}) {
   const session = await resolveChatSessionForRead(repoId, sessionHint);
   if (session.codexSessionId) {
     const repo = repos.find((item) => item.id === session.repoId || item.id === repoId) || null;
@@ -1936,8 +1950,7 @@ async function getChatMessages(repoId, sessionHint, options = {}) {
           if (rank) return rank;
         }
         return new Date(a.time) - new Date(b.time);
-      })
-      .slice(-maxStoredChatMessages);
+      });
   }
 
   const sourceMessages = session.messages;
@@ -1945,6 +1958,21 @@ async function getChatMessages(repoId, sessionHint, options = {}) {
     .map(normalizeChatMessage)
     .filter((item) => item.text)
     .slice(-maxStoredChatMessages);
+}
+
+async function getChatHistory(repoId, sessionHint, options = {}) {
+  const requested = chatHistoryLimit(options.limit), anchor = chatHistoryAnchor(options.anchor);
+  const timeline = await getChatTimelineMessages(repoId, sessionHint, options);
+  const index = anchor ? timeline.findIndex(item => item.id === anchor) : -1;
+  const limit = Math.min(2000, Math.max(requested, index < 0 ? 0 : timeline.length - index));
+  const messages = timeline.slice(-limit);
+  return { messages, ...(timeline.some(item => item.messageType === "threadReadError") ? {} : {
+    history: { total: timeline.length, limit, hasMore: timeline.length > limit, ...(anchor ? { anchorRetained: messages.some(item => item.id === anchor) } : {}) },
+  }) };
+}
+
+async function getChatMessages(repoId, sessionHint, options = {}) {
+  return (await getChatHistory(repoId, sessionHint, options)).messages;
 }
 
 async function saveChatMessages(repoId, sessionHint, messages) {
@@ -10412,6 +10440,8 @@ app.get("/api/chat/search", async (req, res) => {
 
 app.get("/api/chat/sessions", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
+  const limit = chatHistoryLimit(req.query?.limit);
+  const anchor = chatHistoryAnchor(req.query?.anchor);
   const summary = await getRepoSessions(repo.id, { timeout: appServerFastReadTimeoutMs, requireAppServerSync: false });
   const requestedSessionId = String(req.query?.sessionId || "");
   if (!summary.ok) {
@@ -10466,6 +10496,7 @@ app.get("/api/chat/sessions", async (req, res) => {
     : summary.activeSessionId
       ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
       : null;
+  if (requestedSessionId && !active) return res.status(404).json({ ok: false, repoId: repo.id, error: "当前项目中未找到该会话" });
   if (!active) {
     return res.json({
       ok: true,
@@ -10482,7 +10513,7 @@ app.get("/api/chat/sessions", async (req, res) => {
   if (active.codexSessionId) {
     await refreshSessionRuntimeFromAppServer(repo, active, { timeout: appServerFastReadTimeoutMs }).catch(() => active);
   }
-  const messages = await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs });
+  const history = await getChatHistory(repo.id, active.id, { timeout: appServerFastReadTimeoutMs, limit, ...(anchor ? { anchor } : {}) });
   const refreshedSummary = await getRepoSessions(repo.id, { sync: false });
   const activeIsAppServer = Boolean(active.codexSessionId);
   res.json({
@@ -10494,7 +10525,7 @@ app.get("/api/chat/sessions", async (req, res) => {
     sessionListAuthoritative: summary.authoritative === true,
     activeSessionId: active.id,
     sessions: refreshedSummary.sessions,
-    messages,
+    ...history,
   });
 });
 
@@ -10515,6 +10546,8 @@ app.post("/api/chat/sessions", async (req, res) => {
 
 app.post("/api/chat/sessions/:id/select", async (req, res) => {
   const repo = getRepoById(req.body?.repoId || req.query?.repoId);
+  const limit = chatHistoryLimit(req.body?.limit);
+  const anchor = chatHistoryAnchor(req.body?.anchor);
   const session = await mutateChatStore((store) => {
     const selected = store.sessions[req.params.id];
     if (!selected || selected.repoId !== repo.id) return null;
@@ -10523,9 +10556,9 @@ app.post("/api/chat/sessions/:id/select", async (req, res) => {
   });
   if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
   if (session.codexSessionId) await refreshSessionRuntimeFromAppServer(repo, session, { timeout: appServerFastReadTimeoutMs });
-  const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
+  const history = await getChatHistory(repo.id, session.id, { timeout: appServerFastReadTimeoutMs, limit, ...(anchor ? { anchor } : {}) });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: !session.codexSessionId });
-  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages });
+  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, ...history });
 });
 
 app.use("/api/personal", personalFeedbackRouter({
@@ -10827,6 +10860,8 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
 
 app.get("/api/chat/history", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
+  const limit = chatHistoryLimit(req.query?.limit);
+  const anchor = chatHistoryAnchor(req.query?.anchor);
   const resolved = await resolveSyncedChatSessionForRequest(repo, req.query?.sessionId);
   const { session, summary, requestedSessionId } = resolved;
   if (!session && requestedSessionId) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
@@ -10854,13 +10889,13 @@ app.get("/api/chat/history", async (req, res) => {
       messages: [],
     });
   }
-  const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
+  const history = await getChatHistory(repo.id, session.id, { timeout: appServerFastReadTimeoutMs, limit, ...(anchor ? { anchor } : {}) });
   res.json({
     ok: true,
     repoId: repo.id,
     activeSessionId: session.id,
     sessions: (await getRepoSessions(repo.id, { sync: false })).sessions,
-    messages,
+    ...history,
   });
 });
 
