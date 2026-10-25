@@ -1,6 +1,6 @@
 # 旧任务终态取消兼容
 
-日期：2026-10-25，Asia/Shanghai。基线 `769aa58`，工作分支 `codex/legacy-terminal-cancel`。本项是 F04/M2 兼容修复，不是待核对任务自动结案、生产客户端闭环或整体目标完成。正式本机/EC2 仍为 `70b191f`，没有部署或重启。
+日期：2026-10-25，Asia/Shanghai。基线 `769aa58`，工作分支 `codex/legacy-terminal-cancel`，[PR #25](https://github.com/WilsonWang01/codex-cloud-console/pull/25)。本项是 F04/M2 兼容修复，不是待核对任务自动结案、生产客户端闭环或整体目标完成。正式本机/EC2 仍为 `70b191f`，没有部署或重启。最终提交、合并和 CI 结果以该 PR 的准确头提交检查为准，不把旧主线 CI 当作本修复的证明。
 
 ## 复现与根因
 
@@ -23,7 +23,7 @@
 - 新增持久存储检查已通过：五种终态各重复取消两次，任务、原事件键、执行代次、回调与存储修订均不变；其他调用方/自动化返回 404。相关文件 24 项，22 通过、2 项 Linux 专属跳过、失败 0。
 - 旧 JSON 的 `cancelled/interrupted/needs_reconciliation/completed/failed` 分别查询并重复取消；响应保持原记录，未知用量不改零，无凭据 401、其他有效调用方 404；检查原 JSON 字节和新增原生启动/中断调用数量。
 - 定向 HTTP 修复后通过，34,495ms，作用域明确为 `selected`，不是全量 17 组通过的替代；日志 `/tmp/codex-legacy-terminal-cancel-green-20261025.log`。
-- 随后的完整 `npm run verify:local` 退出 0：368 项、365 通过、3 项 Linux 专属跳过、失败 0；17 组 HTTP 的作用域为 `all`，末尾 GitHub 隔离流程通过。日志 `/tmp/codex-legacy-terminal-local-20261025.log`。OpenAPI/SDK 发现契约单独 5 项复验也通过。新提交 CI 仍需独立核对。
+- 随后的完整 `npm run verify:local` 退出 0：368 项、365 通过、3 项 Linux 专属跳过、失败 0；17 组 HTTP 的作用域为 `all`，末尾 GitHub 隔离流程通过。日志 `/tmp/codex-legacy-terminal-local-20261025.log`。OpenAPI/SDK 发现契约单独 5 项复验也通过。新提交 CI 与本地证据分开，见 PR 的检查记录。
 
 仅使用独立临时目录、假 CLI 和回环后端，不读取真实邮件/日历、运行真实模型、改生产任务或创建生产令牌。没有前端改动，因此不制造无关页面截图来代替接口验收。
 
