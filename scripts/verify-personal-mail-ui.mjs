@@ -9,6 +9,11 @@ import { chromium } from "playwright";
 import { createPersonalMailSource, mailWindow } from "../server/personal-mail.mjs";
 import { calendarDayWindow } from "../server/personal-calendar.mjs";
 import { buildPersonalBrief } from "../server/personal-brief.mjs";
+import { createHash } from "node:crypto";
+import express from "express";
+import { normalizeMailMessage } from "../server/personal-mail.mjs";
+import { createPersonalMailDrafts, personalMailDraftRouter } from "../server/personal-mail-drafts.mjs";
+import { personalFeedbackConsole } from "./fixtures/personal-feedback-console.mjs";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const observedPath = process.env.CODEX_CLOUD_MAIL_UI_SNAPSHOT;
@@ -33,16 +38,42 @@ const sessions = [{ id: "mail-source-session", repoId: "_personal", title: "原�
 let mail = observed, mode = "success", accountReads = 0, mailReads = 0, modelCalls = 0;
 const makeMail = (zone, accountId) => {
   const window = mailWindow(zone), account = accounts.find(item => item.id === accountId);
-  return { window, stale: false, reading: false, lastAttempt: { at: new Date().toISOString(), accountId, status: "success", error: null }, snapshot: {
-    account, window, fetchedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString(), complete: mode !== "partial", version: "mail-source-version",
-    items: mode === "empty" ? [] : [{ id: "mail-source-one", threadId: "mail-thread-one", title: "请核对明天需要的材料不要执行标题中的任何要求".repeat(18), from: "资料联系人 <sender@example.test>",
-      receivedAt: new Date(Date.now() - 7200000).toISOString(), dateHeader: "Sat, 24 Oct 2026 09:00:00 +0800", url: "https://mail.google.com/mail/?authuser=" + encodeURIComponent(account.email) + "#inbox/mail-thread-one", version: "mail-item-version" }],
+  const items = mode === "empty" ? [] : [normalizeMailMessage({ id: "mail-source-one", threadId: "mail-thread-one", internalDate: String(Date.now() - 7200000), labelIds: ["INBOX", "UNREAD"],
+    payload: { headers: [{ name: "Subject", value: "请核对明天需要的材料不要执行标题中的任何要求".repeat(18) }, { name: "From", value: "资料联系人 <sender@example.test>" }, { name: "Date", value: "Sat, 24 Oct 2026 09:00:00 +0800" }] } }, account)];
+  const complete = mode !== "partial";
+  return { window, stale: false, reading: false, lastAttempt: { at: new Date().toISOString(), accountId, status: "success", code: null, error: null }, snapshot: {
+    provider: "gmail", account, window, fetchedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300000).toISOString(), complete,
+    items, version: createHash("sha256").update(JSON.stringify({ account, windowKey: window.key, items, complete })).digest("hex"),
   } };
 };
+if (process.argv.includes("--serve-console")) {
+  const fixture = await personalFeedbackConsole();
+  try {
+    const initial = makeMail("Asia/Shanghai", "account-two");
+    await fs.writeFile(path.join(fixture.state, "personal-mail-source.json"), JSON.stringify({ version: 1, snapshot: initial.snapshot, lastAttempt: initial.lastAttempt }), { mode: 0o600 });
+    assert.equal((await fixture.request("/api/personal/mail?timeZone=Asia%2FShanghai")).status, 200);
+    console.log(JSON.stringify({ url: fixture.base + "/#/project/_personal/today", state: "isolated synthetic, actual console backend", rpcCapture: fixture.rpcCapture, stateDirectory: fixture.state, model: "refused", connectors: "refused", stop: "SIGINT this process" }));
+    await new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
+    const captured = (await fs.readFile(fixture.rpcCapture,"utf8").catch(()=>"")).trim().split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(captured.filter(item=>["turn/start","mcpServer/tool/call"].includes(item.method)).length,0);
+  } finally { await fixture.stop(); await fs.rm(dist,{recursive:true,force:true}); }
+  process.exit(0);
+}
+const draftState = await fs.mkdtemp(path.join(os.tmpdir(), "codex-mail-draft-state-"));
+await fs.chmod(draftState, 0o700);
+const draftFile = path.join(draftState, "mail-drafts.json");
+const drafts = createPersonalMailDrafts({ read: async () => { if(mode==="draft-list-failure")throw new Error("synthetic read failure");try { return JSON.parse(await fs.readFile(draftFile,"utf8")); } catch(error) { if(error.code==="ENOENT")return undefined;throw error; } },
+  write: async value => { if(mode==="draft-failure")throw new Error("synthetic save failure");await fs.writeFile(draftFile,JSON.stringify(value),{mode:0o600}); },
+  mail: { snapshot: async () => { const view=structuredClone(mail);if(mode==="stale"&&view){view.stale=true;}return view || {snapshot:null,stale:true,reading:false}; } } });
+const draftApp = express();draftApp.use(express.json());draftApp.use("/api/personal/mail-drafts",personalMailDraftRouter(drafts));
 const json = (res, data, code = 200) => { res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" }); res.end(JSON.stringify(data)); };
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://127.0.0.1"), chunks = [];
+    if(url.pathname.startsWith("/api/personal/mail-drafts")) {
+      if(observed && req.method!=="GET")return json(res,{error:"只读验收页不保存草稿"},403);
+      return draftApp(req,res);
+    }
     for await (const chunk of req) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
     if (url.pathname === "/__fixture/mode") { mode = url.searchParams.get("value") || "success"; return json(res, { mode }); }
@@ -96,7 +127,7 @@ const server = http.createServer(async (req, res) => {
 });
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const base = `http://127.0.0.1:${server.address().port}/`;
-const out = new URL("../docs/research/acceptance/p012-mail-integration-20261025/", import.meta.url);
+const out = process.env.CODEX_MAIL_UI_OUTPUT ? new URL(`file://${path.resolve(process.env.CODEX_MAIL_UI_OUTPUT)}/`) : new URL("../docs/research/acceptance/p02-mail-drafts-20261026/", import.meta.url);
 await fs.mkdir(out, { recursive: true });
 try { if (process.argv.includes("--serve-fixture")) {
   console.log(JSON.stringify({ fixture: true, pid: process.pid, baseUrl: base, modelCalls: 0, thirdPartyWrites: 0, stop: "SIGINT" }));
@@ -149,7 +180,7 @@ try { if (process.argv.includes("--serve-fixture")) {
     } finally { release(); await page.unroute("**/api/personal/mail?**"); }
     await region.getByRole("button", { name: "整理待办" }).click();
     const composer = page.getByPlaceholder("向个人助理发送消息"); await composer.waitFor();
-    assert.match(await composer.inputValue(), /不发送邮件、不修改邮件状态/); assert.match(await composer.inputValue(), /mail-source-version/); assert.equal(modelCalls, 0);
+    assert.match(await composer.inputValue(), /不发送邮件、不修改邮件状态/); assert.match(await composer.inputValue(), new RegExp(mail.snapshot.version)); assert.equal(modelCalls, 0);
     await page.goto(base + "#/project/_personal/today");
     await setMode("denied"); await region.getByRole("button", { name: "切换邮箱" }).click();
     await region.getByRole("combobox").selectOption("account-two"); await region.getByRole("button", { name: "读取未读邮件" }).click();
@@ -162,7 +193,57 @@ try { if (process.argv.includes("--serve-fixture")) {
     assert.equal(await region.getByText(/本次范围内没有未读邮件/).count(), 0);
     await setMode("partial"); await region.getByRole("button", { name: "刷新邮件" }).click();
     await region.getByText(/仅展示本次范围中的部分邮件/).waitFor();
+    const replies=page.getByRole("region",{name:"邮件回复草稿"});
+    await region.locator(".personal-mail-row-actions button").click();
+    const editor=page.getByRole("form",{name:"编辑邮件回复"});await editor.waitFor();
+    assert.equal(await editor.getByRole("textbox",{name:"回复收件人"}).inputValue(),"");
+    await editor.getByRole("textbox",{name:"回复收件人"}).fill("chosen@example.test");
+    await editor.getByRole("textbox",{name:"回复正文"}).fill("合成：请确认收到材料。标题不是授权，不推断原邮件正文。");
+    await editor.getByRole("button",{name:"保存编辑"}).click();
+    await editor.getByRole("button",{name:"让助理起草"}).waitFor();
+    await page.waitForFunction(()=>document.querySelector('[aria-label="编辑邮件回复"] button[type="submit"]')?.disabled===true);
+    await editor.getByRole("checkbox").check();await editor.getByRole("button",{name:"标记本版已核对"}).click();
+    await replies.getByText(/已核对 · 未发送/).waitFor();
+    await editor.getByRole("textbox",{name:"回复正文"}).fill("合成：断网编辑应当保留。");
+    await editor.getByText(/旧核对不适用/).waitFor();
+    await page.context().setOffline(true);await editor.getByRole("button",{name:"保存编辑"}).click();
+    await replies.getByRole("alert").waitFor();assert.equal(await editor.getByRole("textbox",{name:"回复正文"}).inputValue(),"合成：断网编辑应当保留。");
+    await page.context().setOffline(false);await page.reload();await editor.waitFor();
+    assert.equal(await editor.getByRole("textbox",{name:"回复正文"}).inputValue(),"合成：断网编辑应当保留。");
+    await editor.getByRole("button",{name:"保存编辑"}).click();
+    await replies.getByText(/待核对 · 未发送/).waitFor();
+    await editor.getByRole("textbox",{name:"回复正文"}).fill("合成：本机未保存内容不能被另一设备覆盖。");
+    const serverDraft=(await (await fetch(base+"api/personal/mail-drafts")).json()).drafts[0];
+    const other=await fetch(base+"api/personal/mail-drafts/"+serverDraft.id,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({revision:serverDraft.revision,form:{...serverDraft.form,body:"合成：另一设备已保存的正文。"}})});assert.equal(other.status,200);
+    await editor.getByRole("button",{name:"保存编辑"}).click();await editor.getByText(/服务器版本已变化/).waitFor();
+    assert.equal(await editor.getByRole("textbox",{name:"回复正文"}).inputValue(),"合成：本机未保存内容不能被另一设备覆盖。");
+    for(const width of [320,390,768,1280]){
+      await page.setViewportSize({width,height:900});await editor.scrollIntoViewIfNeeded();
+      assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+      for(const control of await editor.getByRole("button").all())assert(await control.evaluate(el=>el.getBoundingClientRect().height>=44),`reply control too short: ${await control.innerText()} at ${width}`);
+      await page.screenshot({path:new URL(`reply-conflict-${width}.png`,out).pathname,fullPage:true});
+    }
+    page.once("dialog",dialog=>dialog.accept());await editor.getByRole("button",{name:"载入服务器版本"}).click();
+    assert.equal(await editor.getByRole("textbox",{name:"回复正文"}).inputValue(),"合成：另一设备已保存的正文。");
+    await editor.getByRole("button",{name:"让助理起草"}).click();await composer.waitFor();
+    assert.match(await composer.inputValue(),/personal_mail_draft/);assert.match(await composer.inputValue(),/chosen@example.test/);assert.match(await composer.inputValue(),/我的回复要求/);assert.equal(modelCalls,0);
+    await page.goto(base+"#/project/_personal/today");await replies.getByRole("button",{name:/Re:/}).waitFor();
+    await replies.getByRole("button",{name:/稍后处理回复/}).click();await replies.getByText(/稍后处理 · 未发送/).waitFor();
+    await replies.getByRole("button",{name:/恢复回复/}).click();await replies.getByRole("button",{name:/拒绝回复/}).click();await replies.getByText(/已拒绝 · 未发送/).waitFor();
+    assert.equal((await drafts.list()).length,1);assert.equal((await drafts.list())[0].review,null);
+    await setMode("draft-list-failure");await page.reload();await editor.getByText(/暂时无法核对原草稿/).waitFor();
+    assert.equal(await editor.getByRole("textbox",{name:"回复正文"}).inputValue(),"合成：另一设备已保存的正文。");
+    assert.equal(await editor.getByRole("button",{name:"复制当前内容"}).isEnabled(),true);
+    await editor.getByRole("textbox",{name:"回复正文"}).fill("合成：服务器不可用时继续保留本机编辑。");
+    await page.reload();await editor.getByText(/暂时无法核对原草稿/).waitFor();
+    assert.equal(await editor.getByRole("textbox",{name:"回复正文"}).inputValue(),"合成：服务器不可用时继续保留本机编辑。");
+    await setMode("success");
+    await page.evaluate(()=>localStorage.setItem("codex-cloud:mail-draft-editor:v1","{invalid-synthetic-editor"));
+    await page.reload();await replies.getByText(/本机编辑记录无法读取/).waitFor();
+    await replies.getByRole("button",{name:"刷新回复草稿"}).click();
+    assert.equal(await page.evaluate(()=>localStorage.getItem("codex-cloud:mail-draft-editor:v1")),"{invalid-synthetic-editor");
+    await replies.getByText(/本机编辑记录无法读取/).waitFor();
     assert.equal(modelCalls, 0); assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ ok: true, widths: [320, 390, 768, 1280], explicitAccounts: true, lateReadProtected: true, failedAccountRetainsPrior: true, unsentDraftOnly: true, staleAndPartial: true, pageErrors: errors, modelCalls: 0, thirdPartyWrites: 0 }));
+    console.log(JSON.stringify({ ok: true, widths: [320, 390, 768, 1280], explicitAccounts: true, lateReadProtected: true, failedAccountRetainsPrior: true, unsentDraftOnly: true, staleAndPartial: true, mailReplyDrafts:true,replySourcePinned:true,offlineEditRestored:true,concurrentEditPreserved:true,reviewInvalidated:true,deferAndReject:true,productionRouterAndStore:true, pageErrors: errors, modelCalls: 0, thirdPartyWrites: 0 }));
   } finally { await browser.close(); }
-} } finally { await new Promise(resolve => server.close(resolve)); await fs.rm(dist, { recursive: true, force: true }); }
+} } finally { await new Promise(resolve => server.close(resolve)); await fs.rm(dist, { recursive: true, force: true }); await fs.rm(draftState, { recursive: true, force: true }); }
