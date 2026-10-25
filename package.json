@@ -32,6 +32,7 @@
     "verify:approvals": "node --test scripts/verify-approvals.mjs",
     "verify:clients": "node --test scripts/verify-api-clients.mjs",
     "verify:external-client": "node --test scripts/verify-external-client-example.mjs",
+    "verify:external-client:codex": "node scripts/verify-external-client-codex.mjs",
     "verify:mcp": "node --test scripts/verify-mcp.mjs",
     "verify:model-api": "node --test scripts/verify-model-api.mjs scripts/verify-api-discovery.mjs scripts/verify-structured-output.mjs scripts/verify-inline-inputs.mjs scripts/verify-external-input-body.mjs scripts/verify-pdf-inputs.mjs",
     "verify:model-api:codex": "node scripts/verify-model-api-codex.mjs",
