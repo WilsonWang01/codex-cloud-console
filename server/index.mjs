@@ -3437,6 +3437,10 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
       try {
         await resolveThreadForJob(job);
         if (job.completed) return;
+        if (job.cancelRequested) {
+          await finishTurnJob(job, false, 130, "Review cancelled before start");
+          return;
+        }
         const result = await requestJobStart(job,
           "review/start",
           {
@@ -3452,6 +3456,7 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
           return;
         }
         if (result?.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
+        if (job.cancelRequested) await requestJobInterruption(job).catch(() => null);
         rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
         emitJobEvent(job, "status", { text: result?.reviewThreadId ? `已启动 detached review ${String(result.reviewThreadId).slice(0, 8)}` : "已启动官方 review" });
       } catch (error) {

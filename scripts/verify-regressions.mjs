@@ -538,6 +538,15 @@ input.on("line", (line) => {
     }
     return;
   }
+  if (process.env.FAKE_CANCEL_GATES === "1" && message.method === "review/start") {
+    const turnId = "cancel-review-" + (++turnSequence), threadId = message.params.delivery === "detached" ? "detached-" + turnId : message.params.threadId;
+    cancelGates.set(turnId, { uncertain: false, waiting: false });
+    const receipt = () => {
+      if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".review-start-release-" + message.params.delivery)) return setTimeout(receipt, 20);
+      send({ id: message.id, result: { turn: { id: turnId }, reviewThreadId: threadId } });
+    };
+    receipt(); return;
+  }
   if (process.env.FAKE_TURN_OWNERSHIP === "1" && message.method === "review/start") {
     const threadId = message.params.delivery === "detached" ? "detached-review-" + (++turnSequence) : message.params.threadId;
     const id = "review-owned-" + turnSequence;
@@ -947,6 +956,7 @@ await check("cancel retries before and after the start receipt never repeat inte
     const other = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "other caller", automationIds: ["sample-research"] }) });
     assert.equal(client.response.status, 201); assert.equal(other.response.status, 201);
     const auth = { ...headers, "x-codex-cloud-token": client.data.token };
+    let reviewSessionId;
     for (const [index, mode] of ["hold start receipt", "interrupt uncertain"].entries()) {
       const start = await jsonRequest(base, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...auth, "idempotency-key": `cancel-once-event-${index}` }, body: JSON.stringify({ prompt: `cancel regression ${mode}` }) });
       assert.equal(start.response.status, 200);
@@ -956,7 +966,6 @@ await check("cancel retries before and after the start receipt never repeat inte
         assert.equal(result.response.status, 200);
         return result.data.run.status === "running" && (await rpc()).some(item => item.method === "turn/start" && JSON.stringify(item.params).includes(mode)) ? result.data.run : null;
       });
-      const nativeStart = (await rpc()).find(item => item.method === "turn/start" && JSON.stringify(item.params).includes(mode));
       const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
       const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
       assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST", headers: { ...headers, "x-codex-cloud-token": other.data.token } })).response.status, 404);
@@ -969,6 +978,7 @@ await check("cancel retries before and after the start receipt never repeat inte
       try { sessionId = JSON.parse(db.prepare("SELECT record FROM external_tasks WHERE id=?").get(before.id).record).sessionId; }
       finally { db.close(); }
       assert.ok(sessionId);
+      reviewSessionId = sessionId;
       const consoleStop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
         body: JSON.stringify({ repoId: "sample-app", sessionId }) });
       if (index === 0) {
@@ -1009,7 +1019,30 @@ await check("cancel retries before and after the start receipt never repeat inte
       assert.equal((await cancel()).response.status, 200);
       assert.equal((await interrupts()).length, 1);
     }
+    for (const delivery of ["inline", "detached"]) {
+      const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
+      const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
+      const review = await fetch(base + "/api/codex/review/stream", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId: reviewSessionId, delivery }), signal: AbortSignal.timeout(15000) });
+      const started = await wait(async () => (await rpc()).find(item => item.method === "review/start" && item.params.delivery === delivery));
+      const stop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId: reviewSessionId }) });
+      const early = await stop();
+      assert.equal(early.response.status, 202); assert.equal(early.data.pending, true);
+      assert.equal((await interrupts()).length, 0);
+      await fs.writeFile(capture + ".review-start-release-" + delivery, "release synthetic review receipt");
+      const sent = await wait(async () => (await interrupts())[0]);
+      assert.equal(sent.params.threadId, delivery === "detached" ? "detached-" + sent.params.turnId : started.params.threadId);
+      for (const result of await Promise.all([stop(), stop()])) {
+        assert.equal(result.response.status, 202); assert.equal(result.data.pending, true);
+      }
+      assert.equal((await interrupts()).length, 1);
+      await fs.writeFile(capture + ".cancel-completion-" + sent.params.turnId, "release synthetic review stop");
+      const events = await review.text();
+      assert.match(events, /event: done/); assert.match(events, /"ok":false/); assert.doesNotMatch(events, /"ok":true/);
+    }
     assert.equal((await rpc()).filter(item => item.method === "turn/start").length, 2, "重复取消不能创建新模型回合");
+    assert.equal((await rpc()).filter(item => item.method === "review/start").length, 2);
   } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
