@@ -76,7 +76,7 @@ test("未知数据库、范围变化、权限与链接均拒绝，不覆盖原�
   fs.chmodSync(root, 0o770); assert.throws(() => open({ file: path.join(root, "must-not-create.sqlite") })); fs.chmodSync(root, 0o700);
   assert.equal(fs.existsSync(path.join(root, "must-not-create.sqlite")), false);
   const absent = path.join(root, "absent.sqlite"); assert.throws(() => open({ file: absent, readOnly: true })); assert.equal(fs.existsSync(absent), false);
-  const reader = open({ file: own, readOnly: true });
+  const reader = open({ file: own, readOnly: true, secret: undefined });
   try { assert.deepEqual(reader.list().items, []); assert.throws(() => reader.receive(signed(event()))); }
   finally { reader.close(); }
   assert.equal(digest(fs.readFileSync(own)), before);
@@ -142,12 +142,21 @@ test("独立接收进程并发及强制重启只保存一个事件，命令行�
     const restarted = await start(); assert.equal(await post(restarted.url, value), 200);
     assert.equal(await post(restarted.url, event()), 202);
     const list = async args => {
-      const child = spawn(process.execPath, [command, "--list", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
-      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.resume();
-      assert.equal(await new Promise(resolve => child.once("close", resolve)), 0); assert.equal(output.includes(secret), false); return JSON.parse(output);
+      const { CODEX_CALLBACK_RECEIVER_SECRET: _secret, ...readEnv } = env;
+      const child = spawn(process.execPath, [command, "--list", ...args], { env: readEnv, stdio: ["ignore", "pipe", "pipe"] });
+      let output = "", stderr = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+      assert.equal(await new Promise(resolve => child.once("close", resolve)), 0, stderr); assert.equal(output.includes(secret), false); return JSON.parse(output);
     };
     const first = await list(["--limit", "1"]); assert.equal(first.items.length, 1); assert.equal(first.items[0].event.id, value.id);
     const second = await list(["--after", String(first.nextCursor)]); assert.equal(second.items.length, 1); assert.notEqual(second.items[0].event.id, value.id);
+    const writer = new DatabaseSync(file); writer.exec("BEGIN EXCLUSIVE");
+    let waiting;
+    try {
+      waiting = list([]).then(value => ({ value }), error => ({ error }));
+      await new Promise(resolve => setTimeout(resolve, 200));
+    } finally { writer.exec("ROLLBACK"); writer.close(); }
+    const result = await waiting; if (result.error) throw result.error;
+    assert.equal(result.value.items.length, 2);
   } finally {
     for (const { child } of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     await Promise.all(children.map(item => item.closed));

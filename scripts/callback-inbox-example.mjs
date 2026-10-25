@@ -11,9 +11,9 @@ const applicationId = 0x43435849;
 const failure = (message, statusCode = 503) => Object.assign(new Error(message), { statusCode });
 
 export function openCallbackInbox({ file, secret, automationId, capacity = 4096, readOnly = false }) {
+  const validSecret = typeof secret === "string" && Buffer.byteLength(secret) >= 32 && Buffer.byteLength(secret) <= 256 && !/[\x00-\x1f\x7f]/.test(secret);
   if (typeof file !== "string" || !path.isAbsolute(file) || typeof automationId !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(automationId) ||
-      typeof secret !== "string" || Buffer.byteLength(secret) < 32 || Buffer.byteLength(secret) > 256 || /[\x00-\x1f\x7f]/.test(secret) ||
-      !Number.isSafeInteger(capacity) || capacity < 1 || capacity > 4096 || typeof readOnly !== "boolean") throw failure("需要独立状态文件、明确的自动化 ID 和有效的私有密钥");
+      (!readOnly && !validSecret) || !Number.isSafeInteger(capacity) || capacity < 1 || capacity > 4096 || typeof readOnly !== "boolean") throw failure("状态文件或绑定配置无效；接收模式需要有效私有密钥");
   const parent = fs.lstatSync(path.dirname(file));
   if (!parent.isDirectory() || parent.mode & 0o022 || process.getuid && parent.uid !== process.getuid()) throw failure("状态目录必须由当前用户拥有，且不能由其他用户写入");
   let created = false;
@@ -25,6 +25,7 @@ export function openCallbackInbox({ file, secret, automationId, capacity = 4096,
   if (!stat.isFile() || stat.nlink !== 1 || stat.mode & 0o077 || process.getuid && stat.uid !== process.getuid()) throw failure("状态文件必须是当前用户拥有且没有链接的私有普通文件");
   const db = new DatabaseSync(file, { readOnly });
   try {
+    db.exec("PRAGMA busy_timeout=1000;");
     if (created) {
       db.exec(`BEGIN IMMEDIATE;
         PRAGMA application_id=${applicationId}; PRAGMA user_version=1;
@@ -38,7 +39,6 @@ export function openCallbackInbox({ file, secret, automationId, capacity = 4096,
         db.prepare("SELECT automation_id FROM inbox_meta WHERE id=1").get()?.automation_id !== automationId) {
       throw failure("状态文件不属于本接收端或自动化范围不一致，未覆盖原文件");
     }
-    db.exec("PRAGMA busy_timeout=1000;");
     if (!readOnly) db.exec("PRAGMA synchronous=FULL;");
   } catch (error) { db.close(); throw error; }
   let closed = false;

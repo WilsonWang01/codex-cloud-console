@@ -88,10 +88,10 @@ node scripts/callback-inbox-example.mjs
 
 验签、自动化归属和原始正文哈希核对后，事件在 SQLite 事务提交成功后才返回 202；相同事件的相同原始正文返回 200，不增加记录或覆盖首次接收时间。同 ID 内容变化返回 409，签名/内容或归属无效返回 401，超大正文 413，不支持的类型/压缩 415，存储不可用或容量满返回 503。两种 2xx 都只确认通知可靠接收，不表示任务或后续业务成功。
 
-同一私有环境下可只读查看，不启动 HTTP 服务，也不创建缺失的数据库：
+使用原状态路径和自动化 ID 可只读查看，不需要回调密钥，不启动 HTTP 服务，也不创建缺失的数据库：
 
 ```bash
-node scripts/callback-inbox-example.mjs --list --limit 20
+env -u CODEX_CALLBACK_RECEIVER_SECRET node scripts/callback-inbox-example.mjs --list --limit 20
 ```
 
 输出包含 `items` 和 `nextCursor`，后续使用实际返回值执行 `--list --after 下一游标 --limit 20`，不要把页码当游标。程序内可导入 `openCallbackInbox`，使用 `readOnly: true` 打开并分页读取；接收端只保存最少事件元数据，不保存密钥、prompt、回答或产物正文，不自动查询或重新运行 Codex。
