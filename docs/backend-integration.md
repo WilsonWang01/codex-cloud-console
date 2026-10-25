@@ -100,6 +100,8 @@ Python `Client` 的整体等待期限从初始化开始计算；期限耗尽后�
 
 `queued`、`running`、`canceling` 是进行中状态。`completed` 是执行成功；`failed`、`canceled`、`interrupted`、`needs_reconciliation` 不能当作成功。任务是否真正交付还应结合 `completionContract`、`completionOutcome` 与业务验收，不以模型一句“完成了”为依据。
 
+对已结束的任务重复调用 `cancel` 返回 HTTP 200 和原记录，包括旧 JSON 格式的已中断任务；不会把 `interrupted` 或 `needs_reconciliation` 改成 `canceled`，也不会清零未知用量或撤销已发生的动作。仍以响应中的 `run.status` 判断结果，不能只按 HTTP 200 记为成功。旧部署可能对旧中断记录返回 409，见[兼容修复与验收](acceptance/2026-10-25-legacy-terminal-cancellation.md)。
+
 ### 排队与服务重启
 
 新外部请求先持久保存任务、原始执行输入和幂等摘要，再返回 `queued`。默认最多保留 32 个待执行请求；满时返回 429 和 `Retry-After`，应使用原事件键重试。app-server 自动化默认同时执行最多 2 个、同一调用方最多 1 个；按满足并发限制的接收顺序领取。控制台原有 app-server 自动化仍共享执行并发上限；此限制不覆盖直接聊天或 systemd 任务，不是账户总并发/费用上限。

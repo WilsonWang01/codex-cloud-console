@@ -5572,7 +5572,7 @@ async function requestAutomationRunCancellation(runId, automationId, clientId) {
     if (!clientCanReadRun({ id: clientId }, automationId, current)) {
       throw Object.assign(new Error("Run not found"), { statusCode: 404 });
     }
-    if (["completed", "failed", "canceled", "needs_reconciliation"].includes(current.status)) {
+    if (["completed", "failed", "canceled", "interrupted", "needs_reconciliation"].includes(current.status)) {
       return { run: current, pending: false };
     }
     if (current.status === "canceling") return { run: current, pending: true };

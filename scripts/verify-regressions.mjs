@@ -3835,19 +3835,37 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     }
     const legacyRunPath = path.join(stateRoot, "automation-runs.json");
     const legacyRunStore = JSON.parse(await fs.readFile(legacyRunPath, "utf8"));
-    const legacyCanceled = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
-    legacyCanceled.status = "cancelled";
+    const legacySource = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
+    const legacyTerminals = ["cancelled", "interrupted", "needs_reconciliation", "completed", "failed"].map((status) => ({
+      ...legacySource, id: `legacy-terminal-${status}`, status,
+      ...(["interrupted", "needs_reconciliation"].includes(status) ? { usage: { status: "unknown", reason: "合成旧任务未确认用量" } } : {}),
+    }));
+    legacyRunStore.runs.push(...legacyTerminals);
     await fs.writeFile(legacyRunPath, JSON.stringify(legacyRunStore));
     const legacyBytes = await fs.readFile(legacyRunPath, "utf8");
+    const terminalDatabase = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+    try {
+      for (const run of legacyTerminals) assert.equal(terminalDatabase.prepare("SELECT id FROM external_tasks WHERE id=?").get(run.id), undefined, "旧记录不能被持久任务同 ID 覆盖而虚假通过");
+    } finally { terminalDatabase.close(); }
+    const foreignLegacyClient = await jsonRequest(baseUrl, "/api/clients", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "legacy-terminal-other-client", automationIds: ["sample-on-demand"] }) });
+    assert.equal(foreignLegacyClient.response.status, 201);
     const rpcBeforeLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
-    const legacyResult = await jsonRequest(baseUrl, cancelStart.data.run.resultPath, { headers: { "x-codex-cloud-token": competingClient.data.token } });
-    assert.equal(legacyResult.data.run.status, "canceled");
-    assert.equal(legacyResult.data.run.id, canceledRun.id);
-    const legacyCancelAgain = await jsonRequest(baseUrl, `${cancelStart.data.run.resultPath}/cancel`, {
-      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
-    });
-    assert.equal(legacyCancelAgain.response.status, 200);
-    assert.equal(legacyCancelAgain.data.run.status, "canceled");
+    for (const run of legacyTerminals) {
+      const route = `/api/automations/${run.automationId}/runs/${run.id}`, expected = run.status === "cancelled" ? "canceled" : run.status;
+      const legacyResult = await jsonRequest(baseUrl, route, { headers: { "x-codex-cloud-token": competingClient.data.token } });
+      assert.equal(legacyResult.response.status, 200); assert.equal(legacyResult.data.run.status, expected);
+      if (["interrupted", "needs_reconciliation"].includes(run.status)) {
+        assert.equal(legacyResult.data.run.usage.status, "unknown"); assert.equal(legacyResult.data.run.usage.totalTokens, undefined);
+      }
+      for (let repeat = 0; repeat < 2; repeat++) {
+        const result = await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token } });
+        assert.equal(result.response.status, 200, `旧终态 ${run.status} 的重复取消应返回原记录`);
+        assert.deepEqual(result.data.run, legacyResult.data.run, "取消不是将旧终态改写成成功或已取消");
+      }
+      assert.equal((await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST", headers: { "x-codex-cloud-token": foreignLegacyClient.data.token } })).response.status, 404, "其他调用方不能操作旧记录");
+      assert.equal((await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST" })).response.status, 401);
+    }
     assert.equal(await fs.readFile(legacyRunPath, "utf8"), legacyBytes, "查询和重复取消不触发旧数据重写");
     const rpcAfterLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
     assert.equal(rpcAfterLegacyRead, rpcBeforeLegacyRead, "旧取消结果不再启动或中断模型");
