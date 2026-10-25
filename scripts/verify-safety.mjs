@@ -22,6 +22,18 @@ const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
 
+test("消息时间格式化器只建立一次，输出和原格式一致", () => {
+  let created = 0;
+  const context = vm.createContext({ Date, Intl: { DateTimeFormat: class extends Intl.DateTimeFormat { constructor(...args) { super(...args); created++; } } } });
+  vm.runInContext(ts.transpileModule(section(frontend, "const chatTimeFormatter =", "function datePartsInShanghai("), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  for (let index = 0; index < 500; index++) {
+    const date = new Date(1792900000000 + index * 1000).toISOString();
+    assert.equal(context.timeLabel(date), new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(date)));
+  }
+  assert.equal(created, 1);
+  assert.throws(() => context.timeLabel("invalid date"), RangeError);
+});
+
 test("原生回合归属同时核对线程、回合和已知条目，旧编号不能匹配新任务或压缩", () => {
   const job = { repoId: "repo", sessionId: "session", threadId: "thread", turnId: "new", itemIds: new Set(["new-item"]) };
   const context = vm.createContext({
@@ -837,18 +849,19 @@ test("会话回写拒绝旧项目、旧请求及错误项目响应", () => {
     hydrateChatDraft: (_repo, draft) => draft || { input: "", attachments: [] },
     draftStorageKey: (repo, session) => `${repo}:${session}`, draftSnapshot: JSON.stringify,
   };
-  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatInput", "setChatAttachments"]) {
+  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatHistoryWindow", "setChatInput", "setChatAttachments"]) {
     context[name] = (value) => updates.push([name, value]);
   }
   vm.createContext(context);
   vm.runInContext(ts.transpileModule(section(frontend, "  const applyChatHistory =", "  const loadChatHistory ="), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + "\nglobalThis.apply = applyChatHistory", context);
-  const result = { repoId: "B", activeSessionId: "b-1", sessions: [], messages: [] };
+  const result = { repoId: "B", activeSessionId: "b-1", sessions: [], messages: [], history: { total: 500, limit: 80, hasMore: true } };
   assert.equal(context.apply(result, { id: "A" }, 5), false);
   assert.equal(context.apply(result, { id: "B" }, 4), false);
   assert.equal(context.apply({ ...result, repoId: "A" }, { id: "B" }, 5), false);
   assert.deepEqual(updates, []);
   assert.equal(context.apply(result, { id: "B" }, 5), true);
-  assert.equal(updates.length, 5);
+  assert.equal(updates.length, 6);
+  assert.deepEqual(updates.find(([name]) => name === "setChatHistoryWindow")[1], result.history);
 });
 
 function frontendRuntimeFixture() {
@@ -931,7 +944,7 @@ test("项目切换清空编辑器且旧文件不能写入新项目", async () =>
     api: async () => assert.fail("stale file must not be written"),
   };
   context.editorRef = { current: { file: context.selectedFile, draft: context.fileDraft } };
-  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setThreadGoal", "setThreadTokenUsage", "setCompactStatus", "setReviewPrContext", "setChatInput", "setChatAttachments", "setChatHistoryError"]) context[name] = () => {};
+  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatHistoryWindow", "setThreadGoal", "setThreadTokenUsage", "setCompactStatus", "setReviewPrContext", "setChatInput", "setChatAttachments", "setChatHistoryError"]) context[name] = () => {};
   const code = section(frontend, "  const switchRepoConversation =", "\n  useEffect(() => {\n    if (!statusReady") + section(frontend, "  const saveAgentFile =", "  const runTerminalCommand =");
   vm.createContext(context);
   vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);

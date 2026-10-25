@@ -1,5 +1,5 @@
 import { DraftPersistence } from "./draft-persistence";
-import { useChatReadingPosition } from "./chat-reading-position";
+import { chatReadingHistoryAnchor, chatReadingHistoryLimit, useChatReadingPosition } from "./chat-reading-position";
 import { PageReloadContext, recoverableLazy } from "./lazy-recovery";
 import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
 import PersonalAssistantGuide from "./PersonalAssistantGuide";
@@ -155,6 +155,7 @@ type ChatHistoryResponse = {
   activeSessionId: string;
   sessions: ChatSession[];
   messages: ChatMessage[];
+  history?: { total: number; limit: number; hasMore: boolean; anchorRetained?: boolean };
   archived?: boolean;
   source?: string;
   authoritative?: boolean;
@@ -1354,12 +1355,9 @@ function mentionQueryParts(query: string) {
   };
 }
 
+const chatTimeFormatter = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 function timeLabel(value: string) {
-  return new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(value));
+  return chatTimeFormatter.format(new Date(value));
 }
 
 function datePartsInShanghai(date = new Date()) {
@@ -3339,6 +3337,7 @@ export function App() {
   const [personalApprovalCount, setPersonalApprovalCount] = useState(0);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatHistoryWindow, setChatHistoryWindow] = useState<ChatHistoryResponse["history"]>();
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [chatInput, setChatInput] = useState("");
@@ -3433,6 +3432,7 @@ export function App() {
   const lastWorkRepoId = useRef(window.localStorage.getItem("codex-cloud-last-work-repo") || defaultRepoId);
   const activeSessionIdRef = useRef(activeSessionId);
   const chatInputRef = useRef(chatInput);
+  const chatSessionsRef = useRef(chatSessions);
   const chatAttachmentsRef = useRef<UploadedAttachment[]>(chatAttachments);
   const flushComposerDraftRef = useRef<() => Promise<void>>(async () => undefined);
   const pendingRouteSessionRef = useRef(pendingRouteSession);
@@ -3445,6 +3445,7 @@ export function App() {
   selectedRepoIdRef.current = selectedRepoId;
   activeSessionIdRef.current = activeSessionId;
   chatInputRef.current = chatInput;
+  chatSessionsRef.current = chatSessions;
   chatAttachmentsRef.current = chatAttachments;
   chatRuntimeRef.current = chatRuntime;
 
@@ -3574,6 +3575,7 @@ export function App() {
       setChatSessions([]);
       setActiveSessionId("");
       setChatMessages([]);
+      setChatHistoryWindow(undefined);
       setThreadGoal(null);
       setThreadTokenUsage(null);
       setCompactStatus(null);
@@ -4264,13 +4266,14 @@ export function App() {
     setChatSessions(nextSessions);
     setActiveSessionId(nextActiveSessionId);
     setChatMessages(result.messages || []);
+    setChatHistoryWindow(result.history);
     setChatInput(draft.input);
     setChatAttachments(draft.attachments);
     return true;
   }, [detachConversationStream]);
 
   const loadChatHistory = useCallback(
-    async (repoId: string, sessionId?: string) => {
+    async (repoId: string, sessionId?: string, historyLimit?: number) => {
       if (selectedRepoIdRef.current !== repoId) return;
       chatHistoryController.current?.abort();
       const controller = new AbortController();
@@ -4282,6 +4285,11 @@ export function App() {
       try {
         const params = new URLSearchParams({ repoId });
         if (sessionId) params.set("sessionId", sessionId);
+        const session = chatSessionsRef.current.find(item => item.repoId === repoId && (item.id === sessionId || item.codexSessionId === sessionId));
+        const nativeId = session?.codexSessionId || sessionId || "";
+        params.set("limit", String(historyLimit || chatReadingHistoryLimit(repoId, nativeId)));
+        const anchor = chatReadingHistoryAnchor(repoId, nativeId);
+        if (anchor) params.set("anchor", anchor);
         const result = await apiWithRetry<ChatHistoryResponse>(`/api/chat/sessions?${params.toString()}`, { signal: controller.signal }, 5);
         if (requestSeq !== chatLoadSeq.current || selectedRepoIdRef.current !== repoId || result.repoId !== repoId) return;
         if (result.degraded && !sessionId) {
@@ -4761,7 +4769,9 @@ export function App() {
       const result = await api<ChatHistoryResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId: selectedRepo.id }),
+        body: JSON.stringify({ repoId: selectedRepo.id,
+          limit: chatReadingHistoryLimit(selectedRepo.id, chatSessions.find(item => item.id === sessionId)?.codexSessionId || sessionId),
+          anchor: chatReadingHistoryAnchor(selectedRepo.id, chatSessions.find(item => item.id === sessionId)?.codexSessionId || sessionId) || undefined }),
       });
       if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
     } catch (error) {
@@ -6389,6 +6399,8 @@ export function App() {
               onForkThread={forkThread}
               onArchiveThread={archiveThread}
               messages={chatMessages}
+              historyWindow={chatHistoryWindow}
+              onLoadEarlier={() => void loadChatHistory(selectedRepo.id, activeSessionId, Math.min(2000, Math.max(chatMessages.length, chatHistoryWindow?.limit || 80) + 80))}
               input={chatInput}
               attachments={chatAttachments}
               uploadingAttachments={uploadingAttachments}
@@ -9218,6 +9230,8 @@ function CloudChat({
   historyLoading,
   runtimeReady,
   historyError,
+  historyWindow,
+  onLoadEarlier,
 }: {
   status: ConsoleStatus;
   cloudConnection: CloudConnection;
@@ -9292,6 +9306,8 @@ function CloudChat({
   historyLoading: boolean;
   runtimeReady: boolean;
   historyError: string;
+  historyWindow?: ChatHistoryResponse["history"];
+  onLoadEarlier: () => void;
 }) {
   const chatWindowRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -9367,7 +9383,7 @@ function CloudChat({
   const lastMessage = messages.at(-1);
   const reading = useChatReadingPosition(chatWindowRef, JSON.stringify([repo.id, activeSession?.codexSessionId || activeSessionId]),
     !historyLoading && !historyError && messages.length > 0 && activeSession?.repoId === repo.id,
-    JSON.stringify([lastMessage?.id || "", lastMessage?.text.length || 0, busy]));
+    JSON.stringify([lastMessage?.id || "", lastMessage?.text.length || 0, busy]), messages.length);
   const queuedTurn = activeSession?.queuedTurn;
   const displaySessions = useMemo(() => visibleSessionList(sessions, activeSessionId), [activeSessionId, sessions]);
   const activeSessionTitle = sessionDisplayTitle(activeSession);
@@ -10171,6 +10187,15 @@ function CloudChat({
 
       <div className="chat-window" ref={chatWindowRef} aria-busy={historyLoading} onScroll={reading.onScroll}
         onPointerMove={reading.onUserIntent} onPointerDown={reading.onUserIntent} onTouchStart={reading.onUserIntent} onWheel={reading.onUserIntent} onKeyDown={reading.onUserIntent}>
+        {historyWindow && (historyWindow.hasMore || historyWindow.anchorRetained === false) && <div className="chat-history-window">
+          <span>显示最近 {messages.length} 条，共 {historyWindow.total} 条</span>
+          {historyWindow.anchorRetained === false && <span role="status">原阅读位置不在当前记录范围</span>}
+          {historyWindow.hasMore && <button className="mini-action" type="button" onClick={onLoadEarlier} disabled={historyLoading || Boolean(busyAction) || historyWindow.limit >= 2000}>
+            <History size={15} />{historyLoading ? "加载中…" : historyWindow.limit >= 2000 ? "已达页面显示上限" : "加载更早的消息"}
+          </button>}
+          {(historyWindow.limit >= 2000 || historyWindow.anchorRetained === false) && activeSession?.codexSessionId && <a className="mini-action" target="_blank" rel="noreferrer"
+            href={`/api/codex/thread-read?${new URLSearchParams({ repoId: repo.id, sessionId: activeSessionId })}`} title="打开完整原生 JSON 记录">完整原生记录<CornerUpRight size={15} /></a>}
+        </div>}
         {repo.kind === "personal" && !historyLoading && !historyError && messages.length === 0 && <PersonalAssistantGuide onChoose={choosePersonalTask} onConnect={() => setActivePanel("connections")} />}
         {historyLoading && messages.length === 0 && (
           <article className="chat-bubble codex compact">

@@ -1723,6 +1723,27 @@ h3 {
   padding: 10px 13px;
 }
 
+@supports (content-visibility: auto) and (contain-intrinsic-block-size: auto 160px) {
+  .chat-window .chat-bubble:not(.streaming) {
+    flex-shrink: 0;
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 160px;
+  }
+}
+
+.chat-history-window {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-history-window .mini-action { min-height: 44px; }
+
 .chat-bubble.user {
   align-self: flex-end;
   color: #ffffff;

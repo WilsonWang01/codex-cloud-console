@@ -99,21 +99,31 @@ export function PersonalMessageFeedback({ message, entry, disabled, saving, erro
   onSave: (input: PersonalFeedbackInput) => Promise<void>;
 }) {
   const [content, setContent] = useState({ text: "", digest: "", error: "" });
+  const container = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    let canceled = false;
-    void (async () => {
+    let canceled = false, started = false;
+    let observer: IntersectionObserver | undefined;
+    const verify = async () => {
+      if (canceled || started) return;
+      started = true;
       try {
         const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(message.text));
         const digest = [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
         if (!canceled) setContent({ text: message.text, digest, error: "" });
       } catch { if (!canceled) setContent({ text: message.text, digest: "", error: "当前浏览器无法核对回复内容，暂不能评价" }); }
-    })();
-    return () => { canceled = true; };
+    };
+    if (container.current && typeof IntersectionObserver !== "undefined") {
+      observer = new IntersectionObserver(entries => {
+        if (entries.some(entry => entry.isIntersecting)) { observer?.disconnect(); void verify(); }
+      }, { root: container.current.closest(".chat-window"), rootMargin: "160px" });
+      observer.observe(container.current);
+    } else void verify();
+    return () => { canceled = true; observer?.disconnect(); };
   }, [message.text]);
   const digest = content.text === message.text ? content.digest : "";
   const selected = entry?.messageId === message.id && entry.contentDigest === digest ? entry.decision : null;
   const choose = (decision: Exclude<Decision, null>) => onSave({ turnId: message.turnId, messageId: message.id, contentDigest: digest, decision: selected === decision ? null : decision, expectedRevision: entry?.revision || 0 });
-  return <div className="personal-message-feedback" aria-label="回复评价" aria-busy={saving}>
+  return <div ref={container} className="personal-message-feedback" aria-label="回复评价" aria-busy={saving}>
     <button type="button" className="icon-command" disabled={disabled || saving || !digest} aria-label="有帮助" title={selected === "helpful" ? "撤销有帮助评价" : "有帮助"} aria-pressed={selected === "helpful"} onClick={() => void choose("helpful")}><ThumbsUp size={15} /></button>
     <button type="button" className="icon-command" disabled={disabled || saving || !digest} aria-label="没有帮助" title={selected === "not_helpful" ? "撤销没有帮助评价" : "没有帮助"} aria-pressed={selected === "not_helpful"} onClick={() => void choose("not_helpful")}><ThumbsDown size={15} /></button>
     <span className="personal-feedback-status" aria-live="polite">{saving ? <Loader2 size={14} className="spin" aria-label="正在保存评价" /> : selected ? <Check size={14} aria-label="评价已保存" /> : null}</span>

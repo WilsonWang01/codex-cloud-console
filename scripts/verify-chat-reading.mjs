@@ -61,3 +61,14 @@ test("blocked tab storage and quota errors do not crash navigation or discard th
     assert.equal(cache.get("a").top, 3500); assert.equal(cache.get("b").top, 200);
   }
 });
+
+test("expanded history size survives reload without storing messages or breaking old reading entries", () => {
+  const local = storage(), cache = new ChatReadingPositions(() => local);
+  cache.set("expanded", { ...position, count: 500 });
+  cache.set("legacy", position);
+  assert.equal(new ChatReadingPositions(() => local).get("expanded").count, 500);
+  assert.deepEqual(copy(new ChatReadingPositions(() => local).get("legacy")), position);
+  for (const count of [-1, 0, 1.5, 2001, "500", NaN]) cache.set("invalid", { ...position, count });
+  assert.equal(cache.get("invalid"), null);
+  assert.equal(local.getItem(storageKey).includes("合成历史"), false);
+});
