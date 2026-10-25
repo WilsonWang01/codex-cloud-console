@@ -27,4 +27,5 @@ jobs:
       - run: npm run verify:mail-drafts:codex
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only
+      - run: npm run verify:personal-results:quality
       - run: npm run verify:runtime

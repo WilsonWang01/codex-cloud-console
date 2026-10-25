@@ -60,6 +60,7 @@
     "verify:personal-commitments": "node --test scripts/verify-personal-commitments.mjs scripts/verify-personal-commitments-api.mjs scripts/verify-personal-result-references.mjs scripts/verify-personal-result-references-api.mjs",
     "verify:personal-goal-progress-ui": "node scripts/verify-personal-goal-progress-ui.mjs",
     "verify:personal-results:ui": "node scripts/verify-personal-result-references-ui.mjs",
+    "verify:personal-results:quality": "node scripts/verify-personal-result-references-ui.mjs && node scripts/verify-personal-followup-quality.mjs",
     "verify:personal-routines": "node --test scripts/verify-personal-routines.mjs",
     "verify:personal-schedule": "node --test scripts/verify-personal-schedule.mjs",
     "verify:personal-brief": "node --test scripts/verify-personal-brief.mjs scripts/verify-personal-calendar.mjs scripts/verify-personal-mail.mjs scripts/verify-personal-source-freshness.mjs scripts/verify-personal-mail-drafts.mjs",
