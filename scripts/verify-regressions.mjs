@@ -2123,6 +2123,16 @@ await check("calendar and mail sources are explicit, account-bound, durable and 
     assert.equal(mailCalls.length, 2); assert.ok(mailCalls.every(item => item.params.arguments.link_id === "mail-two"));
     assert.equal(mailCalls[1].params.arguments.format, "metadata");
     assert.equal(native.some(item => item.method === "turn/start"), false);
+    const snapshot = mailDone.data.mail.snapshot, message = snapshot.items[0];
+    const draftInput = { timeZone: "UTC", source: { accountId: snapshot.account.id, messageId: message.id, itemVersion: message.version, snapshotVersion: snapshot.version } };
+    const createDraft = extra => jsonRequest(base, "/api/personal/mail-drafts", { method: "POST", headers: { ...headers, ...extra }, body: JSON.stringify(draftInput) });
+    assert.equal((await createDraft({ origin: "https://untrusted.example.test" })).response.status, 403);
+    const reply = await createDraft({}); assert.equal(reply.response.status, 200); assert.equal(reply.data.draft.source.accountEmail, "two@example.test");
+    assert.deepEqual(reply.data.draft.form.to, []); assert.equal(reply.data.draft.review, null);
+    assert.equal((await createDraft({})).data.draft.id, reply.data.draft.id);
+    const draftPath = path.join(stateRoot,"personal-mail-drafts.json"), draftPreserved = await fs.readFile(draftPath,"utf8");
+    assert.equal((await fs.stat(draftPath)).mode & 0o777, 0o600);
+    assert.equal((await captured()).filter(item => ["turn/start","mcpServer/tool/call"].includes(item.method)).length, 3, "local drafts neither read mail nor start a model");
     assert.ok(native.find(item => item.id === "calendar-unexpected-approval")?.error);
     assert.ok(native.find(item => item.id === "mail-unexpected-approval")?.error);
     const stateFile = path.join(stateRoot, "personal-calendar-source.json"), preserved = await fs.readFile(stateFile, "utf8");
@@ -2136,6 +2146,14 @@ await check("calendar and mail sources are explicit, account-bound, durable and 
     assert.equal(await fs.readFile(stateFile, "utf8"), preserved);
     assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.snapshot.version, mailDone.data.mail.snapshot.version);
     assert.equal(await fs.readFile(mailStateFile, "utf8"), mailPreserved);
+    const restoredDrafts = await jsonRequest(base,"/api/personal/mail-drafts",{headers});
+    assert.equal(restoredDrafts.data.drafts[0].id,reply.data.draft.id);assert.equal(await fs.readFile(draftPath,"utf8"),draftPreserved);
+    assert.equal((await createDraft({})).data.draft.id,reply.data.draft.id);
+    await fs.writeFile(draftPath,"null");
+    assert.equal((await jsonRequest(base,"/api/personal/mail-drafts",{headers})).response.status,503);
+    assert.equal((await createDraft({})).response.status,503);assert.equal(await fs.readFile(draftPath,"utf8"),"null");
+    await fs.unlink(draftPath);await fs.symlink(capture,draftPath);
+    assert.equal((await jsonRequest(base,"/api/personal/mail-drafts",{headers})).response.status,503);assert.equal((await fs.lstat(draftPath)).isSymbolicLink(),true);
     const oversized = "x".repeat(1024 * 1024 + 1);
     await fs.writeFile(stateFile, oversized);
     assert.equal((await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers })).response.status, 503);
@@ -2208,7 +2226,7 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(starts[1].params.sandbox, "read-only");
     assert.equal(starts[1].params.config.features.memories, false);
     assert.equal(starts[0].params.dynamicTools, undefined);
-    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference"]);
+    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference", "personal_mail_draft"]);
     assert.match(starts[1].params.developerInstructions, /only this conversation/);
     const personalSessionId = sessions[1].sessionId;
     const writable = await jsonRequest(base, `/api/chat/sessions/${personalSessionId}/runtime`, {

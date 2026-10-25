@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import { approvalDigest, createApprovalBroker, declineAppServerRequest } from "../server/approval-broker.mjs";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
+import { personalMailDraftTool } from "../server/personal-mail-drafts.mjs";
 
 test("双向协议保留零编号请求，服务器同号请求不能吞掉客户端等待的响应", async () => {
   const seen = [], writes = [];
@@ -154,6 +155,20 @@ test("回合结束只关闭本次审批，旧审批和取消竞态不能继续�
   });
   vm.runInContext(source.slice(source.indexOf("async function appServerRequestResult("), source.indexOf("\nfunction personalAppServerRequestResult(")), context);
   assert.equal((await context.appServerRequestResult("item/commandExecution/requestApproval", {})).decision, "decline");
+});
+
+test("个人邮件工具只进入当前已归属回合的草稿处理器，受限或无归属请求不转交", async()=>{
+  const source=fs.readFileSync(new URL("../server/index.mjs",import.meta.url),"utf8");
+  const job={repo:{kind:"personal"},repoId:"_personal",sessionId:"session",threadId:"thread",turnId:"turn"};let calls=0;
+  const store={};
+  const context=vm.createContext({personalSources:[],ownerFromParams:p=>({turnId:p.turnId}),findTurnJob:p=>p.threadId===job.threadId&&p.turnId===job.turnId?job:null,findCompactJob:()=>null,
+    recordAppServerRequestDecision:()=>{},declineAppServerRequest,personalMailDraftTool,personalMailDrafts:store,
+    handlePersonalMailDraftCall:async(p,actual,actualStore)=>{assert.equal(actual,job);assert.equal(actualStore,store);assert.equal(p.tool,personalMailDraftTool.name);calls++;return{success:true};}});
+  vm.runInContext(source.slice(source.indexOf("async function appServerRequestResult("),source.indexOf("\nfunction personalAppServerRequestResult(")),context);
+  const params={threadId:"thread",turnId:"turn",tool:personalMailDraftTool.name};
+  assert.equal((await context.appServerRequestResult("item/tool/call",params)).success,true);assert.equal(calls,1);
+  await assert.rejects(context.appServerRequestResult("item/tool/call",{...params,turnId:"old"}),/不属于当前已确认/);assert.equal(calls,1);
+  job.executionProfile={};assert.equal((await context.appServerRequestResult("item/tool/call",params)).success,false);assert.equal(calls,1);
 });
 
 test("immediate decline follows each supported app-server response shape", () => {

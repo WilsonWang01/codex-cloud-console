@@ -47,6 +47,7 @@ import { personalFileBridgeJson, personalFileBridgeStream, personalFileSocketPat
 import { createPersonalFactsStore, normalizePersonalFactContext, personalFactContextIssue } from "./personal-facts.mjs";
 import { handlePersonalFactReferenceCall, personalFactReferenceTool, personalFactReferenceMessages } from "./personal-fact-references.mjs";
 import { personalMemoryTool, handlePersonalMemoryCall } from "./personal-memory.mjs";
+import { createPersonalMailDrafts, mailDraftLimits, personalMailDraftRouter, personalMailDraftTool, handlePersonalMailDraftCall } from "./personal-mail-drafts.mjs";
 import { createPersonalCommitmentsStore, personalCommitmentDraft, personalCommitmentLinks } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
@@ -125,6 +126,14 @@ const personalMailSource = createPersonalMailSource({
   },
 });
 const personalSources = [personalCalendarSource, personalMailSource];
+const personalMailDraftPath = path.join(stateRoot, "personal-mail-drafts.json");
+const personalMailDrafts = createPersonalMailDrafts({
+  read: async () => {
+    try { return JSON.parse((await readRootedFile(stateRoot, path.basename(personalMailDraftPath), mailDraftLimits.bytes)).buffer.toString("utf8")); }
+    catch (error) { if (error.code === "file_not_found") return undefined; throw error; }
+  },
+  write: value => atomicWriteJson(personalMailDraftPath, value), mail: personalMailSource,
+});
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
 let runUsageLedger;
@@ -2119,7 +2128,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null, sta
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
-    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool] } : {}),
+    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool, personalMailDraftTool] } : {}),
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
       ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, personalSnapshot.facts, await personalCommitmentsStore.list())] : []),
@@ -2663,6 +2672,7 @@ async function appServerRequestResult(method, params = {}) {
     return declineAppServerRequest(method, "受限任务不能请求人工确认或扩大权限");
   }
   if (method === "item/tool/call") {
+    if (params.tool === personalMailDraftTool.name) return handlePersonalMailDraftCall(params, job, personalMailDrafts);
     if (params.tool === personalFactReferenceTool.name) return handlePersonalFactReferenceCall(params, job);
     const result = await handlePersonalMemoryCall(params, job, personalFactsStore);
     if (result.success && job) emitJobEvent(job, "status", { text: "个人记忆候选已保存，等待你在个人设置中核对；尚未成为事实" });
@@ -11397,6 +11407,8 @@ app.post("/api/personal/calendar/refresh", async (req, res) => {
   try { res.json({ ok: true, calendar: await personalCalendarSource.refresh(req.body.timeZone) }); }
   catch (error) { sendRouteError(res, error); }
 });
+
+app.use("/api/personal/mail-drafts", personalMailDraftRouter(personalMailDrafts));
 
 app.get("/api/personal/mail", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
