@@ -99,7 +99,7 @@ test("unattended personal schedules decline approvals before they enter the pend
   const events = [];
   let brokerCalls = 0;
   const context = vm.createContext({
-    personalCalendarSource: { ownsThread: () => false },
+    personalSources: [{ ownsThread: () => false }, { ownsThread: () => false }],
     findTurnJob: () => job,
     ownerFromParams: params => ({ turnId: params.turnId }),
     findCompactJob: () => null,
@@ -125,12 +125,14 @@ test("unattended personal schedules decline approvals before they enter the pend
   const interactive = await appServerRequestResult("item/commandExecution/requestApproval", { threadId: "personal-thread", turnId: "personal-turn" });
   assert.equal(interactive.decision, "accept");
   assert.equal(brokerCalls, 1);
-  context.personalCalendarSource.ownsThread = id => id === "source-thread";
-  for (const handler of [appServerRequestResult, personalAppServerRequestResult]) {
-    await assert.rejects(handler("item/commandExecution/requestApproval", { threadId: "source-thread" }), /既定只读/);
-    await assert.rejects(handler("mcpServer/elicitation/request", { threadId: "source-thread" }), /既定只读/);
+  for (let index = 0; index < context.personalSources.length; index++) {
+    context.personalSources.forEach((source, other) => { source.ownsThread = id => index === other && id === "source-thread"; });
+    for (const handler of [appServerRequestResult, personalAppServerRequestResult]) {
+      await assert.rejects(handler("item/commandExecution/requestApproval", { threadId: "source-thread" }), /既定只读/);
+      await assert.rejects(handler("mcpServer/elicitation/request", { threadId: "source-thread" }), /既定只读/);
+    }
   }
-  assert.equal(brokerCalls, 1, "calendar refresh never prompts the user to grant runtime permissions");
+  assert.equal(brokerCalls, 1, "calendar and mail refresh never prompt the user to grant runtime permissions");
 });
 
 test("回合结束只关闭本次审批，旧审批和取消竞态不能继续批准权限", async () => {
@@ -146,7 +148,7 @@ test("回合结束只关闭本次审批，旧审批和取消竞态不能继续�
   broker.closeAll(); await current; await other;
   const source = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8");
   const job = { repoId: "repo", sessionId: "s", turnId: "turn" };
-  const context = vm.createContext({ personalCalendarSource: { ownsThread: () => false }, ownerFromParams: () => ({ turnId: "turn" }),
+  const context = vm.createContext({ personalSources: [{ ownsThread: () => false }, { ownsThread: () => false }], ownerFromParams: () => ({ turnId: "turn" }),
     findTurnJob: () => job, findCompactJob: () => null, recordAppServerRequestDecision: () => {}, declineAppServerRequest,
     approvalBroker: { request: async () => { job.cancelRequested = true; return { decision: "accept" }; } },
   });
