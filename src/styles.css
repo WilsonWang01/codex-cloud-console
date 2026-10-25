@@ -1695,6 +1695,7 @@ h3 {
 }
 
 .chat-window {
+  overflow-anchor: none;
   display: flex;
   flex: 1;
   flex-direction: column;

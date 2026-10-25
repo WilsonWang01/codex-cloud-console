@@ -110,6 +110,7 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   assert.equal((await records()).length, 3, "状态查询失败后应等待再重试");
   await waitUntil(async () => (await records()).length === 4);
   assert.equal((await records())[3].path, "/api/chat/job-events");
+  await page.locator('[data-chat-message-id="active-fixture-running-job"]').waitFor();
   await emit(3, "delta", { text: "重放输出唯一标记" });
   await navigate("sample-app-2");
   await page.evaluate(() => { location.hash = "/project/sample-app/thread/sample-app-1"; });
@@ -127,10 +128,18 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   assert.equal(await page.getByText("验收模拟连接断开重放输出唯一标记", { exact: true }).count(), 0);
   assert.equal(await busy().count(), 1);
   assert.equal(await page.locator(".chat-bubble.streaming").filter({ hasText: "重放输出唯一标记" }).count(), 1);
+  assert.equal(await page.locator('[data-chat-message-id="active-fixture-running-job"]').count(), 1, "reconnection retains the original accepted job message identity");
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  assert.equal((await records()).filter(record => record.path === "/api/chat/stream").length, 1, "background return must not submit an accepted conversation again");
   await page.screenshot({ path: new URL("desktop-reconnected.png", out).pathname, fullPage: true });
   await navigate("sample-service-1");
   assert.equal((await records())[5].aborted, true);
   activeJobs.clear();
   assert.equal(await page.evaluate(() => window.__streamHarness.interrupts), 0);
-  return ["压缩切换会话只取消订阅", "旧流结束不释放新任务", "Review 离开后不污染其他会话", "聊天生成状态持续保留", "失败的补充指令不伪装已发送且保留输入", "回到运行中会话重新订阅", "状态查询失败后自动重试", "重连退避避免请求风暴", "事件重放不重复输出或残留错误", "跨项目离开不终止云端任务"];
+  return ["压缩切换会话只取消订阅", "旧流结束不释放新任务", "Review 离开后不污染其他会话", "聊天生成状态持续保留", "失败的补充指令不伪装已发送且保留输入", "回到运行中会话重新订阅", "状态查询失败后自动重试", "重连退避避免请求风暴", "事件重放不重复输出或残留错误", "模拟后台返回不重发任务且原运行消息编号保持", "跨项目离开不终止云端任务"];
 }
