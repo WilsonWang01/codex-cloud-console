@@ -17,6 +17,7 @@ import { createKeyedQueue, retainAutomationRuns, recoveryExecutionRepo, mapConcu
 import { createApprovalBroker, approvalDigest, declineAppServerRequest } from "./approval-broker.mjs";
 import { createApiClientStore } from "./api-clients.mjs";
 import { clientCanReadRun, externalRunView, scopedHeartbeatSource, validateExternalTriggerInput } from "./external-automation.mjs";
+import { normalizeExecutionProfile, assertExecutionProfile, automationExecutionProfile, assertProfileSource, profileRuntime, profileThreadConfig, profileSandbox, verifyProfileThread } from "./automation-execution-profile.mjs";
 import { authenticateModelApiRequest, createModelApiHandler, modelApiProtocol, sendModelApiError } from "./model-api.mjs";
 import { createDiscoveryHandler } from "./api-discovery.mjs";
 import { modelApiTurnResult } from "./model-api-output.mjs";
@@ -25,7 +26,7 @@ import { automationEventsSince, mergeAutomationEvents, normalizeAutomationEvents
 import { notificationAttempt, pendingNotificationChannels } from "./notification-delivery.mjs";
 import { createRunAdmission } from "./run-admission.mjs";
 import { checkKnownTokenBudget } from "./run-budget.mjs";
-import { aggregateRunUsage, runUsageDetails, runUsageFromProtocol, summarizeRunUsage } from "./run-usage.mjs";
+import { aggregateRunUsage, createTurnUsageMeter, normalizeRunUsage, runUsageDetails, summarizeRunUsage } from "./run-usage.mjs";
 import { summarizeDeliveryUsage } from "./delivery-usage.mjs";
 import { mergeUsageRuns, openRunUsageLedger } from "./run-usage-ledger.mjs";
 import { createExternalTaskStore, createExternalTaskOwner, executionPayloadLimits } from "./external-task-store.mjs";
@@ -54,6 +55,8 @@ import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSett
 import { calendarSourceLimits, createPersonalCalendarSource } from "./personal-calendar.mjs";
 import { createCalendarProposalStore, calendarProposalLimits } from "./personal-calendar-proposals.mjs";
 import { createPersonalCalendarActions, calendarActionRouter } from "./personal-calendar-actions.mjs";
+import { createPersonalFeedbackStore, personalFeedbackRouter } from "./personal-feedback.mjs";
+import { mailSourceLimits, createPersonalMailSource } from "./personal-mail.mjs";
 import { createGitHubWorkflow, githubIssuePrompt } from "./github-workflow.mjs";
 import { readReleaseInfo } from "./release-info.mjs";
 
@@ -90,6 +93,7 @@ const chatHistoryPath = path.join(stateRoot, "chat-history.json");
 const personalFactsStore = createPersonalFactsStore(path.join(stateRoot, "personal-facts.json"));
 const personalCommitmentsStore = createPersonalCommitmentsStore(path.join(stateRoot, "personal-commitments.json"));
 const personalRoutinesStore = createPersonalRoutinesStore(path.join(stateRoot, "personal-routines.json"));
+const personalFeedbackStore = createPersonalFeedbackStore(path.join(stateRoot, "personal-message-feedback.json"));
 const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
 const personalCalendarPath = path.join(stateRoot, "personal-calendar-source.json");
 const personalCalendarProposalsPath = path.join(stateRoot, "personal-calendar-proposals.json");
@@ -127,6 +131,23 @@ const personalCalendarSource = createPersonalCalendarSource({
     return { cwd: getRepoById(personalRepoId).path, model: defaultRuntime.model };
   },
 });
+const personalMailPath = path.join(stateRoot, "personal-mail-source.json");
+const personalMailSource = createPersonalMailSource({
+  read: async () => {
+    try { return JSON.parse((await readRootedFile(stateRoot, path.basename(personalMailPath), mailSourceLimits.resultBytes)).buffer.toString("utf8")); }
+    catch (error) {
+      if (error.code === "file_not_found") return { version: 1, snapshot: null, lastAttempt: null };
+      throw Object.assign(new Error("邮件缓存无法安全读取，未覆盖原记录"), { code: "mail_cache_invalid", statusCode: 503 });
+    }
+  },
+  write: value => atomicWriteJson(personalMailPath, value),
+  request: (method, params, timeout) => getPersonalAppServerClient().request(method, params, timeout),
+  context: () => {
+    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行不可用"), { statusCode: 503 });
+    return { cwd: getRepoById(personalRepoId).path, model: defaultRuntime.model };
+  },
+});
+const personalSources = [personalCalendarSource, personalMailSource];
 const customReposPath = path.join(stateRoot, "custom-repos.json");
 const automationRunsPath = path.join(stateRoot, "automation-runs.json");
 let runUsageLedger;
@@ -466,6 +487,7 @@ const defaultAutomations = [
 ];
 
 const automations = parseBase64ArrayConfig("CODEX_CLOUD_AUTOMATIONS_CONFIG_B64", defaultAutomations);
+automations.forEach(automationExecutionProfile);
 
 await loadCustomRepos();
 const personalRootOverlapsWork = repos.some((repo) => {
@@ -667,6 +689,7 @@ function normalizeChatMessage(item) {
   if (item?.status) normalized.status = String(item.status);
   if (item?.source) normalized.source = String(item.source);
   if (item?.turnId) normalized.turnId = String(item.turnId);
+  if (item?.turnStatus) normalized.turnStatus = String(item.turnStatus);
   if (typeof item?.turnIndex === "number") normalized.turnIndex = item.turnIndex;
   if (item?.details && typeof item.details === "object") normalized.details = item.details;
   if (Array.isArray(item?.attachments)) {
@@ -1890,7 +1913,21 @@ function scheduleThreadSummaryRefresh(repo, session) {
   threadSummaryRefreshByKey.set(key, task);
 }
 
-async function getChatMessages(repoId, sessionHint, options = {}) {
+function chatHistoryLimit(value) {
+  if (value === undefined) return maxStoredChatMessages;
+  if (!["string", "number"].includes(typeof value) || !/^[1-9]\d{0,3}$/.test(String(value)) || Number(value) > 2000) {
+    throw Object.assign(new Error("历史显示数量须为 1–2000 的整数"), { statusCode: 400 });
+  }
+  return Number(value);
+}
+
+function chatHistoryAnchor(value) {
+  if (value === undefined) return "";
+  if (typeof value !== "string" || !value || value.length > 512) throw Object.assign(new Error("历史阅读位置无效"), { statusCode: 400 });
+  return value;
+}
+
+async function getChatTimelineMessages(repoId, sessionHint, options = {}) {
   const session = await resolveChatSessionForRead(repoId, sessionHint);
   if (session.codexSessionId) {
     const repo = repos.find((item) => item.id === session.repoId || item.id === repoId) || null;
@@ -1939,8 +1976,7 @@ async function getChatMessages(repoId, sessionHint, options = {}) {
           if (rank) return rank;
         }
         return new Date(a.time) - new Date(b.time);
-      })
-      .slice(-maxStoredChatMessages);
+      });
   }
 
   const sourceMessages = session.messages;
@@ -1948,6 +1984,21 @@ async function getChatMessages(repoId, sessionHint, options = {}) {
     .map(normalizeChatMessage)
     .filter((item) => item.text)
     .slice(-maxStoredChatMessages);
+}
+
+async function getChatHistory(repoId, sessionHint, options = {}) {
+  const requested = chatHistoryLimit(options.limit), anchor = chatHistoryAnchor(options.anchor);
+  const timeline = await getChatTimelineMessages(repoId, sessionHint, options);
+  const index = anchor ? timeline.findIndex(item => item.id === anchor) : -1;
+  const limit = Math.min(2000, Math.max(requested, index < 0 ? 0 : timeline.length - index));
+  const messages = timeline.slice(-limit);
+  return { messages, ...(timeline.some(item => item.messageType === "threadReadError") ? {} : {
+    history: { total: timeline.length, limit, hasMore: timeline.length > limit, ...(anchor ? { anchorRetained: messages.some(item => item.id === anchor) } : {}) },
+  }) };
+}
+
+async function getChatMessages(repoId, sessionHint, options = {}) {
+  return (await getChatHistory(repoId, sessionHint, options)).messages;
 }
 
 async function saveChatMessages(repoId, sessionHint, messages) {
@@ -2085,7 +2136,7 @@ async function preparePersonalFactContext(repo, session) {
   return snapshot;
 }
 
-async function appServerThreadParams(repo, runtime, personalSnapshot = null, starting = false) {
+async function appServerThreadParams(repo, runtime, personalSnapshot = null, starting = false, executionConfig = {}) {
   if (repo.kind === "personal" && !personalSnapshot) throw new Error("个人资料上下文尚未核对");
   return {
     cwd: repo.path,
@@ -2103,6 +2154,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null, sta
       model_reasoning_effort: runtime.reasoning,
       tools: { web_search: runtime.search },
       ...(repo.kind === "personal" ? { features: { memories: false } } : {}),
+      ...executionConfig,
     },
   };
 }
@@ -2132,13 +2184,13 @@ function inlineShellCommand(command, limit = 180) {
   return `${text.slice(0, limit - 1)}…`;
 }
 
-async function appServerTurnParams(threadId, repo, runtime, message, attachments = [], imageInputs = []) {
+async function appServerTurnParams(threadId, repo, runtime, message, attachments = [], imageInputs = [], executionProfile = null) {
   return {
     threadId,
     input: [...await buildUserInputs(repo, message, attachments), ...imageInputs],
     cwd: repo.path,
     approvalPolicy: runtime.approval,
-    sandboxPolicy: appServerSandboxPolicy(runtime, repo),
+    sandboxPolicy: executionProfile ? profileSandbox(repo.path) : appServerSandboxPolicy(runtime, repo),
     model: runtime.model,
     effort: runtime.reasoning,
   };
@@ -2626,8 +2678,20 @@ async function appServerRequestResult(method, params = {}) {
     if (!personalCalendarActions.canApprove(method, params)) throw new Error("日历提案不允许扩权或执行其他动作");
     return approvalBroker.request(method, params, { repoId: personalRepoId });
   }
-  if (personalCalendarSource.ownsThread(params.threadId || params.thread_id)) throw new Error("日历来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
-  const job = findTurnJob(params) || findCompactJob(params);
+  if (personalSources.some(source => source.ownsThread(params.threadId || params.thread_id))) throw new Error("个人来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
+  const waiting = findTurnJob(params, true) || findCompactJob(params, true);
+  if (waiting?.startRequestPending) await waiting.startReady.promise;
+  const job = ownerFromParams(params).turnId ? findTurnJob(params) || findCompactJob(params) : null;
+  if (!job || job.cancelRequested) {
+    recordAppServerRequestDecision(method, params, "declined-unowned");
+    return declineAppServerRequest(method, "请求不属于当前已确认的回合，未申请额外权限");
+  }
+  if (job?.executionProfile) {
+    job.profileApprovalDenied = true;
+    recordAppServerRequestDecision(method, params, "declined-execution-profile");
+    if (method === "item/tool/call") return { success: false, contentItems: [{ type: "inputText", text: "受限任务不允许调用连接器或控制台工具" }] };
+    return declineAppServerRequest(method, "受限任务不能请求人工确认或扩大权限");
+  }
   if (method === "item/tool/call") {
     if (params.tool === personalCalendarTool.name) {
       const result = await handlePersonalCalendarCall(params, job, personalCalendarActions);
@@ -2647,7 +2711,8 @@ async function appServerRequestResult(method, params = {}) {
   }
   recordAppServerRequestDecision(method, params, "pending");
   try {
-    const result = await approvalBroker.request(method, params, { repoId: job?.repoId, sessionId: job?.sessionId });
+    let result = await approvalBroker.request(method, params, { repoId: job.repoId, sessionId: job.sessionId, turnId: job.turnId });
+    if (job.cancelRequested || (findTurnJob(params) !== job && findCompactJob(params) !== job)) result = declineAppServerRequest(method, "原回合已经结束或取消，审批不再生效");
     const declined = result.decision === "decline" || Boolean(result.decision?.denied) || result.action === "decline";
     recordAppServerRequestDecision(method, params, declined ? "declined" : "accepted");
     return result;
@@ -2659,19 +2724,20 @@ async function appServerRequestResult(method, params = {}) {
 
 function personalAppServerRequestResult(method, params = {}) {
   if (personalCalendarActions.ownsThread(params.threadId || params.thread_id)) return appServerRequestResult(method, params);
-  const job = findTurnJob(params) || findCompactJob(params);
+  const job = findTurnJob(params, true) || findCompactJob(params, true);
   if (!job || job.repoId !== personalRepoId) throw new Error("Personal worker request has no active personal turn");
   return appServerRequestResult(method, params);
 }
 
 function personalAppServerNotification(message) {
-  if (message.method === "thread/closed") personalCalendarSource.closedThread(message.params?.threadId);
+  if (message.method === "thread/closed") personalSources.forEach(source => source.closedThread(message.params?.threadId));
   if (message.method === "account/login/completed") {
     completeAccountLoginFlow(message.params || {}, personalRepoId);
     return;
   }
-  const job = findTurnJob(message.params || {}) || findCompactJob(message.params || {});
-  if (job?.repoId !== personalRepoId) return;
+  const job = findTurnJob(message.params || {}, true) || findCompactJob(message.params || {}, true);
+  const owner = ownerFromParams(message.params || {});
+  if (job?.repoId !== personalRepoId && threadOwners.get(owner.threadId)?.repoId !== personalRepoId) return;
   handleAppServerNotification(message);
 }
 
@@ -2755,7 +2821,7 @@ function getAppServerClient() {
     });
   });
   appServerClient.on("exit", ({ message }) => {
-    if (!personalRuntime.enabled) personalCalendarSource.resetRuntime();
+    if (!personalRuntime.enabled) personalSources.forEach(source => source.resetRuntime());
     if (personalRuntime.enabled) {
       for (const repo of repos.filter((item) => item.kind !== "personal")) {
         approvalBroker.closeForRepo(repo.id, message || "Codex app-server stopped");
@@ -2784,7 +2850,7 @@ function getPersonalAppServerClient() {
   });
   personalAppServerClient.on("notification", personalAppServerNotification);
   personalAppServerClient.on("exit", ({ message }) => {
-    personalCalendarSource.resetRuntime();
+    personalSources.forEach(source => source.resetRuntime());
     approvalBroker.closeForRepo(personalRepoId, message || "Personal app-server stopped");
     for (const job of [...activeTurns.values()].filter((item) => item.repoId === personalRepoId)) {
       finishTurnJob(job, false, 1, message || "Personal app-server stopped");
@@ -2920,7 +2986,7 @@ function reqSafeClose(res, cleanup) {
 function ownerFromParams(params = {}) {
   const item = params.item || {};
   const itemId = params.itemId || item.id || null;
-  const turnId = params.turnId || params.turn?.id || item.turnId || null;
+  const turnId = params.turnId || params.turn?.id || item.turnId || (itemId && itemOwners.get(itemId)?.turnId) || null;
   const threadId =
     params.threadId ||
     params.thread?.id ||
@@ -2952,39 +3018,105 @@ function clearJobOwners(job) {
   }
 }
 
-function findTurnJob(params = {}) {
+function jobMatchesOwner(job, owner, pending = false) {
+  if (!job || job.completed || job.finishing) return false;
+  if (owner.threadId && owner.threadId !== job.threadId && owner.threadId !== job.reviewThreadId) return false;
+  if (owner.turnId && owner.turnId !== job.turnId && !(pending && job.startRequestPending && !job.turnId)) return false;
+  if (owner.itemId && !owner.turnId && !job.itemIds.has(owner.itemId) && !(pending && job.startRequestPending)) return false;
+  return true;
+}
+
+function findTurnJob(params = {}, pending = false) {
   const owner = ownerFromParams(params);
   if (owner.itemId && itemOwners.has(owner.itemId)) {
     const itemOwner = itemOwners.get(owner.itemId);
     const job = activeTurns.get(makeSessionKey(itemOwner.repoId, itemOwner.sessionId));
-    if (job) return job;
+    if (jobMatchesOwner(job, owner, pending)) return job;
   }
   if (owner.turnId && turnOwners.has(owner.turnId)) {
     const turnOwner = turnOwners.get(owner.turnId);
     const job = activeTurns.get(makeSessionKey(turnOwner.repoId, turnOwner.sessionId));
-    if (job) return job;
+    if (jobMatchesOwner(job, owner, pending)) return job;
   }
   if (owner.threadId && threadOwners.has(owner.threadId)) {
     const threadOwner = threadOwners.get(owner.threadId);
     const job = activeTurns.get(makeSessionKey(threadOwner.repoId, threadOwner.sessionId));
-    if (job) return job;
+    if (jobMatchesOwner(job, owner, pending)) return job;
   }
   return null;
 }
 
-function findCompactJob(params = {}) {
+function findCompactJob(params = {}, pending = false) {
   const owner = ownerFromParams(params);
   if (owner.threadId) {
     for (const job of activeCompactions.values()) {
-      if (job.threadId === owner.threadId) return job;
+      if (job.threadId === owner.threadId && jobMatchesOwner(job, owner, pending)) return job;
     }
   }
   if (owner.itemId && itemOwners.has(owner.itemId)) {
     const itemOwner = itemOwners.get(owner.itemId);
     const key = makeSessionKey(itemOwner.repoId, itemOwner.sessionId);
-    return activeCompactions.get(key) || null;
+    const job = activeCompactions.get(key);
+    return jobMatchesOwner(job, owner, pending) ? job : null;
   }
   return null;
+}
+
+function bufferStartNotification(job, message) {
+  if (job.completed || job.finishing || job.startConfirmationFailed) return;
+  const bytes = Buffer.byteLength(JSON.stringify(message));
+  if (job.startNotifications.length >= 128 || job.startNotificationBytes + bytes > 2 * 1024 * 1024) {
+    job.startConfirmationFailed = true;
+    if (job.kind === "compact") void finishCompactJob(job, false, "启动回执前通知超限，无法核对压缩结果，未重试");
+    else interruptTimedOutTurn(job, "启动回执前通知超限，任务结果需核对；未自动重试");
+    return;
+  }
+  job.startNotifications.push(message);
+  job.startNotificationBytes += bytes;
+}
+
+function requestJobInterruption(job) {
+  const threadId = job.reviewThreadId || job.threadId, turnId = job.turnId;
+  // A late start receipt must still be interruptible; do not cache an unbound target.
+  if (!threadId || !turnId) return Promise.resolve(false);
+  return job.interruptPromise ||= Promise.resolve().then(() => appServerClientForJob(job).request("turn/interrupt", { threadId, turnId }, 20_000));
+}
+
+async function requestJobStart(job, method, params) {
+  // Only the RPC receipt binds a turn; earlier notifications wait in a bounded buffer.
+  job.startReady = Promise.withResolvers();
+  job.startRequestPending = true;
+  job.startNotifications = [];
+  job.startNotificationBytes = 0;
+  job.startMethod = method;
+  job.operationStartedAt = Date.now();
+  try {
+    const result = await appServerClientForJob(job).request(method, params, 30_000);
+    if (method !== "thread/compact/start") {
+      job.turnId = result?.turn?.id || result?.reviewTurnId || null;
+      if (!job.turnId) throw new Error("Codex 没有返回本次回合编号，未复用其他回合");
+      if (result.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
+      rememberOwner({ threadId: job.reviewThreadId || job.threadId, turnId: job.turnId }, { repoId: job.repoId, sessionId: job.sessionId });
+    }
+    job.startRequestPending = false;
+    const pending = job.startNotifications;
+    job.startNotifications = [];
+    for (const notification of pending) {
+      const owner = ownerFromParams(notification.params);
+      if (jobMatchesOwner(job, owner) || (job.kind === "compact" && owner.threadId === job.threadId)) handleAppServerNotification(notification);
+    }
+    return result;
+  } catch (error) {
+    job.startConfirmationFailed = true;
+    job.cancelRequested = true;
+    if (job.turnId) void requestJobInterruption(job).catch(() => null);
+    throw new Error(`启动回执未能确认，请核对原任务；未自动重试：${error.message || error}`);
+  } finally {
+    job.startRequestPending = false;
+    job.startNotifications = [];
+    job.startNotificationBytes = 0;
+    job.startReady.resolve();
+  }
 }
 
 function commandToolRecord(job, itemOrId = {}) {
@@ -3121,7 +3253,7 @@ function createServerJob(kind, repo, session, runtime) {
     output: "",
     stderr: "",
     latestTokenUsage: session.tokenUsage || null,
-    rawTurnUsage: null,
+    turnUsage: kind === "turn" ? createTurnUsageMeter() : null,
     latestGoal: session.goal || null,
     completed: false,
     finishing: false,
@@ -3138,6 +3270,7 @@ function createServerJob(kind, repo, session, runtime) {
     }),
     makeSessionActive: true,
     cancelRequested: false,
+    interruptPromise: null,
   };
   job.resolve = resolvePromise;
   return job;
@@ -3146,9 +3279,7 @@ function createServerJob(kind, repo, session, runtime) {
 function interruptTimedOutTurn(job, message) {
   if (job.completed || job.finishing) return;
   job.cancelRequested = true;
-  const interrupt = job.threadId && job.turnId
-    ? appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null)
-    : Promise.resolve();
+  const interrupt = requestJobInterruption(job).catch(() => null);
   interrupt.finally(() => {
     finishTurnJob(job, false, 124, message).catch((error) => {
       emitJobEvent(job, "error", { message: error.message || "Codex turn timeout cleanup failed" });
@@ -3205,11 +3336,13 @@ async function resolveThreadForJob(job) {
   const client = appServerClientForJob(job);
   const snapshot = job.personalFactSnapshot || await preparePersonalFactContext(job.repo, job.session);
   job.personalFactSnapshot = snapshot;
+  const executionConfig = job.executionProfile ? profileThreadConfig((await client.request("config/read", { cwd: job.repo.path, includeLayers: false }, 15000)).config, job.repo.path) : {};
   const context = (threadId) => snapshot ? { personalFactContext: { ...snapshot.context, threadId } } : {};
   if (job.threadId) {
     if (snapshot) await updateSessionRuntime(job.repoId, job.sessionId, context(job.threadId), { makeActive: false });
     try {
-      await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime, snapshot) }, 30_000);
+      const resumed = await client.request("thread/resume", { threadId: job.threadId, ...await appServerThreadParams(job.repo, job.runtime, snapshot, false, executionConfig) }, 30_000);
+      if (job.executionProfile) await verifyProfileThread((...args) => client.request(...args), resumed, job.repo.path, job.threadId);
       emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}` });
       rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
       return job.threadId;
@@ -3217,10 +3350,11 @@ async function resolveThreadForJob(job) {
       throw new Error(`原 app-server thread 无法恢复，已保留原会话，请重试：${error.message || error}`);
     }
   }
-  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot, true), 30_000);
+  const started = await client.request("thread/start", await appServerThreadParams(job.repo, job.runtime, snapshot, true, executionConfig), 30_000);
   job.threadId = started?.thread?.id;
   if (!job.threadId) throw new Error("Codex app-server did not return a thread id");
   rememberOwner({ threadId: job.threadId }, { repoId: job.repoId, sessionId: job.sessionId });
+  if (job.executionProfile) await verifyProfileThread((...args) => client.request(...args), started, job.repo.path);
   await updateSessionRuntime(job.repoId, job.sessionId, (current) => ({ codexSessionId: job.threadId, ...jobRuntimePatch(job, current), ...context(job.threadId) }), { makeActive: job.makeSessionActive !== false });
   emitJobEvent(job, "session", { codexSessionId: job.threadId, threadId: job.threadId });
   emitJobEvent(job, "status", { text: `已创建 app-server thread ${job.threadId.slice(0, 8)}` });
@@ -3235,7 +3369,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
   return serializeSessionTransition(key, async () => {
     const storedSession = await readStoredSessionForJob(repo.id, session.id);
     session = storedSession;
-    runtime = runtimeForRepo(repo, normalizeRuntime(runtime, session));
+    const executionProfile = normalizeExecutionProfile(options.executionProfile);
+    runtime = profileRuntime(runtimeForRepo(repo, normalizeRuntime(runtime, session)), executionProfile);
     const storedQueuedTurn = storedSession.queuedTurn;
     if (storedSession.externalActionReview) {
       throw Object.assign(new Error("连接服务操作尚待核对。请先在对应服务检查结果，再确认已核对。"), { statusCode: 409 });
@@ -3251,6 +3386,8 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
 
     const personalFactSnapshot = await preparePersonalFactContext(repo, session);
     const job = createServerJob("turn", repo, session, runtime);
+    job.executionProfile = executionProfile;
+    job.modelStartAttempted = false;
     job.personalFactSnapshot = personalFactSnapshot;
     job.maxRuntimeMs = options.maxRuntimeMs;
     job.automationRunId = options.automationRunId || null;
@@ -3277,14 +3414,14 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
           await finishTurnJob(job, false, 130, "Turn cancelled before start");
           return;
         }
-        const params = await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs);
+        const params = await appServerTurnParams(job.threadId, repo, runtime, message, attachments, options.imageInputs, executionProfile);
         if (job.personalFactSnapshot) await preparePersonalFactContext(repo, { ...session, codexSessionId: job.threadId, personalFactContext: { ...job.personalFactSnapshot.context, threadId: job.threadId } });
         if (options.outputSchema) params.outputSchema = options.outputSchema;
-        const result = await appServerClientForJob(job).request("turn/start", params, 30_000);
-        job.turnId = result?.turn?.id || null;
-        if (job.completed) {
+        job.modelStartAttempted = true;
+        await requestJobStart(job, "turn/start", params);
+        if (job.completed || job.finishing) {
           if (job.threadId && job.turnId) {
-            await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+            await requestJobInterruption(job).catch(() => null);
           }
           return;
         }
@@ -3297,7 +3434,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
         );
         rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
         if (job.cancelRequested && job.threadId && job.turnId) {
-          await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+          await requestJobInterruption(job).catch(() => null);
         }
         emitJobEvent(job, "status", { text: job.turnId ? `已启动 turn ${job.turnId.slice(0, 8)}` : "已启动 app-server turn" });
       } catch (error) {
@@ -3336,23 +3473,26 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
       try {
         await resolveThreadForJob(job);
         if (job.completed) return;
-        const result = await appServerClientForJob(job).request(
+        if (job.cancelRequested) {
+          await finishTurnJob(job, false, 130, "Review cancelled before start");
+          return;
+        }
+        const result = await requestJobStart(job,
           "review/start",
           {
             threadId: job.threadId,
             target,
             delivery,
           },
-          30_000,
         );
-        job.turnId = result?.turn?.id || result?.reviewTurnId || null;
-        if (job.completed) {
+        if (job.completed || job.finishing) {
           if (job.threadId && job.turnId) {
-            await appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+            await requestJobInterruption(job).catch(() => null);
           }
           return;
         }
         if (result?.reviewThreadId) job.reviewThreadId = result.reviewThreadId;
+        if (job.cancelRequested) await requestJobInterruption(job).catch(() => null);
         rememberOwner({ threadId: job.threadId, turnId: job.turnId }, { repoId: repo.id, sessionId: session.id });
         emitJobEvent(job, "status", { text: result?.reviewThreadId ? `已启动 detached review ${String(result.reviewThreadId).slice(0, 8)}` : "已启动官方 review" });
       } catch (error) {
@@ -3366,6 +3506,7 @@ async function startReviewJob(repo, session, runtime, target = { type: "uncommit
 async function finishTurnJob(job, ok, code = 0, error = null) {
   if (job.completed || job.finishing) return;
   job.finishing = true;
+  approvalBroker.closeForTurn(job, "原回合已结束，未保留可继续批准的请求");
   if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
   if (job.maxRuntimeTimer) clearTimeout(job.maxRuntimeTimer);
   if (job.externalWriteTimer) clearTimeout(job.externalWriteTimer);
@@ -3456,7 +3597,7 @@ async function startCompactJob(repo, session, runtime) {
         if (!job.threadId) throw new Error("先发送一条消息建立 app-server thread，再压缩上下文。");
         await resolveThreadForJob(job);
         emitJobEvent(job, "status", { text: `已恢复 app-server thread ${job.threadId.slice(0, 8)}，正在启动上下文压缩...` });
-        await appServerClientForJob(job).request("thread/compact/start", { threadId: job.threadId }, 30_000);
+        await requestJobStart(job, "thread/compact/start", { threadId: job.threadId });
         emitJobEvent(job, "status", { text: "正在压缩上下文..." });
       } catch (error) {
         await finishCompactJob(job, false, error.message || "主动压缩失败");
@@ -3469,6 +3610,7 @@ async function startCompactJob(repo, session, runtime) {
 async function finishCompactJob(job, ok, error = null) {
   if (job.completed) return;
   job.completed = true;
+  approvalBroker.closeForTurn(job, "原压缩任务已结束，未保留可继续批准的请求");
   if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
   activeCompactions.delete(job.key);
   const compactedAt = ok ? new Date().toISOString() : null;
@@ -3509,8 +3651,25 @@ async function finishCompactJob(job, ok, error = null) {
 
 function handleAppServerNotification(rpcMessage) {
   const params = rpcMessage.params || {};
-  if (rpcMessage.method === "thread/closed") personalCalendarSource.closedThread(params.threadId);
+  if (rpcMessage.method === "thread/closed") personalSources.forEach(source => source.closedThread(params.threadId));
   const owner = ownerFromParams(params);
+  const starting = findTurnJob(params, true) || findCompactJob(params, true);
+  if (starting?.startRequestPending && (owner.turnId || owner.itemId)) {
+    bufferStartNotification(starting, rpcMessage);
+    return;
+  }
+  // Detached review notifications may arrive before its new thread is acknowledged.
+  if (!starting && (owner.turnId || owner.itemId)) {
+    const pendingReviews = [...activeTurns.values()].filter(job => job.startRequestPending && job.startMethod === "review/start");
+    if (pendingReviews.length) {
+      for (const job of pendingReviews) bufferStartNotification(job, rpcMessage);
+      return;
+    }
+  }
+  if (owner.turnId && rpcMessage.method === "item/started" && params.item?.type === "contextCompaction") {
+    const compact = [...activeCompactions.values()].find(job => job.threadId === owner.threadId && job.startMethod === "thread/compact/start" && !job.startRequestPending && !job.turnId);
+    if (compact && Number.isFinite(params.startedAtMs) && params.startedAtMs >= compact.operationStartedAt) compact.turnId = owner.turnId;
+  }
   const turnJob = findTurnJob(params);
   const compactJob = findCompactJob(params);
   const job = compactJob || turnJob;
@@ -3572,8 +3731,9 @@ function handleAppServerNotification(rpcMessage) {
     return;
   }
   if (rpcMessage.method === "thread/tokenUsage/updated") {
+    if (!owner.turnId) return;
     if (job) {
-      if (job.kind === "turn" && params.tokenUsage) job.rawTurnUsage = params.tokenUsage;
+      if (job.kind === "turn") job.turnUsage.observe(params.tokenUsage);
       job.latestTokenUsage = normalizeTokenUsage(params.tokenUsage) || job.latestTokenUsage;
       emitJobEvent(job, "tokenUsage", { tokenUsage: job.latestTokenUsage });
     }
@@ -3619,17 +3779,14 @@ function handleAppServerNotification(rpcMessage) {
   if (rpcMessage.method === "thread/compacted") {
     if (compactJob) {
       emitJobEvent(compactJob, "compacted", { text: "上下文已压缩" });
-      finishCompactJob(compactJob, true).catch((error) => {
-        emitJobEvent(compactJob, "error", { message: error.message || "主动压缩完成状态保存失败" });
-      });
     } else if (turnJob) {
       emitJobEvent(turnJob, "status", { text: "上下文已自动压缩" });
     }
     return;
   }
   if (rpcMessage.method === "turn/started") {
+    if (!owner.turnId) return;
     if (turnJob) {
-      turnJob.turnId = params.turn?.id || turnJob.turnId;
       rememberOwner({ threadId: turnJob.threadId, turnId: turnJob.turnId }, { repoId: turnJob.repoId, sessionId: turnJob.sessionId });
       emitJobEvent(turnJob, "status", { text: "Codex 正在运行 turn..." });
     }
@@ -3642,6 +3799,7 @@ function handleAppServerNotification(rpcMessage) {
     }
     auditAppServerItem(params.item || {}, job, owner);
     if (turnJob) {
+      turnJob.turnUsage.observeItem(params.item);
       const attempt = externalWriteAttempt(params.item, { includeUnverified: turnJob.reviewUnverifiedMcpCalls });
       if (attempt && !turnJob.externalWriteItems.has(attempt.id)) {
         turnJob.externalWriteItems.set(attempt.id, { ...attempt, startedAt: Date.now() });
@@ -3652,7 +3810,7 @@ function handleAppServerNotification(rpcMessage) {
           turnJob.cancelRequested = true;
           emitJobEvent(turnJob, "status", { text: "个人流程遇到未确认只读的连接服务操作，正在中断并等待核对" });
           if (turnJob.threadId && turnJob.turnId) {
-            appServerClientForJob(turnJob).request("turn/interrupt", { threadId: turnJob.threadId, turnId: turnJob.turnId }, 20_000).catch(() => null);
+            requestJobInterruption(turnJob).catch(() => null);
           }
         }
       }
@@ -3681,6 +3839,7 @@ function handleAppServerNotification(rpcMessage) {
   }
   if (rpcMessage.method === "item/completed") {
     const item = params.item || {};
+    if (turnJob) turnJob.turnUsage.observeItem(item);
     if (turnJob && turnJob.externalWriteItems.has(item.id)) {
       const attempt = turnJob.externalWriteItems.get(item.id);
       attempt.status = item.status === "completed" && !item.error ? "completed" : "failed";
@@ -3694,9 +3853,6 @@ function handleAppServerNotification(rpcMessage) {
     if (item.type === "contextCompaction") {
       const target = compactJob || turnJob;
       if (target) emitJobEvent(target, "status", { text: "压缩摘要已生成，正在写回会话..." });
-      if (compactJob) finishCompactJob(compactJob, true).catch((error) => {
-        emitJobEvent(compactJob, "error", { message: error.message || "主动压缩完成状态保存失败" });
-      });
       return;
     }
     if (item.type === "commandExecution" && job) {
@@ -4044,17 +4200,19 @@ function handleAppServerNotification(rpcMessage) {
     return;
   }
   if (rpcMessage.method === "turn/completed") {
+    if (!owner.turnId) return;
     if (compactJob) {
-      finishCompactJob(compactJob, true).catch((error) => {
+      const completed = params.turn?.status === "completed";
+      finishCompactJob(compactJob, completed, completed ? null : params.turn?.error?.message || "原生压缩回合未成功完成").catch((error) => {
         emitJobEvent(compactJob, "error", { message: error.message || "主动压缩完成状态保存失败" });
       });
       return;
     }
     if (turnJob) {
-      turnJob.rawTurnUsage = params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage || turnJob.rawTurnUsage;
+      turnJob.turnUsage.observe(params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage);
       turnJob.latestTokenUsage =
         normalizeTokenUsage(params.tokenUsage || params.turn?.tokenUsage || params.turn?.token_usage) || turnJob.latestTokenUsage;
-      const status = params.turn?.status || "completed";
+      const status = params.turn?.status || "unknown";
       finishTurnJob(turnJob, status === "completed", status === "completed" ? 0 : 1, status === "completed" ? null : status);
     }
     return;
@@ -5352,8 +5510,9 @@ function normalizeAutomationRun(run = {}) {
     worktreePolicy: String(run.worktreePolicy || "none"),
     model: run.model ? String(run.model) : null,
     reasoning: run.reasoning ? String(run.reasoning) : null,
+    ...(run.executionProfile != null ? { executionProfile: normalizeExecutionProfile(run.executionProfile) } : {}),
     prompt: redactAutomationPrompt(run.prompt),
-    usage: run.usage && typeof run.usage === "object" ? run.usage : { status: "unknown", reason: "No per-turn usage snapshot" },
+    usage: normalizeRunUsage(run.usage),
     summary: run.summary ? String(run.summary).slice(0, 4000) : "",
     diffStat: run.diffStat ? String(run.diffStat).slice(0, 4000) : "",
     error: run.error ? String(run.error).slice(0, 2000) : null,
@@ -5460,7 +5619,7 @@ async function requestAutomationRunCancellation(runId, automationId, clientId) {
     if (!clientCanReadRun({ id: clientId }, automationId, current)) {
       throw Object.assign(new Error("Run not found"), { statusCode: 404 });
     }
-    if (["completed", "failed", "canceled", "needs_reconciliation"].includes(current.status)) {
+    if (["completed", "failed", "canceled", "interrupted", "needs_reconciliation"].includes(current.status)) {
       return { run: current, pending: false };
     }
     if (current.status === "canceling") return { run: current, pending: true };
@@ -7048,7 +7207,10 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   const updateRun = (id, patch, event) => appendAutomationRunEvent(id, patch, event, { taskClaim: options.taskClaim });
   const settleRun = (id, patch, event) => appendAutomationRunEventWithRetry(id, patch, event, 3, { taskClaim: options.taskClaim });
   const runId = options.runId || automationRunId(automation.id);
-  const runtime = normalizeRuntime(
+  const executionProfile = automationExecutionProfile(automation);
+  if (options.taskClaim || Object.hasOwn(options, "executionProfile")) assertExecutionProfile(options.executionProfile, executionProfile);
+  if (executionProfile && (repo.kind === "personal" || (options.worktree === false && !options.sessionId))) throw automationRequestError(400, "受限任务必须使用独立工作树");
+  const runtime = profileRuntime(normalizeRuntime(
     {
       model: options.model || automation.model,
       reasoning: options.reasoning || automation.reasoning,
@@ -7057,7 +7219,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       search: typeof options.search === "boolean" ? options.search : true,
     },
     {},
-  );
+  ), executionProfile);
   const prompt = String(options.prompt || automation.prompt || "").trim();
   if (!prompt) throw new Error("Automation prompt is required");
   const completionContractSource = Object.prototype.hasOwnProperty.call(options, "completionContract")
@@ -7074,6 +7236,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   if (heartbeatSessionId && (!heartbeatSession || heartbeatSession.repoId !== repo.id)) {
     throw new Error("Heartbeat session does not belong to this automation repo");
   }
+  if (heartbeatSession && executionProfile) {
+    const durable = externalTaskStore().latest(options.clientId, automation.id, { repoId: repo.id, sessionId: heartbeatSessionId });
+    const source = scopedHeartbeatSource([...(await readAutomationRuns()).runs, ...(durable ? [durable] : [])], { clientId: options.clientId || null, automationId: automation.id, repoId: repo.id, sessionId: heartbeatSessionId });
+    assertProfileSource(executionProfile, source);
+    const executionRepo = await recoveryExecutionRepo(getRepoById(repo.id), source, worktreesRoot);
+    if (await fs.realpath(executionRepo.path) === await fs.realpath(getRepoById(repo.id).path)) throw automationRequestError(409, "受限任务不能在主仓库复用会话");
+    options = { ...options, heartbeatWorktreePath: executionRepo.path, executionPolicy: "detached-worktree" };
+  }
   const client = await assertAutomationClientActive(options.clientId, automation.id);
   const releaseAdmission = runAdmission.reserve(options.clientId || "console", client?.maxConcurrent);
   const useWorktree = heartbeatSession ? false : options.worktree !== false;
@@ -7081,7 +7251,6 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
   let runRecord;
   let job = null;
   let settlementRegistered = false;
-  let modelStartAttempted = false;
   try {
     runRecord = await upsertAutomationRun({
       id: runId,
@@ -7107,6 +7276,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       worktreePolicy: options.executionPolicy || (heartbeatSession ? "existing-thread" : useWorktree ? "detached-worktree" : "repo-cwd"),
       model: runtime.model,
       reasoning: runtime.reasoning,
+      ...(executionProfile ? { executionProfile } : {}),
       prompt,
     }, { type: "queued", text: heartbeatSession ? "Heartbeat turn queued" : "Automation run queued" }, {
       budgetLimit: options.budgetLimit ?? process.env.CODEX_AUTOMATION_DAILY_KNOWN_TOKEN_LIMIT,
@@ -7140,7 +7310,6 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
     }
     const session = heartbeatSession || (await createStoredChatSession(repo.id, `Automation: ${automation.name}`, { makeActive: false }));
     if (options.taskClaim) await assertAutomationClientActive(options.clientId, automation.id);
-    modelStartAttempted = true;
     job = await startTurnJob(runRepo, session, runtime, executionPrompt, [], prompt, {
       makeSessionActive: false,
       requireExistingThread: options.requireExistingThread === true,
@@ -7150,13 +7319,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       maxRuntimeMs: options.maxRuntimeMs,
       imageInputs: [...(options.imageInputs || []), ...prepared.inputs],
       outputSchema: options.outputSchema,
+      executionProfile,
     });
     job.externalTaskClaim = options.taskClaim;
     activeAutomationRuns.set(runId, job);
     if ((await readAutomationRuns()).runs.find((item) => item.id === runId)?.cancelRequestedAt) {
       job.cancelRequested = true;
       if (job.threadId && job.turnId) {
-        appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000).catch(() => null);
+        requestJobInterruption(job).catch(() => null);
       }
     }
     await updateRun(runId, { threadId: job.threadId, sessionId: session.id }, { type: "thread", text: "Started Codex app-server automation thread" });
@@ -7198,7 +7368,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           deliveryError = { code: "original_turn_unavailable", message: "原始回合读取失败，未保存可交付结果" };
         }
       }
-      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && structuredOutput?.status !== "invalid" && !deliveryError;
+      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && !job.profileApprovalDenied && structuredOutput?.status !== "invalid" && !deliveryError;
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const personalKnownWriteObserved = [...job.externalWriteItems.values()].some((item) => !item.unverifiedReadOnly);
@@ -7224,7 +7394,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
         ? `检测到连接服务写入；请在对应服务核对结果，${personalActionDisposition}。`
         : `连接服务操作未声明只读；请核对是否造成外部修改，${personalActionDisposition}。`;
       const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
-      const error = needsExternalReview ? result.externalActionReview.reason
+      const error = job.profileApprovalDenied ? "受限任务请求了额外权限或工具，已拒绝；请核对原任务，不会自动重跑。" : needsExternalReview ? result.externalActionReview.reason
         : personalWriteObserved ? personalExternalActionError
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
           : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : structuredOutput?.error?.message || deliveryError?.message || completion.error || result.error || job.error || "自动化任务失败";
@@ -7232,12 +7402,14 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       await settleRun(
         runId,
         {
-          status: needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
+          status: job.startConfirmationFailed || needsExternalReview || personalWriteObserved || completion.outcome === "artifact-unknown" ? "needs_reconciliation" : canceled ? "canceled" : completed ? "completed" : "failed",
           finishedAt: new Date().toISOString(),
           threadId: job.threadId,
           turnId: job.turnId,
           summary: job.output || "",
-          usage: runUsageFromProtocol(job.rawTurnUsage),
+          usage: job.modelStartAttempted ? result.ok && !job.startConfirmationFailed ? job.turnUsage.snapshot()
+            : { status: "unknown", reason: "回合未确认正常结束，已观察到的请求不能证明全部消耗" }
+            : { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
           ...(structuredOutput ? { structuredOutput } : {}),
           ...(keepResult ? { delivery: delivery || { status: "failed", error: deliveryError || { code: "run_not_completed", message: error || "任务未成功完成，未交付结果" } } } : {}),
           error,
@@ -7289,7 +7461,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       completionOutcome: completionContract ? "turn-failed" : null,
       completionCheckedAt: completionContract ? new Date().toISOString() : null,
       ...(error.inputProcessing ? { inputProcessing: error.inputProcessing } : {}),
-      ...(!modelStartAttempted ? { usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 } } : {}),
+      usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     }, { type: job ? "needs-reconciliation" : "error", text: error.message }).catch(() => null);
     throw error;
   }
@@ -7297,8 +7469,10 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
 
 async function enqueueExternalAutomationRun(automation, repo, options) {
   const results = externalResultStore();
-  const runtime = normalizeRuntime({ model: options.model || automation.model, reasoning: options.reasoning || automation.reasoning,
-    sandbox: options.sandbox || defaultRuntime.sandbox, approval: options.approval || defaultRuntime.approval, search: options.search !== false }, {});
+  const executionProfile = automationExecutionProfile(automation);
+  if (executionProfile && (repo.kind === "personal" || options.worktree === false)) throw automationRequestError(400, "受限任务必须使用独立工作树");
+  const runtime = profileRuntime(normalizeRuntime({ model: options.model || automation.model, reasoning: options.reasoning || automation.reasoning,
+    sandbox: options.sandbox || defaultRuntime.sandbox, approval: options.approval || defaultRuntime.approval, search: options.search !== false }, {}), executionProfile);
   const prompt = String(options.prompt || automation.prompt || "").trim();
   if (!prompt) throw automationRequestError(400, "Automation prompt is required");
   const accepted = await withPublicationLock(publicationLockPath, async () => {
@@ -7311,6 +7485,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
     const run = normalizeAutomationRun({ id: automationRunId(automation.id), automationId: automation.id, repoId: repo.id, name: automation.name,
       trigger: options.trigger, clientId: options.clientId, runner: "app-server", status: "queued", prompt,
       model: runtime.model, reasoning: runtime.reasoning, completionContract: options.completionContract,
+      ...(executionProfile ? { executionProfile } : {}),
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       ...(options.artifactPaths?.length ? { artifactPaths: options.artifactPaths } : {}),
       ...(options.inputFiles?.length ? { inputFiles: options.inputFiles } : {}),
@@ -7318,7 +7493,7 @@ async function enqueueExternalAutomationRun(automation, repo, options) {
       triggerIdempotencyHash: options.triggerIdempotencyHash, triggerRequestHash: options.triggerRequestHash,
       ...mergeAutomationEvents(null, [{ type: "queued", text: "任务已持久接收，等待执行" }]),
     });
-    const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt } },
+    const result = externalTaskStore().accept({ run, execution: { automationId: automation.id, repoId: repo.id, options: { ...options, ...runtime, prompt, executionProfile } },
       keyHash: options.triggerIdempotencyHash, requestHash: options.triggerRequestHash, ttlMs: automationTriggerIdempotencyTtlMs,
       maxQueued: automationMaxQueued,
       callback: callbackTargets.binding(options.clientId,automation.id),
@@ -7365,6 +7540,8 @@ async function drainExternalTasks() {
       try {
         const automation = automations.find((item) => item.id === task.execution.automationId);
         if (!automation || automation.repoId !== task.execution.repoId || automation.personalRoutine) throw new Error("排队任务的自动化配置已变化，请核对后重试");
+        assertExecutionProfile(task.run.executionProfile, task.execution.options?.executionProfile);
+        assertExecutionProfile(task.run.executionProfile, automationExecutionProfile(automation));
         await assertAutomationClientActive(task.run.clientId, automation.id);
         const repo = getRepoById(task.execution.repoId);
         handedToRunner = true;
@@ -7484,6 +7661,7 @@ async function recoverInterruptedAutomationRuns() {
       const executionRepo = await recoveryExecutionRepo(repo, runRecord, worktreesRoot);
       const recoveryRun = await startAppServerAutomationRun(automation, executionRepo, {
         executionPolicy: runRecord.worktreePolicy,
+        executionProfile: runRecord.executionProfile ?? null,
         trigger: runRecord.trigger,
         clientId: runRecord.clientId,
         triggerIdempotencyHash: runRecord.triggerIdempotencyHash,
@@ -9798,7 +9976,7 @@ app.get("/api/codex/app-host/status", (req, res) => {
     appHost: client.status(),
     activeTurns: activeTurns.size,
     activeCompactions: activeCompactions.size,
-    activeSourceReads: personalCalendarSource.activeCount(),
+    activeSourceReads: personalSources.reduce((total, source) => total + source.activeCount(), 0),
     activeJobs: activeJobSummaries({ includeEvents: true }),
   });
 });
@@ -10242,9 +10420,12 @@ app.post("/api/codex/turn-interrupt", async (req, res) => {
   const session = await ensureChatSession(repo.id, String(req.body?.sessionId || ""));
   const active = activeTurns.get(`${repo.id}:${session.id}`);
   if (!active) return res.status(409).json({ ok: false, error: "当前没有正在运行的 turn。" });
-  await appServerClientForRepo(repo).request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId }, 20_000);
-  emitJobEvent(active, "status", { text: "已请求打断当前 turn" });
-  res.json({ ok: true, sessionId: session.id, threadId: active.threadId, turnId: active.turnId });
+  active.cancelRequested = true;
+  const awaitingStartReceipt = !active.threadId || !active.turnId;
+  await requestJobInterruption(active);
+  const pending = !active.completed;
+  if (pending && !active.finishing) emitJobEvent(active, "status", { text: awaitingStartReceipt ? "已记录取消，等待启动回执后核对停止结果" : "已请求打断当前 turn" });
+  res.status(pending ? 202 : 200).json({ ok: true, pending, sessionId: session.id, threadId: active.threadId, turnId: active.turnId });
 });
 
 app.get("/api/logs/:name", async (req, res) => {
@@ -10312,6 +10493,8 @@ app.get("/api/chat/search", async (req, res) => {
 
 app.get("/api/chat/sessions", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
+  const limit = chatHistoryLimit(req.query?.limit);
+  const anchor = chatHistoryAnchor(req.query?.anchor);
   const summary = await getRepoSessions(repo.id, { timeout: appServerFastReadTimeoutMs, requireAppServerSync: false });
   const requestedSessionId = String(req.query?.sessionId || "");
   if (!summary.ok) {
@@ -10366,6 +10549,7 @@ app.get("/api/chat/sessions", async (req, res) => {
     : summary.activeSessionId
       ? await resolveChatSessionForRead(repo.id, summary.activeSessionId, { strictHint: true })
       : null;
+  if (requestedSessionId && !active) return res.status(404).json({ ok: false, repoId: repo.id, error: "当前项目中未找到该会话" });
   if (!active) {
     return res.json({
       ok: true,
@@ -10382,7 +10566,7 @@ app.get("/api/chat/sessions", async (req, res) => {
   if (active.codexSessionId) {
     await refreshSessionRuntimeFromAppServer(repo, active, { timeout: appServerFastReadTimeoutMs }).catch(() => active);
   }
-  const messages = await getChatMessages(repo.id, active.id, { timeout: appServerFastReadTimeoutMs });
+  const history = await getChatHistory(repo.id, active.id, { timeout: appServerFastReadTimeoutMs, limit, ...(anchor ? { anchor } : {}) });
   const refreshedSummary = await getRepoSessions(repo.id, { sync: false });
   const activeIsAppServer = Boolean(active.codexSessionId);
   res.json({
@@ -10394,7 +10578,7 @@ app.get("/api/chat/sessions", async (req, res) => {
     sessionListAuthoritative: summary.authoritative === true,
     activeSessionId: active.id,
     sessions: refreshedSummary.sessions,
-    messages,
+    ...history,
   });
 });
 
@@ -10415,6 +10599,8 @@ app.post("/api/chat/sessions", async (req, res) => {
 
 app.post("/api/chat/sessions/:id/select", async (req, res) => {
   const repo = getRepoById(req.body?.repoId || req.query?.repoId);
+  const limit = chatHistoryLimit(req.body?.limit);
+  const anchor = chatHistoryAnchor(req.body?.anchor);
   const session = await mutateChatStore((store) => {
     const selected = store.sessions[req.params.id];
     if (!selected || selected.repoId !== repo.id) return null;
@@ -10423,10 +10609,16 @@ app.post("/api/chat/sessions/:id/select", async (req, res) => {
   });
   if (!session || session.repoId !== repo.id) return res.status(404).json({ ok: false, error: "Unknown session" });
   if (session.codexSessionId) await refreshSessionRuntimeFromAppServer(repo, session, { timeout: appServerFastReadTimeoutMs });
-  const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
+  const history = await getChatHistory(repo.id, session.id, { timeout: appServerFastReadTimeoutMs, limit, ...(anchor ? { anchor } : {}) });
   const summary = await getRepoSessions(repo.id, { sync: false, preserveLocalActive: !session.codexSessionId });
-  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, messages });
+  res.json({ ok: true, repoId: repo.id, activeSessionId: session.id, sessions: summary.sessions, ...history });
 });
+
+app.use("/api/personal", personalFeedbackRouter({
+  store: personalFeedbackStore,
+  resolveSession: async id => findStoredSessionByHint(await readChatStore(), personalRepoId, id),
+  readThread: session => getAppServerThreadMessages(session, getRepoById(personalRepoId), { timeout: appServerFastReadTimeoutMs }),
+}));
 
 app.get("/api/chat/sessions/:id/personal-context", async (req, res) => {
   const repo = getRepoById(req.query.repoId);
@@ -10671,9 +10863,7 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
       }
       activeTurn.cancelRequested = true;
       if (activeTurn.threadId && activeTurn.turnId) {
-        await appServerClientForRepo(repo)
-          .request("turn/interrupt", { threadId: activeTurn.threadId, turnId: activeTurn.turnId }, 20_000)
-          .catch(() => null);
+        await requestJobInterruption(activeTurn).catch(() => null);
       }
       await Promise.race([activeTurn.promise, new Promise((resolve) => setTimeout(resolve, 10_000))]);
       if (!activeTurn.completed) {
@@ -10721,6 +10911,8 @@ app.delete("/api/chat/sessions/:id", async (req, res) => {
 
 app.get("/api/chat/history", async (req, res) => {
   const repo = getRepoById(req.query?.repoId);
+  const limit = chatHistoryLimit(req.query?.limit);
+  const anchor = chatHistoryAnchor(req.query?.anchor);
   const resolved = await resolveSyncedChatSessionForRequest(repo, req.query?.sessionId);
   const { session, summary, requestedSessionId } = resolved;
   if (!session && requestedSessionId) return res.status(404).json({ ok: false, repoId: repo.id, error: "Unknown session" });
@@ -10748,13 +10940,13 @@ app.get("/api/chat/history", async (req, res) => {
       messages: [],
     });
   }
-  const messages = await getChatMessages(repo.id, session.id, { timeout: appServerFastReadTimeoutMs });
+  const history = await getChatHistory(repo.id, session.id, { timeout: appServerFastReadTimeoutMs, limit, ...(anchor ? { anchor } : {}) });
   res.json({
     ok: true,
     repoId: repo.id,
     activeSessionId: session.id,
     sessions: (await getRepoSessions(repo.id, { sync: false })).sessions,
-    messages,
+    ...history,
   });
 });
 
@@ -11244,6 +11436,26 @@ app.post("/api/personal/calendar/refresh", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   if (!req.body || Object.keys(req.body).some(key => key !== "timeZone")) return res.status(400).json({ ok: false, error: "只接受当前时区，不允许指定工具、账号或任意日历查询" });
   try { res.json({ ok: true, calendar: await personalCalendarSource.refresh(req.body.timeZone) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.get("/api/personal/mail", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ ok: true, mail: await personalMailSource.snapshot(req.query.timeZone) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/mail/accounts", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).length) return res.status(400).json({ ok: false, error: "账号列表不接受查询或工具参数" });
+  try { res.json({ ok: true, accounts: await personalMailSource.accounts() }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
+app.post("/api/personal/mail/refresh", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body) || Object.keys(req.body).some(key => !["timeZone", "accountId"].includes(key))) return res.status(400).json({ ok: false, error: "只接受当前时区和已连接邮箱标识，不允许指定工具或任意邮件查询" });
+  try { res.json({ ok: true, mail: await personalMailSource.refresh(req.body.timeZone, req.body.accountId) }); }
   catch (error) { sendRouteError(res, error); }
 });
 
@@ -11969,10 +12181,10 @@ app.post("/api/automations/:id/runs/:runId/cancel", async (req, res) => {
   const { run: updated, pending } = await requestAutomationRunCancellation(run.id, req.params.id, req.apiClient.id);
   if (!pending) return res.json({ ok: true, run: externalRunView(updated, req.params.id) });
   const job = activeAutomationRuns.get(run.id);
-  if (job && !job.completed) {
+  if (job && !job.completed && !job.cancelRequested) {
     job.cancelRequested = true;
     if (job.threadId && job.turnId) {
-      appServerClientForJob(job).request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId }, 20_000)
+      requestJobInterruption(job)
         .catch((error) => appendAutomationRunEvent(run.id, {}, { type: "cancel-warning", text: `Interrupt request uncertain: ${error.message}` }, { taskClaim: job.externalTaskClaim }).catch(() => null));
     }
   }
@@ -12079,6 +12291,7 @@ async function submitAutomationTriggerRequest(req, trigger) {
       throw automationRequestError(403, "Heartbeat session is outside this API client's automation scope");
     }
     if (source) {
+      assertExecutionProfile(source.executionProfile, automationExecutionProfile(automation));
       if (source.status !== "completed") {
         throw automationRequestError(409, "Previous run needs review before this session can continue");
       }
@@ -12188,7 +12401,7 @@ const handleDiscovery = createDiscoveryHandler({
   authenticate: (req, token) => apiClientStore.authenticate(token, req.params.id),
   automation: (id) => {
     const item = automations.find((automation) => automation.id === id);
-    return item ? { model: item.model || defaultRuntime.model, reasoning: item.reasoning || defaultRuntime.reasoning } : null;
+    return item ? { model: item.model || defaultRuntime.model, reasoning: item.reasoning || defaultRuntime.reasoning, executionProfile: automationExecutionProfile(item) } : null;
   },
   catalog: async () => (await getModelListForRoute()).data,
   runtime: readDiscoveryRuntime,
@@ -12219,6 +12432,8 @@ app.get("/api/automations/:id/v1/capabilities", (req, res) => handleDiscovery(re
 const handleModelApi = createModelApiHandler({
   authenticate: (req, token) => authenticateAutomationTrigger(req, { token, allowLocalDevelopment: false }),
   submit: (req, body, imageInputs) => {
+    const automation = automations.find(item => item.id === req.params.id);
+    if (automation && automationExecutionProfile(automation) && (req.path.endsWith("/images/generations") || req.body?.tools?.some(tool => tool.type === "image_generation"))) throw automationRequestError(400, "当前受限自动化不支持图片生成；未接收任务或启动模型");
     const internal = Object.assign(Object.create(req), { body, modelApiImageInputs: imageInputs });
     const key = automationTriggerIdempotencyKey(internal, req.params.id, "webhook", req.apiClient.id);
     if (key.error) throw automationRequestError(400, key.error);

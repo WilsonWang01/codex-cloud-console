@@ -1,6 +1,8 @@
 import { normalizeOutputSchema } from "./structured-output.mjs";
 import { normalizeArtifactPaths, resultPath } from "./external-results.mjs";
 import { normalizeInlineAttachments } from "./inline-inputs.mjs";
+import { executionProfileView } from "./automation-execution-profile.mjs";
+import { normalizeRunUsage } from "./run-usage.mjs";
 const triggerFields = new Set(["runner", "prompt", "model", "reasoning", "search", "worktree", "sessionId", "completionContract", "outputSchema", "artifactPaths", "attachments"]);
 const reasoningLevels = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
@@ -13,7 +15,7 @@ export function validateExternalTriggerInput(body = {}, { trigger, scoped }) {
     if (body.worktree === false) invalid("API client runs require a detached worktree");
     if (trigger !== "heartbeat" && Object.hasOwn(body, "sessionId")) invalid("sessionId 仅允许用于 Heartbeat，Webhook 必须创建独立会话");
   }
-  if (Object.hasOwn(body, "sandbox") || Object.hasOwn(body, "approval")) invalid("执行权限由控制台配置，API 不能覆盖 sandbox 或 approval");
+  if (["sandbox", "approval", "executionProfile"].some(field => Object.hasOwn(body, field))) invalid("执行权限由控制台配置，API 不能覆盖 sandbox、approval 或 executionProfile");
   if (body.runner !== undefined && body.runner !== "app-server") invalid("runner 仅支持 app-server");
   for (const field of ["search", "worktree"]) {
     if (body[field] !== undefined && typeof body[field] !== "boolean") invalid(`${field} 必须是布尔值`);
@@ -39,12 +41,13 @@ export function externalRunView(run, automationId) {
     finishedAt: run.finishedAt,
     model: run.model,
     reasoning: run.reasoning,
+    execution: executionProfileView(run.executionProfile),
     completionContract: run.completionContract,
     completionOutcome: run.completionOutcome,
     cancelRequestedAt: run.cancelRequestedAt,
     summary: run.summary,
     error: run.error,
-    usage: run.usage,
+    usage: normalizeRunUsage(run.usage),
     ...(run.inputFiles?.length ? { inputFiles: run.inputFiles } : {}),
     ...(run.inputProcessing ? { inputProcessing: run.inputProcessing } : {}),
     ...(run.callbackDelivery ? { callbackDelivery: run.callbackDelivery } : {}),

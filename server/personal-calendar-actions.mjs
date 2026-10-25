@@ -44,6 +44,8 @@ export async function withCalendarActionConnection({ request, context, onThread 
     const validators = {};
     for (const name of methods) {
       const tool = tools[name], annotations = tool?.annotations;
+      const links = tool?._meta?.link_accounts;
+      if (links != null && (!Array.isArray(links) || links.length !== 1 || links[0]?.link_id !== base.link_id)) throw fail("calendar_account_ambiguous", "日历工具声明了多个账号或账号来源无法确认，未读取或执行操作", 409);
       if (tool?.name !== `google_calendar.${name}` || tool._meta?.connector_id !== base.connector_id || tool._meta?.link_id !== base.link_id ||
           annotations?.readOnlyHint !== (name !== "create_event") || annotations.destructiveHint !== false || (name === "create_event" && annotations.openWorldHint !== true)) throw fail("calendar_contract_changed", "日历工具的账号或权限说明已变化，未执行操作", 409);
       try { validators[name] = ajv.compile(tool.inputSchema); }

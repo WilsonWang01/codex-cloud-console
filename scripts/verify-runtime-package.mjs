@@ -22,8 +22,7 @@ try {
   for (const name of ["package.json", "package-lock.json"]) {
     await fs.copyFile(path.join(projectRoot, name), path.join(root, name));
   }
-  await fs.mkdir(path.join(root, "server"));
-  for (const name of ["pdf-inputs.mjs", "pdf-input-worker.mjs", "inline-inputs.mjs", "run-admission.mjs", "external-automation.mjs", "structured-output.mjs", "external-results.mjs", "safe-file-read.mjs", "personal-calendar.mjs", "personal-calendar-actions.mjs", "personal-calendar-proposals.mjs", "personal-calendar-tool.mjs", "personal-memory.mjs", "approval-broker.mjs", "run-safety.mjs", "run-budget.mjs"]) await fs.copyFile(path.join(projectRoot, "server", name), path.join(root, "server", name));
+  await fs.cp(path.join(projectRoot, "server"), path.join(root, "server"), { recursive: true });
   await fs.mkdir(path.join(root, "scripts"));
   for (const name of ["codex-cloud-mcp.mjs", "external-client-example.mjs"]) await fs.copyFile(path.join(projectRoot, "scripts", name), path.join(root, "scripts", name));
   execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {

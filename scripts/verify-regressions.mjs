@@ -9,6 +9,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
 import { runExternalClient } from "./external-client-example.mjs";
 import { modelApiJsonLimit } from "../server/model-api.mjs";
@@ -21,6 +22,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 const results = [];
+const selectedCheck = process.env.CODEX_CLOUD_REGRESSION_CASE;
 const fixtureClosures = new WeakMap();
 const isolatedProcessGroups = process.platform === "linux";
 
@@ -31,6 +33,7 @@ function spawn(command, args, options) {
 }
 
 async function check(name, task) {
+  if (selectedCheck && name !== selectedCheck) return;
   const startedAt = Date.now();
   await task();
   results.push({ name, ok: true, ms: Date.now() - startedAt });
@@ -140,6 +143,8 @@ import readline from "node:readline";
 if (process.env.FAKE_CAPTURE_CALLBACK_ENV_PATH) fsSync.writeFileSync(process.env.FAKE_CAPTURE_CALLBACK_ENV_PATH, JSON.stringify(Object.keys(process.env).filter(key => key.startsWith("CODEX_CLOUD_CALLBACK_SECRET_"))));
 const initDelay = Number(process.env.FAKE_INIT_DELAY_MS || 0);
 const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
+const queuedNextDelay = Number(process.env.FAKE_QUEUE_NEXT_DELAY_MS || 80);
+if (!Number.isSafeInteger(queuedNextDelay) || queuedNextDelay < 0 || queuedNextDelay > 3000) throw new Error("Invalid fixture queue delay");
 const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
 const threads = [];
 let modelApiText = null;
@@ -147,8 +152,11 @@ let modelApiImages = [];
 let modelApiTurnId = null;
 let modelApiStructured = false;
 let turnSequence = 0;
+let mailSourceSequence = 0;
 const fixtureTurns = new Map();
 const fixtureCwds = new Map();
+const cancelGates = new Map();
+const acceptedApprovals = new Set();
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
 const input = readline.createInterface({ input: process.stdin });
@@ -156,6 +164,7 @@ input.on("line", (line) => {
   const message = JSON.parse(line);
   if (process.env.FAKE_CAPTURE_PATH) fsSync.appendFileSync(process.env.FAKE_CAPTURE_PATH, JSON.stringify(message) + "\\n");
   if (!message.id) return;
+  if (!message.method) { if (message.result?.decision === "accept") acceptedApprovals.add(message.id); return; }
   const send = (payload, delay = 0) => setTimeout(() => {
     if (payload.method === "item/agentMessage/delta") {
       const turn = fixtureTurns.get(payload.params.threadId)?.find(turn => turn.id === payload.params.turnId);
@@ -168,7 +177,33 @@ input.on("line", (line) => {
     process.stdout.write(JSON.stringify(payload) + "\\n");
   }, delay);
   if (message.method === "initialize") return send({ id: message.id, result: { ready: true } }, initDelay);
-  if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: "calendar-ephemeral", ephemeral: true } } });
+  if (process.env.FAKE_EXECUTION_PROFILE === "1") {
+    if (message.method === "config/read") return send({ id: message.id, result: { config: { mcp_servers: { fixture: { command: "fixture", tool_timeout_sec: "" } } } } });
+    if (["thread/start", "thread/resume"].includes(message.method) && message.params.config?.mcp_servers?.fixture?.enabled === false) {
+      const id = message.params.threadId || "thread-profile-" + threads.length;
+      const thread = { id, cwd: message.params.cwd }; threads.push(thread); fixtureCwds.set(id, message.params.cwd);
+      return send({ id: message.id, result: { thread, cwd: message.params.cwd, approvalPolicy: message.params.approvalPolicy,
+        sandbox: { type: "workspaceWrite", writableRoots: [message.params.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true } } });
+    }
+    if (message.method === "mcpServerStatus/list" && message.params.threadId?.startsWith("thread-profile-")) {
+      return send({ id: message.id, result: { data: [{ name: "fixture", runtimeStatus: fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".unsafe-mcp") ? "connected" : "disabled", tools: {} }], nextCursor: null } });
+    }
+  }
+  if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: message.params.serviceName?.includes("mail") ? "mail-ephemeral-" + (++mailSourceSequence) : "calendar-ephemeral", ephemeral: true } } });
+  if (message.method === "mcpServerStatus/list" && String(message.params.threadId || "").startsWith("mail-ephemeral-")) return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: Object.fromEntries(["gmail.search_email_ids", "gmail.read_email"].map(name => [name, {
+    name, annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
+    _meta: { connector_id: "mail", link_id: "mail-one", link_accounts: [{ link_id: "mail-one", profile_email: "one@example.test", link_name: "个人" }, { link_id: "mail-two", profile_email: "two@example.test", link_name: "另一个" }] }
+  }])) }], nextCursor: null } });
+  if (message.method === "mcpServer/tool/call" && String(message.params.threadId || "").startsWith("mail-ephemeral-")) {
+    if (message.params.tool === "gmail.search_email_ids") {
+      send({ id: "mail-unexpected-approval", method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, command: "must-not-run" } });
+      const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".mail-release")
+        ? send({ id: message.id, result: { structuredContent: { message_ids: ["metadata-mail-id"], next_page_token: null } } }) : setTimeout(reply, 10);
+      return reply();
+    }
+    return send({ id: message.id, result: { structuredContent: { id: "metadata-mail-id", threadId: "metadata-thread-id", internalDate: String(Date.now() - 7200000), labelIds: ["INBOX", "UNREAD"],
+      payload: { headers: [{ name: "Subject", value: "HTTP 元信息验收" }, { name: "From", value: "sender@example.test" }], body: { data: "must-not-persist-private-body" } } } } });
+  }
   if (message.method === "mcpServerStatus/list" && message.params.threadId === "calendar-ephemeral") return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: { "google_calendar.search": {
     name: "google_calendar.search", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
     _meta: { connector_id: "calendar", link_id: "synthetic-calendar-account", link_owner_profile: { email: "calendar@example.test" } }
@@ -179,9 +214,9 @@ input.on("line", (line) => {
       ? send({ id: message.id, result: { structuredContent: { events: [], next_page_token: null } } }) : setTimeout(reply, 10);
     return reply();
   }
-  if (message.method === "thread/unsubscribe" && message.params.threadId === "calendar-ephemeral") {
+  if (message.method === "thread/unsubscribe" && (message.params.threadId === "calendar-ephemeral" || String(message.params.threadId || "").startsWith("mail-ephemeral-"))) {
     send({ id: message.id, result: { status: "unsubscribed" } });
-    return send({ method: "thread/closed", params: { threadId: "calendar-ephemeral" } });
+    return send({ method: "thread/closed", params: { threadId: message.params.threadId } });
   }
   if (message.method === "app/list") return send({ id: message.id, result: { data: [{ id: "mail", name: "Mail", isAccessible: true, isEnabled: true, installUrl: "https://chatgpt.com/apps/mail/mail" }], nextCursor: null } });
   if (message.method === "app/installed") return send({ id: message.id, result: { apps: [{ id: "mail", enabled: true, callable: true }, { id: "calendar", enabled: true, callable: true }] } });
@@ -294,6 +329,13 @@ input.on("line", (line) => {
     return reply();
   }
   if (message.method === "thread/resume") {
+    if (process.env.FAKE_TURN_OWNERSHIP === "1" && fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".preflight")) {
+      const previous = fixtureTurns.get(message.params.threadId)?.at(-1)?.id;
+      if (previous) {
+        send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: previous, tokenUsage: { last: { inputTokens: 999999, outputTokens: 1 } } } });
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: previous, status: "completed" } } });
+      }
+    }
     if (message.params?.threadId === "thread-settings-race" && message.params?.model === "gpt-6-sol") {
       const reply = () => fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".runtime-patch-release")
         ? send({ id: message.id, result: { thread: { id: message.params.threadId } } }) : setTimeout(reply, 10);
@@ -318,6 +360,37 @@ input.on("line", (line) => {
     const uniqueTurn = process.pid + "-" + (++turnSequence);
     const turns = fixtureTurns.get(message.params.threadId) || [];
     fixtureTurns.set(message.params.threadId, turns);
+    if (process.env.FAKE_TURN_OWNERSHIP === "1") {
+      if (requestText.includes("uncertain ownership")) return send({ id: message.id, error: { code: -32000, message: "synthetic uncertain start receipt" } });
+      const id = "owned-turn-" + uniqueTurn, old = turns.at(-1)?.id, early = requestText.includes("early ownership");
+      turns.push({ id, nativeKnown: true, items: [{ type: "agentMessage", phase: "final_answer", text: "owned output" }] });
+      send({ id: message.id, result: { turn: { id } } }, early ? 150 : 0);
+      send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id, status: "inProgress" } } }, 10);
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: id, delta: "owned output" } }, 20);
+      if (requestText.includes("approval ownership")) send({ id: "own-approval-" + id, method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: id, itemId: "new-command", command: "synthetic-only" } }, 20);
+      if (requestText.includes("orphan ownership")) send({ id: "orphan-approval-" + id, method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: id, itemId: "orphan-command", command: "synthetic-orphan" } }, 20);
+      if (old) {
+        send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id: old, status: "inProgress" } } }, 25);
+        send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: old, tokenUsage: { last: { inputTokens: 999999, outputTokens: 1 } } } }, 30);
+        send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: old, delta: "STALE OUTPUT MUST NOT APPEAR" } }, 35);
+        send({ id: "stale-approval-" + id, method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: old, itemId: "old-command", command: "must-not-run" } }, 40);
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: old, status: "completed" } } }, 45);
+      }
+      const complete = () => {
+        if (requestText.includes("approval ownership") && !acceptedApprovals.has("own-approval-" + id)) return setTimeout(complete, 20);
+        if (requestText.includes("held ownership") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".release")) return setTimeout(complete, 20);
+        if (requestText.includes("orphan ownership") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".orphan-release")) return setTimeout(complete, 20);
+        if (requestText.includes("delegated usage")) send({ method: "item/started", params: { threadId: message.params.threadId, turnId: id,
+          item: { type: "subAgentActivity", id: "delegate-item-" + id, kind: "started", agentThreadId: "child-" + id, agentPath: "/root/fixture" } } });
+        if (requestText.includes("multi usage")) {
+          send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id, tokenUsage: { total: { inputTokens: 1000, outputTokens: 300 }, last: { inputTokens: 100, outputTokens: 30 } } } });
+          for (let duplicate = 0; duplicate < 2; duplicate++) send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id,
+            tokenUsage: { total: { inputTokens: 1100, outputTokens: 330 }, last: { inputTokens: 100, outputTokens: 30 } } } });
+        } else send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: id, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } } } });
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id, status: "completed" } } }, 10);
+      };
+      setTimeout(complete, 60); return;
+    }
     if (requestText.includes("artifact delivery fixture")) {
       const cwd = fixtureCwds.get(message.params.threadId);
       fsSync.mkdirSync(cwd + "/results", { recursive: true });
@@ -330,15 +403,24 @@ input.on("line", (line) => {
       modelApiImages = requestText.includes("generated output") ? [{ id: "ig-fixture", type: "imageGeneration", status: "completed", failure: null, result: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", revisedPrompt: "图片输出验收" }] : [];
       turns.push({ id: modelApiTurnId, nativeKnown: true, items: [...(modelApiStructured ? [{ type: "agentMessage", phase: "commentary", text: "private non-JSON progress" }] : []),
         { type: "agentMessage", text: modelApiText, ...(modelApiStructured ? { phase: "final_answer" } : {}) }, ...modelApiImages] });
+      if (requestText.includes("profile approval denied")) send({ id: "profile-request-extra", method: "item/commandExecution/requestApproval", params: { threadId: message.params.threadId, turnId: modelApiTurnId, command: "must-not-run" } }, 30);
       send({ id: message.id, result: { turn: { id: modelApiTurnId } } });
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(0, 2) } }, 40);
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: modelApiTurnId, delta: modelApiText.slice(2) } }, 150);
-      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
+      send({ method: "thread/tokenUsage/updated", params: { threadId: message.params.threadId, turnId: modelApiTurnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30, totalTokens: 130 }, last: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } } }, 170);
       send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: modelApiTurnId, status: "completed" } } }, 300);
       return;
     }
     const turnId = (requestText.includes("cancel regression") ? "turn-cancel-regression-" : "turn-regression-") + uniqueTurn;
     turns.push({ id: turnId, items: [] });
+    if (process.env.FAKE_CANCEL_GATES === "1") {
+      cancelGates.set(turnId, { uncertain: requestText.includes("interrupt uncertain"), waiting: false });
+      const receipt = () => {
+        if (requestText.includes("hold start receipt") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".cancel-start-release")) return setTimeout(receipt, 20);
+        send({ id: message.id, result: { turn: { id: turnId } } });
+      };
+      receipt(); return;
+    }
     const progressRegression = requestText.includes("progress regression");
     const queuedFirstRegression = requestText.includes("progress regression queue first");
     const queueRegressionNext = requestText.includes("queue regression next");
@@ -358,7 +440,7 @@ input.on("line", (line) => {
       if (!isTimeout) {
         send({ method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed" } } }, 65);
         send({ method: "thread/tokenUsage/updated", params: {
-          threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+          threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } },
         } }, 75);
         send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: "completed" } } }, 90);
       }
@@ -371,7 +453,7 @@ input.on("line", (line) => {
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
         turn: { id: turnId, status: "completed" },
-      } }, 80);
+      } }, queuedNextDelay);
     } else if (progressRegression) {
       const progressDelays = queuedFirstRegression ? Array.from({ length: 16 }, (_, index) => 150 * (index + 1)) : [150, 300, 450];
       for (const delay of progressDelays) {
@@ -382,7 +464,7 @@ input.on("line", (line) => {
           message: "progress regression activity",
         } }, delay);
       }
-      send({ method: "turn/completed", params: {
+      if (!queuedFirstRegression || process.env.FAKE_HOLD_QUEUE_FIRST !== "1") send({ method: "turn/completed", params: {
         threadId: "thread-regression",
         turn: { id: turnId, status: "completed" },
       } }, queuedFirstRegression ? 2_600 : 650);
@@ -428,14 +510,14 @@ input.on("line", (line) => {
         threadId: message.params?.threadId, turnId, delta: "模拟试运行结果：已核对资料，无外部写入",
       } }, 40);
       send({ method: "thread/tokenUsage/updated", params: {
-        threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 30 } },
+        threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } },
       } }, 60);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
       } }, 80);
     } else if (personalEmptyTestRegression) {
       send({ method: "thread/tokenUsage/updated", params: {
-        threadId: message.params?.threadId, tokenUsage: { last: { inputTokens: 100, outputTokens: 1 } },
+        threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 1 }, last: { inputTokens: 100, outputTokens: 1 } },
       } }, 60);
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId, turn: { id: turnId, status: "completed" },
@@ -456,7 +538,50 @@ input.on("line", (line) => {
     }
     return;
   }
+  if (process.env.FAKE_CANCEL_GATES === "1" && message.method === "review/start") {
+    const turnId = "cancel-review-" + (++turnSequence), threadId = message.params.delivery === "detached" ? "detached-" + turnId : message.params.threadId;
+    cancelGates.set(turnId, { uncertain: false, waiting: false });
+    const receipt = () => {
+      if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".review-start-release-" + message.params.delivery)) return setTimeout(receipt, 20);
+      send({ id: message.id, result: { turn: { id: turnId }, reviewThreadId: threadId } });
+    };
+    receipt(); return;
+  }
+  if (process.env.FAKE_TURN_OWNERSHIP === "1" && message.method === "review/start") {
+    const threadId = message.params.delivery === "detached" ? "detached-review-" + (++turnSequence) : message.params.threadId;
+    const id = "review-owned-" + turnSequence;
+    send({ method: "turn/started", params: { threadId, turn: { id, status: "inProgress" } } });
+    send({ method: "item/agentMessage/delta", params: { threadId, turnId: id, delta: "owned review" } }, 10);
+    send({ method: "turn/completed", params: { threadId, turn: { id, status: "completed" } } }, 20);
+    return send({ id: message.id, result: { turn: { id }, reviewThreadId: threadId } }, 80);
+  }
+  if (process.env.FAKE_TURN_OWNERSHIP === "1" && message.method === "thread/compact/start") {
+    const id = "compact-owned-" + (++turnSequence), threadId = message.params.threadId;
+    const old = fixtureTurns.get(threadId)?.at(-1)?.id;
+    if (old) send({ method: "turn/completed", params: { threadId, turn: { id: old, status: "completed" } } });
+    send({ method: "item/started", params: { threadId, turnId: id, startedAtMs: Date.now(), item: { type: "contextCompaction", id: "compact-item" } } }, 10);
+    send({ id: message.id, result: {} }, 80);
+    const finish = () => {
+      if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".compact-release")) return setTimeout(finish, 20);
+      send({ method: "item/completed", params: { threadId, turnId: id, item: { type: "contextCompaction", id: "compact-item" } } });
+      send({ method: "turn/completed", params: { threadId, turn: { id, status: fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".compact-fail") ? "failed" : "completed" } } }, 20);
+    };
+    setTimeout(finish, 100); return;
+  }
   if (message.method === "turn/interrupt") {
+    const gate = cancelGates.get(message.params?.turnId);
+    if (gate) {
+      send(gate.uncertain ? { id: message.id, error: { code: -32000, message: "Synthetic interruption receipt uncertain" } } : { id: message.id, result: {} });
+      if (!gate.waiting) {
+        gate.waiting = true;
+        const complete = () => {
+          if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".cancel-completion-" + message.params.turnId)) return setTimeout(complete, 20);
+          send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: message.params.turnId, status: "interrupted" } } });
+        };
+        complete();
+      }
+      return;
+    }
     send({ id: message.id, result: {} });
     if (String(message.params?.turnId).startsWith("turn-cancel-regression-")) {
       send({ method: "turn/completed", params: {
@@ -643,9 +768,9 @@ await check("scoped API callback intent survives restart and changed registratio
   await fs.writeFile(config,JSON.stringify([target]),{mode:0o600});
   const port=await freePort(),base=`http://127.0.0.1:${port}`,admin={"content-type":"application/json","x-codex-cloud-token":"callback-admin-fixture-token"};
   const auth=letter=>({"content-type":"application/json",authorization:`Bearer callback-fixture-token-${letter}`});
-  const start=()=>spawn(process.execPath,[path.join(projectRoot,"server/index.mjs")],{cwd:projectRoot,stdio:["ignore","pipe","pipe"],env:{...process.env,NODE_ENV:"production",HOST:"127.0.0.1",PORT:String(port),CODEX_CLOUD_ROOT:cloudRoot,CODEX_STATE_ROOT:stateRoot,CODEX_HOME:path.join(root,".codex"),CODEX_CLOUD_WEBHOOK_TOKEN:admin["x-codex-cloud-token"],CODEX_CLOUD_CALLBACKS_FILE:config,CODEX_CLOUD_CALLBACK_SECRET_FIXTURE:"synthetic-fixture-secret-not-a-real-credential",FAKE_CAPTURE_CALLBACK_ENV_PATH:capturedEnv,CODEX_AUTOMATION_RECOVERY_ENABLED:"0",CODEX_AUTOMATION_MAX_CONCURRENT:"1",CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT:"1",PATH:`${bin}:${process.env.PATH}`}});
+  const start=()=>spawn(process.execPath,[path.join(projectRoot,"server/index.mjs")],{cwd:projectRoot,stdio:["ignore","pipe","pipe"],env:{...process.env,NODE_ENV:"production",HOST:"127.0.0.1",PORT:String(port),CODEX_CLOUD_ROOT:cloudRoot,CODEX_STATE_ROOT:stateRoot,CODEX_HOME:path.join(root,".codex"),CODEX_CLOUD_WEBHOOK_TOKEN:admin["x-codex-cloud-token"],CODEX_CLOUD_CALLBACKS_FILE:config,CODEX_CLOUD_CALLBACK_SECRET_FIXTURE:"synthetic-fixture-secret-not-a-real-credential",FAKE_CAPTURE_CALLBACK_ENV_PATH:capturedEnv,FAKE_HOLD_QUEUE_FIRST:"1",CODEX_AUTOMATION_RECOVERY_ENABLED:"0",CODEX_AUTOMATION_MAX_CONCURRENT:"1",CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT:"1",PATH:`${bin}:${process.env.PATH}`}});
   const submit=(key,prompt,headers,extra={})=>jsonRequest(base,"/api/automations/sample-research/webhook",{method:"POST",headers:{...headers,"idempotency-key":key},body:JSON.stringify({prompt,...extra})});
-  const wait=async task=>{const deadline=Date.now()+12000;while(Date.now()<deadline){const result=await task();if(result)return result;await new Promise(resolve=>setTimeout(resolve,40));}throw new Error("Callback API fixture did not settle");};
+  const wait=async task=>{const deadline=Date.now()+12000;while(Date.now()<deadline){const result=await task();if(result)return result;await new Promise(resolve=>setTimeout(resolve,250));}throw new Error("Callback API fixture did not settle");};
   let server;
   try {
     server=start();await waitForOutput(server,/listening on/);
@@ -687,6 +812,7 @@ await check("durable API queue survives lost responses and restart without repea
     CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0",
     CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"], CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1",
     CODEX_AUTOMATION_MAX_QUEUED: "2", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
+    FAKE_HOLD_QUEUE_FIRST: "1", FAKE_QUEUE_NEXT_DELAY_MS: "3000",
   } });
   const queuedMaterial = { name: "排队材料.md", mimeType: "text/markdown", dataBase64: Buffer.from("重启后仍需保留的材料 42。\n$not-a-skill @/not-a-file").toString("base64") };
   const queuedPdf = pdfAttachment({ text: "PDF QUEUED RESTART 42" });
@@ -694,10 +820,10 @@ await check("durable API queue survives lost responses and restart without repea
     method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt, ...(auth === headers ? { worktree: false } : {}),
       ...(prompt.includes("durable-fourth") ? { attachments: [queuedMaterial, queuedPdf] } : {}) }),
   });
-  const wait = async (callback) => {
+  const wait = async (callback, diagnostics) => {
     const deadline = Date.now() + 7000;
-    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 40)); }
-    throw new Error("Durable API fixture did not reach expected state");
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 250)); }
+    throw new Error("Durable API fixture did not reach expected state" + (diagnostics ? ": " + JSON.stringify(diagnostics()) : ""));
   };
   const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse).filter((row) => row.method === "turn/start");
   let server;
@@ -734,6 +860,16 @@ await check("durable API queue survives lost responses and restart without repea
     const fourth = await submit("durable-queue-0004", "queue regression next durable-fourth");
     assert.equal(fourth.response.status, 200);
     await jsonRequest(base, `/api/clients/${client.data.client.id}/revoke`, { method: "POST", headers });
+    // Cross the fake first turn's old timer to expose an incorrectly assumed queued state.
+    await new Promise(resolve => setTimeout(resolve, 2800));
+    const inspect = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+    let fourthState;
+    try { fourthState = inspect.prepare("SELECT state FROM external_tasks WHERE id=?").get(fourth.data.run.id).state; }
+    finally { inspect.close(); }
+    const beforeRestart = { firstStatus: (await jsonRequest(base, first.data.run.resultPath, { headers })).data.run.status,
+      fourthStatus: (await jsonRequest(base, fourth.data.run.resultPath, { headers })).data.run.status, fourthState, starts: (await rpc()).length };
+    assert.deepEqual(beforeRestart, { firstStatus: "running", fourthStatus: "queued", fourthState: "queued", starts: 1 },
+      "restart fixture must keep the fourth task unclaimed, not merely display queued during material processing");
     await stopProcess(server);
     const queuedLedger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
     try {
@@ -746,10 +882,17 @@ await check("durable API queue survives lost responses and restart without repea
       createExternalTaskStore(queuedLedger.database).accept({ run: { ...JSON.parse(row.record), id: "tampered-input", triggerIdempotencyHash: null, triggerRequestHash: null }, execution, ttlMs: 60000 });
     } finally { queuedLedger.close(); }
     server = start(); await waitForOutput(server, /listening on/);
+    let observed, resultPolls = 0;
+    const recoveryStartedAt = Date.now();
     const completed = await wait(async () => {
       const result = await jsonRequest(base, fourth.data.run.resultPath, { headers });
+      observed = { ...observed, http: result.response.status, retryAfter: result.response.headers.get("retry-after"), polls: ++resultPolls, elapsedMs: Date.now() - recoveryStartedAt,
+        ...(result.data.run ? { status: result.data.run.status, inputProcessing: result.data.run.inputProcessing, error: result.data.run.error } : {}), beforeRestart };
+      assert.equal(result.response.status, 200, "recovery observation failed: " + JSON.stringify(observed));
+      assert.ok(!["failed", "canceled", "interrupted", "needs_reconciliation"].includes(result.data.run?.status), "unclaimed work did not recover: " + JSON.stringify(observed));
       return result.data.run?.status === "completed" ? result.data.run : null;
-    });
+    }, () => observed);
+    assert.ok(resultPolls < 60, "one bounded recovery check must remain within the actual result polling limit");
     assert.equal(completed.id, fourth.data.run.id);
     const replay = await submit("durable-lost-response-0001", "progress regression queue first durable-one");
     assert.equal(replay.data.run.id, first.data.run.id);
@@ -772,6 +915,7 @@ await check("durable API queue survives lost responses and restart without repea
     assert.equal(stored.find((run) => run.id === third.data.run.id).usage.totalTokens, 0);
     const tampered = await wait(async () => {
       const result = await jsonRequest(base, "/api/automations/sample-research/runs/tampered-input", { headers });
+      assert.equal(result.response.status, 200, "tampered input observation must remain within the result polling limit");
       return result.data.run?.status === "failed" ? result.data.run : null;
     });
     assert.equal(tampered.usage.totalTokens, 0);
@@ -782,6 +926,325 @@ await check("durable API queue survives lost responses and restart without repea
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id=?").get(fourth.data.run.id).execution, "{}");
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
     } finally { checked.close(); }
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("cancel retries before and after the start receipt never repeat interruption or invent a stopped result", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-cancel-once-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "cancel-once-fixture-token-123456" };
+  const child = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    FAKE_CAPTURE_PATH: capture, FAKE_CANCEL_GATES: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const wait = async callback => {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); }
+    throw new Error("Cancellation fixture did not reach its explicit gate");
+  };
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  try {
+    await waitForOutput(child, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "cancellation owner", automationIds: ["sample-research"] }) });
+    const other = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "other caller", automationIds: ["sample-research"] }) });
+    assert.equal(client.response.status, 201); assert.equal(other.response.status, 201);
+    const auth = { ...headers, "x-codex-cloud-token": client.data.token };
+    let reviewSessionId;
+    for (const [index, mode] of ["hold start receipt", "interrupt uncertain"].entries()) {
+      const start = await jsonRequest(base, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...auth, "idempotency-key": `cancel-once-event-${index}` }, body: JSON.stringify({ prompt: `cancel regression ${mode}` }) });
+      assert.equal(start.response.status, 200);
+      const route = start.data.run.resultPath;
+      const before = await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        assert.equal(result.response.status, 200);
+        return result.data.run.status === "running" && (await rpc()).some(item => item.method === "turn/start" && JSON.stringify(item.params).includes(mode)) ? result.data.run : null;
+      });
+      const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
+      const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
+      assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST", headers: { ...headers, "x-codex-cloud-token": other.data.token } })).response.status, 404);
+      assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST" })).response.status, 401);
+      const cancel = () => jsonRequest(base, route + "/cancel", { method: "POST", headers: auth });
+      const first = await cancel();
+      assert.equal(first.response.status, 202); assert.equal(first.data.run.status, "canceling");
+      const db = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+      let sessionId;
+      try { sessionId = JSON.parse(db.prepare("SELECT record FROM external_tasks WHERE id=?").get(before.id).record).sessionId; }
+      finally { db.close(); }
+      assert.ok(sessionId);
+      reviewSessionId = sessionId;
+      const consoleStop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId }) });
+      if (index === 0) {
+        const earlyStop = await consoleStop();
+        assert.equal(earlyStop.response.status, 202); assert.equal(earlyStop.data.pending, true);
+        assert.equal((await interrupts()).length, 0, "未绑定回合编号时不能向猜测的回合发送中断");
+        await fs.writeFile(capture + ".cancel-start-release", "release synthetic receipt");
+      }
+      const sent = await wait(async () => (await interrupts())[0]);
+      for (let repeat = 0; repeat < 3; repeat++) {
+        const result = await cancel();
+        assert.equal(result.response.status, 202); assert.equal(result.data.run.status, "canceling");
+        assert.equal(result.data.run.cancelRequestedAt, first.data.run.cancelRequestedAt);
+      }
+      const concurrent = await Promise.all([cancel(), cancel()]);
+      for (const result of concurrent) {
+        assert.equal(result.response.status, 202); assert.equal(result.data.run.status, "canceling");
+        assert.equal(result.data.run.cancelRequestedAt, first.data.run.cancelRequestedAt);
+      }
+      const webStop = await consoleStop();
+      assert.equal(webStop.response.status, index === 0 ? 202 : 500);
+      if (index === 0) assert.equal(webStop.data.pending, true);
+      assert.equal((await interrupts()).length, 1, "原生停止回执尚未到达时，重复取消不能重复发送中断");
+      if (index === 1) await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        return result.data.events?.some(event => event.type === "cancel-warning");
+      });
+      const pending = await jsonRequest(base, route, { headers: auth });
+      assert.equal(pending.data.run.status, "canceling"); assert.equal(pending.data.run.finishedAt, null);
+      assert.equal(pending.data.events.filter(event => event.type === "cancel-requested").length, 1);
+      assert.equal(pending.data.events.filter(event => event.type === "cancel-warning").length, index);
+      await fs.writeFile(capture + ".cancel-completion-" + sent.params.turnId, "release synthetic stop");
+      const stopped = await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        return result.data.run.status === "canceled" ? result.data.run : null;
+      });
+      assert.equal(stopped.id, before.id); assert.equal(stopped.usage.status, "unknown");
+      assert.equal((await cancel()).response.status, 200);
+      assert.equal((await interrupts()).length, 1);
+    }
+    for (const delivery of ["inline", "detached"]) {
+      const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
+      const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
+      const review = await fetch(base + "/api/codex/review/stream", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId: reviewSessionId, delivery }), signal: AbortSignal.timeout(15000) });
+      const started = await wait(async () => (await rpc()).find(item => item.method === "review/start" && item.params.delivery === delivery));
+      const stop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId: reviewSessionId }) });
+      const early = await stop();
+      assert.equal(early.response.status, 202); assert.equal(early.data.pending, true);
+      assert.equal((await interrupts()).length, 0);
+      await fs.writeFile(capture + ".review-start-release-" + delivery, "release synthetic review receipt");
+      const sent = await wait(async () => (await interrupts())[0]);
+      assert.equal(sent.params.threadId, delivery === "detached" ? "detached-" + sent.params.turnId : started.params.threadId);
+      for (const result of await Promise.all([stop(), stop()])) {
+        assert.equal(result.response.status, 202); assert.equal(result.data.pending, true);
+      }
+      assert.equal((await interrupts()).length, 1);
+      await fs.writeFile(capture + ".cancel-completion-" + sent.params.turnId, "release synthetic review stop");
+      const events = await review.text();
+      assert.match(events, /event: done/); assert.match(events, /"ok":false/); assert.doesNotMatch(events, /"ok":true/);
+    }
+    assert.equal((await rpc()).filter(item => item.method === "turn/start").length, 2, "重复取消不能创建新模型回合");
+    assert.equal((await rpc()).filter(item => item.method === "review/start").length, 2);
+  } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("old turn notifications and approvals cannot complete, charge or corrupt a new API heartbeat before or after its start receipt", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-turn-ownership-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "ownership-fixture-token-123456" };
+  const server = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    FAKE_CAPTURE_PATH: capture, FAKE_TURN_OWNERSHIP: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const wait = async callback => {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 30)); }
+    throw new Error("Turn ownership fixture timed out");
+  };
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  try {
+    await waitForOutput(server, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "ownership fixture", automationIds: ["sample-research"] }) });
+    const auth = { ...headers, "x-codex-cloud-token": client.data.token };
+    const submit = (key, prompt, trigger = "heartbeat") => jsonRequest(base, `/api/automations/sample-research/${trigger}`, { method: "POST", headers: { ...auth, "idempotency-key": key }, body: JSON.stringify({ prompt }) });
+    const read = async run => {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const result = await jsonRequest(base, run.resultPath, { headers: auth });
+      assert.equal(result.response.status, 200, String(result.data.error || "Result polling failed"));
+      return result.data.run;
+    };
+    const completed = run => wait(async () => { const value = await read(run); return value.status === "completed" ? value : null; });
+    const first = await submit("owned-first-0001", "first ownership", "webhook");
+    const one = await completed(first.data.run); assert.equal(one.usage.totalTokens, 130);
+    for (const [index, prompt] of ["held ownership", "early ownership", "preflight ownership"].entries()) {
+      if (prompt.startsWith("preflight")) await fs.writeFile(capture + ".preflight", "inject");
+      const next = await submit("owned-next-000" + (index + 2), prompt);
+      assert.equal(next.response.status, 200);
+      await wait(async () => (await rpc()).filter(row => row.method === "turn/start").length === index + 2);
+      if (prompt.startsWith("held")) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        assert.equal((await read(next.data.run)).status, "running", "old completion must not terminate the new turn");
+        const approvals = await jsonRequest(base, "/api/approvals", { headers });
+        assert.equal(approvals.data.pending.length, 0, "stale permissions must never enter human approval");
+        await fs.writeFile(capture + ".release", "finish");
+      }
+      const done = await completed(next.data.run);
+      assert.equal(done.usage.totalTokens, 130); assert.equal(done.summary, "owned output");
+      assert.equal((await rpc()).filter(row => row.method === "turn/start").length, index + 2, "no alternate thread or model replay");
+    }
+    const requests = await rpc();
+    const stale = requests.filter(row => String(row.id).startsWith("stale-approval-") && !row.method);
+    assert.equal(stale.length, 3); assert.equal(stale.every(row => row.result?.decision === "decline" || row.error), true);
+    const orphan = await submit("owned-orphan-0005", "orphan ownership");
+    const orphanApproval = await wait(async () => { const value = await jsonRequest(base, "/api/approvals", { headers }); return value.data.pending.find(item => item.params.command === "synthetic-orphan"); });
+    await fs.writeFile(capture + ".orphan-release", "finish");
+    assert.equal((await completed(orphan.data.run)).usage.totalTokens, 130);
+    assert.equal((await jsonRequest(base, "/api/approvals", { headers })).data.pending.length, 0);
+    const expired = await jsonRequest(base, `/api/approvals/${orphanApproval.id}/decision`, { method: "POST", headers, body: JSON.stringify({ decision: "accept", digest: orphanApproval.digest }) });
+    assert.equal(expired.response.status, 410);
+    const approval = await submit("owned-approval-0006", "early approval ownership");
+    const pending = await wait(async () => { const value = await jsonRequest(base, "/api/approvals", { headers }); return value.data.pending.find(item => String(item.params.command) === "synthetic-only"); });
+    assert.equal(pending.owner.repoId, "sample-app");
+    const accepted = await jsonRequest(base, `/api/approvals/${pending.id}/decision`, { method: "POST", headers, body: JSON.stringify({ decision: "accept", digest: pending.digest }) });
+    assert.equal(accepted.response.status, 200);
+    assert.equal((await completed(approval.data.run)).usage.totalTokens, 130);
+    const sessionId = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs.find(run => run.id === approval.data.run.id).sessionId;
+    let compactSettled = false;
+    const compact = jsonRequest(base, "/api/codex/thread-compact", { method: "POST", headers, body: JSON.stringify({ repoId: "sample-app", sessionId }) }).then(result => { compactSettled = true; return result; });
+    await wait(async () => (await rpc()).some(row => row.method === "thread/compact/start"));
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(compactSettled, false, "old turn completion must not finish a new compaction");
+    await fs.writeFile(capture + ".compact-release", "finish");
+    assert.equal((await compact).response.status, 200);
+    await fs.writeFile(capture + ".compact-fail", "failed");
+    assert.equal((await jsonRequest(base, "/api/codex/thread-compact", { method: "POST", headers, body: JSON.stringify({ repoId: "sample-app", sessionId }) })).response.status, 500);
+    for (const delivery of ["inline", "detached"]) {
+      const review = await fetch(base + "/api/codex/review/stream", { method: "POST", headers, body: JSON.stringify({ repoId: "sample-app", sessionId, delivery }), signal: AbortSignal.timeout(5000) });
+      const events = await review.text();
+      assert.match(events, /owned review/); assert.match(events, /"ok":true/);
+    }
+    const uncertain = await submit("owned-uncertain-0007", "uncertain ownership");
+    const unknown = await wait(async () => { const run = await read(uncertain.data.run); return run.status === "needs_reconciliation" ? run : null; });
+    assert.equal(unknown.usage.status, "unknown");
+    assert.equal((await submit("owned-uncertain-0007", "uncertain ownership")).data.run.id, unknown.id);
+    const multi = await submit("owned-multi-usage-0008", "multi usage ownership", "webhook");
+    const multiDone = await completed(multi.data.run);
+    assert.equal(multiDone.usage.totalTokens, 260);
+    assert.equal(multiDone.usage.source, "app-server:turn-counter-delta");
+    const delegated = await submit("owned-delegated-usage-0009", "delegated usage ownership", "webhook");
+    const delegatedDone = await completed(delegated.data.run);
+    assert.equal(delegatedDone.usage.status, "unknown");
+    assert.match(delegatedDone.usage.reason, /独立协作/);
+    const usageDetails = await jsonRequest(base, "/api/clients/usage", { headers });
+    assert.equal(usageDetails.response.status, 200);
+    assert.match(usageDetails.data.runs.find(run => run.id === delegatedDone.id).usage.reason, /独立协作/);
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("operator execution policy is pinned through API acceptance, continuation and restart and refuses unsafe native runtime before inference", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-api-profile-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const directory of [repo, stateRoot, bin]) await fs.mkdir(directory, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "profile-fixture-token-123456" };
+  const profile = "workspace-restricted-v1";
+  let apiHeaders = headers;
+  const automation = { id: "restricted", name: "Restricted fixture", repoId: "sample-app", mode: "on-demand", prompt: "model api regression", model: "gpt-6-sol", reasoning: "medium", executionProfile: profile };
+  const start = (executionProfile = profile) => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture,
+    CODEX_CLOUD_AUTOMATIONS_CONFIG_B64: Buffer.from(JSON.stringify([{ ...automation, executionProfile }])).toString("base64"), FAKE_EXECUTION_PROFILE: "1", FAKE_HOLD_QUEUE_FIRST: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const submit = (key, prompt, extra = {}, trigger = "webhook") => jsonRequest(base, `/api/automations/restricted/${trigger}`, {
+    method: "POST", headers: { ...apiHeaders, "idempotency-key": key }, body: JSON.stringify({ prompt, ...extra }),
+  });
+  const wait = async callback => {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 40)); }
+    throw new Error("Execution profile fixture timed out");
+  };
+  const terminal = run => wait(async () => {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { response, data } = await jsonRequest(base, run.resultPath, { headers: apiHeaders });
+    assert.equal(response.status, 200, "profile result observation must not exhaust result queries");
+    return ["completed", "failed"].includes(data.run?.status) ? data.run : null;
+  });
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  let server;
+  try {
+    server = start(); await waitForOutput(server, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "profile-only-fixture", automationIds: ["restricted"] }) });
+    assert.equal(client.response.status, 201);
+    apiHeaders = { ...headers, "x-codex-cloud-token": client.data.token };
+    const caps = await jsonRequest(base, "/api/automations/restricted/v1/capabilities", { headers: apiHeaders });
+    assert.equal(caps.data.execution.profile, profile); assert.equal(caps.data.features.image_output.supported, false);
+    for (const extra of [{ worktree: false }, { executionProfile: null }, { sandbox: "danger-full-access" }]) assert.equal((await submit("profile-invalid-0001", "must-not-start", extra)).response.status, 400);
+    for (const [route, body] of [["images/generations", { prompt: "generated output" }], ["responses", { input: "generated output", tools: [{ type: "image_generation" }] }]]) {
+      const result = await jsonRequest(base, `/api/automations/restricted/v1/${route}`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + client.data.token, "idempotency-key": "profile-image-0001" }, body: JSON.stringify({ model: "gpt-6-sol", ...body }) });
+      assert.equal(result.response.status, 400); assert.match(result.data.error.message, /受限自动化/);
+    }
+    assert.equal((await rpc()).filter(row => row.method === "turn/start").length, 0);
+    const first = await submit("profile-success-0001", "model api regression restricted first", { model: "gpt-6-astra", reasoning: "ultra", search: true });
+    assert.equal(first.response.status, 200);
+    const done = await terminal(first.data.run); assert.equal(done.status, "completed"); assert.equal(done.execution.profile, profile);
+    const replay = await submit("profile-success-0001", "model api regression restricted first", { model: "gpt-6-astra", reasoning: "ultra", search: true });
+    assert.equal(replay.data.run.id, done.id);
+    const continued = await submit("profile-heartbeat-0002", "model api regression restricted continued", {}, "heartbeat");
+    assert.equal((await terminal(continued.data.run)).status, "completed");
+    let requests = await rpc();
+    const turn = requests.find(row => row.method === "turn/start");
+    assert.equal(turn.params.model, "gpt-6-astra"); assert.equal(turn.params.effort, "ultra");
+    assert.deepEqual(turn.params.sandboxPolicy, { type: "workspaceWrite", writableRoots: [turn.params.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
+    assert.equal(turn.params.approvalPolicy, "never");
+    assert.ok(requests.some(row => row.method === "thread/resume" && row.params.config?.mcp_servers?.fixture?.enabled === false));
+    const beforeUnsafe = requests.filter(row => row.method === "turn/start").length;
+    await fs.writeFile(capture + ".unsafe-mcp", "unsafe");
+    const unsafe = await submit("profile-unsafe-0003", "must-not-start unsafe connector");
+    const rejected = await terminal(unsafe.data.run);
+    assert.equal(rejected.status, "failed"); assert.equal(rejected.usage.totalTokens, 0); assert.equal(rejected.usage.source, "not-started");
+    assert.equal((await rpc()).filter(row => row.method === "turn/start").length, beforeUnsafe);
+    await fs.rm(capture + ".unsafe-mcp");
+    const approval = await submit("profile-approval-0004", "model api regression profile approval denied");
+    const declined = await terminal(approval.data.run);
+    assert.equal(declined.status, "failed"); assert.match(declined.error, /额外权限/);
+    assert.ok((await rpc()).some(row => row.id === "profile-request-extra" && row.result?.decision === "decline"));
+    const holding = await submit("profile-holding-0005", "progress regression queue first held");
+    await wait(async () => (await rpc()).some(row => row.method === "turn/start" && JSON.stringify(row.params).includes("queue first held")));
+    const restored = await submit("profile-restored-0006", "model api regression same profile after restart");
+    assert.equal(restored.data.run.status, "queued");
+    await stopProcess(server);
+    server = start(); await waitForOutput(server, /listening on/);
+    assert.equal((await terminal(restored.data.run)).status, "completed");
+    assert.equal((await jsonRequest(base, holding.data.run.resultPath, { headers: apiHeaders })).data.run.status, "needs_reconciliation");
+    await submit("profile-holding-0007", "progress regression queue first held again");
+    await wait(async () => (await rpc()).some(row => row.method === "turn/start" && JSON.stringify(row.params).includes("held again")));
+    const queued = await submit("profile-change-0008", "model api regression must-not-start after config change");
+    assert.equal(queued.data.run.status, "queued");
+    await stopProcess(server);
+    const ledger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+    try {
+      const row = ledger.database.prepare("SELECT record,execution FROM external_tasks WHERE id=?").get(queued.data.run.id);
+      assert.equal(JSON.parse(row.record).executionProfile, profile); assert.equal(JSON.parse(row.execution).options.executionProfile, profile);
+    } finally { ledger.close(); }
+    server = start(null); await waitForOutput(server, /listening on/);
+    const changed = await terminal(queued.data.run);
+    assert.equal(changed.status, "failed"); assert.equal(changed.usage.totalTokens, 0); assert.match(changed.error, /执行策略/);
+    assert.equal((await submit("profile-success-0001", "model api regression restricted first", { model: "gpt-6-astra", reasoning: "ultra", search: true })).data.run.id, done.id);
+    assert.equal((await jsonRequest(base, holding.data.run.resultPath, { headers: apiHeaders })).data.run.status, "needs_reconciliation");
+    requests = await rpc();
+    assert.equal(requests.some(row => row.method === "turn/start" && JSON.stringify(row.params).includes("after config change")), false);
+    const policyMismatch = await submit("profile-mismatch-0009", "must-not-start legacy heartbeat", {}, "heartbeat");
+    assert.equal(policyMismatch.response.status, 409);
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -816,7 +1279,7 @@ await check("independent clients retrieve private exact-turn files and images af
     const inputImage = { name: "image.png", mimeType: "image/png", dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC" };
     const inputPdf = pdfAttachment({ text: "PDF CLIENT MATERIAL 42" });
     const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"], attachments: [material, inputImage, inputPdf] };
-    const options = { automationId: "sample-research", origin, token, pollMs: 50, timeoutMs: 10000, requestTimeoutMs: 3000 };
+    const options = { automationId: "sample-research", origin, token, timeoutMs: 10000, requestTimeoutMs: 3000 };
     const lost = await fetch(origin + "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ runner: "app-server", worktree: true, ...input }) });
     assert.equal(lost.status, 200); await lost.body.cancel();
     const run = await runExternalClient({ ...options, command: "submit", eventId: "file-delivery-0001", input, wait: true });
@@ -915,14 +1378,20 @@ await check("independent clients retrieve private exact-turn files and images af
     assert.equal(JSON.stringify(badRun.data).includes("PRIVATE PDF CONTENT"), false);
     assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, 2);
     const waitClaimed = async (accepted, auth) => {
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const snapshot = (await jsonRequest(origin, accepted.resultPath, { headers: auth })).data.run;
-        if (snapshot?.executionStartedAt) {
-          assert.equal(snapshot.inputProcessing, undefined, "the test must act while PDF conversion is still pending");
-          return;
+      const db = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+      try {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const row = db.prepare("SELECT record FROM external_tasks WHERE id=?").get(accepted.id);
+          if (row && JSON.parse(row.record).executionStartedAt) {
+            const result = await jsonRequest(origin, accepted.resultPath, { headers: auth });
+            assert.equal(result.response.status, 200, "PDF phase observation must not exhaust result queries");
+            assert.ok(result.data.run.executionStartedAt);
+            assert.equal(result.data.run.inputProcessing, undefined, "the test must act while PDF conversion is still pending");
+            return;
+          }
+          await new Promise(resolve => setTimeout(resolve, 5));
         }
-        await new Promise(resolve => setTimeout(resolve, 5));
-      }
+      } finally { db.close(); }
       throw new Error("PDF task was not claimed");
     };
     const canceledPdf = await runExternalClient({ ...options, command: "submit", eventId: "pdf-cancel-0002", input: { prompt: "must not start", attachments: [inputPdf] } });
@@ -1592,7 +2061,7 @@ await check("external automation interrupted by restart waits for reconciliation
   }
 });
 
-await check("calendar source HTTP is explicit, read-only, durable and protected from cross-site requests and approvals", async () => {
+await check("calendar and mail sources are explicit, account-bound, durable and protected from cross-site requests and approvals", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-calendar-"));
   const fake = await writeFakeCodex(root), cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
   const capture = path.join(root, "requests.jsonl"), port = await freePort(), base = `http://127.0.0.1:${port}`;
@@ -1614,6 +2083,16 @@ await check("calendar source HTTP is explicit, read-only, durable and protected 
     assert.equal((await captured().catch(() => [])).filter(item => item.method === "mcpServer/tool/call").length, 0);
     const invalid = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC", tool: "write" }) });
     assert.equal(invalid.response.status, 400);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.snapshot, null);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC")).response.status, 200, "the trusted loopback backend is behind Caddy admin authentication, not a public token endpoint");
+    const accountsRequest = { method: "POST", headers, body: "{}" };
+    assert.equal((await jsonRequest(base, "/api/personal/mail/accounts", { ...accountsRequest, headers: { ...headers, origin: "https://untrusted.example.test" } })).response.status, 403);
+    assert.equal((await jsonRequest(base, "/api/personal/mail/refresh", { ...accountsRequest, headers: { ...headers, "sec-fetch-site": "cross-site" } })).response.status, 403);
+    assert.equal((await jsonRequest(base, "/api/personal/mail/accounts", accountsRequest)).data.accounts.length, 2);
+    assert.equal((await captured()).filter(item => item.method === "mcpServer/tool/call").length, 0, "mail account discovery never reads data");
+    for (const body of [{ timeZone: "UTC" }, { timeZone: "UTC", accountId: "mail-two", query: "anywhere" }, { timeZone: "UTC", accountId: "not/valid" }]) {
+      assert.equal((await jsonRequest(base, "/api/personal/mail/refresh", { method: "POST", headers, body: JSON.stringify(body) })).response.status, 400);
+    }
     const refreshing = jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC" }) });
     refreshing.catch(() => null);
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -1622,21 +2101,41 @@ await check("calendar source HTTP is explicit, read-only, durable and protected 
     }
     const during = await jsonRequest(base, "/api/codex/app-host/status", { headers });
     assert.equal(during.data.activeSourceReads, 1); assert.deepEqual(during.data.activeJobs, []);
+    const mailRefreshing = jsonRequest(base, "/api/personal/mail/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC", accountId: "mail-two" }) });
+    mailRefreshing.catch(() => null);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await captured()).some(item => item.method === "mcpServer/tool/call" && item.params.tool === "gmail.search_email_ids")) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.equal((await jsonRequest(base, "/api/codex/app-host/status", { headers })).data.activeSourceReads, 2);
     await fs.writeFile(capture + ".calendar-release", "release fixture only");
     const done = await refreshing;
     assert.equal(done.response.status, 200); assert.equal(done.data.calendar.stale, false); assert.deepEqual(done.data.calendar.snapshot.items, []);
     assert.equal(done.response.headers.get("cache-control"), "no-store");
+    await fs.writeFile(capture + ".mail-release", "release fixture only");
+    const mailDone = await mailRefreshing;
+    assert.equal(mailDone.data.mail.snapshot.account.email, "two@example.test");
+    assert.equal(mailDone.data.mail.snapshot.items[0].title, "HTTP 元信息验收");
+    assert.equal((await jsonRequest(base, "/api/codex/app-host/status", { headers })).data.activeSourceReads, 0);
     const native = await captured();
-    assert.equal(native.filter(item => item.method === "mcpServer/tool/call").length, 1);
+    assert.equal(native.filter(item => item.method === "mcpServer/tool/call").length, 3);
+    const mailCalls = native.filter(item => item.method === "mcpServer/tool/call" && item.params.tool.startsWith("gmail."));
+    assert.equal(mailCalls.length, 2); assert.ok(mailCalls.every(item => item.params.arguments.link_id === "mail-two"));
+    assert.equal(mailCalls[1].params.arguments.format, "metadata");
     assert.equal(native.some(item => item.method === "turn/start"), false);
     assert.ok(native.find(item => item.id === "calendar-unexpected-approval")?.error);
+    assert.ok(native.find(item => item.id === "mail-unexpected-approval")?.error);
     const stateFile = path.join(stateRoot, "personal-calendar-source.json"), preserved = await fs.readFile(stateFile, "utf8");
+    const mailStateFile = path.join(stateRoot, "personal-mail-source.json"), mailPreserved = await fs.readFile(mailStateFile, "utf8");
+    assert.equal(mailPreserved.includes("must-not-persist-private-body"), false);
     const history = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8").catch(() => '{"sessions":{}}'));
     assert.equal(Object.keys(history.sessions).length, 0, "ephemeral source is not a console conversation");
     await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
     const restored = await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers });
     assert.equal(restored.data.calendar.snapshot.version, done.data.calendar.snapshot.version);
     assert.equal(await fs.readFile(stateFile, "utf8"), preserved);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.snapshot.version, mailDone.data.mail.snapshot.version);
+    assert.equal(await fs.readFile(mailStateFile, "utf8"), mailPreserved);
     const oversized = "x".repeat(1024 * 1024 + 1);
     await fs.writeFile(stateFile, oversized);
     assert.equal((await jsonRequest(base, "/api/personal/calendar?timeZone=UTC", { headers })).response.status, 503);
@@ -1648,6 +2147,9 @@ await check("calendar source HTTP is explicit, read-only, durable and protected 
     await fs.writeFile(stateFile, '{"version":99,"preserve":"invalid fixture"}');
     const broken = await jsonRequest(base, "/api/personal/calendar/refresh", { method: "POST", headers, body: JSON.stringify({ timeZone: "UTC" }) });
     assert.equal(broken.response.status, 503); assert.equal(JSON.parse(await fs.readFile(stateFile, "utf8")).preserve, "invalid fixture");
+    await fs.unlink(mailStateFile); await fs.symlink(capture, mailStateFile);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).response.status, 503);
+    assert.equal((await fs.lstat(mailStateFile)).isSymbolicLink(), true);
   } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
@@ -3481,19 +3983,37 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     }
     const legacyRunPath = path.join(stateRoot, "automation-runs.json");
     const legacyRunStore = JSON.parse(await fs.readFile(legacyRunPath, "utf8"));
-    const legacyCanceled = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
-    legacyCanceled.status = "cancelled";
+    const legacySource = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
+    const legacyTerminals = ["cancelled", "interrupted", "needs_reconciliation", "completed", "failed"].map((status) => ({
+      ...legacySource, id: `legacy-terminal-${status}`, status,
+      ...(["interrupted", "needs_reconciliation"].includes(status) ? { usage: { status: "unknown", reason: "合成旧任务未确认用量" } } : {}),
+    }));
+    legacyRunStore.runs.push(...legacyTerminals);
     await fs.writeFile(legacyRunPath, JSON.stringify(legacyRunStore));
     const legacyBytes = await fs.readFile(legacyRunPath, "utf8");
+    const terminalDatabase = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+    try {
+      for (const run of legacyTerminals) assert.equal(terminalDatabase.prepare("SELECT id FROM external_tasks WHERE id=?").get(run.id), undefined, "旧记录不能被持久任务同 ID 覆盖而虚假通过");
+    } finally { terminalDatabase.close(); }
+    const foreignLegacyClient = await jsonRequest(baseUrl, "/api/clients", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "legacy-terminal-other-client", automationIds: ["sample-on-demand"] }) });
+    assert.equal(foreignLegacyClient.response.status, 201);
     const rpcBeforeLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
-    const legacyResult = await jsonRequest(baseUrl, cancelStart.data.run.resultPath, { headers: { "x-codex-cloud-token": competingClient.data.token } });
-    assert.equal(legacyResult.data.run.status, "canceled");
-    assert.equal(legacyResult.data.run.id, canceledRun.id);
-    const legacyCancelAgain = await jsonRequest(baseUrl, `${cancelStart.data.run.resultPath}/cancel`, {
-      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
-    });
-    assert.equal(legacyCancelAgain.response.status, 200);
-    assert.equal(legacyCancelAgain.data.run.status, "canceled");
+    for (const run of legacyTerminals) {
+      const route = `/api/automations/${run.automationId}/runs/${run.id}`, expected = run.status === "cancelled" ? "canceled" : run.status;
+      const legacyResult = await jsonRequest(baseUrl, route, { headers: { "x-codex-cloud-token": competingClient.data.token } });
+      assert.equal(legacyResult.response.status, 200); assert.equal(legacyResult.data.run.status, expected);
+      if (["interrupted", "needs_reconciliation"].includes(run.status)) {
+        assert.equal(legacyResult.data.run.usage.status, "unknown"); assert.equal(legacyResult.data.run.usage.totalTokens, undefined);
+      }
+      for (let repeat = 0; repeat < 2; repeat++) {
+        const result = await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token } });
+        assert.equal(result.response.status, 200, `旧终态 ${run.status} 的重复取消应返回原记录`);
+        assert.deepEqual(result.data.run, legacyResult.data.run, "取消不是将旧终态改写成成功或已取消");
+      }
+      assert.equal((await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST", headers: { "x-codex-cloud-token": foreignLegacyClient.data.token } })).response.status, 404, "其他调用方不能操作旧记录");
+      assert.equal((await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST" })).response.status, 401);
+    }
     assert.equal(await fs.readFile(legacyRunPath, "utf8"), legacyBytes, "查询和重复取消不触发旧数据重写");
     const rpcAfterLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
     assert.equal(rpcAfterLegacyRead, rpcBeforeLegacyRead, "旧取消结果不再启动或中断模型");
@@ -3922,4 +4442,5 @@ await check("webhook snippets use the server token contract", async () => {
   assert.equal(source.includes("status.publicConfig?.publicOrigin"), true);
 });
 
-console.log(JSON.stringify({ ok: true, checks: results }, null, 2));
+assert.ok(results.length, "No regression case matched the requested name");
+console.log(JSON.stringify({ ok: true, scope: selectedCheck ? "selected" : "all", checks: results }, null, 2));

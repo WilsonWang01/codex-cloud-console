@@ -24,6 +24,40 @@ const confirmation = item => ({ revision: item.revision, digest: item.preview.di
 const availability = (payload, extra = {}) => ({ version: calendarAvailabilityDigest(target, payload, []), checkedAt: new Date(start).toISOString(), conflicts: [], complete: true, ...extra });
 const draft = f => f.actions.create(crypto.randomUUID(), calendarProposalPayload(form()));
 
+test("calendar actions reject ambiguous account lists on every used tool before reading a profile or saving a draft", async () => {
+  for (const tool of ["search", "get_profile", "fetch", "create_event"]) {
+    for (const links of [[], [{ link_id: "other-link" }], [{ link_id: "fixture-link" }, { link_id: "other-link" }], {}]) {
+      const f = fixture();
+      const actions = createPersonalCalendarActions({ store: f.store, context: () => ({ cwd: "/synthetic-personal" }), now: () => start,
+        request: async (method, params) => {
+          const result = await f.runtime.request(method, params);
+          if (method === "mcpServerStatus/list") result.data[0].tools[`google_calendar.${tool}`]._meta.link_accounts = links;
+          return result;
+        },
+      });
+      await assert.rejects(actions.create(crypto.randomUUID(), calendarProposalPayload(form())), { code: "calendar_account_ambiguous" });
+      assert.equal(f.runtime.calls.some(call => call.method === "mcpServer/tool/call"), false);
+      assert.equal(f.runtime.writes(), 0); assert.deepEqual(await f.store.list(), []);
+    }
+  }
+  const f = fixture();
+  let boundLinks = [{ link_id: "fixture-link" }];
+  const actions = createPersonalCalendarActions({ store: f.store, context: () => ({ cwd: "/synthetic-personal" }), now: () => start,
+    request: async (method, params) => {
+      const result = await f.runtime.request(method, params);
+      if (method === "mcpServerStatus/list") for (const tool of Object.values(result.data[0].tools)) tool._meta.link_accounts = boundLinks;
+      return result;
+    },
+  });
+  const item = await actions.create(crypto.randomUUID(), calendarProposalPayload(form()));
+  assert.equal(item.target.email, "calendar@example.test");
+  const preview = await actions.preview(item.id, item.revision);
+  boundLinks = [{ link_id: "fixture-link" }, { link_id: "other-link" }];
+  await assert.rejects(actions.execute(item.id, confirmation(preview)), { code: "calendar_account_ambiguous" });
+  assert.equal((await f.store.get(item.id)).attempted, false);
+  assert.equal(f.runtime.writes(), 0);
+});
+
 test("calendar wall times reject gaps, require explicit repeated offsets and preserve all-day exclusive ends", () => {
   const p = calendarProposalPayload(form()); assert.equal(p.start, "2026-10-25T15:50:00.000Z"); assert.deepEqual(calendarProposalPayload(calendarProposalForm(p)), p);
   assert.throws(() => calendarProposalPayload(form({ timeZone: "America/New_York", startLocal: "2026-03-08T02:30", endLocal: "2026-03-08T04:00" })), { code: "calendar_time_invalid" });

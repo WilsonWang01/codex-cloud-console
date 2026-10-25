@@ -9,7 +9,8 @@ import { withPublicationLock } from "../server/publication-lock.mjs";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { openRunUsageLedger } from "../server/run-usage-ledger.mjs";
-import { createExternalTaskStore, createExternalTaskOwner } from "../server/external-task-store.mjs";
+import { createExternalTaskStore, createExternalTaskOwner, externalTaskSchemaVersion } from "../server/external-task-store.mjs";
+import { restrictedExecutionProfile } from "../server/automation-execution-profile.mjs";
 
 const time = Date.parse("2026-10-23T00:00:00Z");
 const task = (id, clientId = "client-a") => ({ id, clientId, automationId: "research", repoId: "repo", status: "queued", startedAt: new Date(time).toISOString(), triggerIdempotencyHash: "a".repeat(64), triggerRequestHash: "b".repeat(64), events: [], eventSeq: 0 });
@@ -46,6 +47,26 @@ test("queue limits reject only new acceptance; claims enforce global and per-cli
   store.accept(options("3", "client-b"));
   assert.equal(store.claim({ owner: "worker-b", maxGlobal: 2, maxPerClient: 1 }).run.id, "3");
   assert.equal(store.claim({ owner: "worker-c", maxGlobal: 2, maxPerClient: 1 }), null);
+}));
+
+test("accepted execution profile is bound to payload, immutable and survives reopening without changing legacy rows", () => fixture(({ store, ledger }) => {
+  const input = options("1");
+  input.run.executionProfile = restrictedExecutionProfile;
+  assert.throws(() => store.accept(input), { statusCode: 409 });
+  assert.equal(store.runs().length, 0);
+  input.execution.options = { executionProfile: restrictedExecutionProfile };
+  store.accept(input);
+  store.accept(options("2", "other"));
+  const reopened = createExternalTaskStore(ledger.database, { now: () => time });
+  const claimed = reopened.claim({ owner: "one" });
+  assert.equal(claimed.run.executionProfile, restrictedExecutionProfile);
+  assert.equal(claimed.execution.options.executionProfile, restrictedExecutionProfile);
+  assert.throws(() => reopened.update({ ...claimed.run, executionProfile: null }, claimed.claim), { statusCode: 409 });
+  reopened.update({ ...claimed.run, status: "completed" }, claimed.claim);
+  const legacy = reopened.claim({ owner: "two" });
+  assert.equal(legacy.run.executionProfile, undefined);
+  assert.throws(() => reopened.update({ ...legacy.run, executionProfile: restrictedExecutionProfile }, legacy.claim), { statusCode: 409 });
+  assert.equal(reopened.accept({ ...input, execution: {} }).run.id, input.run.id, "same request recovers the accepted policy, never replaces it");
 }));
 
 test("transactional claims honor current client limits and skip temporarily blocked clients", () => fixture(({ store }) => {
@@ -146,6 +167,22 @@ test("pending and uncertain work keeps its original key beyond the nominal TTL",
   assert.throws(() => store.accept({ ...input, requestHash: "c".repeat(64) }), { statusCode: 409 });
 }));
 
+test("canceling any settled durable task is an unchanged replay, including interruption and unknown outcomes", () => fixture(({ store, ledger }) => {
+  for (const [index, status] of ["completed", "failed", "canceled", "interrupted", "needs_reconciliation"].entries()) {
+    const id = String(index + 1);
+    store.accept(options(id));
+    const claim = store.claim({ owner: "fixture" });
+    store.update({ ...claim.run, status, usage: { status: "unknown", source: "synthetic" } }, claim.claim);
+    const original = store.read(id);
+    const snapshot = () => JSON.stringify(["external_tasks", "external_task_keys", "external_tasks_meta", "external_callbacks"].map(table => ledger.database.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()));
+    const before = snapshot();
+    for (let repeat = 0; repeat < 2; repeat++) assert.deepEqual(store.cancel(id, { id: "client-a", automationId: "research" }, { type: "cancel-requested" }), { run: original, pending: false });
+    assert.throws(() => store.cancel(id, { id: "client-b", automationId: "research" }, {}), { statusCode: 404 });
+    assert.throws(() => store.cancel(id, { id: "client-a", automationId: "other" }, {}), { statusCode: 404 });
+    assert.equal(snapshot(), before, "终态取消不能改事件、原键、未知用量或执行代次");
+  }
+}));
+
 test("unknown task schema is not rewritten", () => fixture(({ ledger }) => {
   ledger.database.exec("UPDATE external_tasks_meta SET value=99 WHERE key='schema_version'; DELETE FROM external_tasks_meta WHERE key='revision'");
   const before = ledger.database.prepare("SELECT * FROM external_tasks_meta").all();
@@ -175,7 +212,7 @@ test("queued material capacity is byte-based, atomic, scoped and released only a
   assert.equal(ledger.database.prepare("SELECT execution FROM external_tasks WHERE id='3'").get().execution, "{}");
 }));
 
-for (const version of [3, 4, 5]) test(`version-${version} queued inputs remain intact and accepted material descriptors are immutable`, () => fixture(({ store, ledger }) => {
+for (const version of [3, 4, 5, 6]) test(`version-${version} queued inputs remain intact and accepted material descriptors are immutable`, () => fixture(({ store, ledger }) => {
   const inputFiles = [{ index: 1, name: "notes.md", mimeType: "text/markdown", bytes: 5, sha256: "f".repeat(64) }];
   const accepted = options("1");
   accepted.run.inputFiles = inputFiles;
@@ -184,7 +221,7 @@ for (const version of [3, 4, 5]) test(`version-${version} queued inputs remain i
   const before = ledger.database.prepare("SELECT * FROM external_tasks").all();
   ledger.database.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(version);
   const reopened = createExternalTaskStore(ledger.database);
-  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 6);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, externalTaskSchemaVersion);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
   const owned = reopened.claim({ owner: "worker" });
   assert.deepEqual(owned.execution, accepted.execution);
@@ -198,7 +235,7 @@ test("version-one tasks migrate without changing identity, execution or claims",
   ledger.database.exec("UPDATE external_tasks_meta SET value=1 WHERE key='schema_version'");
   createExternalTaskStore(ledger.database);
   assert.deepEqual(ledger.database.prepare("SELECT * FROM external_tasks").all(), before);
-  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 6);
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, externalTaskSchemaVersion);
 }));
 
 test("accepted output schema is immutable and structured results survive reopening", () => fixture(({ store, ledger }) => {
@@ -239,6 +276,9 @@ test("rollback rejects incompatible releases without altering task data", () => 
   const script = new URL("../ops/check-task-rollback.mjs", import.meta.url).pathname;
   const execute = () => promisify(execFile)(process.execPath, [script, root, previous], { timeout: 10000 });
   await execute();
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 6;");
+  await execute();
+  assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 6);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 5;");
   await execute();
   assert.equal(ledger.database.prepare("SELECT value FROM external_tasks_meta WHERE key='schema_version'").get().value, 5);
@@ -268,6 +308,8 @@ test("rollback rejects incompatible releases without altering task data", () => 
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 5;");
   await assert.rejects(execute, /不能自动退回/);
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 6;");
+  await assert.rejects(execute, /不能自动退回/);
+  fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 7;");
   await execute();
   fs.writeFileSync(path.join(previous, "server/external-task-store.mjs"), "export const externalTaskSchemaVersion = 99;");
   await assert.rejects(execute, /不能自动退回/);

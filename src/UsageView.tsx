@@ -8,7 +8,7 @@ type PolicyDraft = { maxConcurrent: string; dailyKnownTokenLimit: string; expire
 type RequestBucket = { hour: string; clientId: string; requests: number; accepted: number; errors: number; replayed: number; polls?: number; pollErrors?: number; controls?: number; discovery?: number };
 type RunBucket = { hour: string; clientId: string; runs: number; completed: number; failed: number; knownRuns: number; unknownRuns: number; inputTokens: number; outputTokens: number; totalTokens: number };
 type RequestRow = { id: string; clientId: string; automationId: string; trigger: string; status: number; runId: string | null; deduplicated: boolean; durationMs: number | null; time: string };
-type RunRow = { id: string; clientId: string; automationId: string; status: string; startedAt: string; finishedAt: string | null; model: string | null; reasoning: string | null; usage: { status: "complete" | "unknown"; inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number | null } };
+type RunRow = { id: string; clientId: string; automationId: string; status: string; startedAt: string; finishedAt: string | null; model: string | null; reasoning: string | null; usage: { status: "complete" | "unknown"; reason?: string; inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedInputTokens?: number | null } };
 type Duration = { samples: number; p50Ms: number | null; p95Ms: number | null };
 type RequestSummary = { groups: { kind: string; requests: number; errors: number; accepted: number; replayed: number; duration: Duration }[]; errorTypes: { type: string; count: number }[] };
 type RunSummary = { tasks: number; completed: number; failed: number; canceled: number; unresolved: number; active: number; unclassified: number; observedModelTurns: number; successRate: number | null; unknownUsageRate: number | null; queueWait: Duration; execution: Duration };
@@ -270,7 +270,7 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
         {hasCurrentData && <details className="usage-chart-data"><summary>查看分时数据</summary><div><table><thead><tr><th scope="col">时间</th><th scope="col">提交</th><th scope="col">能力</th><th scope="col">查询</th><th scope="col">Token</th></tr></thead><tbody>{chart.map((point) => <tr key={point.key}><th scope="row">{point.fullLabel}</th><td>{point.requests.toLocaleString()}</td><td>{visibleUsage.requestSummary ? point.discovery.toLocaleString() : "--"}</td><td>{point.polls.toLocaleString()}</td><td>{point.tokens.toLocaleString()}</td></tr>)}</tbody></table></div></details>}
         {visibleUsage.droppedRequests > 0 && <p className="usage-note">有 {visibleUsage.droppedRequests} 条损坏的请求明细未计入，曲线可能不完整。</p>}
         {!!visibleUsage.missingMetricFiles && <p className="usage-note">读取期间有 {visibleUsage.missingMetricFiles} 个指标文件已移除，统计可能不完整。</p>}
-        {unknownRuns > 0 && <p className="usage-note">Token 仅统计 {knownRuns} 次有完整单轮快照的运行；未知用量未计入，不代表零消耗。</p>}
+        {unknownRuns > 0 && <p className="usage-note">Token 仅统计 {knownRuns} 次已核对完整回合用量的运行；未知用量未计入，不代表零消耗。</p>}
       </section>
       <section className="usage-section" aria-label="任务质量与耗时">
         <div className="usage-section-head"><h2>任务质量与耗时</h2></div>
@@ -325,7 +325,11 @@ export default function UsageView({ automations, automationsReady, apiRequest: r
       </section>
       <section className="usage-section" aria-label="请求明细"><div className="usage-section-head"><h2>最近请求</h2><Activity size={18} /></div><div className="usage-requests">{visibleUsage.requests.map((row) => {
         const run = row.runId ? runsById.get(row.runId) : null;
-        return <details className="usage-request" key={row.id}><summary><time>{new Date(row.time).toLocaleString()}</time><strong>{clients.find((client) => client.id === row.clientId)?.name || (row.clientId === "legacy-shared" ? "旧共享令牌" : row.clientId)}</strong><span>{row.automationId} · {triggerLabels[row.trigger] || row.trigger}</span><span>{row.status}{row.deduplicated ? " · 重放" : ""}</span><small>{row.runId || "无关联任务"}</small></summary><div className="usage-request-expanded"><span>请求 ID <code>{row.id}</code></span><span>耗时 {durationText(row.durationMs)}</span>{run ? <><span>任务 {runLabels[run.status] || "状态未知"} · {run.model || "模型未知"} / {run.reasoning || "推理未知"}</span><span>Token {run.usage.status === "complete" ? `${run.usage.totalTokens}（输入 ${run.usage.inputTokens}，输出 ${run.usage.outputTokens}）` : "未知，未计为零"}</span>{onOpenRun && <button type="button" className="mini-action" onClick={() => onOpenRun(run.automationId, run.id)}>打开任务</button>}</> : row.runId ? <span>任务明细超出当前保留范围</span> : <span>本次请求没有关联任务记录</span>}</div></details>;
+        return <details className="usage-request" key={row.id}><summary><time>{new Date(row.time).toLocaleString()}</time><strong>{clients.find((client) => client.id === row.clientId)?.name || (row.clientId === "legacy-shared" ? "旧共享令牌" : row.clientId)}</strong><span>{row.automationId} · {triggerLabels[row.trigger] || row.trigger}</span><span>{row.status}{row.deduplicated ? " · 重放" : ""}</span><small>{row.runId || "无关联任务"}</small></summary><div className="usage-request-expanded"><span>请求 ID <code>{row.id}</code></span><span>耗时 {durationText(row.durationMs)}</span>{run ? <>
+          <span>任务 {runLabels[run.status] || "状态未知"} · {run.model || "模型未知"} / {run.reasoning || "推理未知"}</span>
+          <span>Token {run.usage.status === "complete" ? `${run.usage.totalTokens}（输入 ${run.usage.inputTokens}，输出 ${run.usage.outputTokens}）` : "未知，未计为零"}</span>
+          {run.usage.status !== "complete" && run.usage.reason && <span>用量核对：{run.usage.reason}</span>}
+          {onOpenRun && <button type="button" className="mini-action" onClick={() => onOpenRun(run.automationId, run.id)}>打开任务</button>}</> : row.runId ? <span>任务明细超出当前保留范围</span> : <span>本次请求没有关联任务记录</span>}</div></details>;
       })}</div>{hasCurrentData && !visibleUsage.requests.length && <p className="usage-empty">所选范围暂无请求。</p>}</section>
     </div>
   );

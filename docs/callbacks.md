@@ -70,6 +70,36 @@ const event = verifyCallback({
 
 接收端先限制正文大小，再用原始字节验证签名、时间差（示例为正负 5 分钟）、事件 ID 和同源查询路径。保持两端系统时钟正常。验签不是业务幂等：事件 ID 去重必须持久化，不能只放内存。返回 2xx 代表接收方已可靠接收，不代表后续业务动作已完成；需要发送邮件、发布等动作仍按接收方自己的具体授权执行。
 
+## 可运行的持久接收端
+
+[最小接收端](../scripts/callback-inbox-example.mjs)使用 Node 22.16+ 内置的 SQLite（本地数据库），不安装新依赖。按一组调用方/自动化绑定使用一个独立状态文件；先按上文确认接收方、密钥和费用，再手动配置。不要指向 Codex Cloud 生产账本或其他业务数据库。
+
+```bash
+# 使用新的独立目录；如果目录已存在，先核对用途，不要覆盖或删除。
+mkdir -m 700 "$HOME/codex-callback-inbox"
+export CODEX_CALLBACK_RECEIVER_STATE="$HOME/codex-callback-inbox/receipts.sqlite"
+export CODEX_CALLBACK_RECEIVER_AUTOMATION_ID="my-research"
+export CODEX_CALLBACK_RECEIVER_SECRET="${YOUR_PRIVATE_CALLBACK_SECRET:?请先通过私有环境注入独立回调密钥}"
+export CODEX_CALLBACK_RECEIVER_PORT=8788
+node scripts/callback-inbox-example.mjs
+```
+
+密钥须与登记目标使用的专用密钥相同，不复用 API 令牌、不写入 Git 或聊天。CLI 只监听 `127.0.0.1`；不设端口时使用随机端口，并在启动输出中给出真实地址。仅当前进程运行时接收，不安装常驻服务。需要公网接入时，由已经批准的 HTTPS 443 域名和反向代理转发 `/codex/completed`；不能直接把打印出的回环 HTTP 地址登记为云端回调目标。本示例不会自动改安全组、开放公网端口、建立隧道或创建 AWS 资源。
+
+验签、自动化归属和原始正文哈希核对后，事件在 SQLite 事务提交成功后才返回 202；相同事件的相同原始正文返回 200，不增加记录或覆盖首次接收时间。同 ID 内容变化返回 409，签名/内容或归属无效返回 401，超大正文 413，不支持的类型/压缩 415，存储不可用或容量满返回 503。两种 2xx 都只确认通知可靠接收，不表示任务或后续业务成功。
+
+使用原状态路径和自动化 ID 可只读查看，不需要回调密钥，不启动 HTTP 服务，也不创建缺失的数据库：
+
+```bash
+env -u CODEX_CALLBACK_RECEIVER_SECRET node scripts/callback-inbox-example.mjs --list --limit 20
+```
+
+输出包含 `items` 和 `nextCursor`，后续使用实际返回值执行 `--list --after 下一游标 --limit 20`，不要把页码当游标。程序内可导入 `openCallbackInbox`，使用 `readOnly: true` 打开并分页读取；接收端只保存最少事件元数据，不保存密钥、prompt、回答或产物正文，不自动查询或重新运行 Codex。
+
+收件箱固定最多 4096 条记录，每条原始正文最多 2048 字节，数据库仍有索引和日志开销，不是精确磁盘费用上限。记录只追加、不自动删旧；满时新事件不确认，旧重复事件仍可确认。不要通过删库、切换空库或旧备份覆盖新记录来清空间，否则会失去去重状态。较大业务应把验签与事件唯一键写入现有业务数据库的接收事务，并按自己的保留/归档规则处理。
+
+这是有界通知收件箱，不是业务任务队列或业务动作的“恰好一次”保证。处理通知后，仍用固定服务地址和原调用方令牌查询原运行，核对 `completionOutcome`、结果和待核对状态；回调不可用时按[独立客户端说明](backend-integration.md)轮询，不能换业务事件键重新执行。处理游标、业务幂等和外部写入的具体确认由调用方保留。示例需要可信的私有状态路径，不是同用户进程或主机文件的安全沙箱。见[接收端验收与边界](acceptance/2026-10-26-durable-callback-inbox.md)。
+
 ## 重试、状态与保留
 
 最多五次发送，失败后依次等待 30 秒、2 分钟、10 分钟、1 小时；每次 DNS/TLS/HTTP 总墙钟最多 10 秒，事件最多发送 24 小时。网络/认证存储暂时故障及 HTTP 408/429/5xx 重试，3xx 和其他非 2xx HTTP 结果不重试；不跟随 Location。撤销/过期/失去原作用范围的调用方，以及登记绑定变化，均停止发送。

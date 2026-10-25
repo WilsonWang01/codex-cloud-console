@@ -1,4 +1,5 @@
 import { DraftPersistence } from "./draft-persistence";
+import { chatReadingHistoryAnchor, chatReadingHistoryLimit, useChatReadingPosition } from "./chat-reading-position";
 import { PageReloadContext, recoverableLazy } from "./lazy-recovery";
 import { ConversationStreamScope, type ConversationStream } from "./conversation-stream";
 import PersonalAssistantGuide from "./PersonalAssistantGuide";
@@ -57,6 +58,7 @@ import { Suspense, memo, useCallback, useEffect, useMemo, useRef, useState, type
 import type { AppServerLiveSnapshot, AttentionItem, AttentionSummary, AuditEvent, Automation, AutomationRun, CodexDiagnostics, ConsoleStatus, LogFile, Repo } from "./types";
 import PersonalContextNotice from "./PersonalContextNotice";
 import PersonalFactReferences, { personalFactReferenceData } from "./PersonalFactReferences";
+import { PersonalFeedbackReadError, PersonalMessageFeedback, usePersonalMessageFeedback, type PersonalFeedbackEntry, type PersonalFeedbackInput } from "./PersonalMessageFeedback";
 
 const LazyChatMarkdown = recoverableLazy(() => import("./ChatMarkdownRenderer"));
 const LazyCodexPluginManager = recoverableLazy(() => import("./CodexPluginManager"));
@@ -68,6 +70,7 @@ const LazyPersonalCommitments = recoverableLazy(() => import("./PersonalCommitme
 const LazyPersonalBrief = recoverableLazy(() => import("./PersonalBrief"));
 const LazyPersonalCalendar = recoverableLazy(() => import("./PersonalCalendar"));
 const LazyPersonalCalendarActions = recoverableLazy(() => import("./PersonalCalendarActions"));
+const LazyPersonalMail = recoverableLazy(() => import("./PersonalMail"));
 const LazyPersonalReminders = recoverableLazy(() => import("./PersonalReminders"));
 const LazyGitHubIssues = recoverableLazy(() => import("./GitHubIssues"));
 
@@ -143,6 +146,8 @@ type ChatMessage = {
   status?: string;
   messageType?: string;
   details?: Record<string, unknown>;
+  turnId?: string | null;
+  turnStatus?: string | null;
 };
 
 type ChatHistoryResponse = {
@@ -151,6 +156,7 @@ type ChatHistoryResponse = {
   activeSessionId: string;
   sessions: ChatSession[];
   messages: ChatMessage[];
+  history?: { total: number; limit: number; hasMore: boolean; anchorRetained?: boolean };
   archived?: boolean;
   source?: string;
   authoritative?: boolean;
@@ -1350,12 +1356,9 @@ function mentionQueryParts(query: string) {
   };
 }
 
+const chatTimeFormatter = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 function timeLabel(value: string) {
-  return new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(value));
+  return chatTimeFormatter.format(new Date(value));
 }
 
 function datePartsInShanghai(date = new Date()) {
@@ -3335,6 +3338,7 @@ export function App() {
   const [personalApprovalCount, setPersonalApprovalCount] = useState(0);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatHistoryWindow, setChatHistoryWindow] = useState<ChatHistoryResponse["history"]>();
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [chatInput, setChatInput] = useState("");
@@ -3429,6 +3433,7 @@ export function App() {
   const lastWorkRepoId = useRef(window.localStorage.getItem("codex-cloud-last-work-repo") || defaultRepoId);
   const activeSessionIdRef = useRef(activeSessionId);
   const chatInputRef = useRef(chatInput);
+  const chatSessionsRef = useRef(chatSessions);
   const chatAttachmentsRef = useRef<UploadedAttachment[]>(chatAttachments);
   const flushComposerDraftRef = useRef<() => Promise<void>>(async () => undefined);
   const pendingRouteSessionRef = useRef(pendingRouteSession);
@@ -3441,6 +3446,7 @@ export function App() {
   selectedRepoIdRef.current = selectedRepoId;
   activeSessionIdRef.current = activeSessionId;
   chatInputRef.current = chatInput;
+  chatSessionsRef.current = chatSessions;
   chatAttachmentsRef.current = chatAttachments;
   chatRuntimeRef.current = chatRuntime;
 
@@ -3570,6 +3576,7 @@ export function App() {
       setChatSessions([]);
       setActiveSessionId("");
       setChatMessages([]);
+      setChatHistoryWindow(undefined);
       setThreadGoal(null);
       setThreadTokenUsage(null);
       setCompactStatus(null);
@@ -4260,13 +4267,14 @@ export function App() {
     setChatSessions(nextSessions);
     setActiveSessionId(nextActiveSessionId);
     setChatMessages(result.messages || []);
+    setChatHistoryWindow(result.history);
     setChatInput(draft.input);
     setChatAttachments(draft.attachments);
     return true;
   }, [detachConversationStream]);
 
   const loadChatHistory = useCallback(
-    async (repoId: string, sessionId?: string) => {
+    async (repoId: string, sessionId?: string, historyLimit?: number) => {
       if (selectedRepoIdRef.current !== repoId) return;
       chatHistoryController.current?.abort();
       const controller = new AbortController();
@@ -4278,6 +4286,11 @@ export function App() {
       try {
         const params = new URLSearchParams({ repoId });
         if (sessionId) params.set("sessionId", sessionId);
+        const session = chatSessionsRef.current.find(item => item.repoId === repoId && (item.id === sessionId || item.codexSessionId === sessionId));
+        const nativeId = session?.codexSessionId || sessionId || "";
+        params.set("limit", String(historyLimit || chatReadingHistoryLimit(repoId, nativeId)));
+        const anchor = chatReadingHistoryAnchor(repoId, nativeId);
+        if (anchor) params.set("anchor", anchor);
         const result = await apiWithRetry<ChatHistoryResponse>(`/api/chat/sessions?${params.toString()}`, { signal: controller.signal }, 5);
         if (requestSeq !== chatLoadSeq.current || selectedRepoIdRef.current !== repoId || result.repoId !== repoId) return;
         if (result.degraded && !sessionId) {
@@ -4397,7 +4410,7 @@ export function App() {
     if (externalRoute) {
       if (activeView !== externalRoute.view || (externalRoute.repoId && selectedRepoId !== externalRoute.repoId)) return;
       if (externalRoute.view === "automations" && selectedAutomationId !== (externalRoute.automationId || "")) return;
-      if (externalRoute.view === "cli" && externalRoute.sessionId && activeRouteSessionId !== externalRoute.sessionId) return;
+      if (externalRoute.view === "cli" && externalRoute.sessionId && ![activeRouteSessionId, activeSessionId].includes(externalRoute.sessionId)) return;
       pendingHashNavigationRef.current = null;
     }
     const pendingTarget = pendingRouteSession || pendingRouteSessionRef.current;
@@ -4405,7 +4418,7 @@ export function App() {
       activeView === "cli" &&
       pendingTarget?.repoId === selectedRepoId &&
       pendingTarget.sessionId &&
-      pendingTarget.sessionId !== activeRouteSessionId
+      ![activeRouteSessionId, activeSessionId].includes(pendingTarget.sessionId)
     ) {
       return;
     }
@@ -4415,7 +4428,7 @@ export function App() {
       sessionId: activeView === "cli" ? activeRouteSessionId || undefined : undefined,
       automationId: activeView === "automations" ? selectedAutomationId : undefined,
     });
-  }, [activeRouteSessionId, activeView, pendingRouteSession, selectedAutomationId, selectedRepoId, writeAppHash]);
+  }, [activeRouteSessionId, activeSessionId, activeView, pendingRouteSession, selectedAutomationId, selectedRepoId, writeAppHash]);
 
   useEffect(() => {
     const onHashChange = () => {
@@ -4757,7 +4770,9 @@ export function App() {
       const result = await api<ChatHistoryResponse>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoId: selectedRepo.id }),
+        body: JSON.stringify({ repoId: selectedRepo.id,
+          limit: chatReadingHistoryLimit(selectedRepo.id, chatSessions.find(item => item.id === sessionId)?.codexSessionId || sessionId),
+          anchor: chatReadingHistoryAnchor(selectedRepo.id, chatSessions.find(item => item.id === sessionId)?.codexSessionId || sessionId) || undefined }),
       });
       if (!applyChatHistory(result, selectedRepo, requestSeq)) return;
     } catch (error) {
@@ -6385,6 +6400,8 @@ export function App() {
               onForkThread={forkThread}
               onArchiveThread={archiveThread}
               messages={chatMessages}
+              historyWindow={chatHistoryWindow}
+              onLoadEarlier={() => void loadChatHistory(selectedRepo.id, activeSessionId, Math.min(2000, Math.max(chatMessages.length, chatHistoryWindow?.limit || 80) + 80))}
               input={chatInput}
               attachments={chatAttachments}
               uploadingAttachments={uploadingAttachments}
@@ -6651,6 +6668,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取变化…</p></section>}><LazyPersonalBrief refreshKey={status.generatedAt} onContinue={onContinue} /></Suspense>
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取日历记录…</p></section>}><LazyPersonalCalendar refreshKey={status.generatedAt} onChooseTask={onChooseTask} onConnections={onConnections} /></Suspense>
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取日程提案…</p></section>}><LazyPersonalCalendarActions onContinue={onContinue} onDraft={onChooseTask} onPendingCountChange={updateCalendarDecisionCount} /></Suspense>
+    <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取邮件记录…</p></section>}><LazyPersonalMail refreshKey={status.generatedAt} onChooseTask={onChooseTask} onConnections={onConnections} /></Suspense>
     {guideFirst && guide}
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取关注事项…</p></section>}>
       <LazyPersonalCommitments sessions={sessions} onStart={onStartCommitment} onContinue={onContinue} onDueCountChange={updateDueCount} />
@@ -6966,7 +6984,7 @@ function ChatMarkdown({ text, streaming }: { text: string; streaming?: boolean }
   );
 }
 
-function ChatMessageText({
+const ChatMessageText = memo(function ChatMessageText({
   text,
   pre,
   streaming,
@@ -7002,9 +7020,12 @@ function ChatMessageText({
       )}
     </>
   );
-}
+});
 
-const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }: { message: ChatMessage; repo: Repo }) {
+const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo, feedbackEntry, feedbackDisabled, feedbackSaving, feedbackError, onFeedback }: {
+  message: ChatMessage; repo: Repo; feedbackEntry?: PersonalFeedbackEntry; feedbackDisabled?: boolean; feedbackSaving?: boolean; feedbackError?: string;
+  onFeedback?: (input: PersonalFeedbackInput) => Promise<void>;
+}) {
   const meta = timelineMessageMeta(message);
   const body = displayProjectMessageText(message.text || (message.streaming ? " " : "Codex 没有返回内容。"), repo);
   const attachments = messageTimelineAttachments(message, repo);
@@ -7012,7 +7033,7 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }:
   const proposal = repo.kind === "personal" && message.details?.personalCalendarProposal && typeof message.details.personalCalendarProposal === "object"
     ? message.details.personalCalendarProposal as Record<string, unknown> : null;
   return (
-    <article className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
+    <article data-chat-message-id={message.id} className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
       <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
       <div>
         <strong>
@@ -7023,6 +7044,8 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }:
         <ChatMessageText text={body} pre={meta.pre} streaming={message.streaming} />
         {proposal?.available === true && typeof proposal.id === "string" && /^[a-f0-9-]{36}$/.test(proposal.id) && <a className="mini-action calendar-proposal-link" href="#/project/_personal/today"><ListTodo size={16} />查看日程提案</a>}
         <MessageAttachments attachments={attachments} />
+        {onFeedback && message.turnId && <PersonalMessageFeedback message={{ id: message.id, turnId: message.turnId, text: message.text }}
+          entry={feedbackEntry} disabled={Boolean(feedbackDisabled)} saving={Boolean(feedbackSaving)} error={feedbackError} onSave={onFeedback} />}
         <TimelineDetailsPanel details={message.details} />
         {status && <em className="chat-status">{status}</em>}
       </div>
@@ -7030,8 +7053,27 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo }:
   );
 });
 
-const ChatTimeline = memo(function ChatTimeline({ messages, repo }: { messages: ChatMessage[]; repo: Repo }) {
-  return messages.map((message) => <ChatTimelineMessage key={message.id} message={message} repo={repo} />);
+const ChatTimeline = memo(function ChatTimeline({ messages, repo, sessionId, feedbackEnabled }: { messages: ChatMessage[]; repo: Repo; sessionId: string; feedbackEnabled: boolean }) {
+  const targets = useMemo(() => {
+    const byTurn = new Map<string, ChatMessage>();
+    for (const message of messages) {
+      if (message.role === "codex" && message.messageType === "agentMessage" && message.turnId && message.turnStatus === "completed" && !message.mocked && !message.streaming
+        && message.text.trim() && (message.details?.phase == null || message.details.phase === "final_answer")) byTurn.set(message.turnId, message);
+    }
+    return new Set(byTurn.values());
+  }, [messages]);
+  const enabled = repo.kind === "personal" && feedbackEnabled && targets.size > 0;
+  const feedback = usePersonalMessageFeedback(sessionId, enabled);
+  const byTurn = useMemo(() => new Map(feedback.entries.map(entry => [entry.turnId, entry])), [feedback.entries]);
+  return <>{messages.map(message => {
+    const eligible = enabled && targets.has(message) && feedback.status !== "unavailable";
+    return <ChatTimelineMessage key={message.id} message={message} repo={repo}
+      feedbackEntry={eligible ? byTurn.get(message.turnId || "") : undefined}
+      feedbackDisabled={eligible ? feedback.status !== "ready" || Boolean(feedback.saving) : undefined}
+      feedbackSaving={eligible ? feedback.saving === message.turnId : undefined}
+      feedbackError={eligible && feedback.saveError && feedback.saveError.turnId === message.turnId ? feedback.saveError.message : undefined}
+      onFeedback={eligible ? feedback.save : undefined} />;
+  })}{enabled && feedback.error && <PersonalFeedbackReadError message={feedback.error} onRetry={feedback.retry} />}</>;
 });
 
 function AttentionRunCard({
@@ -9196,6 +9238,8 @@ function CloudChat({
   historyLoading,
   runtimeReady,
   historyError,
+  historyWindow,
+  onLoadEarlier,
 }: {
   status: ConsoleStatus;
   cloudConnection: CloudConnection;
@@ -9270,12 +9314,10 @@ function CloudChat({
   historyLoading: boolean;
   runtimeReady: boolean;
   historyError: string;
+  historyWindow?: ChatHistoryResponse["history"];
+  onLoadEarlier: () => void;
 }) {
-  const endRef = useRef<HTMLDivElement | null>(null);
   const chatWindowRef = useRef<HTMLDivElement | null>(null);
-  const followChatRef = useRef(true);
-  const lastProgressRef = useRef("");
-  const [newProgress, setNewProgress] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [commandIndex, setCommandIndex] = useState(0);
   const [draggingAttachments, setDraggingAttachments] = useState(false);
@@ -9346,6 +9388,10 @@ function CloudChat({
   const [renamingSessionId, setRenamingSessionId] = useState("");
   const [renameDraft, setRenameDraft] = useState("");
   const activeSession = sessions.find((session) => session.id === activeSessionId);
+  const lastMessage = messages.at(-1);
+  const reading = useChatReadingPosition(chatWindowRef, JSON.stringify([repo.id, activeSession?.codexSessionId || activeSessionId]),
+    !historyLoading && !historyError && messages.length > 0 && activeSession?.repoId === repo.id,
+    JSON.stringify([lastMessage?.id || "", lastMessage?.text.length || 0, busy]), messages.length);
   const queuedTurn = activeSession?.queuedTurn;
   const displaySessions = useMemo(() => visibleSessionList(sessions, activeSessionId), [activeSessionId, sessions]);
   const activeSessionTitle = sessionDisplayTitle(activeSession);
@@ -10038,19 +10084,6 @@ function CloudChat({
     onFilesSelected(files);
   };
 
-  useEffect(() => { followChatRef.current = true; lastProgressRef.current = ""; setNewProgress(false); }, [activeSessionId]);
-  useEffect(() => {
-    const scroller = chatWindowRef.current;
-    if (!scroller) return;
-    const last = messages.at(-1);
-    const progress = `${last?.id || ""}:${last?.text?.length || 0}:${last?.status || ""}:${busy}`;
-    if (followChatRef.current) {
-      scroller.scrollTop = scroller.scrollHeight;
-      setNewProgress(false);
-    } else if (lastProgressRef.current && progress !== lastProgressRef.current) setNewProgress(true);
-    lastProgressRef.current = progress;
-  }, [messages, busy]);
-
   useEffect(() => {
     setCommandIndex(0);
   }, [commandQuery, inlineTrigger?.prefix, inlineTrigger?.query]);
@@ -10160,11 +10193,17 @@ function CloudChat({
         </div>
       </div>}
 
-      <div className="chat-window" ref={chatWindowRef} aria-busy={historyLoading} onScroll={(event) => {
-        const target = event.currentTarget;
-        followChatRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 96;
-        if (followChatRef.current) setNewProgress(false);
-      }}>
+      <div className="chat-window" ref={chatWindowRef} aria-busy={historyLoading} onScroll={reading.onScroll}
+        onPointerMove={reading.onUserIntent} onPointerDown={reading.onUserIntent} onTouchStart={reading.onUserIntent} onWheel={reading.onUserIntent} onKeyDown={reading.onUserIntent}>
+        {historyWindow && (historyWindow.hasMore || historyWindow.anchorRetained === false) && <div className="chat-history-window">
+          <span>显示最近 {messages.length} 条，共 {historyWindow.total} 条</span>
+          {historyWindow.anchorRetained === false && <span role="status">原阅读位置不在当前记录范围</span>}
+          {historyWindow.hasMore && <button className="mini-action" type="button" onClick={onLoadEarlier} disabled={historyLoading || Boolean(busyAction) || historyWindow.limit >= 2000}>
+            <History size={15} />{historyLoading ? "加载中…" : historyWindow.limit >= 2000 ? "已达页面显示上限" : "加载更早的消息"}
+          </button>}
+          {(historyWindow.limit >= 2000 || historyWindow.anchorRetained === false) && activeSession?.codexSessionId && <a className="mini-action" target="_blank" rel="noreferrer"
+            href={`/api/codex/thread-read?${new URLSearchParams({ repoId: repo.id, sessionId: activeSessionId })}`} title="打开完整原生 JSON 记录">完整原生记录<CornerUpRight size={15} /></a>}
+        </div>}
         {repo.kind === "personal" && !historyLoading && !historyError && messages.length === 0 && <PersonalAssistantGuide onChoose={choosePersonalTask} onConnect={() => setActivePanel("connections")} />}
         {historyLoading && messages.length === 0 && (
           <article className="chat-bubble codex compact">
@@ -10177,7 +10216,7 @@ function CloudChat({
             </div>
           </article>
         )}
-        <ChatTimeline messages={messages} repo={repo} />
+        <ChatTimeline messages={messages} repo={repo} sessionId={activeSessionId} feedbackEnabled={!historyLoading && !historyError} />
         {busy && !messages.some((message) => message.streaming) && (
           <article className="chat-bubble codex">
             <span className="chat-avatar">
@@ -10189,7 +10228,6 @@ function CloudChat({
             </div>
           </article>
         )}
-        <div ref={endRef} />
       </div>
 
       <div
@@ -10229,11 +10267,7 @@ function CloudChat({
         {repo.kind === "personal" && activeSessionId && <PersonalContextNotice key={`${activeSessionId}:${activeSession?.messageCount || 0}`} sessionId={activeSessionId}
           disabled={busy || Boolean(busyAction) || uploadingAttachments || Boolean(queuedTurn) || Boolean(activeSession?.externalActionReview)} onContinue={onContinuePersonalContext} />}
         </div>
-        {newProgress && <button className="chat-new-progress" type="button" onClick={() => {
-          followChatRef.current = true;
-          if (chatWindowRef.current) chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
-          setNewProgress(false);
-        }}>有新进展 <ChevronRight size={15} /></button>}
+        {reading.newProgress && <button className="chat-new-progress" type="button" onClick={reading.scrollToLatest}>有新进展 <ChevronRight size={15} /></button>}
         {draggingAttachments && (
           <div className="composer-drop-overlay" data-testid="composer-drop-overlay">
             <Paperclip size={18} />

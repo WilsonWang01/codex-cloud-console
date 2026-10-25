@@ -54,10 +54,10 @@ try {
         const resultsEmpty = !db.prepare("SELECT name FROM sqlite_master WHERE name='external_results'").get() || db.prepare("SELECT count(*) AS n FROM external_results").get().n === 0;
         // Only known, empty format changes are reversible without understanding new records.
         const callbacksEmpty = !db.prepare("SELECT name FROM sqlite_master WHERE name='external_callbacks'").get() || db.prepare("SELECT count(*) AS n FROM external_callbacks").get().n === 0;
-        if (empty && resultsEmpty && callbacksEmpty && ((version === 6 && previous === 5) || (version === 5 && previous === 4) || (version === 4 && previous === 3) || (version === 3 && previous === 2) || (version === 2 && previous === 1))) {
+        if (empty && resultsEmpty && callbacksEmpty && ((version === 7 && previous === 6) || (version === 6 && previous === 5) || (version === 5 && previous === 4) || (version === 4 && previous === 3) || (version === 3 && previous === 2) || (version === 2 && previous === 1))) {
           db.prepare("UPDATE external_tasks_meta SET value=? WHERE key='schema_version'").run(previous);
           compatible = true;
-        } else if (empty && resultsEmpty && callbacksEmpty && [1, 2, 3, 4, 5, 6].includes(version) && previous === null) compatible = true;
+        } else if (empty && resultsEmpty && callbacksEmpty && [1, 2, 3, 4, 5, 6, 7].includes(version) && previous === null) compatible = true;
         db.exec("COMMIT");
       } catch (error) { db.exec("ROLLBACK"); throw error; }
     }

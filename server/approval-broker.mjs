@@ -90,6 +90,17 @@ export function createApprovalBroker({ timeoutMs = 5 * 60_000, onChange = () => 
     return true;
   }
 
+  function closeWhere(predicate, reason) {
+    for (const item of [...pending.values()].filter(predicate)) {
+      try { settle(item, { decision: "decline" }, reason); }
+      catch (error) {
+        pending.delete(item.id);
+        clearTimeout(item.timer);
+        item.resolve(error);
+      }
+    }
+  }
+
   return {
     list,
     request(method, params = {}, owner = {}) {
@@ -100,7 +111,7 @@ export function createApprovalBroker({ timeoutMs = 5 * 60_000, onChange = () => 
         method,
         params,
         digest: approvalDigest(method, params),
-        owner: { repoId: owner.repoId || null, sessionId: owner.sessionId || null },
+        owner: { repoId: owner.repoId || null, sessionId: owner.sessionId || null, ...(owner.turnId ? { turnId: owner.turnId } : {}) },
         createdAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
       };
@@ -127,24 +138,14 @@ export function createApprovalBroker({ timeoutMs = 5 * 60_000, onChange = () => 
       return settle(item, input);
     },
     closeAll(reason = "App-server disconnected") {
-      for (const item of [...pending.values()]) {
-        try { settle(item, { decision: "decline" }, reason); }
-        catch (error) {
-          pending.delete(item.id);
-          clearTimeout(item.timer);
-          item.resolve(error);
-        }
-      }
+      closeWhere(() => true, reason);
     },
     closeForRepo(repoId, reason = "App-server disconnected") {
-      for (const item of [...pending.values()].filter((entry) => entry.owner.repoId === repoId)) {
-        try { settle(item, { decision: "decline" }, reason); }
-        catch (error) {
-          pending.delete(item.id);
-          clearTimeout(item.timer);
-          item.resolve(error);
-        }
-      }
+      closeWhere(entry => entry.owner.repoId === repoId, reason);
+    },
+    closeForTurn(owner, reason = "Turn finished") {
+      if (!owner.turnId) return;
+      closeWhere(entry => entry.owner.repoId === owner.repoId && entry.owner.sessionId === owner.sessionId && entry.owner.turnId === owner.turnId, reason);
     },
     closeForThread(threadId, reason = "Calendar operation ended") {
       for (const item of [...pending.values()].filter(entry => (entry.params.threadId || entry.params.thread_id) === threadId)) settle(item, { decision: "decline" }, reason);

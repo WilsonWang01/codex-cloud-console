@@ -38,7 +38,7 @@ try {
     const link = page.getByRole("link", { name: "查看日程提案", exact: true }); await link.waitFor();
     let item = (await request()).data.proposals[0]; assert.equal(item.source, "assistant"); assert.equal(item.attempted, false); assert.equal(item.preview, null);
     assert.equal(JSON.parse(await fs.readFile(ready.calendarEvents, "utf8")).length, 0);
-    const out = path.join(project, "docs/research/acceptance/p022-model-proposals-20261024"); await fs.mkdir(out, { recursive: true });
+    const out = path.resolve(process.env.CODEX_CALENDAR_UI_OUTPUT || path.join(project, "docs/research/acceptance/p022-model-proposals-20261024")); await fs.mkdir(out, { recursive: true });
     for (const [width, height] of [[1280, 900], [768, 900], [390, 640], [320, 480]]) {
       await page.setViewportSize({ width, height }); await link.scrollIntoViewIfNeeded();
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
@@ -65,7 +65,10 @@ try {
     await section.getByRole("button", { name: "拒绝日程 用户更正后的日程草稿", exact: true }).click();
     await page.reload(); await section.locator("details.personal-completed > summary").click(); await section.getByText("初始提案来源", { exact: true }).click();
     await section.getByRole("button", { name: "查看来源对话", exact: true }).click(); await link.waitFor();
-    assert.match(await page.locator(".chat-window").innerText(), /日程提案已保存：用户更正后的日程草稿/);
+    const updatedProposal = page.locator(".chat-window").getByText("日程提案已保存：用户更正后的日程草稿", { exact: true });
+    await updatedProposal.scrollIntoViewIfNeeded();
+    await updatedProposal.screenshot({ path: path.join(out, "updated-proposal.png") });
+    assert.equal(await updatedProposal.innerText(), "日程提案已保存：用户更正后的日程草稿");
     const current = (await request()).data.proposals[0]; assert.equal(current.status, "rejected"); assert.equal(current.attempted, false);
     await link.click(); await page.getByText("1 项需要你处理", { exact: true }).waitFor({ state: "detached" });
     const rpc = (await fs.readFile(ready.rpcCapture, "utf8")).trim().split("\n").map(JSON.parse);
@@ -85,7 +88,7 @@ try {
   await section.getByLabel("说明", { exact: true }).fill("合成草稿，不连接真实 Google 账号。");
   await page.reload(); await section.getByLabel("日程标题", { exact: true }).waitFor();
   assert.equal(await section.getByLabel("日程标题", { exact: true }).inputValue(), "合成日程：核对申请材料");
-  const out = path.join(project, "docs/research/acceptance/p02-calendar-actions-20261024"); await fs.mkdir(out, { recursive: true });
+  const out = path.resolve(process.env.CODEX_CALENDAR_UI_OUTPUT || path.join(project, "docs/research/acceptance/p02-calendar-actions-20261024")); await fs.mkdir(out, { recursive: true });
   for (const [width, height] of [[1280, 900], [768, 900], [390, 640], [320, 640]]) {
     await page.setViewportSize({ width, height }); await section.scrollIntoViewIfNeeded();
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
@@ -93,6 +96,16 @@ try {
     await section.locator("fieldset").screenshot({ path: path.join(out, `editor-${width}.png`) });
   }
   await page.setViewportSize({ width: 1280, height: 900 });
+  await control({ mode: "ambiguous-accounts" });
+  await section.getByRole("button", { name: "保存草稿", exact: true }).click();
+  await section.getByRole("alert").getByText("日历工具声明了多个账号或账号来源无法确认，未读取或执行操作", { exact: true }).waitFor();
+  assert.equal(await section.getByLabel("日程标题", { exact: true }).inputValue(), "合成日程：核对申请材料");
+  assert.equal((await request()).data.proposals.length, 0);
+  assert.equal(JSON.parse(await fs.readFile(ready.calendarEvents, "utf8")).length, 0);
+  assert.equal((await fs.readFile(ready.rpcCapture, "utf8")).trim().split("\n").map(JSON.parse).some(call => call.method === "mcpServer/tool/call"), false);
+  await page.setViewportSize({ width: 390, height: 640 }); await section.screenshot({ path: path.join(out, "ambiguous-account-390.png") });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await control({ mode: "ok" });
   await section.getByRole("button", { name: "保存草稿", exact: true }).click();
   await section.getByText("草稿 · 未执行", { exact: true }).waitFor();
   assert.equal(JSON.parse(await fs.readFile(ready.calendarEvents, "utf8")).length, 0);
@@ -172,7 +185,7 @@ try {
   const rpc = (await fs.readFile(ready.rpcCapture, "utf8")).trim().split("\n").map(JSON.parse);
   assert.equal(rpc.some(item => ["turn/start", "account/login/start"].includes(item.method)), false);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, backend: "actual isolated console and native RPC fixture", realModelCalls: 0, realThirdPartyWrites: 0, syntheticCreates: 3, checks: ["草稿刷新找回", "四宽度编辑和确认", "账号变化拒绝", "冲突单独确认", "实际RPC单次执行与重复确认", "丢失回执阻止发布/人工核对", "缺少设置不冒充成功且只读核验不重复写入", "请求边界"] }));
+  console.log(JSON.stringify({ ok: true, backend: "actual isolated console and native RPC fixture", realModelCalls: 0, realThirdPartyWrites: 0, syntheticCreates: 3, checks: ["草稿刷新找回", "四宽度编辑和确认", "多账号声明在来源读取前拒绝且保留输入", "账号变化拒绝", "冲突单独确认", "实际RPC单次执行与重复确认", "丢失回执阻止发布/人工核对", "缺少设置不冒充成功且只读核验不重复写入", "请求边界"] }));
   }
 } finally {
   await browser?.close();

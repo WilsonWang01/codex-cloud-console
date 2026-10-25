@@ -116,9 +116,12 @@ try {
   assert.match(logs, /listening on/);
   assert.equal((await fetch(base)).status, 200);
   for (const [repoId, threadId] of [["_personal", "work-thread"], ["sample-app", "legacy-facts-thread"]]) {
-    const rejected = await (await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId, sessionId: "app-" + threadId }))).json();
-    assert.equal(rejected.ok, true, JSON.stringify({ repoId, error: rejected.error, code: rejected.code })); assert.equal(rejected.activeSessionId, null); assert.deepEqual(rejected.messages, []);
-    assert.equal(rejected.sessions.some(session => session.codexSessionId === threadId), false);
+    const response = await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId, sessionId: "app-" + threadId }));
+    const rejected = await response.json();
+    assert.equal(response.status, 404, JSON.stringify({ repoId, rejected })); assert.equal(rejected.ok, false);
+    assert.equal(rejected.repoId, repoId); assert.deepEqual(Object.keys(rejected).sort(), ["error", "ok", "repoId"]);
+    const current = await (await fetch(base + "api/chat/sessions?" + new URLSearchParams({ repoId }))).json();
+    assert.equal(current.ok, true); assert.equal(current.sessions.some(session => session.codexSessionId === threadId), false);
   }
   for (const sessionId of [workHistory.id, "app-work-thread", "unknown-session"]) {
     const response = await fetch(base + "api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ repoId: "_personal", sessionId, message: "合成跨空间拒绝验收" }) });
@@ -132,7 +135,40 @@ try {
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     const errors = []; page.on("pageerror", error => errors.push(error.message));
     const out = path.join(project, "docs/research/acceptance/p03-facts-20261024"); await fs.mkdir(out, { recursive: true });
+    const draftResponse = await fetch(base + "api/chat/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ repoId: "_personal", title: "合成手机聊天验收" }) });
+    assert.equal(draftResponse.status, 200);
+    const draftId = (await draftResponse.json()).activeSessionId;
+    const contextResponse = await fetch(base + `api/chat/sessions/${encodeURIComponent(draftId)}/personal-context?repoId=_personal`);
+    assert.equal(contextResponse.status, 200);
+    assert.equal((await contextResponse.json()).issue, null);
+    await page.goto(`${base}#/project/_personal/thread/${draftId}`);
+    const input = page.getByRole("textbox", { name: "向个人助理发送消息" });
+    await input.waitFor();
+    await page.getByRole("button", { name: /^会话设置：GPT-6 Sol/ }).waitFor();
+    const savedDraft = page.waitForResponse(response => response.request().method() === "PATCH" && new URL(response.url()).pathname === `/api/chat/sessions/${draftId}/draft`);
+    await input.fill("合成手机待发送草稿，不能自动提交。".repeat(12));
+    assert.equal((await savedDraft).status(), 200);
+    const chatOut = path.join(project, "docs/research/acceptance/p04-chat-layout-20261025"); await fs.mkdir(chatOut, { recursive: true });
+    for (const [width, height] of [[320, 800], [390, 844], [768, 900], [1280, 900], [390, 480]]) {
+      await page.setViewportSize({ width, height });
+      if (height === 480) await input.focus();
+      await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue("--app-visual-height").trim() === `${Math.round(window.visualViewport?.height || innerHeight)}px`
+        && document.querySelector(".composer-shell")?.getBoundingClientRect().bottom <= innerHeight + 1);
+      assert.equal(await page.locator(".personal-context-notice").count(), 0, "actual ready context must not show a synthetic failure");
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      const layout = await page.evaluate(() => Object.fromEntries([".chat-window", ".composer textarea", ".composer-shell"].map(selector => [selector, document.querySelector(selector).getBoundingClientRect().toJSON()])));
+      if (width <= 390 && height > 600) assert.ok(layout[".chat-window"].height >= height * 0.5, JSON.stringify(layout));
+      assert.ok(layout[".composer textarea"].height >= 44);
+      assert.ok(layout[".chat-window"].bottom <= layout[".composer-shell"].top);
+      assert.equal(await input.inputValue(), "合成手机待发送草稿，不能自动提交。".repeat(12));
+      await fs.writeFile(path.join(chatOut, `actual-ready-${width}-${height}.json`), JSON.stringify(layout, null, 2));
+      await page.screenshot({ path: path.join(chatOut, `actual-ready-${width}-${height}.png`) });
+    }
+    await page.reload();
+    await page.waitForFunction(() => document.querySelector('textarea[placeholder="向个人助理发送消息"]')?.value === "合成手机待发送草稿，不能自动提交。".repeat(12));
+    await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`${base}#/project/_personal/thread/facts-source`);
+    await page.waitForURL(url => url.hash.endsWith("/thread/legacy-facts-thread"));
     await page.getByRole("button", { name: "开启新上下文", exact: true }).waitFor();
     assert.equal(await page.getByRole("textbox", { name: "向个人助理发送消息" }).inputValue(), source.draft.input);
     for (const width of [1280, 768, 390, 320]) {
@@ -171,8 +207,22 @@ try {
     await page.getByRole("dialog", { name: "开启新上下文？", exact: true }).waitFor({ state: "hidden" });
     assert.equal(page.url(), beforeCancel);
     await page.getByRole("button", { name: "开启新上下文", exact: true }).click();
+    const continuation = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname.endsWith("/personal-context"));
     await page.getByRole("dialog", { name: "开启新上下文？", exact: true }).getByRole("button", { name: "确认开启", exact: true }).click();
-    await page.waitForURL(url => !url.hash.includes("facts-source") && !url.hash.includes("legacy-facts-thread"));
+    const continued = await continuation.catch(async error => {
+      await fs.writeFile(path.join(chatOut, "context-continuation-no-response.json"), JSON.stringify({ url: page.url(), body: await page.locator("body").innerText() }, null, 2));
+      await page.screenshot({ path: path.join(chatOut, "context-continuation-no-response.png") });
+      throw error;
+    });
+    const continuationResult = await continued.json();
+    await fs.writeFile(path.join(chatOut, "context-continuation.json"), JSON.stringify({ url: page.url(), status: continued.status(), result: continuationResult }, null, 2));
+    await page.screenshot({ path: path.join(chatOut, "context-continuation.png") });
+    assert.equal(continued.status(), 200, JSON.stringify(continuationResult));
+    await page.waitForURL(url => url.hash === `#/project/_personal/thread/${continuationResult.activeSessionId}`).catch(async error => {
+      await fs.writeFile(path.join(chatOut, "context-continuation-no-navigation.json"), JSON.stringify({ url: page.url(), body: await page.locator("body").innerText() }, null, 2));
+      await page.screenshot({ path: path.join(chatOut, "context-continuation-no-navigation.png") });
+      throw error;
+    });
     assert.equal(await page.getByRole("textbox", { name: "向个人助理发送消息" }).inputValue(), source.draft.input);
     assert.equal(await page.getByText("note.txt", { exact: true }).count() > 0, true);
     const chat = JSON.parse(await fs.readFile(path.join(state, "chat-history.json"), "utf8"));
@@ -180,6 +230,7 @@ try {
     assert.equal(copied.codexSessionId, null); assert.deepEqual(copied.messages, []);
     assert.equal(copied.model, "gpt-6-astra"); assert.equal(copied.reasoning, "ultra"); assert.equal(copied.sandbox, "workspace-write");
     assert.equal(chat.sessions[source.id].draft.input, source.draft.input);
+    assert.equal(chat.sessions[draftId].draft.input, "合成手机待发送草稿，不能自动提交。".repeat(12));
     const newContextUrl = page.url();
     await page.locator(".sidebar").getByRole("button", { name: /^合成验收旧会话/ }).click();
     await page.waitForURL(url => url.hash.includes("legacy-facts-thread"));
@@ -263,6 +314,8 @@ try {
     await page.getByRole("button", { name: "工作", exact: true }).click();
     await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).waitFor();
     await page.locator(".sidebar").getByRole("button", { name: /^合成工作历史/ }).waitFor();
+    await page.goto(`${base}#/project/sample-app/thread/work-history`);
+    await page.waitForURL(url => url.hash.endsWith("/thread/work-thread"));
     await page.locator(".sidebar button.session-state-draft").nth(1).waitFor();
     assert.equal(await page.locator(".sidebar").getByRole("button", { name: /^合成验收旧会话/ }).count(), 0);
     assert.equal(await page.locator(".sidebar button.session-state-draft").count(), 2);
@@ -277,6 +330,6 @@ try {
     assert.equal(rpc.some(message => ["turn/start", "turn/steer", "thread/compact/start", "thread/fork", "mcpServer/tool/call"].includes(message.method)), false);
     assert.equal(rpc.some(message => message.method === "thread/resume"), false, "拒绝跨空间导入不能先恢复或改写原线程");
     assert.deepEqual(errors, []);
-    console.log("PASS actual isolated backend/UI: context and drafts, four widths/short screens, memory candidate edit/accept/reject/reload, stale review preserves input, cleanup confirmation keeps accepted fact; zero model or connector writes (candidates synthetically seeded)");
+    console.log("PASS actual isolated backend/UI: ready-context mobile drafts and reload, personal/work thread aliases, exact new-context URL and preserved prior drafts, four widths/short screens, memory review/reload and stale input, cleanup keeps accepted fact; zero model or connector writes (candidates synthetically seeded)");
   }
 } finally { await stop(); }

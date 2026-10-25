@@ -57,6 +57,10 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 
 业务事件 ID 必须先在调用方保存。提交响应丢失时保持相同事件 ID 和输入重试；已拿到运行 ID 就查询它。示例有限重试，拒绝跳转转发令牌，本地等候超时不会自动取消。Python 使用网络超时和整体等待期限；不适合作为硬实时截止控制。更完整的事件游标、异步持久化进度回调可用 Node 参考客户端。
 
+程序直接调用 Python `Client.execute(...)` 时，等待或请求失败的异常会保留 `run_id`、`event_id` 属性（没有格式有效的已知值为 `None`），不改变原有异常类型。先持久保存这两个编号、自动化 ID 与调用方身份：有 `run_id` 就续查；仅有 `event_id` 就以原编号和相同输入恢复提交，不新建业务编号。拒绝或不匹配的响应不会替换已确认的运行编号，下一次调用也不会沿用上一次的恢复信息。恢复字段和错误日志不回显无效编号；响应运行编号含空白/控制字符等异常内容时拒绝，不写入进度日志。命令行最后一条错误同样包含可用编号；Ctrl+C/超时都不代表云端任务已取消。
+
+Python `Client` 的整体等待期限从初始化开始计算；期限耗尽后，恢复请求使用新的 `Client` 实例和保存的原编号，而非对已经过期的实例继续等待。底层 `request(...)` 不承担执行级编号跟踪；业务接入应使用 `execute(...)`。该客户端不建立持久任务队列，业务侧仍需自行保存恢复信息。
+
 新任务支持受限产物清单和鉴权下载，须先查询部署能力；Node/Python 的 `output`、`download` 用法、20 MiB 结果包限额和保留策略见[文件交付](artifact-delivery.md)。异步任务的 `summary` 仍可能截断，不等于完整结果；旧任务不会补造副本。
 
 支持[受限内联文件输入](file-inputs.md)：异步正文 `attachments` 或 Node/Python 的 `--attach`、`--input`，用于 txt/md、普通 PDF 和静态图片材料。先查 `features.file_input` 及 PDF 的运行时状态，不把文件名当服务器路径；同事件键的材料变化会冲突，正文、队列材料和接收缓冲均有上限。PDF 的文字和页面图片在模型前转换，失败和未识别文字层有明确状态。
@@ -96,6 +100,10 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 
 `queued`、`running`、`canceling` 是进行中状态。`completed` 是执行成功；`failed`、`canceled`、`interrupted`、`needs_reconciliation` 不能当作成功。任务是否真正交付还应结合 `completionContract`、`completionOutcome` 与业务验收，不以模型一句“完成了”为依据。
 
+对已结束的任务重复调用 `cancel` 返回 HTTP 200 和原记录，包括旧 JSON 格式的已中断任务；不会把 `interrupted` 或 `needs_reconciliation` 改成 `canceled`，也不会清零未知用量或撤销已发生的动作。仍以响应中的 `run.status` 判断结果，不能只按 HTTP 200 记为成功。旧部署可能对旧中断记录返回 409，见[兼容修复与验收](acceptance/2026-10-25-legacy-terminal-cancellation.md)。
+
+当前源码对同一进程中的同一个运行回合复用一次中断命令：串行/并发重试、网页停止与后台清理不会重复发出原生中断；启动编号未确认时先保留取消意图，收到本次真实编号后才中断。中断请求得到受理或返回不明错误，都不等于已停止；继续查询原运行 ID，等待 `canceled` 或其他明确状态，不创建新事件来“重试取消”。这不是跨进程的全局恰好一次保证，重启后仍按持久状态核对、不自动重放。该修复的发布范围与证据见[取消去重验收](acceptance/2026-10-25-cancel-interruption-idempotency.md)，不要把源码能力当作旧部署已具备。
+
 ### 排队与服务重启
 
 新外部请求先持久保存任务、原始执行输入和幂等摘要，再返回 `queued`。默认最多保留 32 个待执行请求；满时返回 429 和 `Retry-After`，应使用原事件键重试。app-server 自动化默认同时执行最多 2 个、同一调用方最多 1 个；按满足并发限制的接收顺序领取。控制台原有 app-server 自动化仍共享执行并发上限；此限制不覆盖直接聊天或 systemd 任务，不是账户总并发/费用上限。
@@ -125,7 +133,35 @@ python3 scripts/external-client-example.py cancel my-app-review 已保存的运�
 | `runner` | 仅支持 `app-server`，无需显式设置 |
 | `worktree` | 独立调用方只能省略或设为 `true` |
 
-API 不允许覆盖 `sandbox`、`approval`；它们由控制台执行策略决定。旧共享令牌兼容既有会话和仓库目录用法，权限更宽，建议迁移到独立令牌。旧任务及其幂等重放仍返回原运行记录，不会为了应用新参数而重新执行。
+API 不允许覆盖 `sandbox`、`approval`、`executionProfile`；它们由控制台执行策略决定。旧共享令牌兼容既有会话和仓库目录用法，权限更宽，建议迁移到独立令牌。旧任务及其幂等重放仍返回原运行记录，不会为了应用新参数而重新执行。
+
+### 按需任务的受限执行
+
+运营者可在 `CODEX_CLOUD_AUTOMATIONS_CONFIG_B64` 对应的自动化配置中显式增加 `"executionProfile":"workspace-restricted-v1"`。仅支持 `mode: "on-demand"`、没有 `timer/service` 的工作项目自动化；客户端不能选择、取消或覆盖策略。配置未知或与系统定时服务混用时拒绝启动，不静默降级。已有自动化不自动迁移，不修改已有任务、登录或显式模型选择。
+
+该策略固定工作树写入、禁止命令联网、关闭网页搜索、连接器及插件，并禁止申请额外权限。每次模型启动前核对原生线程的实际目录、写权限和完整连接器状态；无法确认就以“未启动”失败，模型计量为零。文本、结构化 JSON、受限材料输入和工作树产物可用；图片生成接口在接收任务前拒绝。`capabilities.execution` 和 `run.execution` 返回策略及限制，图片输出能力同步返回不可用。
+
+任务接收时同时保存策略和执行材料；排队、领取及恢复时再次比对。运营者变更或移除策略后，旧排队任务不会自动使用新权限执行；相同事件键仍找回原记录。继续会话只允许同一策略、已核对的原工作树，不把旧高权限会话直接改成受限会话。任务存储格式升级为 7；非空任务数据库不能自动退回不识别该格式的旧执行器，须先验证兼容版本，不能恢复旧数据库覆盖新任务。
+
+这不是不可信多租户安全沙箱。执行器仍共用服务器系统用户；该策略未证明宿主文件读取隔离、阻止协作或模型费用硬上限。CLI 0.157.1 的本机/EC2 模拟服务实测中，`collaboration.spawn_agent` 不仅列出，还能实际派生子回合。不要把禁用标志或提示词当强制隔离；包含独立协作的运行在尚未完成归集前保持用量未知，而非只报父回合。合法配置名称含 `.`、`@` 的误拒绝已由 PR #21 修复，未知或损坏的配置仍拒绝启动；不能据此向陌生用户开放任意命令。参见[策略验收](acceptance/2026-10-25-automation-execution-profile.md)、[配置修复](acceptance/2026-10-25-personal-memory-quality.md)和 [F07 实际调用/计量验收](acceptance/2026-10-25-turn-usage-accounting.md)，以报告发布状态为准。
+
+### 独立客户端与真实 CLI 自检
+
+```bash
+# 临时回环服务、真实 CLI 0.157.1、模拟模型，不读取现有登录或消耗模型额度。
+npm run verify:external-client:codex
+```
+
+此检查用独立 Node 进程提交虚构 Markdown/PDF、校验 JSON 和报告文件，再由独立 Python 进程在服务重启后下载；同时检查原事件恢复、未领取任务取消、调用方用量和撤销拒绝。只监听 `127.0.0.1`，临时令牌限单一验收自动化、一小时到期，结束撤销并停止进程；私有证据路径在输出中给出。完整命令已在本机与 EC2 的隔离服务通过，不是生产 HTTPS、真实 EC2 模型或图片生成验收。GitHub 托管主机拒绝原生沙箱写入，材料/产物模式在 CI 仍只运行显式的 `--guards-only`（三个真实模式入口拒绝检查），不宣称 CI 已完成原生文件链路；原有全量回归和运行包门禁保持。
+
+```bash
+# 真实 CLI 的运行中取消及进程中断恢复；只有本机受控响应，不用真实模型或现有登录。
+npm run verify:external-client:codex -- --faults-only
+```
+
+此模式确认 CLI 已进入一个尚未完成的响应，再验证取消关闭连接、原生 `interrupted` 回执、重复取消不重发；第二条私有任务在运行中强制结束本轮进程组，重启后原事件只能找回 `needs_reconciliation`（待核对），不能自动执行。未收到可靠计量时保持未知，不填零。只允许两个原生启动尝试，超限尝试也计入失败证据；临时令牌用后撤销。它与 `--live` 互斥、不生成产物、不调用连接器；作为独立 CI 步骤验证原生故障路径，不代替真实模型质量、生产 HTTPS 或完整产物链路。结果和 CI 范围见[运行中恢复验收](acceptance/2026-10-25-native-inflight-recovery.md)。
+
+真实模型模式必须另行得到额度授权，并由用户准备一个私有、已登录且不同于正常 Codex 目录的 `CODEX_EXTERNAL_LIVE_HOME`，再设置 `CODEX_EXTERNAL_LIVE_APPROVED=1` 运行 `npm run verify:external-client:codex -- --live`。脚本不会复制登录凭据、重新登录或自动新增模型回合，默认不进入此模式。CLI 会在该专用目录登记本轮虚构仓库的信任项并保留原生测试线程；这不是无状态调用。不得把普通 `~/.codex` 当测试目录，亦不自动恢复旧配置覆盖并行修改。首次共享目录实测和这一限制见[本轮验收](acceptance/2026-10-25-native-client-evidence.md)。
 
 ## Node.js 集成
 
@@ -187,6 +223,8 @@ async function waitForResearch(runId, signal) {
 命令行也支持 `submit/heartbeat/status/cancel`。只有 `cancel` 会主动请求服务器中断；Ctrl+C 不会。用法见[独立调用方](setup.md#独立调用方)。
 
 ## 当前边界
+
+上线前可以在已有 CLI 环境运行 `npm run verify:command-isolation:codex`，验证明确配置下的工作区写入、命令禁网和虚构 MCP 禁用。它只使用临时无登录目录和本机模拟模型服务；不是给生产自动化设置权限的接口，不会改变当前执行器的全权限默认值，也不能证明协作工具被禁用。完整步骤、EC2 实测与未覆盖限制见[原生隔离检查](acceptance/2026-10-25-native-command-isolation.md)。
 
 独立令牌不能读取管理页面、其他服务的结果或批准任务；运行响应不泄漏工作目录、会话 ID 和原始工具内容。用量缺失时为“未知”，token 不是美元账单。
 

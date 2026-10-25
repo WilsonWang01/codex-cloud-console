@@ -22,6 +22,118 @@ const { DraftPersistence } = await import(`data:text/javascript;base64,${Buffer.
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
 
+test("消息时间格式化器只建立一次，输出和原格式一致", () => {
+  let created = 0;
+  const context = vm.createContext({ Date, Intl: { DateTimeFormat: class extends Intl.DateTimeFormat { constructor(...args) { super(...args); created++; } } } });
+  vm.runInContext(ts.transpileModule(section(frontend, "const chatTimeFormatter =", "function datePartsInShanghai("), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  for (let index = 0; index < 500; index++) {
+    const date = new Date(1792900000000 + index * 1000).toISOString();
+    assert.equal(context.timeLabel(date), new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(date)));
+  }
+  assert.equal(created, 1);
+  assert.throws(() => context.timeLabel("invalid date"), RangeError);
+});
+
+test("原生回合归属同时核对线程、回合和已知条目，旧编号不能匹配新任务或压缩", () => {
+  const job = { repoId: "repo", sessionId: "session", threadId: "thread", turnId: "new", itemIds: new Set(["new-item"]) };
+  const context = vm.createContext({
+    activeTurns: new Map([["repo:session", job]]), activeCompactions: new Map(),
+    threadOwners: new Map([["thread", job]]), turnOwners: new Map([["old", { ...job, turnId: "old" }]]),
+    itemOwners: new Map([["old-item", { ...job, turnId: "old" }], ["new-item", job]]), makeSessionKey: (repo, session) => repo + ":" + session,
+  });
+  vm.runInContext(section(source, "function ownerFromParams(", "function commandToolRecord("), context);
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "new" }), job);
+  assert.equal(context.findTurnJob({ itemId: "new-item" }), job);
+  for (const params of [{ threadId: "thread", turnId: "old" }, { itemId: "old-item" }, { threadId: "other", turnId: "new" }, { threadId: "thread", itemId: "unknown" }]) assert.equal(context.findTurnJob(params), null);
+  job.turnId = null;
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "old" }, true), null);
+  job.startRequestPending = true;
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "candidate" }, true), job);
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "candidate" }), null);
+  job.turnId = "new";
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "old" }, true), null);
+  job.startRequestPending = false;
+  context.activeCompactions.set("repo:session", job);
+  assert.equal(context.findCompactJob({ threadId: "thread", turnId: "old" }), null);
+  assert.equal(context.findCompactJob({ threadId: "thread", turnId: "new" }), job);
+  job.finishing = true;
+  assert.equal(context.findTurnJob({ threadId: "thread", turnId: "new" }), null);
+});
+
+test("启动回执前的通知有界且按原顺序重放，失败或缺失编号不会绑定替代回合", async () => {
+  const gate = deferred(), observed = [], failures = [];
+  const context = vm.createContext({ Buffer, Date, Promise, appServerClientForJob: () => ({ request: () => gate.promise }),
+    ownerFromParams: params => params, jobMatchesOwner: () => true,
+    rememberOwner: (owner) => observed.push(owner.turnId), handleAppServerNotification: message => observed.push(message.params.sequence),
+    interruptTimedOutTurn: (job, reason) => failures.push({ job, reason }), finishCompactJob: () => {},
+  });
+  vm.runInContext(section(source, "function bufferStartNotification(", "function commandToolRecord("), context);
+  const job = { threadId: "thread", repoId: "repo", sessionId: "s" };
+  const started = context.requestJobStart(job, "turn/start", {});
+  context.bufferStartNotification(job, { params: { sequence: 1 } });
+  context.bufferStartNotification(job, { params: { sequence: 2 } });
+  gate.resolve({ turn: { id: "actual" } }); await started;
+  assert.deepEqual(observed, ["actual", 1, 2]); assert.equal(job.startNotifications.length, 0); assert.equal(job.startNotificationBytes, 0);
+  await job.startReady.promise;
+  const failedGate = Promise.withResolvers(); context.appServerClientForJob = () => ({ request: () => failedGate.promise });
+  const failedJob = { threadId: "same" }, failed = context.requestJobStart(failedJob, "turn/start", {});
+  context.bufferStartNotification(failedJob, { params: { sequence: "must-not-replay" } });
+  failedGate.reject(new Error("uncertain RPC")); await assert.rejects(failed, /uncertain RPC/);
+  assert.equal(failedJob.startConfirmationFailed, true); assert.equal(failedJob.cancelRequested, true);
+  await failedJob.startReady.promise; assert.equal(failedJob.startNotifications.length, 0); assert.equal(observed.includes("must-not-replay"), false);
+  context.appServerClientForJob = () => ({ request: async () => ({}) });
+  await assert.rejects(context.requestJobStart({}, "turn/start", {}), /没有返回本次回合编号/);
+  const bounded = { startNotifications: [], startNotificationBytes: 0 };
+  for (let index = 0; index < 130; index++) context.bufferStartNotification(bounded, { params: { index } });
+  assert.equal(bounded.startNotifications.length, 128); assert.equal(failures.length, 1); assert.equal(bounded.startConfirmationFailed, true);
+  const oversized = { startNotifications: [], startNotificationBytes: 0 };
+  context.bufferStartNotification(oversized, { text: "x".repeat(2 * 1024 * 1024) });
+  assert.equal(oversized.startNotifications.length, 0); assert.equal(failures.length, 2);
+  const reviewGate = deferred(); context.appServerClientForJob = () => ({ request: () => reviewGate.promise });
+  context.ownerFromParams = params => ({ threadId: params.threadId, turnId: params.turnId });
+  context.jobMatchesOwner = (job, owner) => owner.threadId === job.reviewThreadId && owner.turnId === job.turnId;
+  const review = { threadId: "source", repoId: "repo", sessionId: "s" };
+  const reviewing = context.requestJobStart(review, "review/start", {});
+  context.bufferStartNotification(review, { params: { threadId: "other-review", turnId: "other", sequence: "foreign-must-not-requeue" } });
+  context.bufferStartNotification(review, { params: { threadId: "own-review", turnId: "own", sequence: "owned-review" } });
+  reviewGate.resolve({ turn: { id: "own" }, reviewThreadId: "own-review" }); await reviewing;
+  assert.equal(observed.includes("foreign-must-not-requeue"), false); assert.equal(observed.includes("owned-review"), true);
+});
+
+test("中断只在原生回合绑定后发送一次，迟到编号、并发入口和 detached review 不串目标", async () => {
+  const requests = [], gate = deferred();
+  const context = vm.createContext({ Promise, appServerClientForJob: job => ({ request: (method, params, timeout) => {
+    requests.push({ job, method, params, timeout }); return gate.promise;
+  } }) });
+  vm.runInContext(section(source, "function requestJobInterruption(", "async function requestJobStart("), context);
+  const job = {};
+  assert.equal(await context.requestJobInterruption(job), false); assert.equal(requests.length, 0);
+  job.threadId = "original-thread"; job.turnId = "actual-turn";
+  const first = context.requestJobInterruption(job), repeated = context.requestJobInterruption(job);
+  assert.equal(first, repeated); await Promise.resolve();
+  assert.equal(requests.length, 1); assert.equal(requests[0].method, "turn/interrupt");
+  assert.equal(JSON.stringify(requests[0].params), JSON.stringify({ threadId: "original-thread", turnId: "actual-turn" }));
+  assert.equal(requests[0].timeout, 20000);
+  gate.resolve({ accepted: true }); await first;
+  assert.equal(context.requestJobInterruption(job), first);
+  const review = { threadId: "source-thread", reviewThreadId: "detached-thread", turnId: "review-turn" };
+  await context.requestJobInterruption(review);
+  assert.equal(requests.length, 2); assert.equal(requests[1].params.threadId, "detached-thread");
+});
+
+test("中断结果不明时保留同一个失败，不因重试或任务已结束再次发送原生命令", async () => {
+  const failure = new Error("synthetic uncertain interruption"); let calls = 0;
+  const context = vm.createContext({ Promise, appServerClientForJob: () => ({ request: () => { calls++; throw failure; } }) });
+  vm.runInContext(section(source, "function requestJobInterruption(", "async function requestJobStart("), context);
+  const job = { threadId: "original-thread", turnId: "actual-turn" };
+  const first = context.requestJobInterruption(job);
+  await assert.rejects(first, error => error === failure);
+  job.completed = true;
+  assert.equal(context.requestJobInterruption(job), first);
+  await assert.rejects(context.requestJobInterruption(job), error => error === failure);
+  assert.equal(calls, 1);
+});
+
 test("个人和工作列表保留非当前文字或附件草稿，仅隐藏空白草稿", () => {
   const context = vm.createContext({});
   const functions = section(frontend, "function persistedDraftInput(", "function draftPayload(")
@@ -125,7 +237,7 @@ test("本机草稿保存返回可靠结果，失败仍允许原服务端保存�
 });
 
 test("所有延迟模块共用局部恢复，加载拒绝不抛出且不会自动刷新", async () => {
-  assert.equal((frontend.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 12);
+  assert.equal((frontend.match(/recoverableLazy\(\(\) => import\(/g) || []).length, 13);
   assert.doesNotMatch(frontend, /\blazy\(\(\) => import\(/);
   const reported = [], exports = {};
   const context = { exports, console: { error: (...args) => reported.push(args) }, require: name => {
@@ -771,18 +883,19 @@ test("会话回写拒绝旧项目、旧请求及错误项目响应", () => {
     hydrateChatDraft: (_repo, draft) => draft || { input: "", attachments: [] },
     draftStorageKey: (repo, session) => `${repo}:${session}`, draftSnapshot: JSON.stringify,
   };
-  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatInput", "setChatAttachments"]) {
+  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatHistoryWindow", "setChatInput", "setChatAttachments"]) {
     context[name] = (value) => updates.push([name, value]);
   }
   vm.createContext(context);
   vm.runInContext(ts.transpileModule(section(frontend, "  const applyChatHistory =", "  const loadChatHistory ="), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText + "\nglobalThis.apply = applyChatHistory", context);
-  const result = { repoId: "B", activeSessionId: "b-1", sessions: [], messages: [] };
+  const result = { repoId: "B", activeSessionId: "b-1", sessions: [], messages: [], history: { total: 500, limit: 80, hasMore: true } };
   assert.equal(context.apply(result, { id: "A" }, 5), false);
   assert.equal(context.apply(result, { id: "B" }, 4), false);
   assert.equal(context.apply({ ...result, repoId: "A" }, { id: "B" }, 5), false);
   assert.deepEqual(updates, []);
   assert.equal(context.apply(result, { id: "B" }, 5), true);
-  assert.equal(updates.length, 5);
+  assert.equal(updates.length, 6);
+  assert.deepEqual(updates.find(([name]) => name === "setChatHistoryWindow")[1], result.history);
 });
 
 function frontendRuntimeFixture() {
@@ -865,7 +978,7 @@ test("项目切换清空编辑器且旧文件不能写入新项目", async () =>
     api: async () => assert.fail("stale file must not be written"),
   };
   context.editorRef = { current: { file: context.selectedFile, draft: context.fileDraft } };
-  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setThreadGoal", "setThreadTokenUsage", "setCompactStatus", "setReviewPrContext", "setChatInput", "setChatAttachments", "setChatHistoryError"]) context[name] = () => {};
+  for (const name of ["setChatSessions", "setActiveSessionId", "setChatMessages", "setChatHistoryWindow", "setThreadGoal", "setThreadTokenUsage", "setCompactStatus", "setReviewPrContext", "setChatInput", "setChatAttachments", "setChatHistoryError"]) context[name] = () => {};
   const code = section(frontend, "  const switchRepoConversation =", "\n  useEffect(() => {\n    if (!statusReady") + section(frontend, "  const saveAgentFile =", "  const runTerminalCommand =");
   vm.createContext(context);
   vm.runInContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);

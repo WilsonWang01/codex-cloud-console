@@ -66,6 +66,32 @@ test("unknown evidence survives restart and cannot replace already known turn us
   assert.equal(checkKnownTokenBudget(rows, { limit: 1000, now: start + 10000 }).statusCode, 409);
 }));
 
+test("legacy native snapshots remain preserved but cannot bypass unknown-usage budget gates after pruning", () => fixture((f) => {
+  const old = run("legacy", { usage: { status: "complete", source: "app-server:last-turn", inputTokens: 10, outputTokens: 2, totalTokens: 12 } });
+  f.ledger.sync([run("legacy")]);
+  f.ledger.database.prepare("UPDATE usage_runs SET snapshot=? WHERE id=?").run(JSON.stringify({ ...old, prompt: undefined }), old.id);
+  const raw = () => f.ledger.database.prepare("SELECT snapshot FROM usage_runs WHERE id=?").get(old.id).snapshot;
+  const before = raw();
+  const read = f.ledger.rows(range)[0];
+  assert.equal(read.usage.status, "unknown");
+  assert.equal(read.usage.reportedLastRequest.totalTokens, 12);
+  assert.equal(raw(), before, "read projection must not overwrite the original stored snapshot");
+  for (const rows of [mergeUsageRuns([], [old]), mergeUsageRuns([old], f.ledger.rows(range))]) {
+    assert.equal(rows[0].usage.status, "unknown");
+    assert.equal(checkKnownTokenBudget(rows, { limit: 1000, now: start + 10000 }).statusCode, 409);
+  }
+  f.reopen();
+  assert.equal(f.ledger.rows(range)[0].usage.reportedLastRequest.totalTokens, 12);
+}));
+
+test("newly seeded legacy counts retain original numbers without becoming billable known totals", () => fixture(({ ledger }) => {
+  const old = run("legacy-seed", { usage: { status: "complete", source: "app-server:last-turn", inputTokens: 10, outputTokens: 2, totalTokens: 12 } });
+  ledger.sync([old]);
+  const saved = ledger.rows(range)[0];
+  assert.equal(saved.usage.status, "unknown");
+  assert.deepEqual(saved.usage.reportedLastRequest, { source: old.usage.source, inputTokens: 10, outputTokens: 2, totalTokens: 12 });
+}));
+
 test("batch failure rolls back all rows; ownership and Codex turn collisions fail closed", () => fixture(({ ledger }) => {
   ledger.sync([run("one")]);
   for (const patch of [{ clientId: "other" }, { automationId: "other" }, { startedAt: new Date(start + 1).toISOString() }, { turnId: "other" }]) {

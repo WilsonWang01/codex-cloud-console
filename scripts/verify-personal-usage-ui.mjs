@@ -6,6 +6,7 @@ import { chromium } from "playwright";
 import { nextPersonalOccurrence } from "../server/personal-schedule.mjs";
 import { buildPersonalBrief } from "../server/personal-brief.mjs";
 import { calendarDayWindow } from "../server/personal-calendar.mjs";
+import { mailWindow } from "../server/personal-mail.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -80,6 +81,7 @@ let failNextCommitmentDraftResponse = false;
 let oldCommitmentApi = false;
 let usageRace = false;
 let usageFailure = false;
+let personalContextMode = "ready";
 const errors = [];
 const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -91,6 +93,14 @@ await context.route("**/api/**", async (route) => {
   const repoId = body.repoId || url.searchParams.get("repoId") || "sample-app";
   const send = (data, code = 200) => route.fulfill({ status: code, contentType: "application/json", body: JSON.stringify(data) });
   if (url.pathname === "/api/status") return send(status);
+  const personalContext = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/personal-context$/);
+  if (personalContext && req.method() === "GET") {
+    if (repoId !== "_personal" || !sessions.some(session => session.id === decodeURIComponent(personalContext[1]) && session.repoId === repoId)) return send({ ok: false, error: "wrong space" }, 404);
+    if (personalContextMode === "http-error") return send({ ok: false, error: "合成：个人资料核对暂时不可用" }, 503);
+    if (personalContextMode === "malformed") return send({ ok: true });
+    return send({ ok: true, issue: null, providedAt: null, providedCount: null, activeCount: personalFacts.length });
+  }
+  if (url.pathname === "/api/personal/mail") return send({ ok: true, mail: { window: mailWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
   if (url.pathname === "/api/personal/calendar") return send({ ok: true, calendar: calendarView || { window: calendarDayWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
   if (url.pathname === "/api/personal/calendar/refresh") {
     calendarReads++;
@@ -381,6 +391,20 @@ page.on("pageerror", (error) => errors.push(error.message));
 const openRecentPersonalChat = () => page.locator(".personal-list-section").filter({ has: page.getByRole("heading", { name: "继续对话" }) }).locator(".personal-task-row").first().click();
 const out = new URL("../docs/research/acceptance/personal-usage-2026-09-26/", import.meta.url);
 await fs.mkdir(out, { recursive: true });
+const chatOut = new URL("../docs/research/acceptance/p04-chat-layout-20261025/", import.meta.url);
+await fs.mkdir(chatOut, { recursive: true });
+const capturePersonalChat = async name => {
+  const layout = await page.evaluate(() => ({ viewport: { width: innerWidth, height: innerHeight }, visual: window.visualViewport?.height,
+    visualCss: getComputedStyle(document.documentElement).getPropertyValue("--app-visual-height"),
+    elements: Object.fromEntries([".workspace", ".session-content-grid", ".chat-panel", ".topbar", ".app-session-strip", ".personal-scope-notice", ".composer-shell", ".composer-notices", ".composer", ".composer textarea", ".composer-footer", ".personal-context-notice .mini-action", ".chat-window"].map(selector => {
+      const element = document.querySelector(selector), rect = element?.getBoundingClientRect();
+      return [selector, { left: rect?.left, width: rect?.width, right: rect?.right, top: rect?.top, height: rect?.height, bottom: rect?.bottom }];
+    })),
+  }));
+  await fs.writeFile(new URL(name + ".json", chatOut), JSON.stringify(layout, null, 2));
+  await page.screenshot({ path: new URL(name + ".png", chatOut).pathname });
+  return layout;
+};
 try {
   const baseUrl = process.env.CODEX_CLOUD_SAFETY_UI_URL || "http://127.0.0.1:5174/";
   const pendingStatusPage = await context.newPage();
@@ -451,6 +475,15 @@ try {
       await calendarPage.screenshot({ path: new URL(`calendar-${width}.png`, calendarOut).pathname, fullPage: true });
     }
     const sendsBefore = submittedMessages;
+    await calendarPage.clock.setFixedTime(Date.parse(calendarView.snapshot.expiresAt) + 1);
+    assert.equal(await source.getByRole("button", { name: "规划今天" }).isEnabled(), true);
+    await source.getByRole("button", { name: "规划今天" }).click();
+    await calendarPage.waitForFunction(() => location.hash !== "#/project/_personal/today" || [...document.querySelectorAll('[aria-label="今日日程"] button')].some(button => button.textContent.includes("规划今天") && button.disabled), null, { timeout: 5000 });
+    assert.equal(new URL(calendarPage.url()).hash, "#/project/_personal/today");
+    assert.equal(await source.getByRole("button", { name: "规划今天" }).isEnabled(), false);
+    assert.equal(submittedMessages, sendsBefore);
+    await calendarPage.clock.setFixedTime(Date.now()); await calendarPage.reload();
+    await source.getByText("原日程时区：America/New_York").waitFor();
     await source.getByRole("button", { name: "规划今天" }).click();
     const input = calendarPage.getByPlaceholder("向个人助理发送消息");
     await input.waitFor();
@@ -754,17 +787,51 @@ try {
         await page.locator(".space-switch").getByRole("button", { name: "个人" }).click();
         await page.getByRole("heading", { name: "今日", exact: true }).waitFor();
         await page.screenshot({ path: new URL("today-390.png", out).pathname });
+        const contextReady = page.waitForResponse(response => new URL(response.url()).pathname === "/api/chat/sessions/_personal-session/personal-context");
         await openRecentPersonalChat();
+        assert.equal((await contextReady).status(), 200);
         await page.locator(".session-current[data-session-id='_personal-session']").waitFor();
         await page.getByText("共用账号", { exact: true }).waitFor();
+        assert.equal(await page.locator(".personal-context-notice").count(), 0);
         const chatHeight = await page.locator(".chat-window").evaluate((element) => element.getBoundingClientRect().height);
-        const chatLayout = await page.evaluate(() => Object.fromEntries([".topbar", ".app-session-strip", ".personal-scope-notice", ".composer-shell", ".composer", ".composer-footer", ".chat-window"].map((selector) => [selector, Math.round(document.querySelector(selector)?.getBoundingClientRect().height || 0)])));
+        const chatLayout = await capturePersonalChat("personal-chat-ready-390");
         assert.ok(chatHeight >= 844 * 0.5, `390px personal chat window too short: ${chatHeight}px; ${JSON.stringify(chatLayout)}`);
         const smallControls = await page.locator(".composer-shell .attach-button, .composer-shell .send-button, .composer-shell .clear-chat, .personal-scope-actions button, .session-actions button").evaluateAll((buttons) => buttons.filter((button) => {
           const rect = button.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0 && (rect.width < 44 || rect.height < 44);
         }).map((button) => button.outerHTML.slice(0, 140)));
         assert.deepEqual(smallControls, [], "undersized personal controls at 390px");
+        const beforeContextFailure = { draft: await composer.inputValue(), submittedMessages };
+        for (const mode of ["http-error", "malformed"]) {
+          personalContextMode = mode;
+          await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+          await page.getByRole("button", { name: "重新核对个人资料", exact: true }).waitFor();
+          await page.getByRole("button", { name: "查看个人资料核对原因", exact: true }).click();
+          const dialog = page.getByRole("dialog", { name: "资料核对未完成", exact: true });
+          await dialog.waitFor();
+          assert.match(await dialog.innerText(), mode === "http-error" ? /个人资料核对暂时不可用/ : /个人资料范围未能核对/);
+          await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+          for (const [errorWidth, errorHeight] of [[390, 844], [390, 480], [320, 480]]) {
+            await page.setViewportSize({ width: errorWidth, height: errorHeight });
+            await page.waitForFunction(() => document.querySelector(".composer-shell")?.getBoundingClientRect().bottom <= innerHeight + 1);
+            const errorLayout = await capturePersonalChat(`personal-chat-${mode}-${errorWidth}-${errorHeight}`);
+            assert.ok(errorLayout.elements[".chat-window"].height > 0);
+            assert.ok(errorLayout.elements[".chat-window"].bottom <= errorLayout.elements[".composer-shell"].top);
+            assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+            const clipped = await page.locator(".composer textarea, .composer .attach-button, .composer .send-button, .composer .clear-chat, .composer-footer, .personal-context-notice .mini-action").evaluateAll(elements => elements.filter(element => {
+              const rect = element.getBoundingClientRect();
+              return rect.width < 44 || rect.height < 44 || rect.top < 0 || rect.bottom > innerHeight + 1;
+            }).map(element => ({ html: element.outerHTML.slice(0, 140), rect: element.getBoundingClientRect().toJSON() })));
+            assert.deepEqual(clipped, [], "failure notices must not hide or shrink composer controls");
+            assert.equal(await composer.inputValue(), beforeContextFailure.draft);
+          }
+          personalContextMode = "ready";
+          await page.getByRole("button", { name: "重新核对个人资料", exact: true }).click();
+          await page.locator(".personal-context-notice").waitFor({ state: "hidden" });
+          await page.setViewportSize({ width: 390, height: 844 });
+          assert.equal(await composer.inputValue(), beforeContextFailure.draft);
+          assert.equal(submittedMessages, beforeContextFailure.submittedMessages, "context checks must not send a message");
+        }
         await page.getByRole("button", { name: "连接服务", exact: true }).click();
         assert.equal(await page.locator(".command-panel").getAttribute("aria-modal"), "true");
         await page.waitForFunction(() => document.activeElement?.closest(".command-panel") !== null);
