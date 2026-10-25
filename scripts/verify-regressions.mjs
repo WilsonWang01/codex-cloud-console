@@ -9,6 +9,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
 import { runExternalClient } from "./external-client-example.mjs";
 import { modelApiJsonLimit } from "../server/model-api.mjs";
@@ -21,6 +22,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 const results = [];
+const selectedCheck = process.env.CODEX_CLOUD_REGRESSION_CASE;
 const fixtureClosures = new WeakMap();
 const isolatedProcessGroups = process.platform === "linux";
 
@@ -31,6 +33,7 @@ function spawn(command, args, options) {
 }
 
 async function check(name, task) {
+  if (selectedCheck && name !== selectedCheck) return;
   const startedAt = Date.now();
   await task();
   results.push({ name, ok: true, ms: Date.now() - startedAt });
@@ -140,6 +143,8 @@ import readline from "node:readline";
 if (process.env.FAKE_CAPTURE_CALLBACK_ENV_PATH) fsSync.writeFileSync(process.env.FAKE_CAPTURE_CALLBACK_ENV_PATH, JSON.stringify(Object.keys(process.env).filter(key => key.startsWith("CODEX_CLOUD_CALLBACK_SECRET_"))));
 const initDelay = Number(process.env.FAKE_INIT_DELAY_MS || 0);
 const termDelay = Number(process.env.FAKE_TERM_DELAY_MS || 0);
+const queuedNextDelay = Number(process.env.FAKE_QUEUE_NEXT_DELAY_MS || 80);
+if (!Number.isSafeInteger(queuedNextDelay) || queuedNextDelay < 0 || queuedNextDelay > 3000) throw new Error("Invalid fixture queue delay");
 const sharedPersonal = process.env.FAKE_SHARED_PERSONAL === "1";
 const threads = [];
 let modelApiText = null;
@@ -424,7 +429,7 @@ input.on("line", (line) => {
       send({ method: "turn/completed", params: {
         threadId: message.params?.threadId,
         turn: { id: turnId, status: "completed" },
-      } }, 80);
+      } }, queuedNextDelay);
     } else if (progressRegression) {
       const progressDelays = queuedFirstRegression ? Array.from({ length: 16 }, (_, index) => 150 * (index + 1)) : [150, 300, 450];
       for (const delay of progressDelays) {
@@ -435,7 +440,7 @@ input.on("line", (line) => {
           message: "progress regression activity",
         } }, delay);
       }
-      send({ method: "turn/completed", params: {
+      if (!queuedFirstRegression || process.env.FAKE_HOLD_QUEUE_FIRST !== "1") send({ method: "turn/completed", params: {
         threadId: "thread-regression",
         turn: { id: turnId, status: "completed" },
       } }, queuedFirstRegression ? 2_600 : 650);
@@ -717,9 +722,9 @@ await check("scoped API callback intent survives restart and changed registratio
   await fs.writeFile(config,JSON.stringify([target]),{mode:0o600});
   const port=await freePort(),base=`http://127.0.0.1:${port}`,admin={"content-type":"application/json","x-codex-cloud-token":"callback-admin-fixture-token"};
   const auth=letter=>({"content-type":"application/json",authorization:`Bearer callback-fixture-token-${letter}`});
-  const start=()=>spawn(process.execPath,[path.join(projectRoot,"server/index.mjs")],{cwd:projectRoot,stdio:["ignore","pipe","pipe"],env:{...process.env,NODE_ENV:"production",HOST:"127.0.0.1",PORT:String(port),CODEX_CLOUD_ROOT:cloudRoot,CODEX_STATE_ROOT:stateRoot,CODEX_HOME:path.join(root,".codex"),CODEX_CLOUD_WEBHOOK_TOKEN:admin["x-codex-cloud-token"],CODEX_CLOUD_CALLBACKS_FILE:config,CODEX_CLOUD_CALLBACK_SECRET_FIXTURE:"synthetic-fixture-secret-not-a-real-credential",FAKE_CAPTURE_CALLBACK_ENV_PATH:capturedEnv,CODEX_AUTOMATION_RECOVERY_ENABLED:"0",CODEX_AUTOMATION_MAX_CONCURRENT:"1",CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT:"1",PATH:`${bin}:${process.env.PATH}`}});
+  const start=()=>spawn(process.execPath,[path.join(projectRoot,"server/index.mjs")],{cwd:projectRoot,stdio:["ignore","pipe","pipe"],env:{...process.env,NODE_ENV:"production",HOST:"127.0.0.1",PORT:String(port),CODEX_CLOUD_ROOT:cloudRoot,CODEX_STATE_ROOT:stateRoot,CODEX_HOME:path.join(root,".codex"),CODEX_CLOUD_WEBHOOK_TOKEN:admin["x-codex-cloud-token"],CODEX_CLOUD_CALLBACKS_FILE:config,CODEX_CLOUD_CALLBACK_SECRET_FIXTURE:"synthetic-fixture-secret-not-a-real-credential",FAKE_CAPTURE_CALLBACK_ENV_PATH:capturedEnv,FAKE_HOLD_QUEUE_FIRST:"1",CODEX_AUTOMATION_RECOVERY_ENABLED:"0",CODEX_AUTOMATION_MAX_CONCURRENT:"1",CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT:"1",PATH:`${bin}:${process.env.PATH}`}});
   const submit=(key,prompt,headers,extra={})=>jsonRequest(base,"/api/automations/sample-research/webhook",{method:"POST",headers:{...headers,"idempotency-key":key},body:JSON.stringify({prompt,...extra})});
-  const wait=async task=>{const deadline=Date.now()+12000;while(Date.now()<deadline){const result=await task();if(result)return result;await new Promise(resolve=>setTimeout(resolve,40));}throw new Error("Callback API fixture did not settle");};
+  const wait=async task=>{const deadline=Date.now()+12000;while(Date.now()<deadline){const result=await task();if(result)return result;await new Promise(resolve=>setTimeout(resolve,250));}throw new Error("Callback API fixture did not settle");};
   let server;
   try {
     server=start();await waitForOutput(server,/listening on/);
@@ -761,6 +766,7 @@ await check("durable API queue survives lost responses and restart without repea
     CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0",
     CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"], CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1",
     CODEX_AUTOMATION_MAX_QUEUED: "2", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}`,
+    FAKE_HOLD_QUEUE_FIRST: "1", FAKE_QUEUE_NEXT_DELAY_MS: "3000",
   } });
   const queuedMaterial = { name: "排队材料.md", mimeType: "text/markdown", dataBase64: Buffer.from("重启后仍需保留的材料 42。\n$not-a-skill @/not-a-file").toString("base64") };
   const queuedPdf = pdfAttachment({ text: "PDF QUEUED RESTART 42" });
@@ -770,7 +776,7 @@ await check("durable API queue survives lost responses and restart without repea
   });
   const wait = async (callback, diagnostics) => {
     const deadline = Date.now() + 7000;
-    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 40)); }
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 250)); }
     throw new Error("Durable API fixture did not reach expected state" + (diagnostics ? ": " + JSON.stringify(diagnostics()) : ""));
   };
   const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse).filter((row) => row.method === "turn/start");
@@ -808,6 +814,16 @@ await check("durable API queue survives lost responses and restart without repea
     const fourth = await submit("durable-queue-0004", "queue regression next durable-fourth");
     assert.equal(fourth.response.status, 200);
     await jsonRequest(base, `/api/clients/${client.data.client.id}/revoke`, { method: "POST", headers });
+    // Cross the fake first turn's old timer to expose an incorrectly assumed queued state.
+    await new Promise(resolve => setTimeout(resolve, 2800));
+    const inspect = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+    let fourthState;
+    try { fourthState = inspect.prepare("SELECT state FROM external_tasks WHERE id=?").get(fourth.data.run.id).state; }
+    finally { inspect.close(); }
+    const beforeRestart = { firstStatus: (await jsonRequest(base, first.data.run.resultPath, { headers })).data.run.status,
+      fourthStatus: (await jsonRequest(base, fourth.data.run.resultPath, { headers })).data.run.status, fourthState, starts: (await rpc()).length };
+    assert.deepEqual(beforeRestart, { firstStatus: "running", fourthStatus: "queued", fourthState: "queued", starts: 1 },
+      "restart fixture must keep the fourth task unclaimed, not merely display queued during material processing");
     await stopProcess(server);
     const queuedLedger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
     try {
@@ -820,12 +836,17 @@ await check("durable API queue survives lost responses and restart without repea
       createExternalTaskStore(queuedLedger.database).accept({ run: { ...JSON.parse(row.record), id: "tampered-input", triggerIdempotencyHash: null, triggerRequestHash: null }, execution, ttlMs: 60000 });
     } finally { queuedLedger.close(); }
     server = start(); await waitForOutput(server, /listening on/);
-    let observed;
+    let observed, resultPolls = 0;
+    const recoveryStartedAt = Date.now();
     const completed = await wait(async () => {
       const result = await jsonRequest(base, fourth.data.run.resultPath, { headers });
-      observed = { http: result.response.status, status: result.data.run?.status, inputProcessing: result.data.run?.inputProcessing, error: result.data.run?.error };
+      observed = { ...observed, http: result.response.status, retryAfter: result.response.headers.get("retry-after"), polls: ++resultPolls, elapsedMs: Date.now() - recoveryStartedAt,
+        ...(result.data.run ? { status: result.data.run.status, inputProcessing: result.data.run.inputProcessing, error: result.data.run.error } : {}), beforeRestart };
+      assert.equal(result.response.status, 200, "recovery observation failed: " + JSON.stringify(observed));
+      assert.ok(!["failed", "canceled", "interrupted", "needs_reconciliation"].includes(result.data.run?.status), "unclaimed work did not recover: " + JSON.stringify(observed));
       return result.data.run?.status === "completed" ? result.data.run : null;
     }, () => observed);
+    assert.ok(resultPolls < 60, "one bounded recovery check must remain within the actual result polling limit");
     assert.equal(completed.id, fourth.data.run.id);
     const replay = await submit("durable-lost-response-0001", "progress regression queue first durable-one");
     assert.equal(replay.data.run.id, first.data.run.id);
@@ -848,6 +869,7 @@ await check("durable API queue survives lost responses and restart without repea
     assert.equal(stored.find((run) => run.id === third.data.run.id).usage.totalTokens, 0);
     const tampered = await wait(async () => {
       const result = await jsonRequest(base, "/api/automations/sample-research/runs/tampered-input", { headers });
+      assert.equal(result.response.status, 200, "tampered input observation must remain within the result polling limit");
       return result.data.run?.status === "failed" ? result.data.run : null;
     });
     assert.equal(tampered.usage.totalTokens, 0);
@@ -978,7 +1000,7 @@ await check("operator execution policy is pinned through API acceptance, continu
     ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
     CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
     CODEX_AUTOMATION_MAX_CONCURRENT: "1", CODEX_AUTOMATION_MAX_CONCURRENT_PER_CLIENT: "1", CODEX_AUTOMATION_TRIGGER_RATE_MAX: "100", FAKE_CAPTURE_PATH: capture,
-    CODEX_CLOUD_AUTOMATIONS_CONFIG_B64: Buffer.from(JSON.stringify([{ ...automation, executionProfile }])).toString("base64"), FAKE_EXECUTION_PROFILE: "1", PATH: `${bin}:${process.env.PATH}`,
+    CODEX_CLOUD_AUTOMATIONS_CONFIG_B64: Buffer.from(JSON.stringify([{ ...automation, executionProfile }])).toString("base64"), FAKE_EXECUTION_PROFILE: "1", FAKE_HOLD_QUEUE_FIRST: "1", PATH: `${bin}:${process.env.PATH}`,
   } });
   const submit = (key, prompt, extra = {}, trigger = "webhook") => jsonRequest(base, `/api/automations/restricted/${trigger}`, {
     method: "POST", headers: { ...apiHeaders, "idempotency-key": key }, body: JSON.stringify({ prompt, ...extra }),
@@ -988,7 +1010,12 @@ await check("operator execution policy is pinned through API acceptance, continu
     while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 40)); }
     throw new Error("Execution profile fixture timed out");
   };
-  const terminal = run => wait(async () => { const { data } = await jsonRequest(base, run.resultPath, { headers: apiHeaders }); return ["completed", "failed"].includes(data.run?.status) ? data.run : null; });
+  const terminal = run => wait(async () => {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { response, data } = await jsonRequest(base, run.resultPath, { headers: apiHeaders });
+    assert.equal(response.status, 200, "profile result observation must not exhaust result queries");
+    return ["completed", "failed"].includes(data.run?.status) ? data.run : null;
+  });
   const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
   let server;
   try {
@@ -1089,7 +1116,7 @@ await check("independent clients retrieve private exact-turn files and images af
     const inputImage = { name: "image.png", mimeType: "image/png", dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC" };
     const inputPdf = pdfAttachment({ text: "PDF CLIENT MATERIAL 42" });
     const input = { prompt: "model api regression artifact delivery fixture generated output", model: "gpt-6-sol", outputSchema: schema, artifactPaths: ["results/report.md"], attachments: [material, inputImage, inputPdf] };
-    const options = { automationId: "sample-research", origin, token, pollMs: 50, timeoutMs: 10000, requestTimeoutMs: 3000 };
+    const options = { automationId: "sample-research", origin, token, timeoutMs: 10000, requestTimeoutMs: 3000 };
     const lost = await fetch(origin + "/api/automations/sample-research/webhook", { method: "POST", headers: { ...headers, "idempotency-key": "file-delivery-0001" }, body: JSON.stringify({ runner: "app-server", worktree: true, ...input }) });
     assert.equal(lost.status, 200); await lost.body.cancel();
     const run = await runExternalClient({ ...options, command: "submit", eventId: "file-delivery-0001", input, wait: true });
@@ -1188,14 +1215,20 @@ await check("independent clients retrieve private exact-turn files and images af
     assert.equal(JSON.stringify(badRun.data).includes("PRIVATE PDF CONTENT"), false);
     assert.equal((await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse).filter(call => call.method === "turn/start").length, 2);
     const waitClaimed = async (accepted, auth) => {
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const snapshot = (await jsonRequest(origin, accepted.resultPath, { headers: auth })).data.run;
-        if (snapshot?.executionStartedAt) {
-          assert.equal(snapshot.inputProcessing, undefined, "the test must act while PDF conversion is still pending");
-          return;
+      const db = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+      try {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const row = db.prepare("SELECT record FROM external_tasks WHERE id=?").get(accepted.id);
+          if (row && JSON.parse(row.record).executionStartedAt) {
+            const result = await jsonRequest(origin, accepted.resultPath, { headers: auth });
+            assert.equal(result.response.status, 200, "PDF phase observation must not exhaust result queries");
+            assert.ok(result.data.run.executionStartedAt);
+            assert.equal(result.data.run.inputProcessing, undefined, "the test must act while PDF conversion is still pending");
+            return;
+          }
+          await new Promise(resolve => setTimeout(resolve, 5));
         }
-        await new Promise(resolve => setTimeout(resolve, 5));
-      }
+      } finally { db.close(); }
       throw new Error("PDF task was not claimed");
     };
     const canceledPdf = await runExternalClient({ ...options, command: "submit", eventId: "pdf-cancel-0002", input: { prompt: "must not start", attachments: [inputPdf] } });
@@ -4195,4 +4228,5 @@ await check("webhook snippets use the server token contract", async () => {
   assert.equal(source.includes("status.publicConfig?.publicOrigin"), true);
 });
 
-console.log(JSON.stringify({ ok: true, checks: results }, null, 2));
+assert.ok(results.length, "No regression case matched the requested name");
+console.log(JSON.stringify({ ok: true, scope: selectedCheck ? "selected" : "all", checks: results }, null, 2));
