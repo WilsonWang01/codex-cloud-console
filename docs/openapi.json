@@ -113,6 +113,7 @@
       "post": {
         "operationId": "cancelRun",
         "summary": "明确请求取消，不能撤回已经发生的外部动作",
+        "description": "进行中取消返回 202，须继续核对 run.status。对已结束任务重复取消返回 200 和原终态，包括旧 interrupted 记录；不把中断、失败或待核对改为成功/已取消，不清零未知用量。HTTP 200 仅表示请求已处理。",
         "parameters": [{"$ref": "#/components/parameters/AutomationId"}, {"$ref": "#/components/parameters/RunId"}],
         "security": [{"ClientToken": []}, {"BearerToken": []}, {"AnthropicKey": []}],
         "responses": {
