@@ -54,6 +54,20 @@ export function normalizeCalendarEvent(value) {
   return { ...event, version: digest(event) };
 }
 
+export function calendarToolData(result) {
+  if (!result || Buffer.byteLength(JSON.stringify(result)) > calendarSourceLimits.resultBytes) throw fail("calendar_result_invalid", "日历返回过大或格式无法确认");
+  const raw = JSON.stringify(result);
+  if (result.isError === true) {
+    if (/forbidden|unauthorized|invalid_grant|permission|authentication|not.authenticated/i.test(raw)) throw fail("calendar_authorization_required", "日历读取被拒绝，请在连接服务中核对授权", 403);
+    throw fail("calendar_read_failed", "日历读取失败，不能据此判断没有日程");
+  }
+  if (result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
+  const content = result.content?.filter(item => item.type === "text");
+  if (content?.length === 1) {
+    try { return JSON.parse(content[0].text); } catch { /* A prose response is not a complete calendar. */ }
+  }
+  throw fail("calendar_shape_changed", "日历返回格式发生变化，未将结果当作空日程");
+}
 function inWindow(event, window) {
   return event.start.date
     ? event.start.date < calendarDayWindow(window.timeZone, Date.parse(window.to)).date && event.end.date > window.date
