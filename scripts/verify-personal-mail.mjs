@@ -71,6 +71,68 @@ test("a selected account is revalidated, every data call is bound to it and only
   assert.equal((await f.source.refresh("Asia/Shanghai", "link-work")).snapshot.version, result.snapshot.version);
 });
 
+test("account discovery invalidates a disconnected cached source across restart without reading another mailbox", async () => {
+  const f = fixture(), old = await f.source.refresh("UTC", "link-work");
+  f.advance(31000);
+  for (const tool of Object.values(f.tools)) tool._meta.link_accounts = tool._meta.link_accounts.filter(item => item.link_id !== "link-work");
+  assert.equal((await f.source.accounts()).length, 1);
+  const revoked = await f.source.snapshot("UTC");
+  assert.equal(revoked.stale, true);
+  assert.deepEqual(revoked.snapshot, old.snapshot);
+  assert.equal(revoked.lastAttempt.code, "mail_account_unavailable");
+  assert.equal(dataCalls(f).length, 2, "account discovery must not read messages or fall back to another account");
+  const reopened = createPersonalMailSource(f.options);
+  assert.equal((await reopened.snapshot("UTC")).stale, true);
+  const recovered = await reopened.refresh("UTC", "link-personal");
+  assert.equal(recovered.stale, false, "metadata-only invalidation must not add a message-read cooldown");
+  assert.equal(recovered.snapshot.account.id, "link-personal");
+  assert.equal(recovered.lastAttempt.operation, undefined);
+  assert.equal(dataCalls(f).length, 4);
+});
+
+test("changed mailbox identity and failed discovery cannot restore a cached source merely by listing accounts", async () => {
+  for (const invalid of ["identity", "catalog"]) {
+    const f = fixture(), old = await f.source.refresh("UTC", "link-work"); f.advance(31000);
+    if (invalid === "identity") {
+      for (const tool of Object.values(f.tools)) tool._meta.link_accounts.find(item => item.link_id === "link-work").profile_email = "changed@example.test";
+      await f.source.accounts();
+    } else {
+      f.catalog.data[0].httpOrigin = "https://untrusted.test";
+      await assert.rejects(f.source.accounts(), error => error.code?.startsWith("mail_"));
+    }
+    assert.equal((await f.source.snapshot("UTC")).stale, true);
+    assert.deepEqual(f.value.snapshot, old.snapshot);
+    assert.equal(f.value.lastAttempt.operation, "accounts");
+    assert.equal(dataCalls(f).length, 2);
+    f.catalog.data[0].httpOrigin = "https://chatgpt.com";
+    for (const tool of Object.values(f.tools)) tool._meta.link_accounts = structuredClone(accounts);
+    f.advance(31000); await f.source.accounts();
+    assert.equal((await f.source.snapshot("UTC")).stale, true, "reconnected metadata alone is not a fresh email read");
+  }
+});
+
+test("account invalidation preserves the original message cooldown and rejects unknown markers or failed saves", async () => {
+  const f = fixture(); await f.source.refresh("UTC", "link-work"); f.advance(1000);
+  for (const tool of Object.values(f.tools)) tool._meta.link_accounts = tool._meta.link_accounts.filter(item => item.link_id !== "link-work");
+  await f.source.accounts();
+  const reopened = createPersonalMailSource(f.options);
+  await assert.rejects(reopened.refresh("UTC", "link-personal"), { code: "mail_refresh_throttled" });
+  f.advance(30000); await reopened.refresh("UTC", "link-personal");
+  const unchanged = structuredClone(f.value);
+  for (const marker of [{ operation: "unexpected" }, { operation: "accounts", mailAttemptAt: "invalid" }]) {
+    f.setValue({ ...unchanged, lastAttempt: { ...unchanged.lastAttempt, ...marker } });
+    const preserved = structuredClone(f.value);
+    await assert.rejects(f.source.snapshot("UTC"), { code: "mail_cache_invalid" });
+    assert.deepEqual(f.value, preserved);
+  }
+  f.setValue(unchanged);
+  for (const tool of Object.values(f.tools)) tool._meta.link_accounts = [{ ...accounts[0], profile_email: "changed@example.test" }];
+  let saves = 0;
+  const broken = createPersonalMailSource({ ...f.options, write: async () => { saves++; throw new Error("synthetic save failure"); } });
+  await assert.rejects(broken.accounts(), /synthetic save failure/);
+  assert.equal(saves, 1); assert.deepEqual(f.value, unchanged);
+});
+
 test("inconsistent, unsupported and revoked accounts never fall back to another mailbox", async () => {
   for (const change of [
     f => { f.tools["gmail.read_email"]._meta.link_accounts.pop(); },

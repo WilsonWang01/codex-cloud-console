@@ -25,6 +25,7 @@ jobs:
       - run: npm run verify:personal-memory:quality
       - run: npm run verify:command-isolation:codex -- --catalog-only
       - run: npm run verify:mail-drafts:quality
+      - run: npm run verify:mail:ui
       - run: npm run verify:mail-drafts:codex
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only

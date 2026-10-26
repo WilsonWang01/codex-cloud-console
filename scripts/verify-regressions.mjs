@@ -192,7 +192,7 @@ input.on("line", (line) => {
   if (message.method === "thread/start" && message.params.ephemeral === true) return send({ id: message.id, result: { thread: { id: message.params.serviceName?.includes("mail") ? "mail-ephemeral-" + (++mailSourceSequence) : "calendar-ephemeral", ephemeral: true } } });
   if (message.method === "mcpServerStatus/list" && String(message.params.threadId || "").startsWith("mail-ephemeral-")) return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: Object.fromEntries(["gmail.search_email_ids", "gmail.read_email"].map(name => [name, {
     name, annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
-    _meta: { connector_id: "mail", link_id: "mail-one", link_accounts: [{ link_id: "mail-one", profile_email: "one@example.test", link_name: "个人" }, { link_id: "mail-two", profile_email: "two@example.test", link_name: "另一个" }] }
+    _meta: { connector_id: "mail", link_id: "mail-one", link_accounts: [{ link_id: "mail-one", profile_email: "one@example.test", link_name: "个人" }, { link_id: "mail-two", profile_email: "two@example.test", link_name: "另一个" }].filter(item => item.link_id !== "mail-two" || !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".mail-account-revoked")) }
   }])) }], nextCursor: null } });
   if (message.method === "mcpServer/tool/call" && String(message.params.threadId || "").startsWith("mail-ephemeral-")) {
     if (message.params.tool === "gmail.search_email_ids") {
@@ -2162,6 +2162,25 @@ await check("calendar and mail sources are explicit, account-bound, durable and 
     const restoredDrafts = await jsonRequest(base,"/api/personal/mail-drafts",{headers});
     assert.equal(restoredDrafts.data.drafts[0].id,reply.data.draft.id);assert.equal(await fs.readFile(draftPath,"utf8"),draftPreserved);
     assert.equal((await createDraft({})).data.draft.id,reply.data.draft.id);
+    await fs.writeFile(capture + ".mail-account-revoked", "fixture account removal only");
+    const remaining = await jsonRequest(base, "/api/personal/mail/accounts", accountsRequest);
+    assert.equal(remaining.response.status, 200); assert.equal(remaining.data.accounts.length, 1);
+    assert.equal(remaining.data.accounts[0].id, "mail-one");
+    const unavailable = (await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail;
+    assert.equal(unavailable.stale, true); assert.equal(unavailable.lastAttempt.code, "mail_account_unavailable");
+    assert.deepEqual(unavailable.snapshot, snapshot);
+    const editPath = "/api/personal/mail-drafts/" + reply.data.draft.id;
+    const editable = await jsonRequest(base, editPath, { method: "PATCH", headers, body: JSON.stringify({ revision: reply.data.draft.revision,
+      form: { to: ["chosen@example.test"], subject: "Synthetic local reply", body: "Local editing remains available after disconnection." } }) });
+    assert.equal(editable.response.status, 200);
+    const editedDraft = await fs.readFile(draftPath, "utf8");
+    const reviewRevoked = await jsonRequest(base, editPath, { method: "PATCH", headers, body: JSON.stringify({ revision: editable.data.draft.revision, status: "ready" }) });
+    assert.equal(reviewRevoked.response.status, 409); assert.equal(reviewRevoked.data.code, "mail_draft_source_changed");
+    assert.equal(await fs.readFile(draftPath, "utf8"), editedDraft);
+    await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
+    assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.stale, true);
+    assert.equal(await fs.readFile(draftPath, "utf8"), editedDraft);
+    assert.equal((await captured()).filter(item => ["turn/start", "mcpServer/tool/call"].includes(item.method)).length, 3, "discovering disconnection and reopening drafts never reads another mailbox or invokes a model");
     await fs.writeFile(draftPath,"null");
     assert.equal((await jsonRequest(base,"/api/personal/mail-drafts",{headers})).response.status,503);
     assert.equal((await createDraft({})).response.status,503);assert.equal(await fs.readFile(draftPath,"utf8"),"null");
