@@ -6294,6 +6294,8 @@ pre {
 
   .session-content-grid {
     grid-template-columns: 1fr;
+    height: calc(100dvh - 58px);
+    min-height: 0;
   }
 
   .session-content-grid .chat-panel.wide-panel,

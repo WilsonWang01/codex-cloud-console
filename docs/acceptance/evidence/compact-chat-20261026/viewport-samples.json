@@ -1,0 +1,119 @@
+{
+  "baseline": "2bb1f56172e7f0f64c18ca56e34ffeea1138c84f",
+  "before": {
+    "error": "聊天区应限制在可视高度：{\"width\":1126,\"height\":753,\"pageHeight\":11717,\"chatHeight\":11284,\"chatContentHeight\":11284,\"inputTop\":11597.953125,\"inputBottom\":11662.328125}",
+    "layout": {
+      "height": 11044,
+      "viewport": 11044
+    }
+  },
+  "after": [
+    {
+      "width": 1126,
+      "height": 753,
+      "pageHeight": 753,
+      "chatHeight": 320,
+      "chatContentHeight": 10947,
+      "inputTop": 633.625,
+      "inputBottom": 698
+    },
+    {
+      "width": 1024,
+      "height": 768,
+      "pageHeight": 768,
+      "chatHeight": 335,
+      "chatContentHeight": 11152,
+      "inputTop": 648.625,
+      "inputBottom": 713
+    },
+    {
+      "width": 821,
+      "height": 753,
+      "pageHeight": 753,
+      "chatHeight": 320,
+      "chatContentHeight": 11548,
+      "inputTop": 633.625,
+      "inputBottom": 698
+    },
+    {
+      "width": 1180,
+      "height": 900,
+      "pageHeight": 900,
+      "chatHeight": 467,
+      "chatContentHeight": 10618,
+      "inputTop": 780.625,
+      "inputBottom": 845
+    },
+    {
+      "width": 1181,
+      "height": 900,
+      "pageHeight": 900,
+      "chatHeight": 467,
+      "chatContentHeight": 10618,
+      "inputTop": 780.625,
+      "inputBottom": 845
+    },
+    {
+      "width": 320,
+      "height": 480,
+      "pageHeight": 480,
+      "chatHeight": 53,
+      "chatContentHeight": 13556,
+      "inputTop": 310,
+      "inputBottom": 364
+    },
+    {
+      "width": 1280,
+      "height": 900,
+      "pageHeight": 900,
+      "chatHeight": 467,
+      "chatContentHeight": 10744,
+      "inputTop": 780.625,
+      "inputBottom": 845
+    },
+    {
+      "width": 768,
+      "height": 900,
+      "pageHeight": 900,
+      "chatHeight": 455,
+      "chatContentHeight": 11068,
+      "inputTop": 730,
+      "inputBottom": 784
+    },
+    {
+      "width": 820,
+      "height": 900,
+      "pageHeight": 900,
+      "chatHeight": 455,
+      "chatContentHeight": 10676,
+      "inputTop": 730,
+      "inputBottom": 784
+    }
+  ],
+  "iab": {
+    "layout1126": {
+      "chatContentHeight": 83952,
+      "chatHeight": 321,
+      "height": 753,
+      "inputBottom": 698,
+      "inputTop": 633.609375,
+      "messages": 500,
+      "pageHeight": 753,
+      "width": 1126
+    },
+    "layout1024": {
+      "chatHeight": 336,
+      "height": 768,
+      "inputBottom": 713,
+      "inputTop": 648.609375,
+      "messages": 500,
+      "pageHeight": 768,
+      "width": 1024
+    },
+    "draftRetained": true,
+    "settingsChatLayoutCount": 0
+  },
+  "realModelCalls": 0,
+  "thirdPartyWrites": 0,
+  "physicalPhone": false
+}
