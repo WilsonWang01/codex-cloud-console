@@ -455,6 +455,19 @@ input.on("line", (line) => {
         turn: { id: turnId, status: "completed" },
       } }, queuedNextDelay);
     } else if (progressRegression) {
+      if (process.env.FAKE_QUEUE_COMPLETION_GATE === "1" && (queuedFirstRegression || requestText.includes("progress regression cancel queue first"))) {
+        // Keep queue preconditions true until the test releases them, even on a throttled host.
+        const progress = setInterval(() => send({ method: "item/mcpToolCall/progress", params: {
+          threadId: message.params.threadId, turnId, itemId: "progress-regression", message: "progress regression activity",
+        } }), 150);
+        const complete = () => {
+          if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".queue-release")) return setTimeout(complete, 20);
+          clearInterval(progress);
+          send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed" } } });
+        };
+        complete();
+        return;
+      }
       const progressDelays = queuedFirstRegression ? Array.from({ length: 16 }, (_, index) => 150 * (index + 1)) : [150, 300, 450];
       for (const delay of progressDelays) {
         send({ method: "item/mcpToolCall/progress", params: {
@@ -2807,6 +2820,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       BENXING_SITE_ORIGIN: `http://127.0.0.1:${benxingPort}`,
       BENXING_SITES_BYPASS_BEARER_TOKEN: "regression-sites-bypass-token",
       FAKE_CAPTURE_PATH: capturePath,
+      FAKE_QUEUE_COMPLETION_GATE: "1",
       PATH: `${binDir}:${process.env.PATH}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -2940,6 +2954,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       body: JSON.stringify({ repoId: "sample-app", sessionId: queueSessionId }),
     });
     assert.equal(archiveQueuedSession.response.status, 409);
+    await fs.writeFile(capturePath + ".queue-release", "");
     await firstQueuedStream.text();
     for (let attempt = 0; attempt < 40; attempt += 1) {
       const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
@@ -2950,6 +2965,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(queueRequests.filter((request) => request.method === "turn/start" && JSON.stringify(request.params).includes("queue regression next")).length, 1);
     const afterQueue = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8"));
     assert.equal(afterQueue.sessions[queueSessionId]?.queuedTurn, null);
+    await fs.rm(capturePath + ".queue-release");
     const canceledSession = await jsonRequest(baseUrl, "/api/chat/sessions", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ repoId: "sample-app", title: "Canceled queue regression" }),
@@ -2976,6 +2992,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(cancelQueue.response.status, 200);
     assert.equal(cancelQueue.data.queuedTurn.preview, "queue regression canceled");
     assert.equal(cancelQueue.data.draft.input, "queue regression canceled");
+    await fs.writeFile(capturePath + ".queue-release", "");
     await canceledStream.text();
     await new Promise((resolve) => setTimeout(resolve, 100));
     const canceledRequests = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));

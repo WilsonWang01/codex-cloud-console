@@ -28,7 +28,6 @@ try {
     const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
     page = await context.newPage(); page.on("pageerror", error => errors.push(error.message));
     const chat = page.locator(".chat-window");
-    const target = page.getByText(control.a.history[20].items[0].text, { exact: true });
     const ready = async name => {
       await wait(async () => page.url().endsWith(`/thread/feedback-thread-${name}`), "native conversation address did not settle");
       await page.getByText(control[name].text, { exact: true }).waitFor();
@@ -44,10 +43,16 @@ try {
       const item = [...node.querySelectorAll("[data-chat-message-id]")].find(item => item.getBoundingClientRect().bottom > top + 1);
       return { id: item?.getAttribute("data-chat-message-id"), offset: item?.getBoundingClientRect().top - top };
     });
+    // Markdown rehydration can replace paragraphs during actionability waits.
+    const reveal = (id, text) => page.evaluate(({ id, text }) => {
+      const message = document.querySelector(`[data-chat-message-id="${id}"]`);
+      const paragraph = [...(message?.querySelectorAll("p") || [])].find(node => node.textContent === text);
+      if (!paragraph) throw new Error("Reading target is missing from the current message tree");
+      paragraph.scrollIntoView({ block: "nearest" });
+    }, { id, text });
     await page.goto(`${fixture.base}/#/project/_personal/thread/personal-a`); await ready("a");
     await chat.hover();
-    await page.locator('[data-chat-message-id="reading-a-message-20"]').scrollIntoViewIfNeeded();
-    await target.scrollIntoViewIfNeeded();
+    await reveal("reading-a-message-20", control.a.history[20].items[0].text);
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     evidence.before = await position();
     assert.ok(evidence.before.top > 500 && evidence.before.offset >= -5 && evidence.before.offset < 350);
@@ -85,10 +90,8 @@ try {
     await page.setViewportSize({ width: 390, height: 844 });
     await wait(async () => Math.abs((await position()).offset - evidence.before.offset) <= 8, "returning to the original viewport lost the reading position");
     await page.evaluate(() => { location.hash = "/project/_personal/thread/personal-b"; }); await ready("b");
-    const bTarget = page.getByText(control.b.history[40].items[0].text, { exact: true });
     await chat.hover();
-    await page.locator('[data-chat-message-id="reading-b-message-40"]').scrollIntoViewIfNeeded();
-    await bTarget.scrollIntoViewIfNeeded();
+    await reveal("reading-b-message-40", control.b.history[40].items[0].text);
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const bTop = await chat.evaluate(node => node.scrollTop);
     await page.evaluate(() => { location.hash = "/project/_personal/thread/personal-a"; }); await ready("a");
