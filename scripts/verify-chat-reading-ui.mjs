@@ -61,8 +61,23 @@ try {
     await wait(async () => Math.abs((await position()).offset - evidence.before.offset) <= 8, "reload did not recover the same reading position");
     evidence.reloaded = await position();
     const portrait = await anchor();
-    for (const size of [{ width: 320, height: 480 }, { width: 1280, height: 900 }, { width: 768, height: 900 }]) {
+    evidence.viewports = [];
+    for (const size of [{ width: 1126, height: 753 }, { width: 1024, height: 768 }, { width: 821, height: 753 },
+      { width: 1180, height: 900 }, { width: 1181, height: 900 }, { width: 320, height: 480 }, { width: 1280, height: 900 },
+      { width: 768, height: 900 }, { width: 820, height: 900 }]) {
       await page.setViewportSize(size);
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const layout = await page.evaluate(() => {
+        const chat = document.querySelector('.chat-window'), composer = document.querySelector('.composer-shell textarea');
+        const box = composer.getBoundingClientRect();
+        return { width: innerWidth, height: innerHeight, pageHeight: document.documentElement.scrollHeight,
+          chatHeight: chat.clientHeight, chatContentHeight: chat.scrollHeight, inputTop: box.top, inputBottom: box.bottom };
+      });
+      evidence.viewports.push(layout);
+      assert.ok(layout.chatHeight > 0 && layout.chatHeight < size.height, `聊天区应限制在可视高度：${JSON.stringify(layout)}`);
+      assert.ok(layout.inputTop >= 0 && layout.inputBottom <= size.height + 1, `输入框应保持可见：${JSON.stringify(layout)}`);
+      assert.ok(layout.pageHeight <= size.height + 1, `长消息不应撑高整个页面：${JSON.stringify(layout)}`);
+      assert.ok(layout.chatContentHeight > layout.chatHeight, '长历史应在聊天区内独立滚动');
       await wait(async () => (await anchor()).id === portrait.id, `resize ${size.width} lost the reading message`);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
       await page.screenshot({ path: path.join(output, `reading-${size.width}-${size.height}.png`), fullPage: true });
@@ -120,6 +135,7 @@ try {
     const rpc = (await fs.readFile(fixture.rpcCapture, "utf8")).trim().split("\n").map(line => JSON.parse(line));
     assert.equal(rpc.some(item => ["turn/start", "thread/start", "mcpServer/tool/call", "feedback/upload", "command/exec"].includes(item.method)), false);
     assert.deepEqual(errors, []);
+    await fs.writeFile(path.join(output, "result.json"), JSON.stringify({ ok: true, evidence }, null, 2));
     console.log(JSON.stringify({ ok: true, evidence }));
   }
 } catch (error) {
