@@ -17,7 +17,10 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
     window.__streamHarness = harness;
     window.fetch = async (input, options = {}) => {
       const url = new URL(String(input), location.href);
-      if (url.pathname === "/api/codex/turn-interrupt") harness.interrupts += 1;
+      if (url.pathname === "/api/codex/turn-interrupt") {
+        harness.interrupts += 1;
+        return new Response(JSON.stringify({ ok: true, pending: true }), { status: 202, headers: { "Content-Type": "application/json" } });
+      }
       if (url.pathname === "/api/codex/turn-steer") harness.steers += 1;
       if (url.pathname === "/api/chat/active" && harness.activeFailures > 0) {
         harness.activeFailures -= 1;
@@ -137,9 +140,20 @@ export async function verifyConversationStreams({ page, baseUrl, sessions, activ
   });
   assert.equal((await records()).filter(record => record.path === "/api/chat/stream").length, 1, "background return must not submit an accepted conversation again");
   await page.screenshot({ path: new URL("desktop-reconnected.png", out).pathname, fullPage: true });
+  await page.getByRole("button", { name: "关闭面板", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__streamHarness.interrupts), 0);
+  await page.getByRole("button", { name: "打断当前回复", exact: true }).click();
+  await waitUntil(() => page.evaluate(() => window.__streamHarness.interrupts === 1));
+  assert.equal(await busy().count(), 1, "202 only accepts the interruption request; it does not confirm completion");
+  assert.equal((await records())[5].closed, false);
+  await page.screenshot({ path: new URL("desktop-cancel-pending.png", out).pathname, fullPage: true });
+  activeJobs.delete("sample-app-1");
+  await emit(5, "done", { ok: false, error: "验收模拟：原生回合确认中断" });
+  await page.evaluate(() => window.__streamHarness.records[5].close());
+  await waitUntil(async () => await busy().count() === 0);
   await navigate("sample-service-1");
   assert.equal((await records())[5].aborted, true);
   activeJobs.clear();
-  assert.equal(await page.evaluate(() => window.__streamHarness.interrupts), 0);
-  return ["压缩切换会话只取消订阅", "旧流结束不释放新任务", "Review 离开后不污染其他会话", "聊天生成状态持续保留", "失败的补充指令不伪装已发送且保留输入", "回到运行中会话重新订阅", "状态查询失败后自动重试", "重连退避避免请求风暴", "事件重放不重复输出或残留错误", "模拟后台返回不重发任务且原运行消息编号保持", "跨项目离开不终止云端任务"];
+  assert.equal(await page.evaluate(() => window.__streamHarness.interrupts), 1);
+  return ["压缩切换会话只取消订阅", "旧流结束不释放新任务", "Review 离开后不污染其他会话", "聊天生成状态持续保留", "失败的补充指令不伪装已发送且保留输入", "回到运行中会话重新订阅", "状态查询失败后自动重试", "重连退避避免请求风暴", "事件重放不重复输出或残留错误", "模拟后台返回不重发任务且原运行消息编号保持", "停止请求202后仍显示运行，原生停止通知才释放", "跨项目离开不终止云端任务"];
 }
