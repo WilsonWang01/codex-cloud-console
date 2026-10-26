@@ -155,6 +155,7 @@ let turnSequence = 0;
 let mailSourceSequence = 0;
 const fixtureTurns = new Map();
 const fixtureCwds = new Map();
+const cancelGates = new Map();
 const acceptedApprovals = new Set();
 if (sharedPersonal) process.stderr.write("token_invalidated: Please log out and sign in again\\n");
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), termDelay));
@@ -412,6 +413,14 @@ input.on("line", (line) => {
     }
     const turnId = (requestText.includes("cancel regression") ? "turn-cancel-regression-" : "turn-regression-") + uniqueTurn;
     turns.push({ id: turnId, items: [] });
+    if (process.env.FAKE_CANCEL_GATES === "1") {
+      cancelGates.set(turnId, { uncertain: requestText.includes("interrupt uncertain"), waiting: false });
+      const receipt = () => {
+        if (requestText.includes("hold start receipt") && !fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".cancel-start-release")) return setTimeout(receipt, 20);
+        send({ id: message.id, result: { turn: { id: turnId } } });
+      };
+      receipt(); return;
+    }
     const progressRegression = requestText.includes("progress regression");
     const queuedFirstRegression = requestText.includes("progress regression queue first");
     const queueRegressionNext = requestText.includes("queue regression next");
@@ -529,6 +538,15 @@ input.on("line", (line) => {
     }
     return;
   }
+  if (process.env.FAKE_CANCEL_GATES === "1" && message.method === "review/start") {
+    const turnId = "cancel-review-" + (++turnSequence), threadId = message.params.delivery === "detached" ? "detached-" + turnId : message.params.threadId;
+    cancelGates.set(turnId, { uncertain: false, waiting: false });
+    const receipt = () => {
+      if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".review-start-release-" + message.params.delivery)) return setTimeout(receipt, 20);
+      send({ id: message.id, result: { turn: { id: turnId }, reviewThreadId: threadId } });
+    };
+    receipt(); return;
+  }
   if (process.env.FAKE_TURN_OWNERSHIP === "1" && message.method === "review/start") {
     const threadId = message.params.delivery === "detached" ? "detached-review-" + (++turnSequence) : message.params.threadId;
     const id = "review-owned-" + turnSequence;
@@ -551,6 +569,19 @@ input.on("line", (line) => {
     setTimeout(finish, 100); return;
   }
   if (message.method === "turn/interrupt") {
+    const gate = cancelGates.get(message.params?.turnId);
+    if (gate) {
+      send(gate.uncertain ? { id: message.id, error: { code: -32000, message: "Synthetic interruption receipt uncertain" } } : { id: message.id, result: {} });
+      if (!gate.waiting) {
+        gate.waiting = true;
+        const complete = () => {
+          if (!fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".cancel-completion-" + message.params.turnId)) return setTimeout(complete, 20);
+          send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: message.params.turnId, status: "interrupted" } } });
+        };
+        complete();
+      }
+      return;
+    }
     send({ id: message.id, result: {} });
     if (String(message.params?.turnId).startsWith("turn-cancel-regression-")) {
       send({ method: "turn/completed", params: {
@@ -896,6 +927,123 @@ await check("durable API queue survives lost responses and restart without repea
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
     } finally { checked.close(); }
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("cancel retries before and after the start receipt never repeat interruption or invent a stopped result", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-cancel-once-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+  for (const dir of [repo, stateRoot, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "cancel-once-fixture-token-123456" };
+  const child = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot,
+    CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"],
+    FAKE_CAPTURE_PATH: capture, FAKE_CANCEL_GATES: "1", PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const wait = async callback => {
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) { const value = await callback(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); }
+    throw new Error("Cancellation fixture did not reach its explicit gate");
+  };
+  const rpc = async () => (await fs.readFile(capture, "utf8").catch(() => "")).split("\n").filter(Boolean).map(JSON.parse);
+  try {
+    await waitForOutput(child, /listening on/);
+    const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "cancellation owner", automationIds: ["sample-research"] }) });
+    const other = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "other caller", automationIds: ["sample-research"] }) });
+    assert.equal(client.response.status, 201); assert.equal(other.response.status, 201);
+    const auth = { ...headers, "x-codex-cloud-token": client.data.token };
+    let reviewSessionId;
+    for (const [index, mode] of ["hold start receipt", "interrupt uncertain"].entries()) {
+      const start = await jsonRequest(base, "/api/automations/sample-research/webhook", { method: "POST", headers: { ...auth, "idempotency-key": `cancel-once-event-${index}` }, body: JSON.stringify({ prompt: `cancel regression ${mode}` }) });
+      assert.equal(start.response.status, 200);
+      const route = start.data.run.resultPath;
+      const before = await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        assert.equal(result.response.status, 200);
+        return result.data.run.status === "running" && (await rpc()).some(item => item.method === "turn/start" && JSON.stringify(item.params).includes(mode)) ? result.data.run : null;
+      });
+      const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
+      const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
+      assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST", headers: { ...headers, "x-codex-cloud-token": other.data.token } })).response.status, 404);
+      assert.equal((await jsonRequest(base, route + "/cancel", { method: "POST" })).response.status, 401);
+      const cancel = () => jsonRequest(base, route + "/cancel", { method: "POST", headers: auth });
+      const first = await cancel();
+      assert.equal(first.response.status, 202); assert.equal(first.data.run.status, "canceling");
+      const db = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+      let sessionId;
+      try { sessionId = JSON.parse(db.prepare("SELECT record FROM external_tasks WHERE id=?").get(before.id).record).sessionId; }
+      finally { db.close(); }
+      assert.ok(sessionId);
+      reviewSessionId = sessionId;
+      const consoleStop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId }) });
+      if (index === 0) {
+        const earlyStop = await consoleStop();
+        assert.equal(earlyStop.response.status, 202); assert.equal(earlyStop.data.pending, true);
+        assert.equal((await interrupts()).length, 0, "未绑定回合编号时不能向猜测的回合发送中断");
+        await fs.writeFile(capture + ".cancel-start-release", "release synthetic receipt");
+      }
+      const sent = await wait(async () => (await interrupts())[0]);
+      for (let repeat = 0; repeat < 3; repeat++) {
+        const result = await cancel();
+        assert.equal(result.response.status, 202); assert.equal(result.data.run.status, "canceling");
+        assert.equal(result.data.run.cancelRequestedAt, first.data.run.cancelRequestedAt);
+      }
+      const concurrent = await Promise.all([cancel(), cancel()]);
+      for (const result of concurrent) {
+        assert.equal(result.response.status, 202); assert.equal(result.data.run.status, "canceling");
+        assert.equal(result.data.run.cancelRequestedAt, first.data.run.cancelRequestedAt);
+      }
+      const webStop = await consoleStop();
+      assert.equal(webStop.response.status, index === 0 ? 202 : 500);
+      if (index === 0) assert.equal(webStop.data.pending, true);
+      assert.equal((await interrupts()).length, 1, "原生停止回执尚未到达时，重复取消不能重复发送中断");
+      if (index === 1) await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        return result.data.events?.some(event => event.type === "cancel-warning");
+      });
+      const pending = await jsonRequest(base, route, { headers: auth });
+      assert.equal(pending.data.run.status, "canceling"); assert.equal(pending.data.run.finishedAt, null);
+      assert.equal(pending.data.events.filter(event => event.type === "cancel-requested").length, 1);
+      assert.equal(pending.data.events.filter(event => event.type === "cancel-warning").length, index);
+      await fs.writeFile(capture + ".cancel-completion-" + sent.params.turnId, "release synthetic stop");
+      const stopped = await wait(async () => {
+        const result = await jsonRequest(base, route, { headers: auth });
+        return result.data.run.status === "canceled" ? result.data.run : null;
+      });
+      assert.equal(stopped.id, before.id); assert.equal(stopped.usage.status, "unknown");
+      assert.equal((await cancel()).response.status, 200);
+      assert.equal((await interrupts()).length, 1);
+    }
+    for (const delivery of ["inline", "detached"]) {
+      const previousInterrupts = (await rpc()).filter(item => item.method === "turn/interrupt").length;
+      const interrupts = async () => (await rpc()).filter(item => item.method === "turn/interrupt").slice(previousInterrupts);
+      const review = await fetch(base + "/api/codex/review/stream", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId: reviewSessionId, delivery }), signal: AbortSignal.timeout(15000) });
+      const started = await wait(async () => (await rpc()).find(item => item.method === "review/start" && item.params.delivery === delivery));
+      const stop = () => jsonRequest(base, "/api/codex/turn-interrupt", { method: "POST", headers,
+        body: JSON.stringify({ repoId: "sample-app", sessionId: reviewSessionId }) });
+      const early = await stop();
+      assert.equal(early.response.status, 202); assert.equal(early.data.pending, true);
+      assert.equal((await interrupts()).length, 0);
+      await fs.writeFile(capture + ".review-start-release-" + delivery, "release synthetic review receipt");
+      const sent = await wait(async () => (await interrupts())[0]);
+      assert.equal(sent.params.threadId, delivery === "detached" ? "detached-" + sent.params.turnId : started.params.threadId);
+      for (const result of await Promise.all([stop(), stop()])) {
+        assert.equal(result.response.status, 202); assert.equal(result.data.pending, true);
+      }
+      assert.equal((await interrupts()).length, 1);
+      await fs.writeFile(capture + ".cancel-completion-" + sent.params.turnId, "release synthetic review stop");
+      const events = await review.text();
+      assert.match(events, /event: done/); assert.match(events, /"ok":false/); assert.doesNotMatch(events, /"ok":true/);
+    }
+    assert.equal((await rpc()).filter(item => item.method === "turn/start").length, 2, "重复取消不能创建新模型回合");
+    assert.equal((await rpc()).filter(item => item.method === "review/start").length, 2);
+  } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
 await check("old turn notifications and approvals cannot complete, charge or corrupt a new API heartbeat before or after its start receipt", async () => {
@@ -3835,19 +3983,37 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     }
     const legacyRunPath = path.join(stateRoot, "automation-runs.json");
     const legacyRunStore = JSON.parse(await fs.readFile(legacyRunPath, "utf8"));
-    const legacyCanceled = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
-    legacyCanceled.status = "cancelled";
+    const legacySource = legacyRunStore.runs.find((run) => run.id === canceledRun.id);
+    const legacyTerminals = ["cancelled", "interrupted", "needs_reconciliation", "completed", "failed"].map((status) => ({
+      ...legacySource, id: `legacy-terminal-${status}`, status,
+      ...(["interrupted", "needs_reconciliation"].includes(status) ? { usage: { status: "unknown", reason: "合成旧任务未确认用量" } } : {}),
+    }));
+    legacyRunStore.runs.push(...legacyTerminals);
     await fs.writeFile(legacyRunPath, JSON.stringify(legacyRunStore));
     const legacyBytes = await fs.readFile(legacyRunPath, "utf8");
+    const terminalDatabase = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+    try {
+      for (const run of legacyTerminals) assert.equal(terminalDatabase.prepare("SELECT id FROM external_tasks WHERE id=?").get(run.id), undefined, "旧记录不能被持久任务同 ID 覆盖而虚假通过");
+    } finally { terminalDatabase.close(); }
+    const foreignLegacyClient = await jsonRequest(baseUrl, "/api/clients", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "legacy-terminal-other-client", automationIds: ["sample-on-demand"] }) });
+    assert.equal(foreignLegacyClient.response.status, 201);
     const rpcBeforeLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
-    const legacyResult = await jsonRequest(baseUrl, cancelStart.data.run.resultPath, { headers: { "x-codex-cloud-token": competingClient.data.token } });
-    assert.equal(legacyResult.data.run.status, "canceled");
-    assert.equal(legacyResult.data.run.id, canceledRun.id);
-    const legacyCancelAgain = await jsonRequest(baseUrl, `${cancelStart.data.run.resultPath}/cancel`, {
-      method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token },
-    });
-    assert.equal(legacyCancelAgain.response.status, 200);
-    assert.equal(legacyCancelAgain.data.run.status, "canceled");
+    for (const run of legacyTerminals) {
+      const route = `/api/automations/${run.automationId}/runs/${run.id}`, expected = run.status === "cancelled" ? "canceled" : run.status;
+      const legacyResult = await jsonRequest(baseUrl, route, { headers: { "x-codex-cloud-token": competingClient.data.token } });
+      assert.equal(legacyResult.response.status, 200); assert.equal(legacyResult.data.run.status, expected);
+      if (["interrupted", "needs_reconciliation"].includes(run.status)) {
+        assert.equal(legacyResult.data.run.usage.status, "unknown"); assert.equal(legacyResult.data.run.usage.totalTokens, undefined);
+      }
+      for (let repeat = 0; repeat < 2; repeat++) {
+        const result = await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST", headers: { "x-codex-cloud-token": competingClient.data.token } });
+        assert.equal(result.response.status, 200, `旧终态 ${run.status} 的重复取消应返回原记录`);
+        assert.deepEqual(result.data.run, legacyResult.data.run, "取消不是将旧终态改写成成功或已取消");
+      }
+      assert.equal((await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST", headers: { "x-codex-cloud-token": foreignLegacyClient.data.token } })).response.status, 404, "其他调用方不能操作旧记录");
+      assert.equal((await jsonRequest(baseUrl, `${route}/cancel`, { method: "POST" })).response.status, 401);
+    }
     assert.equal(await fs.readFile(legacyRunPath, "utf8"), legacyBytes, "查询和重复取消不触发旧数据重写");
     const rpcAfterLegacyRead = (await fs.readFile(capturePath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse).filter((item) => item.method === "turn/start" || item.method === "turn/interrupt").length;
     assert.equal(rpcAfterLegacyRead, rpcBeforeLegacyRead, "旧取消结果不再启动或中断模型");

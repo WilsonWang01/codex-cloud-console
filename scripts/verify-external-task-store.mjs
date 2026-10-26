@@ -167,6 +167,22 @@ test("pending and uncertain work keeps its original key beyond the nominal TTL",
   assert.throws(() => store.accept({ ...input, requestHash: "c".repeat(64) }), { statusCode: 409 });
 }));
 
+test("canceling any settled durable task is an unchanged replay, including interruption and unknown outcomes", () => fixture(({ store, ledger }) => {
+  for (const [index, status] of ["completed", "failed", "canceled", "interrupted", "needs_reconciliation"].entries()) {
+    const id = String(index + 1);
+    store.accept(options(id));
+    const claim = store.claim({ owner: "fixture" });
+    store.update({ ...claim.run, status, usage: { status: "unknown", source: "synthetic" } }, claim.claim);
+    const original = store.read(id);
+    const snapshot = () => JSON.stringify(["external_tasks", "external_task_keys", "external_tasks_meta", "external_callbacks"].map(table => ledger.database.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()));
+    const before = snapshot();
+    for (let repeat = 0; repeat < 2; repeat++) assert.deepEqual(store.cancel(id, { id: "client-a", automationId: "research" }, { type: "cancel-requested" }), { run: original, pending: false });
+    assert.throws(() => store.cancel(id, { id: "client-b", automationId: "research" }, {}), { statusCode: 404 });
+    assert.throws(() => store.cancel(id, { id: "client-a", automationId: "other" }, {}), { statusCode: 404 });
+    assert.equal(snapshot(), before, "终态取消不能改事件、原键、未知用量或执行代次");
+  }
+}));
+
 test("unknown task schema is not rewritten", () => fixture(({ ledger }) => {
   ledger.database.exec("UPDATE external_tasks_meta SET value=99 WHERE key='schema_version'; DELETE FROM external_tasks_meta WHERE key='revision'");
   const before = ledger.database.prepare("SELECT * FROM external_tasks_meta").all();

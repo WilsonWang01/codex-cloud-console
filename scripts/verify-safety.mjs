@@ -100,6 +100,40 @@ test("启动回执前的通知有界且按原顺序重放，失败或缺失编�
   assert.equal(observed.includes("foreign-must-not-requeue"), false); assert.equal(observed.includes("owned-review"), true);
 });
 
+test("中断只在原生回合绑定后发送一次，迟到编号、并发入口和 detached review 不串目标", async () => {
+  const requests = [], gate = deferred();
+  const context = vm.createContext({ Promise, appServerClientForJob: job => ({ request: (method, params, timeout) => {
+    requests.push({ job, method, params, timeout }); return gate.promise;
+  } }) });
+  vm.runInContext(section(source, "function requestJobInterruption(", "async function requestJobStart("), context);
+  const job = {};
+  assert.equal(await context.requestJobInterruption(job), false); assert.equal(requests.length, 0);
+  job.threadId = "original-thread"; job.turnId = "actual-turn";
+  const first = context.requestJobInterruption(job), repeated = context.requestJobInterruption(job);
+  assert.equal(first, repeated); await Promise.resolve();
+  assert.equal(requests.length, 1); assert.equal(requests[0].method, "turn/interrupt");
+  assert.equal(JSON.stringify(requests[0].params), JSON.stringify({ threadId: "original-thread", turnId: "actual-turn" }));
+  assert.equal(requests[0].timeout, 20000);
+  gate.resolve({ accepted: true }); await first;
+  assert.equal(context.requestJobInterruption(job), first);
+  const review = { threadId: "source-thread", reviewThreadId: "detached-thread", turnId: "review-turn" };
+  await context.requestJobInterruption(review);
+  assert.equal(requests.length, 2); assert.equal(requests[1].params.threadId, "detached-thread");
+});
+
+test("中断结果不明时保留同一个失败，不因重试或任务已结束再次发送原生命令", async () => {
+  const failure = new Error("synthetic uncertain interruption"); let calls = 0;
+  const context = vm.createContext({ Promise, appServerClientForJob: () => ({ request: () => { calls++; throw failure; } }) });
+  vm.runInContext(section(source, "function requestJobInterruption(", "async function requestJobStart("), context);
+  const job = { threadId: "original-thread", turnId: "actual-turn" };
+  const first = context.requestJobInterruption(job);
+  await assert.rejects(first, error => error === failure);
+  job.completed = true;
+  assert.equal(context.requestJobInterruption(job), first);
+  await assert.rejects(context.requestJobInterruption(job), error => error === failure);
+  assert.equal(calls, 1);
+});
+
 test("个人和工作列表保留非当前文字或附件草稿，仅隐藏空白草稿", () => {
   const context = vm.createContext({});
   const functions = section(frontend, "function persistedDraftInput(", "function draftPayload(")
