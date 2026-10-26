@@ -44,7 +44,7 @@ try {
       const context = await browser.newContext({ timezoneId: zone });
       const page = await context.newPage();
       page.on("pageerror", error => errors.push(error));
-      await page.clock.setFixedTime(new Date("2026-11-01T06:45:00Z"));
+      await page.clock.setFixedTime(new Date(Date.parse(snapshot.expiresAt) + 1));
       for (const [width, height] of [[1280, 900], [768, 900], [390, 844], [320, 640]]) {
         await page.setViewportSize({ width, height });
         await page.goto(fixture.base + "/#/project/_personal/today");
