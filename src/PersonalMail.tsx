@@ -54,7 +54,11 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
       if (seq !== sequence.current || controller.signal.aborted) return;
       if (mode === "accounts") {
         setAccounts(result.accounts!);
-        setSelected(result.accounts!.some(account => account.id === mail?.snapshot?.account.id) ? mail!.snapshot!.account.id : "");
+        const cached = mail?.snapshot?.account;
+        const sameAccount = result.accounts!.find(account => account.id === cached?.id && account.email === cached.email);
+        setSelected(sameAccount?.id || "");
+        if (cached && !sameAccount) setMail(value => value && { ...value, stale: true,
+          lastAttempt: { status: "error", accountId: cached.id, error: "上次读取的邮箱连接已变化，请重新连接或选择邮箱并刷新；旧记录仅供参考" } });
       } else {
         setMail(result.mail!); setClock(Date.now());
         if (result.mail!.lastAttempt?.status === "success") setAccounts(null);
@@ -68,6 +72,11 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
   };
   const snapshot = mail?.snapshot, reading = Boolean(busy || mail?.reading);
   const stale = Boolean(error || mail?.stale || snapshot && !personalSourceFresh(snapshot, timeZone, clock));
+  const resolveSource = useCallback((reference: MailDraftSelection["source"]): MailDraftSelection | null => {
+    if (!snapshot || stale || reading || accounts || !personalSourceFresh(snapshot, timeZone, Date.now()) || snapshot.account.id !== reference.accountId ||
+      !snapshot.items.some(item => item.id === reference.messageId && item.version === reference.itemVersion)) return null;
+    return { source: { accountId: reference.accountId, messageId: reference.messageId, itemVersion: reference.itemVersion, snapshotVersion: snapshot.version }, timeZone };
+  }, [snapshot, stale, reading, accounts, timeZone]);
   const plan = () => {
     if (!snapshot || stale || reading || accounts) return;
     const now = Date.now();
@@ -76,10 +85,10 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
   };
 
   const reply = (item: MailItem) => {
-    if (!snapshot || stale || reading || accounts || draftSelection) return;
-    const now = Date.now();
-    if (!personalSourceFresh(snapshot, timeZone, now)) { setClock(now); return; }
-    setDraftSelection({ source: { accountId: snapshot.account.id, messageId: item.id, itemVersion: item.version, snapshotVersion: snapshot.version }, timeZone });
+    if (!snapshot || draftSelection) return;
+    const current = resolveSource({ accountId: snapshot.account.id, messageId: item.id, itemVersion: item.version, snapshotVersion: snapshot.version });
+    if (!current) { setClock(Date.now()); return; }
+    setDraftSelection(current);
   };
 
   return <><section className="personal-list-section personal-calendar personal-mail" aria-label="待处理邮件">
@@ -104,5 +113,5 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
     {mail && !snapshot && !reading && <p className="personal-empty">尚无成功读取的邮件记录，不能判断是否有待处理邮件。</p>}
     {snapshot && !snapshot.items.length && !stale && snapshot.complete && <p className="personal-empty">本次范围内没有未读邮件，不代表所有邮件都已处理或无需回复。</p>}
     {(error || mail?.lastAttempt?.status === "error") && <button type="button" className="mini-action" onClick={onConnections}>检查连接服务</button>}
-  </section><PersonalMailDrafts selection={draftSelection} onSelectionHandled={selectionHandled} refreshKey={refreshKey} onChooseTask={onChooseTask} /></>;
+  </section><PersonalMailDrafts selection={draftSelection} onSelectionHandled={selectionHandled} refreshKey={refreshKey} onChooseTask={onChooseTask} resolveSource={resolveSource} /></>;
 }

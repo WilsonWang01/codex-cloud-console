@@ -93,6 +93,8 @@ export function createPersonalMailSource({ read, write, request, context, now = 
     try {
       if (!value || value.version !== 1 || Buffer.byteLength(JSON.stringify(value)) > mailSourceLimits.resultBytes) throw new Error();
       if (value.lastAttempt && (!instant(value.lastAttempt.at) || !["success", "error"].includes(value.lastAttempt.status) || !identifier(value.lastAttempt.accountId) ||
+          value.lastAttempt.operation !== undefined && (value.lastAttempt.operation !== "accounts" || value.lastAttempt.status !== "error" ||
+            value.lastAttempt.mailAttemptAt !== null && !instant(value.lastAttempt.mailAttemptAt)) ||
           value.lastAttempt.status === "success" && (value.lastAttempt.code !== null || value.lastAttempt.error !== null) ||
           value.lastAttempt.status === "error" && (!/^mail_[a-z_]+$/.test(value.lastAttempt.code || "") || !value.lastAttempt.error || text(value.lastAttempt.error, 300) !== value.lastAttempt.error))) throw new Error();
       const s = value.snapshot;
@@ -137,7 +139,20 @@ export function createPersonalMailSource({ read, write, request, context, now = 
       return run("accounts", async () => {
         if (lastAccountRead && now() - lastAccountRead < mailSourceLimits.refreshMs) throw fail("mail_refresh_throttled", "刚刚读取过邮箱列表，请稍后再试", 429);
         lastAccountRead = now();
-        return listMailAccounts(options());
+        const value = await load(), cached = value.snapshot?.account;
+        let accounts, failure;
+        try { accounts = await listMailAccounts(options()); }
+        catch (error) {
+          if (!error.code?.startsWith("mail_")) throw error;
+          failure = error;
+        }
+        if (cached && (failure || !accounts.some(account => account.id === cached.id && account.email === cached.email))) {
+          const error = failure || fail("mail_account_unavailable", "上次读取的邮箱连接已变化，请重新连接或选择邮箱并刷新；旧记录仅供参考", 409);
+          const mailAttemptAt = value.lastAttempt?.operation === "accounts" ? value.lastAttempt.mailAttemptAt : value.lastAttempt?.at || null;
+          await save({ ...value, lastAttempt: { at: new Date(now()).toISOString(), accountId: cached.id, status: "error", operation: "accounts", mailAttemptAt, code: error.code, error: error.message } });
+        }
+        if (failure) throw failure;
+        return accounts;
       });
     },
     async refresh(timeZone, accountId) {
@@ -145,7 +160,8 @@ export function createPersonalMailSource({ read, write, request, context, now = 
       const window = mailWindow(timeZone, now());
       return run(JSON.stringify([accountId, window.key]), async () => {
         const value = await load();
-        if (now() - Date.parse(value.lastAttempt?.at || "") < mailSourceLimits.refreshMs) throw fail("mail_refresh_throttled", "刚刚读取过邮件，请稍后再刷新", 429);
+        const mailAttemptAt = value.lastAttempt?.operation === "accounts" ? value.lastAttempt.mailAttemptAt : value.lastAttempt?.at;
+        if (now() - Date.parse(mailAttemptAt || "") < mailSourceLimits.refreshMs) throw fail("mail_refresh_throttled", "刚刚读取过邮件，请稍后再刷新", 429);
         const at = new Date(now()).toISOString();
         try {
           const snapshot = await readUnreadMail({ ...options(), accountId, window });

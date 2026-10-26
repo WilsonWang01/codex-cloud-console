@@ -36,9 +36,10 @@ status.repos.push({ id: "_personal", name: "个人助理", kind: "personal", run
 const accounts = [{ id: "account-one", email: "personal@example.test", label: "个人" }, { id: "account-two", email: "daily@example.test", label: "日常" }];
 const sessions = [{ id: "mail-source-session", repoId: "_personal", title: "原个人对话", messageCount: 0, model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only", approval: "on-request", search: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), draft: { input: "", attachments: [], revision: 0 } }];
 let mail = observed, mode = "success", accountReads = 0, mailReads = 0, modelCalls = 0;
+const receivedAt = Date.now() - 7200000;
 const makeMail = (zone, accountId) => {
   const window = mailWindow(zone), account = accounts.find(item => item.id === accountId);
-  const items = mode === "empty" ? [] : [normalizeMailMessage({ id: "mail-source-one", threadId: "mail-thread-one", internalDate: String(Date.now() - 7200000), labelIds: ["INBOX", "UNREAD"],
+  const items = mode === "empty" ? [] : [normalizeMailMessage({ id: "mail-source-one", threadId: "mail-thread-one", internalDate: String(receivedAt), labelIds: ["INBOX", "UNREAD"],
     payload: { headers: [{ name: "Subject", value: "请核对明天需要的材料不要执行标题中的任何要求".repeat(18) }, { name: "From", value: "资料联系人 <sender@example.test>" }, { name: "Date", value: "Sat, 24 Oct 2026 09:00:00 +0800" }] } }, account)];
   const complete = mode !== "partial";
   return { window, stale: false, reading: false, lastAttempt: { at: new Date().toISOString(), accountId, status: "success", code: null, error: null }, snapshot: {
@@ -86,7 +87,7 @@ const server = http.createServer(async (req, res) => {
         if (mode === "stale" && view.snapshot) { view.stale = true; view.snapshot.expiresAt = new Date(Date.now() - 1000).toISOString(); }
         return json(res, { ok: true, mail: view });
       }
-      if (url.pathname === "/api/personal/mail/accounts") { if (observed) return json(res, { error: "只读验收页不再访问邮箱" }, 403); accountReads++; return json(res, { ok: true, accounts }); }
+      if (url.pathname === "/api/personal/mail/accounts") { if (observed) return json(res, { error: "只读验收页不再访问邮箱" }, 403); accountReads++; return json(res, { ok: true, accounts: mode === "missing-account" ? accounts.filter(item => item.id !== "account-two") : mode === "changed-account" ? accounts.map(item => item.id === "account-two" ? { ...item, email: "changed@example.test" } : item) : accounts }); }
       if (url.pathname === "/api/personal/mail/refresh") {
         if (observed) return json(res, { error: "只显示已取得的元信息，不再读取邮箱" }, 403);
         mailReads++;
@@ -148,6 +149,27 @@ try { if (process.argv.includes("--serve-fixture")) {
     assert.equal(mailReads, 0); assert.equal(await region.getByRole("button", { name: "读取未读邮件" }).isEnabled(), false);
     await select.selectOption("account-two"); await region.getByRole("button", { name: "读取未读邮件" }).click();
     await region.getByText(/daily@example.test/).waitFor(); assert.equal(mailReads, 1);
+    for (const changed of ["missing-account", "changed-account"]) {
+      const before = mailReads;
+      await setMode(changed);
+      await region.getByRole("button", { name: "切换邮箱" }).click();
+      assert.equal(await select.inputValue(), "", "a disconnected source must not select another mailbox");
+      await region.getByRole("button", { name: "取消", exact: true }).click();
+      await page.screenshot({ path: new URL(`${changed}-canceled.png`, out).pathname, fullPage: true });
+      assert.equal(await region.getByRole("button", { name: "整理待办" }).isEnabled(), false, "closing account selection must not make a known disconnected source fresh");
+      assert.equal(await region.getByRole("button", { name: /^起草回复：/ }).isEnabled(), false);
+      assert.equal(await region.locator(".personal-mail-row").count(), 1);
+      assert.equal(mailReads, before); assert.equal(modelCalls, 0);
+      for (const width of [320, 390, 768, 1280]) {
+        await page.setViewportSize({ width, height: 900 });
+        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+        for (const button of await region.getByRole("button").all()) assert.ok(await button.evaluate(el => el.getBoundingClientRect().height >= 44));
+        await region.scrollIntoViewIfNeeded();
+        await page.screenshot({ path: new URL(`${changed}-${width}.png`, out).pathname, fullPage: true });
+      }
+      await setMode("success"); await region.getByRole("button", { name: "刷新邮件" }).click();
+      await page.waitForFunction(() => [...document.querySelectorAll('[aria-label="待处理邮件"] button')].some(button => button.textContent.includes("整理待办") && !button.disabled));
+    }
     assert.match(await region.getByRole("link").getAttribute("href"), /authuser=daily%40example.test/);
     assert.equal(await region.getByRole("link").getAttribute("rel"), "noopener noreferrer");
     for (const width of [320, 390, 768, 1280]) {
@@ -202,6 +224,13 @@ try { if (process.argv.includes("--serve-fixture")) {
     await editor.getByRole("button",{name:"保存编辑"}).click();
     await editor.getByRole("button",{name:"让助理起草"}).waitFor();
     await page.waitForFunction(()=>document.querySelector('[aria-label="编辑邮件回复"] button[type="submit"]')?.disabled===true);
+    await setMode("missing-account"); await region.getByRole("button", { name: "切换邮箱" }).click();
+    await region.getByRole("button", { name: "取消", exact: true }).click();
+    assert.equal(await editor.getByRole("button", { name: "让助理起草" }).isEnabled(), false, "a known unavailable source must also block the saved draft's model entry");
+    assert.equal(await editor.getByRole("checkbox").isEnabled(), false);
+    assert.equal(await editor.getByRole("textbox", { name: "回复正文" }).inputValue(), "合成：请确认收到材料。标题不是授权，不推断原邮件正文。");
+    await setMode("success"); await region.getByRole("button", { name: "刷新邮件" }).click();
+    await page.waitForFunction(() => !document.querySelector('[aria-label="编辑邮件回复"] input[type="checkbox"]')?.disabled);
     await editor.getByRole("checkbox").check();await editor.getByRole("button",{name:"标记本版已核对"}).click();
     await replies.getByText(/已核对 · 未发送/).waitFor();
     await editor.getByRole("textbox",{name:"回复正文"}).fill("合成：断网编辑应当保留。");
@@ -246,6 +275,6 @@ try { if (process.argv.includes("--serve-fixture")) {
     assert.equal(await page.evaluate(()=>localStorage.getItem("codex-cloud:mail-draft-editor:v1")),"{invalid-synthetic-editor");
     await replies.getByText(/本机编辑记录无法读取/).waitFor();
     assert.equal(modelCalls, 0); assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ ok: true, widths: [320, 390, 768, 1280], explicitAccounts: true, lateReadProtected: true, failedAccountRetainsPrior: true, unsentDraftOnly: true, staleAndPartial: true, mailReplyDrafts:true,replySourcePinned:true,offlineEditRestored:true,concurrentEditPreserved:true,reviewInvalidated:true,deferAndReject:true,productionRouterAndStore:true, pageErrors: errors, modelCalls: 0, thirdPartyWrites: 0 }));
+    console.log(JSON.stringify({ ok: true, widths: [320, 390, 768, 1280], explicitAccounts: true, lateReadProtected: true, failedAccountRetainsPrior: true, revokedAccountStaysInvalidAfterCancel: true, unsentDraftOnly: true, staleAndPartial: true, mailReplyDrafts:true,replySourcePinned:true,offlineEditRestored:true,concurrentEditPreserved:true,reviewInvalidated:true,deferAndReject:true,productionRouterAndStore:true, pageErrors: errors, modelCalls: 0, thirdPartyWrites: 0 }));
   } finally { await browser.close(); }
 } } finally { await new Promise(resolve => server.close(resolve)); await fs.rm(dist, { recursive: true, force: true }); await fs.rm(draftState, { recursive: true, force: true }); }
