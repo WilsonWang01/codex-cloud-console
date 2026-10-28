@@ -18,6 +18,10 @@ EVENT_ID = re.compile(r"[A-Za-z0-9._:-]{8,160}")
 RUN_ID = re.compile(r"[\w.:-]{1,240}")
 
 
+def valid_run_id(value):
+    return isinstance(value, str) and RUN_ID.fullmatch(value) and value not in (".", "..")
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -92,7 +96,7 @@ class Client:
 
     def execute(self, command, value=None, wait=False, prompt=None, file_id=None, input_body=None):
         recovery = {
-            "run_id": value if command in ("status", "cancel", "output", "download") and isinstance(value, str) and RUN_ID.fullmatch(value) else None,
+            "run_id": value if command in ("status", "cancel", "output", "download") and valid_run_id(value) else None,
             "event_id": value if command in ("submit", "heartbeat") and isinstance(value, str) and EVENT_ID.fullmatch(value) else None,
         }
         try:
@@ -110,9 +114,9 @@ class Client:
                     or data.get("automation_id") != self.automation_id)):
                 raise ValueError("Invalid discovery response")
             return data
+        if command in ("status", "cancel", "output", "download") and not valid_run_id(value):
+            raise ValueError("A valid run ID is required")
         if command in ("output", "download"):
-            if not value:
-                raise ValueError("run ID is required")
             prefix = "/runs/" + urllib.parse.quote(value, safe="") + "/output"
             data = self.request(prefix)
             result = data.get("result", {})
@@ -153,7 +157,7 @@ class Client:
         while True:
             run = data.get("run", {})
             status = run.get("status")
-            if (data.get("ok") is not True or not isinstance(run.get("id"), str) or not RUN_ID.fullmatch(run["id"])
+            if (data.get("ok") is not True or not valid_run_id(run.get("id"))
                     or run.get("automationId") != self.automation_id or (known_id and run["id"] != known_id)
                     or status not in ("queued", "running", "canceling", "completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation")):
                 raise ValueError("Invalid or mismatched run response")

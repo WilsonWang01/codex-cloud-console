@@ -29,6 +29,43 @@ function cliClient(origin, runtime, script, ...args) {
 const pythonClient = (origin, ...args) => cliClient(origin, "python3", "./external-client-example.py", ...args);
 const nodeClient = (origin, ...args) => cliClient(origin, process.execPath, "./external-client-example.mjs", ...args);
 
+test("unsafe run IDs are rejected before Node or Python queries, cancels or downloads", async t => {
+  const { origin, calls } = await fixture(t, (_req, res) => { res.statusCode = 404; res.end("{}"); });
+  const fileId = "00000000-0000-4000-8000-000000000001";
+  for (const runId of ["PRIVATE_RUN_INPUT\nnot-an-id", "run-1\n", "run-1\r\n", ".", "..", "x".repeat(241)]) {
+    for (const command of ["status", "cancel", "output", "download"]) {
+      await assert.rejects(runExternalClient({ ...options, origin, command, runId, fileId }), /valid run-id/);
+      const result = await pythonClient(origin, command, "research", runId, ...(command === "download" ? ["--file-id", fileId, "--output", "unused-output"] : []));
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr.includes("PRIVATE_RUN_INPUT"), false);
+      assert.match(result.stderr, /valid run ID/);
+    }
+  }
+  assert.equal(calls.length, 0, "unsafe identifiers must never reach an authenticated HTTP request");
+});
+
+test("malformed run receipts never become Node recovery IDs or progress notifications", async t => {
+  let id;
+  const { origin, calls } = await fixture(t, (_req, res) => res.end(JSON.stringify(reply("running", { id }))));
+  for (id of ["PRIVATE_RUN_RECEIPT\nnot-an-id", "run-1\n", "run-1\r\n", ".", "..", "x".repeat(241), 7]) {
+    let progress = 0;
+    await assert.rejects(runExternalClient({ ...options, origin, timeoutMs: 1000,
+      onStatus: () => { progress++; }, onProgress: () => { progress++; } }),
+    { code: "INVALID_RESPONSE", runId: null, eventId: options.eventId });
+    assert.equal(progress, 0);
+  }
+  assert.equal(calls.length, 7);
+  assert.ok(calls.every(call => call.method === "POST" && call.key === options.eventId));
+  for (const client of [nodeClient, pythonClient]) {
+    id = "PRIVATE_RUN_RECEIPT\nnot-an-id";
+    const result = await client(origin, "submit", "research", "malformed-cli-receipt-001");
+    assert.equal(result.code, 1);
+    assert.equal((result.stderr + result.stdout).includes("PRIVATE_RUN_RECEIPT"), false);
+    assert.match(result.stderr, /\(event-id: malformed-cli-receipt-001\)/);
+  }
+  assert.equal(calls.length, 9);
+});
+
 const pythonRecovery = (origin, command, value, fault) => cliClient(origin, "python3", "-c", `
 import importlib.util, json, os, sys
 sys.dont_write_bytecode = True
@@ -134,8 +171,7 @@ test("Python recovery never logs invalid input IDs or accepts malformed returned
     assert.equal(result.code, 1);
     assert.equal(result.stderr.includes("PRIVATE_RECOVERY_INPUT"), false, command);
   }
-  assert.equal(calls.length, 1, "invalid event IDs are rejected before HTTP submission");
-  assert.equal(calls[0].method, "GET");
+  assert.equal(calls.length, 0, "invalid event and run IDs are rejected before HTTP requests");
   malformed = true;
   const result = await pythonClient(origin, "submit", "research", "python-invalid-receipt-001");
   assert.equal(result.code, 1);

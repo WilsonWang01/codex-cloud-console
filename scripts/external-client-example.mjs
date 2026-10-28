@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 const activeStatuses = new Set(["queued", "running", "canceling"]);
 const terminalStatuses = new Set(["completed", "failed", "canceled", "cancelled", "interrupted", "needs_reconciliation"]);
 const retryStatuses = new Set([429, 502, 503, 504]);
+const validRunId = value => typeof value === "string" && value.length > 0 && value.length <= 240 &&
+  !/[^\p{L}\p{N}_.:-]/u.test(value) && value !== "." && value !== "..";
 
 export class ExternalClientError extends Error {
   constructor(message, details = {}) {
@@ -52,7 +54,7 @@ export async function runExternalClient({ command, automationId, eventId = "", r
   if (!submitting && !discovery && !output && !["status", "cancel"].includes(command)) throw new Error("command must be submit, heartbeat, status, cancel, models, capabilities, output or download");
   if (command === "download" && !/^[a-f0-9-]{36}$/.test(fileId)) throw new Error("a valid artifact file-id is required");
   if (submitting && !/^[A-Za-z0-9._:-]{8,160}$/.test(eventId)) throw new Error("event-id must be 8-160 letters, numbers, dots, underscores, colons or dashes and stable across retries");
-  if (!submitting && !discovery && !runId) throw new Error("run-id is required");
+  if (!submitting && !discovery && !validRunId(runId)) throw new Error("a valid run-id is required");
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("input must be a JSON object");
   for (const [name, value] of Object.entries({ pollMs, timeoutMs, requestTimeoutMs })) positiveMilliseconds(value, name);
   if (!Number.isSafeInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) throw new Error("maxRetries must be between 0 and 5");
@@ -65,7 +67,7 @@ export async function runExternalClient({ command, automationId, eventId = "", r
   let lastStatus;
   const accept = async (payload) => {
     const run = payload?.run;
-    if (payload?.ok !== true || typeof run?.id !== "string" || !run.id || run.automationId !== automationId ||
+    if (payload?.ok !== true || !validRunId(run?.id) || run.automationId !== automationId ||
       (runId && run.id !== runId) || (!activeStatuses.has(run.status) && !terminalStatuses.has(run.status))) {
       throw new ExternalClientError("Server returned an invalid or mismatched run", { code: "INVALID_RESPONSE" });
     }
