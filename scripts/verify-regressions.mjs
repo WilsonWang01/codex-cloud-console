@@ -18,6 +18,7 @@ import { createExternalTaskStore } from "../server/external-task-store.mjs";
 import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
 import { Client as McpClient } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { verifyNativeMcpReadback } from "./verify-mcp-codex.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -1361,6 +1362,19 @@ await check("independent clients retrieve private exact-turn files and images af
       const denied = await mcpCall(crossMcp, "output", { runId: run.id });
       assert.equal(denied.error, true); assert.equal(denied.data.httpStatus, 404);
     } finally { await mcp.close(); await crossMcp.close(); }
+    if (process.env.CODEX_MCP_NATIVE_CLI_BINARY) {
+      const nativeCross = await jsonRequest(origin, "/api/clients", { method: "POST", headers: admin,
+        body: JSON.stringify({ name: "native-mcp-cross-scope", automationIds: ["sample-research"] }) });
+      assert.equal(nativeCross.response.status, 201);
+      const runsBefore = await fs.readFile(path.join(stateRoot, "automation-runs.json"));
+      const native = await verifyNativeMcpReadback({ root, projectRoot, origin, token, run, manifest, report, reportBytes: file.buffer,
+        crossToken: nativeCross.data.token, revokeCross: async () => {
+          const revoked = await jsonRequest(origin, `/api/clients/${nativeCross.data.client.id}/revoke`, { method: "POST", headers: admin });
+          assert.equal(revoked.response.status, 200);
+        } });
+      assert.deepEqual(await fs.readFile(path.join(stateRoot, "automation-runs.json")), runsBefore, "Native MCP reads do not change tasks");
+      console.log(JSON.stringify({ nativeMcp: native }));
+    }
     const rpc = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
     assert.equal(rpc.filter(call => call.method === "turn/start").length, 2, "reads and restarts must not repeat inference");
     assert.equal(rpc.filter(call => call.method === "thread/read" && call.params.includeTurns).length, 2, "stored delivery does not reread erased native history");

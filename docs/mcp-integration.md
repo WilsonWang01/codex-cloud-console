@@ -39,6 +39,25 @@ MCP 是 AI 客户端调用工具的标准协议。本仓库提供本地 `stdio` 
 
 连接后应能列出五个只读工具。先调用 `codex_cloud_capabilities` 和 `codex_cloud_models`，核对自动化默认模型、能力和保留期限；模型目录不是账号推理权限证明。认证过期或范围不符会被后端拒绝，不会回退借用本机控制台登录。
 
+## Codex CLI 配置
+
+Codex 使用 TOML 而不是上面的 `mcpServers` JSON。按[官方 MCP 配置说明](https://learn.chatgpt.com/docs/extend/mcp)，可以在自己的私有 `~/.codex/config.toml` 中添加下列段落；先核对已有同名配置，不覆盖整个文件：
+
+```toml
+[mcp_servers.codex_cloud]
+command = "/absolute/path/to/node"
+args = ["/absolute/path/to/codex-cloud-console/scripts/codex-cloud-mcp.mjs"]
+env_vars = ["CODEX_CLOUD_API_TOKEN"]
+
+[mcp_servers.codex_cloud.env]
+CODEX_CLOUD_URL = "https://your-console.example.com"
+CODEX_CLOUD_AUTOMATION_ID = "your-automation-id"
+```
+
+由启动 Codex 的进程安全注入 `CODEX_CLOUD_API_TOKEN`，这里不把令牌写进配置、命令行或 Git。仅在另一个终端设置变量，不会改变已经启动的桌面进程环境；缺少变量会明确连接失败，不借用 ChatGPT 或 AWS 登录。省略执行开关保持五个只读工具，可先在 Codex 的 `/mcp` 核对连接和目录，再读取已有任务。要允许提交仍须按下文单独确认费用和动作。
+
+CLI 0.165.0 的真实本地 stdio 连接、此环境变量转发、五个读取工具、报告/图片和重启找回已在隔离控制台验收，见[原生客户端证据](acceptance/2026-10-30-native-mcp-readback.md)。没有替用户安装配置，不能将此测试当作 Codex App 界面、竞品账号或生产 MCP 全流程通过。
+
 ## 工具
 
 | 工具 | 参数与结果 |
@@ -90,6 +109,6 @@ SHA-256 是文件内容的指纹，用来验证下载内容与原产物一致，
 
 采用固定官方 SDK `@modelcontextprotocol/server/client 2.3.1`，服务端和客户端为独立包；Zod 4.6.7 校验工具参数。实现依据：[官方 stdio](https://ts.sdk.modelcontextprotocol.io/v2/serving/stdio.html)、[工具与结果](https://ts.sdk.modelcontextprotocol.io/v2/servers/tools.html)、[取消信号](https://ts.sdk.modelcontextprotocol.io/v2/servers/logging-progress-cancellation.html)。不自行实现 JSON-RPC 或协议握手。
 
-测试使用真实 SDK 客户端和 stdio 子进程，并连接隔离的真实控制台后端核对持久任务、材料、完整结果、文件、跨调用方拒绝及原有模型调用次数。底层模型为替身，不消耗真实推理额度；这不证明生产令牌和真实模型业务闭环已验收。具体证据见[本轮验收](acceptance/2026-10-23-mcp-adapter.md)。
+测试使用真实 SDK 客户端和 stdio 子进程，并连接隔离的真实控制台后端核对持久任务、材料、完整结果、文件、跨调用方拒绝及原有模型调用次数。底层模型为替身，不消耗真实推理额度；原始证据见[SDK 验收](acceptance/2026-10-23-mcp-adapter.md)，后续补充 [CLI 0.165 原生读取验收](acceptance/2026-10-30-native-mcp-readback.md)。另有独立的[生产 HTTP 样例](acceptance/2026-10-30-production-api-client.md)，但不是生产 MCP 或模型自主选择工具的证明。
 
 这不是远程 MCP HTTP/OAuth 服务、MCP 原生任务管理协议、资源订阅或文件系统工具；没有把适配器注册到当前 Codex 环境以免形成递归调用。Muse、Today、Grok Bot 的实际账号和 MCP 入口尚未核实，不能宣称已经接入这些产品。EC2 无需安装/启动新常驻服务，使用当前已兼容的 HTTP 后端即可。
