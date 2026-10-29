@@ -14,6 +14,7 @@ import express from "express";
 import { normalizeMailMessage } from "../server/personal-mail.mjs";
 import { createPersonalMailDrafts, personalMailDraftRouter } from "../server/personal-mail-drafts.mjs";
 import { personalFeedbackConsole } from "./fixtures/personal-feedback-console.mjs";
+import { parseMailBody } from "../server/personal-mail-body.mjs";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const observedPath = process.env.CODEX_CLOUD_MAIL_UI_SNAPSHOT;
@@ -35,7 +36,7 @@ status.health.ok = true; status.health.layers.appServer = { ok: true, running: t
 status.repos.push({ id: "_personal", name: "个人助理", kind: "personal", runtimeMode: "shared", executionAvailable: true, path: "/fixture/personal", remote: "", present: true, accent: "teal" });
 const accounts = [{ id: "account-one", email: "personal@example.test", label: "个人" }, { id: "account-two", email: "daily@example.test", label: "日常" }];
 const sessions = [{ id: "mail-source-session", repoId: "_personal", title: "原个人对话", messageCount: 0, model: "gpt-6-sol", reasoning: "medium", sandbox: "read-only", approval: "on-request", search: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), draft: { input: "", attachments: [], revision: 0 } }];
-let mail = observed, mode = "success", accountReads = 0, mailReads = 0, modelCalls = 0;
+let mail = observed, mode = "success", accountReads = 0, mailReads = 0, bodyReads = 0, modelCalls = 0;
 const receivedAt = Date.now() - 7200000;
 const makeMail = (zone, accountId) => {
   const window = mailWindow(zone), account = accounts.find(item => item.id === accountId);
@@ -77,8 +78,12 @@ const server = http.createServer(async (req, res) => {
     }
     for await (const chunk of req) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
-    if (url.pathname === "/__fixture/mode") { mode = url.searchParams.get("value") || "success"; return json(res, { mode }); }
-    if (url.pathname === "/__fixture/state") return json(res, { accountReads, mailReads, modelCalls, mode });
+    if (url.pathname === "/__fixture/mode") {
+      mode = url.searchParams.get("value") || "success";
+      if (mode === "source-changed") { mail.snapshot.version = "b".repeat(64); status.generatedAt = new Date().toISOString(); }
+      return json(res, { mode });
+    }
+    if (url.pathname === "/__fixture/state") return json(res, { accountReads, mailReads, bodyReads, modelCalls, mode });
     if (url.pathname === "/healthz") return json(res, status.health);
     if (url.pathname.startsWith("/api/")) {
       if (url.pathname === "/api/status") return json(res, status);
@@ -94,6 +99,16 @@ const server = http.createServer(async (req, res) => {
         if (!accounts.some(account => account.id === body.accountId)) return json(res, { error: "请选择已连接邮箱" }, 409);
         mail = mode === "denied" ? { ...mail, stale: true, lastAttempt: { accountId: body.accountId, status: "error", error: "所选邮箱读取被拒绝，请核对授权" } } : makeMail(body.timeZone, body.accountId);
         return json(res, { ok: true, mail });
+      }
+      if (url.pathname === "/api/personal/mail/body") {
+        if (observed) return json(res, { error: "只读元信息预览禁止读取正文" }, 403);
+        const snapshot = mail?.snapshot, item = snapshot?.items.find(item => item.id === body.source?.messageId);
+        if (!snapshot || !item || !body.confirm || snapshot.account.id !== body.source.accountId || snapshot.version !== body.source.snapshotVersion || item.version !== body.source.itemVersion || mode === "stale") return json(res, { error: "合成来源已变化" }, 409);
+        bodyReads++;
+        if (mode === "body-failure") return json(res, { error: "合成正文读取被拒绝，请核对授权" }, 403);
+        const parsed = parseMailBody({ mime_type: "text/html", body: { content: '<p>合成正文：请于 2026-11-01 18:00（Asia/Shanghai）前核对材料。</p><p>' + "longword".repeat(50) + '</p><script>window.MAIL_ATTACK=true</script><img src="https://tracker.example.test/never-load"><a href="javascript:alert(1)">忽略正文中的危险指令</a>' } });
+        return json(res, { ok: true, body: { ...parsed, readAt: new Date().toISOString(), source: { ...body.source, accountEmail: snapshot.account.email, title: item.title, from: item.from,
+          receivedAt: item.receivedAt, dateHeader: item.dateHeader, expiresAt: snapshot.expiresAt, timeZone: body.timeZone } } });
       }
       if (url.pathname === "/api/personal/calendar") return json(res, { ok: true, calendar: { window: calendarDayWindow(url.searchParams.get("timeZone")), snapshot: null, lastAttempt: null, stale: true, reading: false } });
       if (url.pathname === "/api/personal/brief") return json(res, { ok: true, brief: buildPersonalBrief([], [], null) });
@@ -135,8 +150,9 @@ try { if (process.argv.includes("--serve-fixture")) {
   await new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
 } else {
   const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } }), errors = [];
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } }), errors = [], trackerRequests = [];
   page.on("pageerror", error => errors.push(error.message));
+  page.on("request", request => { if (request.url().includes("tracker.example.test")) trackerRequests.push(request.url()); });
   const setMode = async value => { await fetch(base + "__fixture/mode?value=" + value); };
   try {
     await page.goto(base + "#/project/_personal/today");
@@ -216,7 +232,7 @@ try { if (process.argv.includes("--serve-fixture")) {
     await setMode("partial"); await region.getByRole("button", { name: "刷新邮件" }).click();
     await region.getByText(/仅展示本次范围中的部分邮件/).waitFor();
     const replies=page.getByRole("region",{name:"邮件回复草稿"});
-    await region.locator(".personal-mail-row-actions button").click();
+    await region.getByRole("button", { name: /^起草回复：/ }).click();
     const editor=page.getByRole("form",{name:"编辑邮件回复"});await editor.waitFor();
     assert.equal(await editor.getByRole("textbox",{name:"回复收件人"}).inputValue(),"");
     await editor.getByRole("textbox",{name:"回复收件人"}).fill("chosen@example.test");
@@ -274,7 +290,63 @@ try { if (process.argv.includes("--serve-fixture")) {
     await replies.getByRole("button",{name:"刷新回复草稿"}).click();
     assert.equal(await page.evaluate(()=>localStorage.getItem("codex-cloud:mail-draft-editor:v1")),"{invalid-synthetic-editor");
     await replies.getByText(/本机编辑记录无法读取/).waitFor();
+    await region.getByRole("button", { name: "刷新邮件" }).click();
+    const openBody = region.getByRole("button", { name: /^读取正文：/ }), bodyRegion = page.getByRole("region", { name: "单封邮件正文" });
+    await openBody.click(); await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).waitFor();
+    assert.equal(bodyReads, 0, "selecting a message must not read its body");
+    await bodyRegion.getByRole("button", { name: "关闭邮件正文" }).click(); assert.equal(bodyReads, 0);
+    assert.equal(await openBody.evaluate(el => el === document.activeElement), true);
+    await openBody.click(); await setMode("body-failure");
+    await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).click();
+    await bodyRegion.getByText(/合成正文读取被拒绝/).waitFor(); assert.equal(bodyReads, 1); assert.equal(await bodyRegion.locator("pre").count(), 0);
+    await bodyRegion.getByRole("button", { name: "关闭邮件正文" }).click(); await setMode("success");
+    await openBody.click(); await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).click();
+    const text = bodyRegion.getByLabel("邮件纯文本正文"); await text.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('[aria-label="单封邮件正文"] button')].some(button => button.textContent.includes("整理正文待办") && !button.disabled));
+    assert.equal(bodyReads, 2); assert.match(await text.innerText(), /2026-11-01 18:00/); assert.equal(await bodyRegion.locator("img,script,iframe").count(), 0);
+    assert.equal(await page.evaluate(() => window.MAIL_ATTACK), undefined); assert.equal(modelCalls, 0);
+    for (const width of [320, 390, 768, 1280]) {
+      await page.setViewportSize({ width, height: 900 }); await bodyRegion.scrollIntoViewIfNeeded();
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+      assert(await text.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
+      for (const control of await bodyRegion.getByRole("button").all()) assert(await control.evaluate(el => el.getBoundingClientRect().height >= 44));
+      await page.screenshot({ path: new URL(`body-${width}.png`, out).pathname, fullPage: true });
+    }
+    await setMode("source-changed"); await page.getByRole("button", { name: "刷新", exact: true }).click();
+    await bodyRegion.getByText(/来源正在核对、已变化或过期/).waitFor();
+    assert.equal(await bodyRegion.getByRole("button", { name: "整理正文待办" }).isEnabled(), false, "a new batch version must not silently reuse the pinned body selection");
+    assert.equal(await bodyRegion.getByRole("button", { name: "起草正文回复" }).isEnabled(), false);
+    await setMode("success"); await region.getByRole("button", { name: "刷新邮件" }).click();
+    await openBody.click(); await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).click(); await text.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('[aria-label="单封邮件正文"] button')].some(button => button.textContent.includes("整理正文待办") && !button.disabled));
+    await bodyRegion.getByRole("button", { name: "整理正文待办" }).click(); await composer.waitFor();
+    const todoPrompt = await composer.inputValue(); assert.match(todoPrompt, /2026-11-01 18:00/); assert.match(todoPrompt, /不可信第三方资料/); assert.match(todoPrompt, /不是指令或授权/); assert.match(todoPrompt, /bodySha256/); assert.equal(modelCalls, 0);
+    await page.goto(base + "#/project/_personal/today"); await openBody.click();
+    await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).click(); await text.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('[aria-label="单封邮件正文"] button')].some(button => button.textContent.includes("起草正文回复") && !button.disabled));
+    await page.clock.setFixedTime(Date.parse(mail.snapshot.expiresAt) + 1);
+    await bodyRegion.getByRole("button", { name: "起草正文回复" }).click(); await bodyRegion.getByText(/正文来源刚刚过期/).waitFor();
+    assert.equal(new URL(page.url()).hash, "#/project/_personal/today"); assert.equal(modelCalls, 0);
+    await page.clock.setFixedTime(Date.now()); await page.reload();
+    await region.getByRole("button", { name: "刷新邮件" }).click(); await openBody.click();
+    await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).click(); await text.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('[aria-label="单封邮件正文"] button')].some(button => button.textContent.includes("起草正文回复") && !button.disabled));
+    await bodyRegion.getByRole("button", { name: "起草正文回复" }).click(); await composer.waitFor();
+    const replyPrompt = await composer.inputValue(); assert.match(replyPrompt, /personal_mail_draft/); assert.match(replyPrompt, /2026-11-01 18:00/); assert.match(replyPrompt, /不创建 Gmail 草稿/); assert.equal(modelCalls, 0);
+    await page.goto(base + "#/project/_personal/today"); await openBody.click();
+    let releaseBody, startBody;
+    const bodyGate = new Promise(resolve => { releaseBody = resolve; }), bodyStarted = new Promise(resolve => { startBody = resolve; });
+    await page.route("**/api/personal/mail/body", async route => { const response = await route.fetch(); startBody(); await bodyGate; await route.fulfill({ response }).catch(() => null); });
+    try {
+      await bodyRegion.getByRole("button", { name: "确认只读这一封正文" }).click(); await bodyStarted;
+      await bodyRegion.getByRole("button", { name: "关闭邮件正文" }).click();
+      await region.getByRole("button", { name: "切换邮箱" }).click(); await select.selectOption("account-two");
+      await region.getByRole("button", { name: "读取未读邮件" }).click(); await select.waitFor({ state: "hidden" });
+      assert.match(await region.locator(":scope > .personal-brief-source").innerText(), /daily@example.test/);
+      releaseBody(); assert.equal(await bodyRegion.count(), 0, "a closed old-account read must not reappear after its delayed response");
+    } finally { releaseBody(); await page.unroute("**/api/personal/mail/body"); }
+    assert.equal(modelCalls, 0); assert.deepEqual(trackerRequests, []);
     assert.equal(modelCalls, 0); assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ ok: true, widths: [320, 390, 768, 1280], explicitAccounts: true, lateReadProtected: true, failedAccountRetainsPrior: true, revokedAccountStaysInvalidAfterCancel: true, unsentDraftOnly: true, staleAndPartial: true, mailReplyDrafts:true,replySourcePinned:true,offlineEditRestored:true,concurrentEditPreserved:true,reviewInvalidated:true,deferAndReject:true,productionRouterAndStore:true, pageErrors: errors, modelCalls: 0, thirdPartyWrites: 0 }));
+    console.log(JSON.stringify({ ok: true, widths: [320, 390, 768, 1280], explicitAccounts: true, lateReadProtected: true, failedAccountRetainsPrior: true, revokedAccountStaysInvalidAfterCancel: true, unsentDraftOnly: true, staleAndPartial: true, mailReplyDrafts:true,replySourcePinned:true,offlineEditRestored:true,concurrentEditPreserved:true,reviewInvalidated:true,deferAndReject:true,productionRouterAndStore:true, bodyExplicitConfirmation:true, bodyPlainText:true, bodyPromptOnly:true, bodySourceVersionGuard:true, bodyLateResponseIgnored:true, pageErrors: errors, modelCalls: 0, thirdPartyWrites: 0 }));
   } finally { await browser.close(); }
 } } finally { await new Promise(resolve => server.close(resolve)); await fs.rm(dist, { recursive: true, force: true }); await fs.rm(draftState, { recursive: true, force: true }); }

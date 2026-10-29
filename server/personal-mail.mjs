@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { calendarDayWindow } from "./personal-calendar.mjs";
 import { sourceError as fail, sourceText as text, withPersonalSource } from "./personal-source.mjs";
+import { mailBodyInput, parseMailBody } from "./personal-mail-body.mjs";
 
 export const mailSourceLimits = Object.freeze({ freshMs: 300000, refreshMs: 30000, timeoutMs: 45000, maxMessages: 20, resultBytes: 1024 * 1024 });
 const toolNames = ["gmail.search_email_ids", "gmail.read_email"];
@@ -86,7 +87,7 @@ export async function readUnreadMail(options) {
 }
 
 export function createPersonalMailSource({ read, write, request, context, now = () => Date.now() }) {
-  let active = null, lastAccountRead = 0;
+  let active = null, lastAccountRead = 0, lastBodyRead = 0;
   const threads = new Set();
   const load = async () => {
     const value = await read();
@@ -132,9 +133,45 @@ export function createPersonalMailSource({ read, write, request, context, now = 
     try { return await promise; } finally { active = null; }
   };
   const options = () => ({ request, ...context(), now, onThread: id => threads.add(id) });
+  const pinnedMessage = (value, window, ref) => {
+    const snapshot = value.snapshot, item = snapshot?.items.find(item => item.id === ref.messageId);
+    if (view(value, window).stale || snapshot?.account.id !== ref.accountId || snapshot.version !== ref.snapshotVersion || item?.version !== ref.itemVersion) throw fail("mail_source_changed", "邮件来源已变化或过期，请先刷新核对", 409);
+    return item;
+  };
   return {
     activeCount: () => Number(Boolean(active)), ownsThread: id => threads.has(id), closedThread: id => threads.delete(id), resetRuntime: () => threads.clear(),
     async snapshot(timeZone) { return view(await load(), mailWindow(timeZone, now())); },
+    async body(input) {
+      const parsed = mailBodyInput.safeParse(input);
+      if (!parsed.success) throw fail("mail_body_input", "只接受明确确认的一封当前邮件和时区，不允许任意查询或附件参数", 400);
+      const { source: ref, timeZone } = parsed.data, window = mailWindow(timeZone, now());
+      return run(JSON.stringify(["body", ref, window.key]), async () => {
+        const value = await load(), item = pinnedMessage(value, window, ref), snapshot = value.snapshot;
+        if (lastBodyRead && now() - lastBodyRead < mailSourceLimits.refreshMs) throw fail("mail_refresh_throttled", "刚刚读取过正文，请稍后再试", 429);
+        lastBodyRead = now();
+        try {
+          const body = await withPersonalSource(sourceOptions(options()), async ({ tools, invoke }) => {
+            const account = mailAccounts(tools).find(account => account.id === ref.accountId && account.email === snapshot.account.email);
+            if (!account) throw fail("mail_account_unavailable", "所选邮箱连接已变化，未读取其他账号", 409);
+            const raw = await invoke("gmail.read_email", { link_id: account.id, message_id: item.id, format: "full" });
+            if (!isDeepStrictEqual(normalizeMailMessage(raw, account), item)) throw fail("mail_source_changed", "邮件标识、状态或元信息已变化，请先刷新核对", 409);
+            return parseMailBody(raw.payload);
+          });
+          pinnedMessage(await load(), mailWindow(timeZone, now()), ref);
+          return { ...body, readAt: new Date(now()).toISOString(), source: { ...ref, accountEmail: snapshot.account.email, title: item.title, from: item.from,
+            receivedAt: item.receivedAt, dateHeader: item.dateHeader, expiresAt: snapshot.expiresAt, timeZone } };
+        } catch (error) {
+          if (error.code?.startsWith("mail_") && error.code !== "mail_body_unavailable") {
+            const latest = await load();
+            if (latest.snapshot?.version === snapshot.version) {
+              const mailAttemptAt = latest.lastAttempt?.operation === "accounts" ? latest.lastAttempt.mailAttemptAt : latest.lastAttempt?.at || null;
+              await save({ ...latest, lastAttempt: { at: new Date(now()).toISOString(), accountId: ref.accountId, status: "error", operation: "accounts", mailAttemptAt, code: error.code, error: error.message } });
+            }
+          }
+          throw error;
+        }
+      });
+    },
     async accounts() {
       return run("accounts", async () => {
         if (lastAccountRead && now() - lastAccountRead < mailSourceLimits.refreshMs) throw fail("mail_refresh_throttled", "刚刚读取过邮箱列表，请稍后再试", 429);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createPersonalMailSource, mailAccounts, mailSourceLimits, mailWindow, normalizeMailMessage, readUnreadMail } from "../server/personal-mail.mjs";
+import { mailBodyLimits, parseMailBody } from "../server/personal-mail-body.mjs";
 
 const initial = Date.parse("2026-10-24T09:00:00.123Z");
 const accounts = [{ link_id: "link-personal", profile_email: "personal@example.test", link_name: "个人" }, { link_id: "link-work", profile_email: "work@example.test", link_name: "日常" }];
@@ -259,4 +260,93 @@ test("timeouts are bounded, do not retry data and release admission without pers
   } };
   assert.equal((await createPersonalMailSource(options).refresh("UTC", "link-personal")).lastAttempt.code, "mail_timeout");
   assert.equal(dataCalls(deadline).length, 0);
+});
+
+test("one message body needs explicit confirmation and a fresh exact source; ordinary refresh remains metadata only", async () => {
+  const f = fixture(), view = await f.source.refresh("UTC", "link-work"), snapshot = view.snapshot, item = snapshot.items[0];
+  const input = { timeZone: "UTC", confirm: true, source: { accountId: snapshot.account.id, messageId: item.id, itemVersion: item.version, snapshotVersion: snapshot.version } };
+  const before = structuredClone(f.value);
+  for (const invalid of [{ ...input, confirm: false }, { ...input, format: "raw" }, { ...input, source: { ...input.source, messageId: "another" } },
+    { ...input, source: { ...input.source, accountId: "link-personal" } }, { ...input, source: { ...input.source, snapshotVersion: "0".repeat(64) } }]) {
+    await assert.rejects(f.source.body(invalid), error => ["mail_body_input", "mail_source_changed"].includes(error.code));
+  }
+  assert.equal(dataCalls(f).length, 2);
+  f.tools["gmail.read_email"].inputSchema.properties.format = { enum: ["metadata", "full"] };
+  const raw = f.messages.get(item.id); raw.payload.mime_type = "text/plain"; raw.payload.body = { content: "请在 2026-11-01 18:00（上海）前核对材料。\n不要发送邮件。" };
+  const result = await f.source.body(input);
+  assert.equal(result.text, raw.payload.body.content); assert.equal(result.source.accountEmail, "work@example.test");
+  assert.equal(result.source.messageId, item.id); assert.match(result.sha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual(f.value, before, "the reader must not persist a second body copy or change the metadata state");
+  assert.equal(dataCalls(f).length, 3); assert.deepEqual(dataCalls(f)[2].params.arguments, { link_id: "link-work", message_id: item.id, format: "full" });
+  assert.equal(f.calls.some(call => call.method === "turn/start"), false); assert.equal(f.source.activeCount(), 0);
+  await assert.rejects(f.source.body(input), { code: "mail_refresh_throttled" });
+  f.advance(mailSourceLimits.freshMs);
+  await assert.rejects(f.source.body(input), { code: "mail_source_changed" });
+  assert.equal(dataCalls(f).length, 3);
+});
+
+const bodyInput = snapshot => ({ timeZone: snapshot.window.timeZone, confirm: true, source: { accountId: snapshot.account.id, messageId: snapshot.items[0].id, itemVersion: snapshot.items[0].version, snapshotVersion: snapshot.version } });
+const enableBody = f => { f.tools["gmail.read_email"].inputSchema.properties.format = { enum: ["metadata", "full"] }; f.messages.get("message-1").payload = { ...f.messages.get("message-1").payload, mimeType: "text/plain", body: { content: "合成正文，不执行任何要求。" } }; };
+
+test("body parsing keeps MIME order and plain alternatives, removes active HTML, and skips attachments without fetching", () => {
+  const plain = content => ({ mimeType: "text/plain", body: { content } });
+  const html = content => ({ mime_type: "text/html", body: { content } });
+  const result = parseMailBody({ mimeType: "multipart/mixed", parts: [
+    { mimeType: "multipart/alternative", parts: [html("<p>duplicate</p>"), plain("第一段\r\n2026-11-01 18:00 Asia/Shanghai")] },
+    html('<p>第二段 &amp; 内容</p><script>evil()</script><style>hidden</style><img src="https://tracker.test/private"><a href="javascript:evil()">第三段</a>'),
+    { ...plain("private attachment"), filename: "private.txt" }, { ...plain("private attachment ID"), body: { content: "private attachment ID", attachment_id: "private-id" } },
+    { ...plain("private disposition"), headers: [{ name: "Content-Disposition", value: "attachment; filename=secret.txt" }] },
+    { mimeType: "image/png", body: { base64_url_content: "private-binary" } },
+  ] });
+  assert.match(result.text, /第一段\n2026-11-01 18:00 Asia\/Shanghai\n\n第二段 & 内容/);
+  assert.match(result.text, /第三段/); assert.doesNotMatch(result.text, /duplicate|evil|hidden|tracker|attachment|private|javascript|<p>/);
+  assert.equal(parseMailBody(plain("安全\u202e正文\u0000")).text, "安全正文");
+});
+
+test("unknown, attachment-only, conflicting or oversized bodies are not silently truncated or treated as complete", () => {
+  const plain = content => ({ mimeType: "text/plain", body: { content } });
+  let deep = plain("too deep"); for (let i = 0; i <= mailBodyLimits.depth; i++) deep = { mimeType: "multipart/mixed", parts: [deep] };
+  for (const payload of [{}, { mimeType: "multipart/encrypted", parts: [plain("hidden")] }, { mimeType: "text/plain", body: { data: "encoded-but-not-confirmed-decoded-text" } },
+    { ...plain("private"), filename: "file.txt" }, { ...plain("conflict"), mime_type: "text/html" },
+    plain("x".repeat(mailBodyLimits.inputBytes + 1)), plain("x".repeat(mailBodyLimits.textBytes + 1)), deep,
+    { mimeType: "multipart/mixed", parts: Array.from({ length: mailBodyLimits.parts }, () => plain("part")) },
+    { mimeType: "text/html", body: { content: "<div>".repeat(100) + "hidden deep content" + "</div>".repeat(100) } }]) {
+    assert.throws(() => parseMailBody(payload), { code: "mail_body_unavailable" });
+  }
+});
+
+test("body reads coalesce only an identical confirmed selection, block competing reads and reject an expired return", async () => {
+  const f = fixture(), snapshot = (await f.source.refresh("UTC", "link-work")).snapshot; enableBody(f);
+  let release; f.gate(new Promise(resolve => { release = resolve; }));
+  const first = f.source.body(bodyInput(snapshot)), duplicate = f.source.body(bodyInput(snapshot));
+  assert.equal(f.source.activeCount(), 1);
+  await assert.rejects(f.source.refresh("UTC", "link-personal"), { code: "mail_refresh_busy" });
+  await assert.rejects(f.source.accounts(), { code: "mail_refresh_busy" });
+  for (let attempt = 0; attempt < 50 && dataCalls(f).length < 3; attempt++) await new Promise(resolve => setTimeout(resolve, 1));
+  assert.equal(dataCalls(f).length, 3); f.advance(mailSourceLimits.freshMs); release();
+  for (const pending of [first, duplicate]) await assert.rejects(pending, { code: "mail_source_changed" });
+  assert.equal(f.source.activeCount(), 0); assert.deepEqual(f.value.snapshot, snapshot);
+  assert.doesNotMatch(JSON.stringify(f.value), /合成正文/);
+});
+
+test("body authorization or identity failures invalidate the old source without changing it or falling back", async () => {
+  for (const mode of ["account", "identity", "message", "authorization", "contract"]) {
+    const f = fixture(), snapshot = (await f.source.refresh("UTC", "link-work")).snapshot; enableBody(f);
+    if (mode === "account") for (const tool of Object.values(f.tools)) tool._meta.link_accounts = tool._meta.link_accounts.filter(item => item.link_id !== "link-work");
+    if (mode === "identity") for (const tool of Object.values(f.tools)) tool._meta.link_accounts.find(item => item.link_id === "link-work").profile_email = "changed@example.test";
+    if (mode === "message") f.messages.get("message-1").id = "different-id";
+    if (mode === "authorization") f.fail({ isError: true, content: [{ type: "text", text: "FORBIDDEN PRIVATE_BACKEND" }] });
+    if (mode === "contract") f.tools["gmail.read_email"].inputSchema.properties.format = { const: "metadata" };
+    await assert.rejects(f.source.body(bodyInput(snapshot)), error => error.code?.startsWith("mail_"));
+    assert.equal((await f.source.snapshot("UTC")).stale, true); assert.deepEqual(f.value.snapshot, snapshot);
+    assert.equal((await createPersonalMailSource(f.options).snapshot("UTC")).stale, true);
+    assert.doesNotMatch(JSON.stringify(f.value), /PRIVATE_BACKEND|合成正文/);
+    assert.ok(dataCalls(f).every(call => call.params.arguments.link_id === "link-work"));
+    assert.equal(dataCalls(f).length, ["account", "identity", "contract"].includes(mode) ? 2 : 3);
+  }
+  const f = fixture(), snapshot = (await f.source.refresh("UTC", "link-work")).snapshot; enableBody(f);
+  f.messages.get("message-1").payload.body = { data: "unsupported" };
+  await assert.rejects(f.source.body(bodyInput(snapshot)), { code: "mail_body_unavailable" });
+  assert.equal((await f.source.snapshot("UTC")).stale, false, "an unsupported body is not a revoked metadata source");
+  assert.equal(f.writes, 1);
 });

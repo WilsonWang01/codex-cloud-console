@@ -155,6 +155,7 @@ let modelApiTurnId = null;
 let modelApiStructured = false;
 let turnSequence = 0;
 let mailSourceSequence = 0;
+const mailReceivedAt = Date.now() - 7200000;
 const fixtureTurns = new Map();
 const fixtureCwds = new Map();
 const cancelGates = new Map();
@@ -203,8 +204,8 @@ input.on("line", (line) => {
         ? send({ id: message.id, result: { structuredContent: { message_ids: ["metadata-mail-id"], next_page_token: null } } }) : setTimeout(reply, 10);
       return reply();
     }
-    return send({ id: message.id, result: { structuredContent: { id: "metadata-mail-id", threadId: "metadata-thread-id", internalDate: String(Date.now() - 7200000), labelIds: ["INBOX", "UNREAD"],
-      payload: { headers: [{ name: "Subject", value: "HTTP 元信息验收" }, { name: "From", value: "sender@example.test" }], body: { data: "must-not-persist-private-body" } } } } });
+    return send({ id: message.id, result: { structuredContent: { id: "metadata-mail-id", threadId: "metadata-thread-id", internalDate: String(mailReceivedAt), labelIds: ["INBOX", "UNREAD"],
+      payload: { headers: [{ name: "Subject", value: "HTTP 元信息验收" }, { name: "From", value: "sender@example.test" }], mime_type: "text/plain", body: message.params.arguments.format === "full" ? { content: "虚构正文：请于 2026-11-01 18:00（上海）前核对材料。" } : { data: "must-not-persist-private-body" } } } } });
   }
   if (message.method === "mcpServerStatus/list" && message.params.threadId === "calendar-ephemeral") return send({ id: message.id, result: { data: [{ name: "codex_apps", httpOrigin: "https://chatgpt.com", tools: { "google_calendar.search": {
     name: "google_calendar.search", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object" },
@@ -2300,6 +2301,20 @@ await check("calendar and mail sources are explicit, account-bound, durable and 
     const stateFile = path.join(stateRoot, "personal-calendar-source.json"), preserved = await fs.readFile(stateFile, "utf8");
     const mailStateFile = path.join(stateRoot, "personal-mail-source.json"), mailPreserved = await fs.readFile(mailStateFile, "utf8");
     assert.equal(mailPreserved.includes("must-not-persist-private-body"), false);
+    const bodyRequest = { ...draftInput, confirm: true };
+    const readBody = (input = bodyRequest, extra = {}) => jsonRequest(base, "/api/personal/mail/body", { method: "POST", headers: { ...headers, ...extra }, body: JSON.stringify(input) });
+    assert.equal((await readBody(bodyRequest, { origin: "https://untrusted.example.test" })).response.status, 403);
+    for (const invalid of [{ ...bodyRequest, confirm: false }, { ...bodyRequest, format: "raw" }, { ...bodyRequest, source: { ...bodyRequest.source, messageId: "unknown-message" } }]) {
+      assert.ok([400, 409].includes((await readBody(invalid)).response.status));
+    }
+    assert.equal((await captured()).filter(item => item.method === "mcpServer/tool/call").length, 3);
+    const bodyResult = await readBody(); assert.equal(bodyResult.response.status, 200);
+    assert.match(bodyResult.data.body.text, /2026-11-01 18:00/); assert.equal(bodyResult.data.body.source.accountEmail, "two@example.test");
+    assert.equal(bodyResult.response.headers.get("cache-control"), "no-store");
+    assert.equal(await fs.readFile(mailStateFile, "utf8"), mailPreserved); assert.equal(await fs.readFile(draftPath, "utf8"), draftPreserved);
+    const afterBody = await captured(), fullCalls = afterBody.filter(item => item.method === "mcpServer/tool/call" && item.params.arguments.format === "full");
+    assert.equal(fullCalls.length, 1); assert.deepEqual(fullCalls[0].params.arguments, { link_id: "mail-two", message_id: "metadata-mail-id", format: "full" });
+    assert.equal(afterBody.some(item => item.method === "turn/start"), false);
     const history = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8").catch(() => '{"sessions":{}}'));
     assert.equal(Object.keys(history.sessions).length, 0, "ephemeral source is not a console conversation");
     await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
@@ -2329,7 +2344,7 @@ await check("calendar and mail sources are explicit, account-bound, durable and 
     await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
     assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).data.mail.stale, true);
     assert.equal(await fs.readFile(draftPath, "utf8"), editedDraft);
-    assert.equal((await captured()).filter(item => ["turn/start", "mcpServer/tool/call"].includes(item.method)).length, 3, "discovering disconnection and reopening drafts never reads another mailbox or invokes a model");
+    assert.equal((await captured()).filter(item => ["turn/start", "mcpServer/tool/call"].includes(item.method)).length, 4, "discovering disconnection and reopening drafts never reads another mailbox or invokes a model");
     await fs.writeFile(draftPath,"null");
     assert.equal((await jsonRequest(base,"/api/personal/mail-drafts",{headers})).response.status,503);
     assert.equal((await createDraft({})).response.status,503);assert.equal(await fs.readFile(draftPath,"utf8"),"null");
