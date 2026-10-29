@@ -5,10 +5,11 @@ import { spawn as spawnChild } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
 import { runExternalClient } from "./external-client-example.mjs";
@@ -809,6 +810,140 @@ await check("scoped API callback intent survives restart and changed registratio
     const output=await jsonRequest(base,queued.data.run.resultPath+"/output",{headers:auth("a")});assert.equal(output.response.status,200);
     assert.equal(JSON.stringify(finished.callbackDelivery).includes("callback.invalid"),false);
   } finally {await stopProcess(server);await fs.rm(root,{recursive:true,force:true});}
+});
+
+await check("callback committed before sender crash is redelivered once without repeating inference or losing private results", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-callback-roundtrip-"));
+  const cloud = path.join(root, "cloud"), state = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloud, "workspace/sample-app"), capture = path.join(root, "rpc.ndjson"), inboxFile = path.join(root, "inbox.sqlite");
+  for (const dir of [repo, state, bin]) await fs.mkdir(dir, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const secret = "synthetic-roundtrip-signing-secret-not-an-account-key", token = "roundtrip-client-private-fixture-token";
+  const clientId = "callback-roundtrip-client", automationId = "sample-research";
+  await fs.writeFile(path.join(state, "api-clients.json"), JSON.stringify({ version: 1, clients: [{ id: clientId, name: "Roundtrip fixture",
+    tokenHash: crypto.createHash("sha256").update(token).digest("hex"), automationIds: [automationId], expiresAt: null, revokedAt: null }] }));
+  const config = path.join(root, "callbacks.json"), transport = path.join(root, "transport.mjs"), transportTrace = path.join(root, "transport.ndjson");
+  await fs.writeFile(config, JSON.stringify([{ id: "receiver", clientId, automationId, url: "https://callback.test/codex/completed", secretEnv: "CODEX_CLOUD_CALLBACK_SECRET_FIXTURE" }]), { mode: 0o600 });
+  const key = path.join(root, "key.pem"), cert = path.join(root, "cert.pem");
+  const openssl = await runCaptured(process.platform === "darwin" ? "/usr/bin/openssl" : "openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=callback.test", "-addext", "subjectAltName=DNS:callback.test"]);
+  assert.equal(openssl.code, 0, openssl.stderr);
+  const port = await freePort(), origin = `http://127.0.0.1:${port}`, admin = { "x-codex-cloud-token": "roundtrip-admin-fixture-token" };
+  const receiverEnv = { PATH: process.env.PATH, HOME: root, CODEX_CALLBACK_RECEIVER_STATE: inboxFile, CODEX_CALLBACK_RECEIVER_SECRET: secret,
+    CODEX_CALLBACK_RECEIVER_AUTOMATION_ID: automationId, CODEX_CALLBACK_RECEIVER_PORT: "0" };
+  let server, receiver, tls, heldResponse, proxyError;
+  const receipts = [];
+  const wait = async (task, timeoutMs = 10000) => {
+    const deadline = Date.now() + timeoutMs;
+    do {
+      if (proxyError) throw proxyError;
+      const value = await task(); if (value) return value;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
+    throw new Error("Callback roundtrip did not reach its required checkpoint");
+  };
+  try {
+    receiver = spawn(process.execPath, [path.join(projectRoot, "scripts/callback-inbox-example.mjs")], { env: receiverEnv, stdio: ["ignore", "pipe", "pipe"] });
+    const ready = await waitForOutput(receiver, /"url":/);
+    const receiverUrl = JSON.parse(ready.split("\n").find(line => line.startsWith("{"))).url;
+    const certificate = await fs.readFile(cert);
+    tls = https.createServer({ key: await fs.readFile(key), cert: certificate }, (request, response) => {
+      const chunks = [];
+      request.on("data", chunk => chunks.push(chunk));
+      const forward = http.request(receiverUrl, { method: request.method, headers: request.headers }, received => {
+        const answer = [];
+        received.on("data", chunk => answer.push(chunk));
+        received.on("end", () => {
+          receipts.push({ body: Buffer.concat(chunks).toString("utf8"), eventId: request.headers["x-codex-event-id"], code: received.statusCode, receivedAt: Date.now() });
+          if (receipts.length === 1) { heldResponse = response; return; }
+          response.writeHead(received.statusCode, { "content-type": "application/json" }); response.end(Buffer.concat(answer));
+        });
+      });
+      forward.on("error", error => { proxyError = error; response.destroy(); }); request.pipe(forward);
+    });
+    await new Promise(resolve => tls.listen(0, "127.0.0.1", resolve));
+    await assert.rejects(new Promise((resolve, reject) => {
+      const request = https.get({ hostname: "127.0.0.1", port: tls.address().port, path: "/codex/completed", servername: "wrong.test", ca: certificate }, response => {
+        response.resume(); resolve();
+      });
+      request.once("error", reject); request.setTimeout(3000, () => request.destroy(new Error("TLS rejection checkpoint timed out")));
+    }), { code: "ERR_TLS_CERT_ALTNAME_INVALID" });
+    assert.equal(receipts.length, 0, "A wrong TLS hostname cannot reach the receiver");
+    // Only this disposable child maps a verified public fixture IP to a local TLS receiver.
+    // Production DNS/IP checks and certificate verification remain enabled and unchanged.
+    await fs.writeFile(transport, `import assert from 'node:assert/strict';import fs from 'node:fs';import https from 'node:https';import {Resolver} from 'node:dns/promises';
+Resolver.prototype.resolve4=async host=>{assert.equal(host,'callback.test');return ['8.8.8.8'];};
+Resolver.prototype.resolve6=async host=>{assert.equal(host,'callback.test');return [];};
+const original=https.request;https.request=(url,options,respond)=>{assert.equal(url.href,'https://callback.test/codex/completed');assert.equal(options.agent,false);assert.equal(options.family,4);assert.notEqual(options.rejectUnauthorized,false);
+let checked=false;options.lookup(url.hostname,{},(error,address,family)=>{assert.equal(error,null);assert.equal(address,'8.8.8.8');assert.equal(family,4);checked=true;});assert.ok(checked);
+fs.appendFileSync(${JSON.stringify(transportTrace)},JSON.stringify({hostname:url.hostname,checkedAddress:'8.8.8.8',tlsVerified:true})+'\\n');
+return original(url,{...options,port:${tls.address().port},ca:fs.readFileSync(${JSON.stringify(cert)}),lookup:(_h,o,done)=>done(null,o.all?[{address:'127.0.0.1',family:4}]:'127.0.0.1',4)},respond);};\n`, { mode: 0o600 });
+    const start = () => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+      PATH: `${bin}:${process.env.PATH}`, HOME: root, CODEX_HOME: path.join(root, ".codex"), NODE_OPTIONS: `--import=${pathToFileURL(transport).href}`,
+      NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloud, CODEX_STATE_ROOT: state,
+      CODEX_CLOUD_WEBHOOK_TOKEN: admin["x-codex-cloud-token"], CODEX_CLOUD_CALLBACKS_FILE: config, CODEX_CLOUD_CALLBACK_SECRET_FIXTURE: secret,
+      CODEX_AUTOMATION_RECOVERY_ENABLED: "0", CODEX_ALLOW_LOCAL_FALLBACK: "0", FAKE_CAPTURE_PATH: capture,
+    } });
+    server = start(); await waitForOutput(server, /listening on/);
+    const options = { origin, token, automationId, timeoutMs: 10000, requestTimeoutMs: 3000 };
+    const input = { prompt: "model api regression artifact delivery fixture", model: "gpt-6-sol", artifactPaths: ["results/report.md"],
+      outputSchema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false } };
+    const eventId = "callback-roundtrip-0001";
+    const run = await runExternalClient({ ...options, command: "submit", eventId, input, wait: true });
+    assert.equal(run.status, "completed");
+    await wait(() => receipts.length === 1 && receipts[0].code === 202);
+    const before = await runExternalClient({ ...options, command: "status", runId: run.id });
+    assert.equal(before.callbackDelivery.status, "sending"); assert.equal(before.callbackDelivery.attempts, 1);
+    const event = JSON.parse(receipts[0].body);
+    assert.equal(event.id, before.callbackDelivery.eventId); assert.equal(event.data.run_id, run.id); assert.equal(event.data.status, "completed");
+    assert.deepEqual(Object.keys(event.data).sort(), ["automation_id", "output_path", "result_path", "run_id", "status"]);
+    for (const privateValue of [secret, token, input.prompt, "verified artifact delivery"]) assert.equal(receipts[0].body.includes(privateValue), false);
+    const closed = fixtureClosures.get(server);
+    if (isolatedProcessGroups) process.kill(-server.pid, "SIGKILL"); else server.kill("SIGKILL");
+    await closed; await stopProcess(server); server = null;
+    heldResponse.destroy();
+    server = start(); await waitForOutput(server, /listening on/);
+    const resumed = await runExternalClient({ ...options, command: "status", runId: run.id });
+    assert.equal(resumed.callbackDelivery.eventId, event.id); assert.equal(resumed.status, "completed");
+    assert.equal(resumed.callbackDelivery.status, "sending"); assert.equal(resumed.callbackDelivery.attempts, 1); assert.equal(receipts.length, 1);
+    assert.deepEqual(resumed.usage, run.usage);
+    // Wait for the real persisted 30-second lease; do not edit SQL or advance system time.
+    await wait(() => receipts.length === 2, 45000);
+    assert.deepEqual(receipts.map(item => item.code), [202, 200]);
+    assert.equal(receipts[1].body, receipts[0].body); assert.equal(receipts[1].eventId, event.id);
+    const delivered = await wait(async () => {
+      const current = await runExternalClient({ ...options, command: "status", runId: run.id });
+      return current.callbackDelivery.status === "delivered" ? current : null;
+    });
+    assert.equal(delivered.callbackDelivery.attempts, 2); assert.equal(delivered.status, "completed"); assert.deepEqual(delivered.usage, run.usage);
+    const output = await runExternalClient({ ...options, command: "output", runId: event.data.run_id });
+    assert.equal(output.structuredOutput.data.answer, "结构化验收通过");
+    const artifact = output.artifacts.find(item => item.name === "report.md");
+    const download = await runExternalClient({ ...options, command: "download", runId: run.id, fileId: artifact.id });
+    assert.equal(download.buffer.toString(), "verified artifact delivery\n");
+    const replay = await runExternalClient({ ...options, command: "submit", eventId, input }); assert.equal(replay.id, run.id);
+    const { CODEX_CALLBACK_RECEIVER_SECRET: _secret, ...readEnv } = receiverEnv;
+    const listed = await runCaptured(process.execPath, [path.join(projectRoot, "scripts/callback-inbox-example.mjs"), "--list"], { env: readEnv });
+    assert.equal(listed.code, 0, listed.stderr);
+    const inbox = JSON.parse(listed.stdout); assert.equal(inbox.items.length, 1); assert.deepEqual(inbox.items[0].event, event);
+    const rpc = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(rpc.filter(call => call.method === "turn/start").length, 1, "redelivery/replay/readback never repeat inference");
+    const traces = (await fs.readFile(transportTrace, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(traces.length, 2); assert.ok(traces.every(item => item.checkedAddress === "8.8.8.8" && item.tlsVerified));
+    const usage = await jsonRequest(origin, `/api/clients/usage?clientId=${clientId}`, { headers: admin });
+    assert.equal(usage.response.status, 200); assert.equal(usage.data.runs.filter(item => item.id === run.id).length, 1);
+    console.log(JSON.stringify({ callbackRoundtrip: { ok: true, senderRestarted: true, runId: run.id, eventId: event.id,
+      receiverRows: inbox.items.length, receiverCodes: receipts.map(item => item.code), attempts: delivered.callbackDelivery.attempts,
+      redeliveryDelayMs: receipts[1].receivedAt - receipts[0].receivedAt, bodySha256: crypto.createHash("sha256").update(receipts[0].body).digest("hex"),
+      backendTurnStarts: rpc.filter(call => call.method === "turn/start").length, simulatedCodex: true, realModelTurns: 0,
+      tlsHostnameRejected: true, stableEvent: receipts[1].body === receipts[0].body, reportSha256: artifact.sha256 } }));
+  } finally {
+    await stopProcess(server); heldResponse?.destroy();
+    tls?.closeAllConnections(); if (tls?.listening) await new Promise(resolve => tls.close(resolve));
+    await stopProcess(receiver); await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 await check("durable API queue survives lost responses and restart without repeating claimed work", async () => {
