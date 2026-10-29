@@ -20,6 +20,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --audit-level=high
+      - name: Install Linux sandbox dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+      - name: Verify production CLI Linux command boundaries
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:command-isolation:codex'
       - run: npm run verify:local
       - run: npm run verify:chat-reading:ui
       - run: npm run verify:personal-memory:quality
@@ -34,7 +40,5 @@ jobs:
         env:
           CODEX_SCHEMA_CLI_VERSION: 0.165.0
         run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:external-client:codex -- --faults-only'
-      - name: Verify production CLI Linux command boundaries
-        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:command-isolation:codex'
       - run: npm run verify:personal-results:quality
       - run: npm run verify:runtime

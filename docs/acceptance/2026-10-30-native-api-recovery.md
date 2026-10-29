@@ -10,6 +10,8 @@
 
 CI 保留旧版故障检查，另外固定 0.165.0 执行原生运行中取消/重启恢复，以及 Linux 实际命令边界检查。新步骤的精确结果以本文件对应 PR 的同一头提交检查为准，未通过不能合并；不能拿本机结果代替 Linux，也不能拿只列工具目录的检查代替执行边界。
 
+首轮 CI `40936144861` 的旧版和新版原生故障检查均通过，但完整命令检查失败：`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`，探针命令没有开始，不能解释为工作区/网络限制已经验证。原日志保留；没有改为跳过或目录模式。依据 [OpenAI 官方 Linux 沙箱前置要求](https://learn.chatgpt.com/docs/sandboxing#prerequisites)，仅在临时 CI 主机安装发行版 `bubblewrap` 后复验，并把命令检查前移以尽早发现失败；不关闭沙箱，不改 AppArmor 或内核限制。补依赖是否解决问题仍必须由新头的实际结果证明。
+
 ## 已有本机证据
 
 | 检查 | 结果与范围 |
