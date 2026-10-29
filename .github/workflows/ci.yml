@@ -30,5 +30,11 @@ jobs:
       - run: npm run verify:mail-drafts:codex
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only
+      - name: Verify production CLI in-flight cancellation and restart
+        env:
+          CODEX_SCHEMA_CLI_VERSION: 0.165.0
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:external-client:codex -- --faults-only'
+      - name: Verify production CLI Linux command boundaries
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:command-isolation:codex'
       - run: npm run verify:personal-results:quality
       - run: npm run verify:runtime

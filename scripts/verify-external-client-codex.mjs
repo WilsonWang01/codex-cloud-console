@@ -40,9 +40,11 @@ if (guardsOnly) {
   process.exit(0);
 }
 const project = fileURLToPath(new URL("..", import.meta.url));
-const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", "--package=@openai/codex@0.157.1", "-c", "command -v codex"], { encoding: "utf8" }).trim();
+const expectedVersion = process.env.CODEX_SCHEMA_CLI_VERSION || "0.157.1";
+assert.match(expectedVersion, /^\d+\.\d+\.\d+$/, "Expected an explicit stable CLI version");
+const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", `--package=@openai/codex@${expectedVersion}`, "-c", "command -v codex"], { encoding: "utf8" }).trim();
 const version = execFileSync(command, ["--version"], { encoding: "utf8" }).trim();
-assert.match(version, /^codex-cli 0\.157\.1$/);
+assert.equal(version, `codex-cli ${expectedVersion}`, "Native CLI must match the explicitly selected version");
 const root = await fs.realpath(await fs.mkdtemp(path.join(process.env.RUNNER_TEMP || os.tmpdir(), "codex-external-native-")));
 await fs.chmod(root, 0o700);
 const cloud = path.join(root, "cloud"), state = path.join(root, "state"), bin = path.join(root, "bin"), home = path.join(root, "home");
