@@ -7284,7 +7284,7 @@ pre {
 .personal-mail-account select { width: 100%; min-width: 0; min-height: 44px; padding: 7px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface); font: inherit; }
 .personal-mail-account button { min-height: 44px; }
 .personal-mail-row strong { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.45; }
-.personal-mail-row { grid-template-columns: minmax(0, 1fr) 88px; }
+.personal-mail-row { grid-template-columns: minmax(0, 1fr) 132px; }
 .personal-mail-row-actions, .personal-mail-draft-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 0; min-width: 0; }
 .personal-mail-row-actions button, .personal-mail-draft-actions > button, .personal-mail-draft-actions > a { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 44px; min-height: 44px; border: 0; border-radius: 6px; background: transparent; color: var(--muted-strong); cursor: pointer; }
 .personal-mail-row-actions button:hover, .personal-mail-draft-actions > button:hover, .personal-mail-draft-actions > a:hover { background: var(--surface); }
@@ -7299,6 +7299,13 @@ pre {
 .personal-mail-reply-editor .personal-mail-review { display: flex; align-items: center; gap: 8px; min-height: 44px; overflow-wrap: anywhere; cursor: pointer; }
 .personal-mail-drafts button:disabled { opacity: .5; cursor: default; }
 .personal-mail-drafts .mini-action { min-height: 44px; }
+.personal-mail-body { min-width: 0; margin-top: 16px; padding: 16px 0; border-top: 1px solid var(--border); }
+.personal-mail-body .personal-section-heading h3 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; }
+.personal-mail-body-subject { overflow-wrap: anywhere; line-height: 1.6; font-size: 13px; }
+.personal-mail-body-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; padding: 12px; margin: 12px 0; border-left: 2px solid var(--border); border-radius: 0; background: var(--surface); color: var(--text); font: inherit; font-size: 14px; line-height: 1.65; }
+.personal-mail-body .mini-action, .personal-mail-body > a { display: inline-flex; align-items: center; min-height: 44px; gap: 6px; }
+.personal-mail-body button:disabled { opacity: .5; cursor: default; }
+@media (max-width: 480px) { .personal-mail-row { grid-template-columns: minmax(0, 1fr); } .personal-mail-row-actions { justify-content: flex-end; } }
 .personal-reminder-settings { display: grid; gap: 12px; margin-top: 18px; }
 .personal-reminder-toggle { display: flex; align-items: center; gap: 10px; min-height: 44px; font-size: 14px; }
 .personal-reminder-toggle input { width: 18px; height: 18px; }

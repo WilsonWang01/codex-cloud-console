@@ -11438,6 +11438,12 @@ app.post("/api/personal/mail/refresh", async (req, res) => {
   catch (error) { sendRouteError(res, error); }
 });
 
+app.post("/api/personal/mail/body", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try { res.json({ ok: true, body: await personalMailSource.body(req.body) }); }
+  catch (error) { sendRouteError(res, error); }
+});
+
 app.get("/api/personal/brief", async (_req, res) => {
   try {
     const [commitments, runs, state] = await Promise.all([
