@@ -2,7 +2,7 @@ import { Check, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 type Fact = { id: string; label: string; value: string; source: string; revision: number; createdAt: string; updatedAt: string; enabled?: boolean; expiresAt?: string | null; confirmedAt?: string | null; origin?: { type?: string } };
-type Candidate = { id: string; label: string; value: string; reason: string; expiresAt: string | null; revision: number; status: "pending" | "accepted" | "rejected"; createdAt: string; origin: { sessionId: string; turnId: string } };
+type Candidate = { id: string; label: string; value: string; reason: string; expiresAt: string | null; revision: number; status: "pending" | "accepted" | "rejected"; factId?: string; createdAt: string; origin: { sessionId: string; turnId: string } };
 type FactsResponse = { facts: Fact[]; candidates?: Candidate[]; governanceVersion?: number };
 const localDate = (value?: string | null) => value ? new Date(Date.parse(value) - new Date(value).getTimezoneOffset() * 60_000).toISOString().slice(0, 16) : "";
 
@@ -121,7 +121,7 @@ export default function PersonalFacts() {
         <div><button type="button" disabled={busy || Boolean(label || value || editing || reviewing)} onClick={() => review(candidate)}><Pencil size={16} />核对 {candidate.label}</button><button type="button" disabled={busy || candidateConflict} onClick={() => void decide(candidate, "reject")}><X size={16} />不记住 {candidate.label}</button></div>
       </div>)}
       {candidates.some(item => item.status !== "pending") && <details><summary>已处理记录</summary>{candidates.filter(item => item.status !== "pending").map(candidate => <div className="personal-fact-row" key={candidate.id}>
-        <span><strong>{candidate.label}</strong><small>{candidate.status === "accepted" ? "已接受，当前内容见个人事实" : "已拒绝，不供后续任务使用"}</small></span>
+        <span><strong>{candidate.label}</strong><small>{candidate.status === "accepted" ? facts.some(fact => fact.id === candidate.factId) ? "已接受，当前内容见个人事实" : "已接受；对应事实已不在当前资料中" : "已拒绝，不供后续任务使用"}</small></span>
         <button type="button" aria-label={`清理候选 ${candidate.label}`} title="清理候选记录，不删除已接受事实" disabled={busy} onClick={() => setDeleting({ kind: "candidate", id: candidate.id, label: candidate.label, revision: candidate.revision })}><Trash2 size={16} /></button>
       </div>)}</details>}
     </section>}

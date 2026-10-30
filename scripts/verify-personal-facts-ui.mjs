@@ -327,6 +327,15 @@ try {
     assert.equal((await factStore.list()).some(item => item.id === removable.id), false);
     assert.equal((await factStore.snapshot()).facts[0].value, "用户核对后的合成出行偏好");
     assert.equal(await page.getByLabel("事实名称", { exact: true }).inputValue(), "未保存的输入");
+    const forgottenCandidate = await factStore.propose({ label: "合成可删除记忆", value: "仅本轮虚构偏好", reason: "确认后删除的显示检查" }, { ...memoryOrigin, callId: "forgotten" });
+    await factStore.reviewCandidate(forgottenCandidate.id, { revision: forgottenCandidate.revision, decision: "accept" });
+    await page.getByRole("button", { name: "刷新个人事实", exact: true }).click();
+    await page.getByRole("button", { name: "删除 合成可删除记忆", exact: true }).click();
+    await factDeletion.getByRole("button", { name: "确认删除", exact: true }).click();
+    await page.getByRole("button", { name: "删除 合成可删除记忆", exact: true }).waitFor({ state: "hidden" });
+    await page.locator(".personal-memory-candidates details > summary").click();
+    await page.locator(".personal-memory-candidates .personal-fact-row").filter({ hasText: "合成可删除记忆" }).getByText("已接受；对应事实已不在当前资料中", { exact: true }).waitFor();
+    assert.equal((await factStore.snapshot()).facts.length, 1);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.getByRole("button", { name: "工作", exact: true }).click();
     await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).waitFor();
