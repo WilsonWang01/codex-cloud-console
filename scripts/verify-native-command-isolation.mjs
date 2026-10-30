@@ -37,7 +37,8 @@ const provider = http.createServer(async (req, res) => {
       assert.ok(receipt, "native command completion receipt is required");
       assert.match(JSON.stringify(receipt.output), /OFFLINE_PROBE_FINISHED/);
     }
-    const probe = `import fs from 'node:fs';fs.writeFileSync('inside.txt','synthetic');try{fs.writeFileSync(${JSON.stringify(outside)},'should-be-blocked')}catch{}try{await fetch(${JSON.stringify(base + "/blocked-probe")},{signal:AbortSignal.timeout(1000)})}catch{}console.log('OFFLINE_PROBE_FINISHED');`;
+    const completionMarker = requests <= 2 ? "synthetic-created" : "synthetic-resumed";
+    const probe = `import fs from 'node:fs';try{fs.writeFileSync(${JSON.stringify(outside)},'should-be-blocked')}catch{}try{await fetch(${JSON.stringify(base + "/blocked-probe")},{signal:AbortSignal.timeout(1000)})}catch{}fs.writeFileSync('inside.txt',${JSON.stringify(completionMarker)});console.log('OFFLINE_PROBE_FINISHED');`;
     const output = !catalogOnly && requests % 2 === 1
       ? [{ id: "fc_offline", type: "custom_tool_call", call_id: callId, name: "exec", namespace: execSpec.namespace,
         input: `const result = await tools.exec_command(${JSON.stringify({ cmd: q(process.execPath) + " --input-type=module -e " + q(probe), workdir: cwd, yield_time_ms: 10000, max_output_tokens: 1000 })}); if (result.session_id) throw new Error("Synthetic command did not finish"); text(result);`, status: "completed" }]
@@ -100,7 +101,7 @@ try {
   await runProbe(restricted.thread.id);
   assert.equal(providerError, null); assert.equal(requests, catalogOnly ? 1 : 2);
   if (catalogOnly) await assert.rejects(fs.stat(path.join(cwd, "inside.txt")), { code: "ENOENT" });
-  else assert.equal(await fs.readFile(path.join(cwd, "inside.txt"), "utf8"), "synthetic");
+  else assert.equal(await fs.readFile(path.join(cwd, "inside.txt"), "utf8"), "synthetic-created");
   await assert.rejects(fs.stat(outside), { code: "ENOENT" }); assert.equal(networkReceived, false);
   await client.stop({ waitForExit: true }); client = createClient();
   const restored = await client.request("thread/resume", { threadId: restricted.thread.id, cwd, model: "gpt-6-sol", approvalPolicy: "never", sandbox: "workspace-write",
@@ -109,10 +110,12 @@ try {
   assert.equal(await fs.readFile(marker, "utf8"), startedCount); assert.equal(requests, catalogOnly ? 1 : 2);
   await runProbe(restored.thread.id);
   assert.equal(providerError, null); assert.equal(requests, catalogOnly ? 2 : 4);
+  if (!catalogOnly) assert.equal(await fs.readFile(path.join(cwd, "inside.txt"), "utf8"), "synthetic-resumed");
   await assert.rejects(fs.stat(outside), { code: "ENOENT" }); assert.equal(networkReceived, false);
   assert.equal(await fs.readFile(marker, "utf8"), startedCount);
   outcome = { ok: true, cli: execFileSync(command, ["--version"], { encoding: "utf8" }).trim(), syntheticProviderRequests: requests, externalModelCalls: 0,
     mode: catalogOnly ? "catalog-only" : "command-boundaries", commandBoundaryChecked: !catalogOnly,
+    phaseCompletionMarkersChecked: !catalogOnly,
     delegationToolsAdvertised: advertisedNames.some(name => /spawn_agent|followup_task/.test(name)),
     checks: ["已启用连接器按线程禁用且未启动", "新建及 CLI 重启后模型工具目录不含连接器、网页搜索与派生代理",
       ...(catalogOnly ? ["仅目录模式未调用命令，不证明命令沙箱边界"] : ["工作区内写入成功", "工作区外写入与命令联网拒绝", "CLI 重启恢复后再次实际检查命令边界"])] };

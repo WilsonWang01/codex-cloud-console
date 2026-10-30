@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
@@ -20,6 +20,17 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --audit-level=high
+      - name: Configure temporary runner bwrap sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap apparmor-profiles
+          dpkg-query -W -f='${Package} ${Version}\n' bubblewrap apparmor-profiles
+          bwrap --version
+          sha256sum /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo grep -F bwrap /sys/kernel/security/apparmor/profiles
+      - name: Verify production CLI Linux command boundaries
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:command-isolation:codex'
       - run: npm run verify:local
       - run: npm run verify:chat-reading:ui
       - run: npm run verify:personal-memory:quality
@@ -30,6 +41,10 @@ jobs:
       - run: npm run verify:mail-drafts:codex
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only
+      - name: Verify production CLI in-flight cancellation and restart
+        env:
+          CODEX_SCHEMA_CLI_VERSION: 0.165.0
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:external-client:codex -- --faults-only'
       - name: Codex 0.165 MCP readback (no model)
         run: >-
           npx --yes --package=@openai/codex@0.165.0 -c
