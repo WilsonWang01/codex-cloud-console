@@ -147,5 +147,8 @@ export function createApprovalBroker({ timeoutMs = 5 * 60_000, onChange = () => 
       if (!owner.turnId) return;
       closeWhere(entry => entry.owner.repoId === owner.repoId && entry.owner.sessionId === owner.sessionId && entry.owner.turnId === owner.turnId, reason);
     },
+    closeForThread(threadId, reason = "Calendar operation ended") {
+      for (const item of [...pending.values()].filter(entry => (entry.params.threadId || entry.params.thread_id) === threadId)) settle(item, { decision: "decline" }, reason);
+    },
   };
 }

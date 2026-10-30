@@ -43,7 +43,7 @@ try {
     lockedPackages += 1;
   }
   execFileSync("npm", ["ls", "--omit=dev", "--all"], { cwd: root, stdio: "pipe", timeout: 30_000 });
-  const dependencies = ["ajv", "cron-parser", "express", "ws", "web-push", "playwright", "@napi-rs/canvas", "pdfjs-dist/legacy/build/pdf.mjs", "@modelcontextprotocol/server", "zod/v4"];
+  const dependencies = ["ajv", "cron-parser", "luxon", "express", "ws", "web-push", "playwright", "@napi-rs/canvas", "pdfjs-dist/legacy/build/pdf.mjs", "@modelcontextprotocol/server", "zod/v4"];
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
     for (const name of ${JSON.stringify(dependencies)}) {
@@ -59,6 +59,12 @@ try {
     const {createCloudMcpServer} = await import("./scripts/codex-cloud-mcp.mjs");
     const mcp = createCloudMcpServer({CODEX_CLOUD_URL:"http://127.0.0.1:1",CODEX_CLOUD_API_TOKEN:"synthetic-runtime-token",CODEX_CLOUD_AUTOMATION_ID:"test"});
     await mcp.close();
+    const {calendarProposalPayload} = await import("./server/personal-calendar-proposals.mjs");
+    const {calendarActionRouter} = await import("./server/personal-calendar-actions.mjs");
+    const {personalCalendarTool} = await import("./server/personal-calendar-tool.mjs");
+    assert.equal(personalCalendarTool.name,"personal_calendar_propose");
+    assert.equal(typeof calendarActionRouter({}).get,"function");
+    assert.equal(calendarProposalPayload({title:"Synthetic runtime",timeZone:"UTC",startLocal:"2026-10-25T10:00",endLocal:"2026-10-25T10:30"}).start,"2026-10-25T10:00:00.000Z");
   `], { cwd: root, stdio: "pipe", timeout: 30_000 });
   for (const name of ["vite", "typescript", "lucide-react", "react-dom", "@vitejs/plugin-react", "@modelcontextprotocol/client"]) {
     await assert.rejects(fs.access(path.join(root, "node_modules", name)), { code: "ENOENT" });

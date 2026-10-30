@@ -2595,7 +2595,7 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(starts[1].params.sandbox, "read-only");
     assert.equal(starts[1].params.config.features.memories, false);
     assert.equal(starts[0].params.dynamicTools, undefined);
-    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference", "personal_mail_draft"]);
+    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference", "personal_mail_draft", "personal_calendar_propose"]);
     assert.match(starts[1].params.developerInstructions, /only this conversation/);
     const personalSessionId = sessions[1].sessionId;
     const writable = await jsonRequest(base, `/api/chat/sessions/${personalSessionId}/runtime`, {
@@ -3155,6 +3155,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
   await fs.writeFile(unmanagedTemp, "must remain");
   await fs.mkdir(binDir, { recursive: true });
   await fs.writeFile(codexShim, `#!/bin/sh\nexec "${process.execPath}" "${fakePath}"\n`, { mode: 0o755 });
+  const triggerRateWindowMs = 5_000;
   const start = () => spawn(process.execPath, [path.join(projectRoot, "server", "index.mjs")], {
     cwd: projectRoot,
     env: {
@@ -3169,7 +3170,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
       CODEX_CLOUD_WEBHOOK_TOKEN: "regression-token-123456",
       CODEX_PERSONAL_MODE: "disabled",
       CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1",
-      CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS: "250",
+      CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS: String(triggerRateWindowMs),
       CODEX_TURN_TIMEOUT_MS: "300",
       CODEX_EXTERNAL_WRITE_TIMEOUT_MS: "120",
       CODEX_ALLOW_LOCAL_FALLBACK: "0",
@@ -4227,7 +4228,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     });
     assert.equal(rateLimitedTrigger.response.status, 429);
     assert.ok(Number(rateLimitedTrigger.response.headers.get("retry-after")) >= 1);
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await new Promise((resolve) => setTimeout(resolve, triggerRateWindowMs + 100));
     // Model completion precedes automation settlement and admission release.
     for (let attempt = 0; attempt < 50; attempt += 1) {
       const status = await jsonRequest(baseUrl, "/api/codex/app-host/status");

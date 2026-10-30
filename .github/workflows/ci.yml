@@ -42,7 +42,14 @@ jobs:
       - run: npm run verify:mail-drafts:quality
       - run: npm run verify:mail:ui
       - run: npm run verify:calendar:ui
+      - run: npm run verify:personal-calendar-actions:ui
+        env:
+          CODEX_CALENDAR_UI_OUTPUT: ${{ runner.temp }}/calendar-actions
+      - run: node scripts/verify-personal-calendar-actions-ui.mjs --model-proposals
+        env:
+          CODEX_CALENDAR_UI_OUTPUT: ${{ runner.temp }}/calendar-proposals
       - run: npm run verify:mail-drafts:codex
+      - run: npm run verify:personal-calendar:codex
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only
       - name: Verify production CLI in-flight cancellation and restart

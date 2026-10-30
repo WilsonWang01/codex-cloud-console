@@ -48,11 +48,14 @@ import { createPersonalFactsStore, normalizePersonalFactContext, personalFactCon
 import { handlePersonalFactReferenceCall, personalFactReferenceTool, personalFactReferenceMessages } from "./personal-fact-references.mjs";
 import { personalMemoryTool, handlePersonalMemoryCall } from "./personal-memory.mjs";
 import { createPersonalMailDrafts, mailDraftLimits, personalMailDraftRouter, personalMailDraftTool, handlePersonalMailDraftCall } from "./personal-mail-drafts.mjs";
+import { personalCalendarTool, handlePersonalCalendarCall, personalCalendarProposalMessages } from "./personal-calendar-tool.mjs";
 import { createPersonalCommitmentsStore, personalCommitmentDraft, personalCommitmentLinks } from "./personal-commitments.mjs";
 import { createPersonalRoutinesStore, personalRoutineAutomation, personalRoutinePromptHash, personalScheduleKnownTokenLimit } from "./personal-routines.mjs";
 import { createPersonalRoutineScheduler } from "./personal-scheduler.mjs";
 import { buildPersonalBrief, inPersonalQuietHours, normalizePersonalReminderSettings, personalReminderItems } from "./personal-brief.mjs";
 import { calendarSourceLimits, createPersonalCalendarSource } from "./personal-calendar.mjs";
+import { createCalendarProposalStore, calendarProposalLimits } from "./personal-calendar-proposals.mjs";
+import { createPersonalCalendarActions, calendarActionRouter } from "./personal-calendar-actions.mjs";
 import { createPersonalFeedbackStore, personalFeedbackRouter } from "./personal-feedback.mjs";
 import { personalResultReferencesRouter } from "./personal-result-references.mjs";
 import { mailSourceLimits, createPersonalMailSource } from "./personal-mail.mjs";
@@ -95,6 +98,26 @@ const personalRoutinesStore = createPersonalRoutinesStore(path.join(stateRoot, "
 const personalFeedbackStore = createPersonalFeedbackStore(path.join(stateRoot, "personal-message-feedback.json"));
 const personalBriefStatePath = path.join(stateRoot, "personal-brief-state.json");
 const personalCalendarPath = path.join(stateRoot, "personal-calendar-source.json");
+const personalCalendarProposalsPath = path.join(stateRoot, "personal-calendar-proposals.json");
+const personalCalendarActions = createPersonalCalendarActions({
+  store: createCalendarProposalStore({
+    read: async () => {
+      try { return JSON.parse((await readRootedFile(stateRoot, path.basename(personalCalendarProposalsPath), calendarProposalLimits.bytes)).buffer.toString("utf8")); }
+      catch (error) {
+        if (error.code === "file_not_found") return null;
+        throw Object.assign(new Error("日程提案无法安全读取，原记录未改写"), { statusCode: 503 });
+      }
+    },
+    write: value => atomicWriteJson(personalCalendarProposalsPath, value),
+  }),
+  request: (method, params, timeout) => getPersonalAppServerClient().request(method, params, timeout),
+  context: () => {
+    if (!personalExecutionAvailable) throw Object.assign(new Error("个人空间执行不可用"), { statusCode: 503 });
+    return { cwd: getRepoById(personalRepoId).path, model: defaultRuntime.model };
+  },
+  closeApprovals: id => approvalBroker.closeForThread(id),
+  withLock: task => withPublicationLock(publicationLockPath, task),
+});
 const personalCalendarSource = createPersonalCalendarSource({
   read: async () => {
     try { return JSON.parse((await readRootedFile(stateRoot, path.basename(personalCalendarPath), calendarSourceLimits.resultBytes)).buffer.toString("utf8")); }
@@ -1851,6 +1874,9 @@ async function getAppServerThreadMessages(session, repo = null, options = {}) {
     const facts = await personalFactsStore.list().catch(() => null);
     messages = personalFactReferenceMessages(messages, session.codexSessionId, facts);
   }
+  if (repo?.kind === "personal" && messages.some(message => message.messageType === "dynamicToolCall" && message.details?.tool === personalCalendarTool.name)) {
+    messages = personalCalendarProposalMessages(messages, session.codexSessionId, await personalCalendarActions.list().catch(() => null));
+  }
   return { ok: true, messages, thread };
 }
 
@@ -2129,7 +2155,7 @@ async function appServerThreadParams(repo, runtime, personalSnapshot = null, sta
     sandbox: runtime.sandbox,
     serviceName: "codex_cloud_console",
     personality: "pragmatic",
-    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool, personalMailDraftTool] } : {}),
+    ...(repo.kind === "personal" && starting ? { dynamicTools: [personalMemoryTool, personalFactReferenceTool, personalMailDraftTool, personalCalendarTool] } : {}),
     developerInstructions: [
       cloudRuntimeDeveloperInstructions(runtime),
       ...(repo.kind === "personal" ? [personalDeveloperInstructions(runtime, personalSnapshot.facts, await personalCommitmentsStore.list())] : []),
@@ -2658,6 +2684,10 @@ const approvalBroker = createApprovalBroker({
 });
 
 async function appServerRequestResult(method, params = {}) {
+  if (personalCalendarActions.ownsThread(params.threadId || params.thread_id)) {
+    if (!personalCalendarActions.canApprove(method, params)) throw new Error("日历提案不允许扩权或执行其他动作");
+    return approvalBroker.request(method, params, { repoId: personalRepoId });
+  }
   if (personalSources.some(source => source.ownsThread(params.threadId || params.thread_id))) throw new Error("个人来源刷新只允许既定只读操作，不能批准权限或执行其他动作");
   const waiting = findTurnJob(params, true) || findCompactJob(params, true);
   if (waiting?.startRequestPending) await waiting.startReady.promise;
@@ -2674,6 +2704,11 @@ async function appServerRequestResult(method, params = {}) {
   }
   if (method === "item/tool/call") {
     if (params.tool === personalMailDraftTool.name) return handlePersonalMailDraftCall(params, job, personalMailDrafts);
+    if (params.tool === personalCalendarTool.name) {
+      const result = await handlePersonalCalendarCall(params, job, personalCalendarActions);
+      if (result.success && job) emitJobEvent(job, "status", { text: "日程提案已保存，等待你在今日核对并确认；尚未创建日程" });
+      return result;
+    }
     if (params.tool === personalFactReferenceTool.name) return handlePersonalFactReferenceCall(params, job);
     const result = await handlePersonalMemoryCall(params, job, personalFactsStore);
     if (result.success && job) emitJobEvent(job, "status", { text: "个人记忆候选已保存，等待你在个人设置中核对；尚未成为事实" });
@@ -2699,6 +2734,7 @@ async function appServerRequestResult(method, params = {}) {
 }
 
 function personalAppServerRequestResult(method, params = {}) {
+  if (personalCalendarActions.ownsThread(params.threadId || params.thread_id)) return appServerRequestResult(method, params);
   const job = findTurnJob(params, true) || findCompactJob(params, true);
   if (!job || job.repoId !== personalRepoId) throw new Error("Personal worker request has no active personal turn");
   return appServerRequestResult(method, params);
@@ -6120,9 +6156,9 @@ function summarizeActiveJob(job = {}, { includeEvents = false } = {}) {
 }
 
 function activeJobSummaries(options = {}) {
-  return [...activeTurns.values(), ...activeCompactions.values()]
+  return [...[...activeTurns.values(), ...activeCompactions.values()]
     .filter((job) => job && !job.completed)
-    .map((job) => summarizeActiveJob(job, options))
+    .map((job) => summarizeActiveJob(job, options)), ...personalCalendarActions.jobs()]
     .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
 }
 
@@ -9421,7 +9457,10 @@ app.get("/healthz", async (_req, res) => {
   let personalFactsHealth;
   try { await personalFactsStore.list(); personalFactsHealth = { ok: true, readableFormats: [1, 2, 3], writeFormat: 3 }; }
   catch { personalFactsHealth = { ok: false, error: "个人资料格式或存储不可用，请勿以旧备份覆盖" }; }
-  const strictOk = Boolean(health.ok && ledgerHealth.ok && clientsHealth.ok && personalFactsHealth.ok);
+  let calendarActionsHealth;
+  try { calendarActionsHealth = await personalCalendarActions.health(); }
+  catch { calendarActionsHealth = { ok: false, error: "日程提案存储不可用，请保留原数据并核对" }; }
+  const strictOk = Boolean(health.ok && ledgerHealth.ok && clientsHealth.ok && personalFactsHealth.ok && calendarActionsHealth.ok);
   res.setHeader("x-codex-status-cache", cache);
   if (data?.partial) res.setHeader("x-codex-health-partial", "true");
   const reachable =
@@ -9430,7 +9469,7 @@ app.get("/healthz", async (_req, res) => {
   const responseHealth =
     {
       ...health,
-      layers: { ...health.layers, usageLedger: ledgerHealth, apiClients: clientsHealth, personalFacts: personalFactsHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
+      layers: { ...health.layers, usageLedger: ledgerHealth, apiClients: clientsHealth, personalFacts: personalFactsHealth, calendarActions: calendarActionsHealth, pdfInput: pdfInputRuntime, callbacks: { ok: ledgerHealth.ok, configuredTargets: callbackTargets.count } },
       ok: strictOk,
       strictOk,
       partial: !strictOk && reachable,
@@ -11403,6 +11442,8 @@ app.delete("/api/personal/commitments/:id", async (req, res) => {
   catch (error) { sendRouteError(res, error); }
 });
 
+app.use("/api/personal/calendar-proposals", calendarActionRouter(personalCalendarActions));
+
 app.get("/api/personal/calendar", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   try { res.json({ ok: true, calendar: await personalCalendarSource.snapshot(req.query.timeZone) }); }
@@ -12668,6 +12709,8 @@ await reconcileStaleAutomationRuns().catch((error) => {
 await reconcileQueuedTurnsOnStartup().catch((error) => {
   console.warn(`Queued turn reconciliation failed: ${error.message}`);
 });
+
+await personalCalendarActions.list().catch(() => console.warn("日程提案存储需要核对，未覆盖原记录；相关发布门禁已保持关闭"));
 
 function startExternalNotificationWatcher() {
   const pollMs = Math.max(30_000, Number(process.env.CODEX_CLOUD_NOTIFY_POLL_MS || 60_000));
