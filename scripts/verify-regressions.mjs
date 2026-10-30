@@ -994,7 +994,34 @@ await check("durable API queue survives lost responses and restart without repea
     const first = await submit("durable-lost-response-0001", "progress regression queue first durable-one");
     assert.equal(first.data.deduplicated, true);
     await wait(async () => (await rpc()).length === 1);
-    const second = await submit("durable-cancel-0002", "queue regression next must-not-start");
+    const burstClient = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "same-key-concurrency", automationIds: ["sample-research"] }) });
+    assert.equal(burstClient.response.status, 201);
+    const burstAuth = { "content-type": "application/json", "x-codex-cloud-token": burstClient.data.token };
+    const burstSubmit = () => submit("durable-cancel-0002", "queue regression next must-not-start", burstAuth);
+    const burst = await Promise.all(Array.from({ length: 100 }, burstSubmit));
+    const accepted = burst.filter(result => result.response.status === 200);
+    assert.ok(accepted.length > 0, "the concurrent burst must actually accept a task");
+    assert.equal(accepted.filter(result => !result.data.deduplicated).length, 1, "only one concurrent submission may create a run");
+    const second = accepted[0];
+    if (accepted.length < burst.length) await new Promise(resolve => setTimeout(resolve, 1000));
+    for (const result of burst) {
+      if (result.response.status === 200) {
+        assert.equal(result.data.run.id, second.data.run.id);
+        continue;
+      }
+      assert.equal(result.response.status, 429);
+      assert.equal(result.data.code, "input_buffer_busy");
+      assert.equal(result.response.headers.get("retry-after"), "1");
+      const retried = await burstSubmit();
+      assert.equal(retried.response.status, 200);
+      assert.equal(retried.data.deduplicated, true);
+      assert.equal(retried.data.run.id, second.data.run.id);
+    }
+    const burstDb = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+    try {
+      assert.equal(burstDb.prepare("SELECT count(*) AS n FROM external_tasks WHERE json_extract(record,'$.clientId')=?").get(burstClient.data.client.id).n, 1);
+      assert.equal(burstDb.prepare("SELECT count(*) AS n FROM external_task_keys WHERE run_id=?").get(second.data.run.id).n, 1);
+    } finally { burstDb.close(); }
     assert.equal(second.data.run.status, "queued");
     const client = await jsonRequest(base, "/api/clients", { method: "POST", headers, body: JSON.stringify({ name: "queued-to-revoke", automationIds: ["sample-research"] }) });
     const scoped = { "content-type": "application/json", "x-codex-cloud-token": client.data.token };
@@ -1003,7 +1030,9 @@ await check("durable API queue survives lost responses and restart without repea
     const full = await submit("durable-queue-0004", "queue regression next durable-fourth");
     assert.equal(full.response.status, 429);
     assert.ok(Number(full.response.headers.get("retry-after")) > 0);
-    const canceled = await jsonRequest(base, second.data.run.resultPath + "/cancel", { method: "POST", headers });
+    const wrongCancel = await jsonRequest(base, second.data.run.resultPath + "/cancel", { method: "POST", headers });
+    assert.equal(wrongCancel.response.status, 404, "another client cannot cancel the accepted burst task");
+    const canceled = await jsonRequest(base, second.data.run.resultPath + "/cancel", { method: "POST", headers: burstAuth });
     assert.equal(canceled.response.status, 200);
     assert.equal(canceled.data.run.status, "canceled");
     assert.equal(canceled.data.run.usage.totalTokens, 0);
@@ -1049,6 +1078,19 @@ await check("durable API queue survives lost responses and restart without repea
     assert.equal(replay.data.run.status, "needs_reconciliation");
     const conflicts = await submit("durable-lost-response-0001", "changed input");
     assert.equal(conflicts.response.status, 409);
+    const burstReplay = await burstSubmit();
+    assert.equal(burstReplay.response.status, 200);
+    assert.equal(burstReplay.data.deduplicated, true);
+    assert.equal(burstReplay.data.run.id, second.data.run.id);
+    assert.equal(burstReplay.data.run.status, "canceled");
+    assert.equal(burstReplay.data.run.usage.totalTokens, 0);
+    const burstConflict = await submit("durable-cancel-0002", "changed concurrent input must-not-start", burstAuth);
+    assert.equal(burstConflict.response.status, 409);
+    const burstUsage = await jsonRequest(base, `/api/clients/usage?clientId=${burstClient.data.client.id}`, { headers });
+    assert.equal(burstUsage.response.status, 200);
+    assert.equal(burstUsage.data.runs.length, 1);
+    assert.equal(burstUsage.data.runs[0].id, second.data.run.id);
+    assert.equal(burstUsage.data.runs[0].usage.totalTokens, 0);
     const requests = await rpc();
     assert.equal(requests.filter((row) => JSON.stringify(row.params).includes("durable-one")).length, 1);
     assert.equal(requests.filter((row) => JSON.stringify(row.params).includes("durable-fourth")).length, 1);
@@ -1075,7 +1117,12 @@ await check("durable API queue survives lost responses and restart without repea
     try {
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id=?").get(fourth.data.run.id).execution, "{}");
       assert.equal(checked.database.prepare("SELECT execution FROM external_tasks WHERE id='tampered-input'").get().execution, "{}");
+      assert.equal(checked.database.prepare("SELECT count(*) AS n FROM external_tasks WHERE json_extract(record,'$.clientId')=?").get(burstClient.data.client.id).n, 1);
+      assert.equal(checked.database.prepare("SELECT count(*) AS n FROM external_task_keys WHERE run_id=?").get(second.data.run.id).n, 1);
     } finally { checked.close(); }
+    console.log(JSON.stringify({ sameKeyConcurrency: { ok: true, initialRequests: burst.length, successfulResponses: accepted.length,
+      busyResponses: burst.length - accepted.length, retries: burst.length - accepted.length, acceptedRuns: 1, durableKeys: 1,
+      restartedStatus: burstReplay.data.run.status, nativeStartsForRun: 0, totalTokens: burstUsage.data.runs[0].usage.totalTokens } }));
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
 });
 
