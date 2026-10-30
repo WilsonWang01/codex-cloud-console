@@ -34,7 +34,7 @@
 # 默认临时、无登录、仅 127.0.0.1 模拟服务；CI 也只跑此模式。
 npm run verify:personal-memory:quality
 # 仅在已得到模型额度授权后手动运行；最多三个限时回合，不自动重试。
-CODEX_PERSONAL_LIVE_APPROVED=1 node scripts/verify-personal-memory-quality.mjs --live
+CODEX_PERSONAL_LIVE_APPROVED=1 CODEX_PERSONAL_LIVE_CWD=/path/to/already-trusted/repo node scripts/verify-personal-memory-quality.mjs --live
 ```
 
 未给显式开关的 `--live` 在启动 CLI 前拒绝。使用已经缓存的固定 CLI，不自动升级或安装；真实模式使用原登录、不复制认证文件、不更改全局配置。每回合限时 120 秒，失败不进入下一个样例，尝试中断并停止自己的 CLI。证据保存在自己的私有临时目录，包括失败；不会删除原数据，也不会加入用户评价。
