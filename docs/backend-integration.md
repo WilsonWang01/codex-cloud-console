@@ -154,7 +154,18 @@ API 不允许覆盖 `sandbox`、`approval`、`executionProfile`；它们由控�
 npm run verify:external-client:codex
 ```
 
-此检查用独立 Node 进程提交虚构 Markdown/PDF、校验 JSON 和报告文件，再由独立 Python 进程在服务重启后下载；同时检查原事件恢复、未领取任务取消、调用方用量和撤销拒绝。只监听 `127.0.0.1`，临时令牌限单一验收自动化、一小时到期，结束撤销并停止进程；私有证据路径在输出中给出。完整命令已在本机与 EC2 的隔离服务通过，不是生产 HTTPS、真实 EC2 模型或图片生成验收。GitHub 托管主机拒绝原生沙箱写入，材料/产物模式在 CI 仍只运行显式的 `--guards-only`（三个真实模式入口拒绝检查），不宣称 CI 已完成原生文件链路；原有全量回归和运行包门禁保持。
+此检查用独立 Node 进程提交虚构 Markdown/PDF、校验 JSON 和报告文件，再由独立 Python 进程在服务重启后下载；同时检查原事件恢复、未领取任务取消、调用方用量和撤销拒绝。只监听 `127.0.0.1`，临时令牌限单一验收自动化、一小时到期，结束撤销并停止进程；私有证据路径在输出中给出。完整命令已在本机与 EC2 的隔离服务通过，不是生产 HTTPS、真实 EC2 模型或图片生成验收。
+
+CI 在已获授权的 Ubuntu 24.04 临时机加载发行版 bwrap 专用配置后，另以固定 CLI 0.165.0 执行完整材料/报告/重启下载检查；原 `--guards-only`、旧版故障、当前版完整命令边界和运行中取消/恢复检查均保留。准确提交结果见[当前版本材料验收](acceptance/2026-10-30-native-client-materials-ci.md)，配置加入不等于实测通过。不在本机或 EC2 加载该安全配置。当前版也可显式自检：
+
+```bash
+# 使用已安装或缓存的固定版本；仍为临时无登录目录和本机模拟响应。
+CODEX_SCHEMA_CLI_VERSION=0.165.0 \
+CODEX_SCHEMA_CLI_BINARY=/absolute/path/to/codex-0.165.0 \
+npm run verify:external-client:codex
+```
+
+实际程序版本必须与显式版本完全匹配；不传变量时仍为 0.157.1。受控响应中的 token 仅用于验证记账，不是付费模型消耗。Linux 沙箱前置条件见[官方说明](https://learn.chatgpt.com/docs/sandboxing#prerequisites)；自检失败时不要通过关闭安全限制来绕过。
 
 ```bash
 # 真实 CLI 的运行中取消及进程中断恢复；只有本机受控响应，不用真实模型或现有登录。

@@ -31,6 +31,10 @@ jobs:
           sudo grep -F bwrap /sys/kernel/security/apparmor/profiles
       - name: Verify production CLI Linux command boundaries
         run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:command-isolation:codex'
+      - name: Verify current CLI material delivery and restart (no model)
+        env:
+          CODEX_SCHEMA_CLI_VERSION: 0.165.0
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:external-client:codex'
       - run: npm run verify:local
       - run: npm run verify:chat-reading:ui
       - run: npm run verify:personal-memory:quality
