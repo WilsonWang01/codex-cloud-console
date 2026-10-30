@@ -16,6 +16,7 @@ import { runExternalClient } from "./external-client-example.mjs";
 import { modelApiJsonLimit } from "../server/model-api.mjs";
 import { openRunUsageLedger } from "../server/run-usage-ledger.mjs";
 import { createExternalTaskStore } from "../server/external-task-store.mjs";
+import { createExternalResultStore } from "../server/external-results.mjs";
 import { pdfAttachment } from "./fixtures/inline-pdf.mjs";
 import { Client as McpClient } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -1443,6 +1444,131 @@ await check("operator execution policy is pinned through API acceptance, continu
     const policyMismatch = await submit("profile-mismatch-0009", "must-not-start legacy heartbeat", {}, "heartbeat");
     assert.equal(policyMismatch.response.status, 409);
   } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("saved result crashes preserve original tasks, private copies and recoverable accounting without replay", async () => {
+  const evidence = [];
+  for (const phase of ["before-terminal", "before-usage"]) {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "codex-result-crash-")));
+    const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+    const repo = path.join(cloudRoot, "workspace/sample-app"), capture = path.join(root, "requests.ndjson");
+    for (const directory of [repo, stateRoot, bin]) await fs.mkdir(directory, { recursive: true });
+    await initializeGitFixture(repo);
+    const fake = await writeFakeCodex(root);
+    await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+    const preload = path.join(root, "crash-window.mjs");
+    // Hold only this fixture at a terminal/accounting write after result fsync.
+    await fs.writeFile(preload, `import fs from 'node:fs';import {DatabaseSync} from 'node:sqlite';
+const prepare=DatabaseSync.prototype.prepare,phase=${JSON.stringify(phase)};let target;
+function hold(){fs.writeSync(1,'RESULT_CRASH_BARRIER:'+phase+'\\n');const wait=new Int32Array(new SharedArrayBuffer(4)),end=Date.now()+15000;while(Date.now()<end)Atomics.wait(wait,0,0,100);throw Error('Owned crash barrier expired');}
+DatabaseSync.prototype.prepare=function(sql,...rest){const statement=prepare.call(this,sql,...rest),run=statement.run;
+statement.run=function(...args){if(sql.startsWith('UPDATE external_tasks SET record=')){const saved=JSON.parse(args[0]);if(saved.status==='completed'&&saved.prompt?.includes('result-crash-window')){target=saved.id;if(phase==='before-terminal')hold();}}
+if(phase==='before-usage'&&sql.startsWith('INSERT INTO usage_runs VALUES')&&args[0]===target)hold();return run.apply(this,args);};return statement;};\n`);
+    const port = await freePort(), origin = `http://127.0.0.1:${port}`;
+    const admin = { "content-type": "application/json", "x-codex-cloud-token": "result-crash-fixture-admin" };
+    const start = (inject = false) => spawn(process.execPath, [...(inject ? ["--import", preload] : []), path.join(projectRoot, "server/index.mjs")], {
+      cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port),
+        CODEX_CLOUD_ROOT: cloudRoot, CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"), CODEX_AUTOMATION_RECOVERY_ENABLED: "0",
+        CODEX_ALLOW_LOCAL_FALLBACK: "0", CODEX_CLOUD_WEBHOOK_TOKEN: admin["x-codex-cloud-token"], FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}` },
+    });
+    const snapshot = () => {
+      const db = new DatabaseSync(path.join(stateRoot, "run-usage.sqlite"), { readOnly: true });
+      try { return { task: db.prepare("SELECT record,state,epoch FROM external_tasks").get(), result: db.prepare("SELECT * FROM external_results").get(),
+        tasks: db.prepare("SELECT count(*) AS n FROM external_tasks").get().n, keys: db.prepare("SELECT count(*) AS n FROM external_task_keys").get().n,
+        usage: db.prepare("SELECT snapshot FROM usage_runs").all().map(row => JSON.parse(row.snapshot)) }; }
+      finally { db.close(); }
+    };
+    const retainedBlobs = async result => {
+      const files = JSON.parse(result.record).files;
+      return Promise.all(files.map(async file => {
+        const bytes = await fs.readFile(path.join(stateRoot, "external-results", `${file.id}.blob`));
+        assert.equal(bytes.length, file.size);
+        assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), file.sha256);
+        return { id: file.id, bytes: bytes.toString("base64") };
+      }));
+    };
+    let server;
+    try {
+      server = start(true); await waitForOutput(server, /listening on/);
+      const client = await jsonRequest(origin, "/api/clients", { method: "POST", headers: admin, body: JSON.stringify({ name: "result-crash-fixture", automationIds: ["sample-research"] }) });
+      assert.equal(client.response.status, 201);
+      const token = client.data.token, headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
+      const input = { prompt: "model api regression artifact delivery fixture result-crash-window", model: "gpt-6-sol", reasoning: "medium",
+        artifactPaths: ["results/report.md"], outputSchema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false } };
+      const options = { origin, token, automationId: "sample-research", timeoutMs: 10000, requestTimeoutMs: 3000 };
+      const eventId = `result-crash-${phase}-0001`;
+      const barrier = waitForOutput(server, new RegExp("RESULT_CRASH_BARRIER:" + phase));
+      barrier.catch(() => {});
+      const accepted = await runExternalClient({ ...options, command: "submit", eventId, input });
+      await barrier;
+      const before = snapshot(), saved = JSON.parse(before.task.record);
+      assert.equal(before.tasks, 1); assert.equal(before.keys, 1);
+      assert.equal(before.result.state, "ready");
+      assert.equal(saved.id, accepted.id);
+      assert.equal(saved.status, phase === "before-terminal" ? "running" : "completed");
+      assert.equal(before.usage.length, 0, "the accounting transaction must not have committed at the barrier");
+      const blobs = await retainedBlobs(before.result);
+      assert.equal(blobs.length, 2, "report and manifest must both be durable before the crash");
+      if (isolatedProcessGroups) process.kill(-server.pid, "SIGKILL");
+      else server.kill("SIGKILL");
+      await stopProcess(server);
+      const signal = server.signalCode;
+      assert.equal(signal, "SIGKILL");
+      const original = await fs.realpath(path.join(saved.worktreePath, "results/report.md"));
+      assert.ok(original.startsWith(root + path.sep));
+      await fs.writeFile(original, "owned original changed after capture\n");
+      server = start(); await waitForOutput(server, /listening on/);
+      const restored = await runExternalClient({ ...options, command: "status", runId: accepted.id });
+      assert.equal(restored.id, accepted.id);
+      assert.equal(restored.status, phase === "before-terminal" ? "needs_reconciliation" : "completed");
+      for (let repeat = 0; repeat < 2; repeat++) {
+        const replay = await runExternalClient({ ...options, command: "submit", eventId, input });
+        assert.equal(replay.id, accepted.id); assert.equal(replay.status, restored.status);
+      }
+      const usage = await jsonRequest(origin, `/api/clients/usage?clientId=${client.data.client.id}`, { headers: admin });
+      assert.equal(usage.response.status, 200); assert.equal(usage.data.runs.length, 1);
+      if (phase === "before-terminal") {
+        assert.equal(restored.usage.status, "unknown");
+        assert.equal(usage.data.runs[0].usage.status, "unknown");
+        const denied = await jsonRequest(origin, accepted.resultPath + "/output", { headers });
+        assert.equal(denied.response.status, 409);
+      } else {
+        assert.equal(restored.usage.status, "complete"); assert.equal(restored.usage.totalTokens, 130);
+        assert.equal(usage.data.runs[0].usage.totalTokens, 130);
+        const manifest = await runExternalClient({ ...options, command: "output", runId: accepted.id });
+        assert.deepEqual(manifest.structuredOutput.data, { answer: "结构化验收通过" });
+        const file = await runExternalClient({ ...options, command: "download", runId: accepted.id, fileId: manifest.artifacts[0].id });
+        assert.equal(file.buffer.toString(), "verified artifact delivery\n");
+      }
+      const after = snapshot();
+      assert.equal(after.tasks, 1); assert.equal(after.keys, 1); assert.equal(after.usage.length, 1);
+      const recoveredTask = JSON.parse(after.task.record);
+      for (const field of ["id", "clientId", "automationId", "threadId", "turnId"]) assert.equal(recoveredTask[field], saved[field], field);
+      assert.equal(after.task.epoch, before.task.epoch + (phase === "before-terminal" ? 1 : 0));
+      assert.equal(after.result.record, before.result.record); assert.equal(after.result.bytes, before.result.bytes);
+      assert.deepEqual(await retainedBlobs(after.result), blobs);
+      const requests = (await fs.readFile(capture, "utf8")).split("\n").filter(Boolean).map(JSON.parse);
+      assert.equal(requests.filter(row => row.method === "turn/start").length, 1, "restart and same-key recovery must not repeat inference");
+      await stopProcess(server); server = null;
+      if (phase === "before-terminal") {
+        const ledger = openRunUsageLedger(path.join(stateRoot, "run-usage.sqlite"));
+        try {
+          const now = () => Date.now() + 3 * 86400000;
+          const tasks = createExternalTaskStore(ledger.database, { now });
+          await createExternalResultStore(ledger.database, path.join(stateRoot, "external-results"), { now }).sweep();
+          tasks.retain([]);
+          assert.equal(tasks.read(accepted.id).status, "needs_reconciliation");
+          assert.equal(tasks.lookup(saved.triggerIdempotencyHash, saved.triggerRequestHash).id, accepted.id);
+          assert.deepEqual(await retainedBlobs(snapshot().result), blobs, "unknown results must survive expiration cleanup for review");
+        } finally { ledger.close(); }
+      }
+      evidence.push({ phase, signal, beforeStatus: saved.status, resultPersisted: true, usageRowsBefore: before.usage.length,
+        recoveredStatus: restored.status, usageStatus: usage.data.runs[0].usage.status,
+        usageTotalTokens: usage.data.runs[0].usage.status === "complete" ? usage.data.runs[0].usage.totalTokens : null,
+        privateBlobsPreserved: true, backendTurnStarts: 1, simulatedCodex: true, realModelTurns: 0 });
+    } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+  }
+  console.log(JSON.stringify({ resultPublishCrashRecovery: { ok: true, checks: evidence } }));
 });
 
 await check("independent clients retrieve private exact-turn files and images after native history and process restart", async () => {
