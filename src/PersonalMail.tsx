@@ -1,7 +1,8 @@
-import { ExternalLink, ListTodo, Mail, RefreshCw, Reply, UserRound } from "lucide-react";
+import { ExternalLink, ListTodo, Mail, MailOpen, RefreshCw, Reply, UserRound } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { personalSourceFresh } from "./personal-source-freshness";
 import PersonalMailDrafts, { type MailDraftSelection } from "./PersonalMailDrafts";
+import PersonalMailBody, { type MailBodySelection } from "./PersonalMailBody";
 
 type Account = { id: string; email: string; label: string };
 type MailItem = { id: string; threadId: string; title: string; from: string; receivedAt: string; dateHeader: string; url: string; version: string };
@@ -20,6 +21,9 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
   const [timeZone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
   const [draftSelection, setDraftSelection] = useState<MailDraftSelection | null>(null);
   const selectionHandled = useCallback(() => setDraftSelection(null), []);
+  const [bodySelection, setBodySelection] = useState<MailBodySelection | null>(null), [bodyBusy, setBodyBusy] = useState(false), [readKey, setReadKey] = useState(0);
+  const bodySettled = useCallback(() => setReadKey(value => value + 1), []);
+  const bodyOpener = useRef<HTMLButtonElement | null>(null);
   const sequence = useRef(0), current = useRef<AbortController | null>(null), running = useRef(false);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 30000);
@@ -38,10 +42,16 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
       if (seq === sequence.current) setError(controller.signal.aborted ? "邮件记录读取超时，请稍后重试" : cause instanceof Error ? cause.message : "邮件记录读取失败");
     }).finally(() => window.clearTimeout(timer));
     return () => { if (seq === sequence.current) sequence.current++; controller.abort(); window.clearTimeout(timer); };
-  }, [refreshKey, timeZone]);
+  }, [refreshKey, timeZone, readKey]);
+  useEffect(() => {
+    if (!mail?.reading) return;
+    const timer = window.setTimeout(bodySettled, 1500);
+    return () => window.clearTimeout(timer);
+  }, [mail, bodySettled]);
 
   const post = async (mode: "accounts" | "refresh", accountId?: string) => {
-    if (running.current || mail?.reading || mode === "refresh" && !accountId) return;
+    if (running.current || bodyBusy || mail?.reading || mode === "refresh" && !accountId) return;
+    setBodySelection(null);
     running.current = true; setBusy(mode); setError("");
     const controller = new AbortController(), seq = ++sequence.current;
     current.current?.abort(); current.current = controller;
@@ -70,7 +80,7 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
       if (seq === sequence.current) setBusy(null);
     }
   };
-  const snapshot = mail?.snapshot, reading = Boolean(busy || mail?.reading);
+  const snapshot = mail?.snapshot, reading = Boolean(busy || bodyBusy || mail?.reading);
   const stale = Boolean(error || mail?.stale || snapshot && !personalSourceFresh(snapshot, timeZone, clock));
   const resolveSource = useCallback((reference: MailDraftSelection["source"]): MailDraftSelection | null => {
     if (!snapshot || stale || reading || accounts || !personalSourceFresh(snapshot, timeZone, Date.now()) || snapshot.account.id !== reference.accountId ||
@@ -107,11 +117,16 @@ export default function PersonalMail({ refreshKey, onChooseTask, onConnections }
     {snapshot && !snapshot.complete && <p className="warn-text" role="status">仅展示本次范围中的部分邮件，可能还有其他未读邮件。</p>}
     {snapshot?.items.map(item => <div className="personal-calendar-row personal-mail-row" key={item.id}>
       <span><strong title={item.title}>{item.title}</strong><small>{item.from}</small><small>收件箱未读 · 收到于 {stamp(item.receivedAt, snapshot.window.timeZone)}</small>{item.dateHeader && <small>原邮件日期：{item.dateHeader}</small>}</span>
-      <div className="personal-mail-row-actions"><button type="button" title="起草回复，不读取正文或发送" aria-label={`起草回复：${item.title}`} disabled={stale || reading || Boolean(accounts) || Boolean(draftSelection)} onClick={() => reply(item)}><Reply size={17} /></button><a href={item.url} target="_blank" rel="noopener noreferrer" title={`在 Gmail 查看：${item.title}`} aria-label={`查看原邮件：${item.title}`}><ExternalLink size={17} /></a></div>
+      <div className="personal-mail-row-actions"><button type="button" title="选择正文，确认后只读这一封" aria-label={`读取正文：${item.title}`} disabled={stale || reading || Boolean(accounts)} onClick={event => {
+        const current = resolveSource({ accountId: snapshot.account.id, messageId: item.id, itemVersion: item.version, snapshotVersion: snapshot.version });
+        if (current) { bodyOpener.current = event.currentTarget; setBodySelection({ ...current, accountEmail: snapshot.account.email, title: item.title, from: item.from, url: item.url, expiresAt: snapshot.expiresAt }); }
+        else setClock(Date.now());
+      }}><MailOpen size={17} /></button><button type="button" title="起草回复，不读取正文或发送" aria-label={`起草回复：${item.title}`} disabled={stale || reading || Boolean(accounts) || Boolean(draftSelection)} onClick={() => reply(item)}><Reply size={17} /></button><a href={item.url} target="_blank" rel="noopener noreferrer" title={`在 Gmail 查看：${item.title}`} aria-label={`查看原邮件：${item.title}`}><ExternalLink size={17} /></a></div>
     </div>)}
     {!mail && !error && <p className="personal-empty" role="status">正在读取已保存的邮件记录…</p>}
     {mail && !snapshot && !reading && <p className="personal-empty">尚无成功读取的邮件记录，不能判断是否有待处理邮件。</p>}
     {snapshot && !snapshot.items.length && !stale && snapshot.complete && <p className="personal-empty">本次范围内没有未读邮件，不代表所有邮件都已处理或无需回复。</p>}
     {(error || mail?.lastAttempt?.status === "error") && <button type="button" className="mini-action" onClick={onConnections}>检查连接服务</button>}
+    {bodySelection && <PersonalMailBody key={JSON.stringify(bodySelection.source)} selection={bodySelection} available={Boolean(resolveSource(bodySelection.source)) && snapshot?.version === bodySelection.source.snapshotVersion} onClose={() => { setBodySelection(null); bodyOpener.current?.focus(); }} onBusy={setBodyBusy} onSettled={bodySettled} onChooseTask={onChooseTask} />}
   </section><PersonalMailDrafts selection={draftSelection} onSelectionHandled={selectionHandled} refreshKey={refreshKey} onChooseTask={onChooseTask} resolveSource={resolveSource} /></>;
 }

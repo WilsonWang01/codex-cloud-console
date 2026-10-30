@@ -2,6 +2,14 @@
 
 日期：2026-10-30，Asia/Shanghai。
 
+## 本次接续：仅 CI 专用配置已获授权
+
+用户明确允许在 GitHub CI 临时测试机加载 bwrap 专用配置，继续原计划；不允许修改本机/EC2 安全设置。原失败日志再次核对为 Ubuntu 24.04.5：第二轮 `40937332907` 已装发行版 bubblewrap，仍在探针开始前失败。此前“缺包”不是充分解释，失败记录不删除。
+
+本次将候选接回主线 `eaf9486`，保留新正文/回调/MCP 代码与门禁，不拿旧分支覆盖主线。CI 固定为当前同款 `ubuntu-24.04`，安装发行版 `bubblewrap` 和 `apparmor-profiles`，只加载 `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict`；记录包版本、bwrap 版本、配置 SHA-256 与内核中已加载的对应配置。依据 [OpenAI 官方 GitHub CI 前置配置](https://learn.chatgpt.com/docs/security/cli/ci/github)，不会运行全局 sysctl 放宽、关闭 AppArmor、增加容器特权或降低 Codex 沙箱策略。
+
+这项系统权限操作只在每次销毁的 GitHub 临时测试机执行，未在本机或 EC2 运行。完整工作区写入/外部拒绝/联网拒绝/重启核对、0.165 取消恢复、旧版兼容及主线其他检查全部保留。执行结果仍须看本次准确头提交；未通过继续保留草稿，不能把“官方建议”写成“已实测解决”。准确候选和合并后 CI 以本轮交付回执为准，不提前宣称生产专项或完整目标完成。以下原报告保留原时间点。
+
 ## 缺口与最小修正
 
 生产 CLI 已为 0.165.0，但原生独立客户端验收脚本仍把版本固定为 0.157.1。实际指定 `CODEX_SCHEMA_CLI_BINARY` 和已有的 `CODEX_SCHEMA_CLI_VERSION=0.165.0` 后，脚本在创建测试目录前被旧版本断言拒绝，无法验证当前 CLI 的中断和恢复。

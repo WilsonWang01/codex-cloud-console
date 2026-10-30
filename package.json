@@ -97,6 +97,7 @@
     "ajv": "8.20.0",
     "cron-parser": "5.10.1",
     "express": "^5.2.1",
+    "html-to-text": "10.0.1",
     "pdfjs-dist": "6.4.299",
     "playwright": "^1.60.0",
     "web-push": "^3.6.7",
