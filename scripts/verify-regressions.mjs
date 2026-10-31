@@ -439,7 +439,7 @@ input.on("line", (line) => {
     if (externalWriteRegression) {
       const isReadOnly = requestText.includes("read only");
       const isTimeout = requestText.includes("timeout");
-      const isFailure = requestText.includes("tool failure");
+      const isFailure = requestText.includes("tool failure") || (isReadOnly && process.env.FAKE_CAPTURE_PATH && fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".source-unavailable"));
       const item = { type: "mcpToolCall", id: "external-write-regression", server: "connected-calendar", tool: isReadOnly ? "list_events" : "create_event", status: "inProgress", readOnlyHint: requestText.includes("missing hint") ? null : isReadOnly, appContext: requestText.includes("no app context") ? null : { connectorId: "fixture-calendar", actionName: isReadOnly ? "list_events" : "create_event" } };
       send({ method: "item/started", params: { threadId: message.params?.threadId, turnId, item } }, 20);
       if (!isTimeout) {
@@ -2555,6 +2555,92 @@ await check("calendar and mail sources are explicit, account-bound, durable and 
     await fs.unlink(mailStateFile); await fs.symlink(capture, mailStateFile);
     assert.equal((await jsonRequest(base, "/api/personal/mail?timeZone=UTC", { headers })).response.status, 503);
     assert.equal((await fs.lstat(mailStateFile)).isSymbolicLink(), true);
+  } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+await check("personal scheduled source failure pauses durably until a new approved trial", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-source-schedule-"));
+  const fake = await writeFakeCodex(root), cloud = path.join(root, "cloud"), state = path.join(root, "state"), bin = path.join(root, "bin");
+  const capture = path.join(root, "requests.jsonl"), gate = capture + ".source-unavailable", routineFile = path.join(state, "personal-routines.json");
+  for (const directory of [path.join(cloud, "workspace", "sample-app"), state, bin]) await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nif [ "$1" = "login" ]; then echo "Logged in using ChatGPT"; exit 0; fi\nif [ "$1" = "--version" ]; then echo "fixture"; exit 0; fi\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`;
+  const start = () => spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], {
+    cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port),
+      CODEX_CLOUD_ROOT: cloud, CODEX_WORKSPACE_ROOT: path.join(cloud, "workspace"), CODEX_STATE_ROOT: state, CODEX_HOME: path.join(root, ".codex"),
+      CODEX_PERSONAL_MODE: "shared", CODEX_PERSONAL_ROOT: path.join(cloud, "personal"), CODEX_PERSONAL_WORKER: "1",
+      CODEX_TURN_TIMEOUT_MS: "5000", CODEX_ALLOW_LOCAL_FALLBACK: "0", FAKE_SHARED_PERSONAL: "1", FAKE_CAPTURE_PATH: capture, PATH: `${bin}:${process.env.PATH}` },
+  });
+  const call = async (route, method = "GET", body) => {
+    const result = await jsonRequest(base, route, { method, headers: { "content-type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    return { status: result.response.status, body: result.data };
+  };
+  const until = async (read, timeout = 6000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 500)); }
+    throw new Error("个人计划来源恢复场景未在限定时间内完成");
+  };
+  const starts = async () => (await fs.readFile(capture, "utf8")).trim().split("\n").map(JSON.parse).filter(item => item.method === "turn/start").length;
+  let child = start();
+  try {
+    await waitForOutput(child, /listening on/i);
+    const created = await call("/api/personal/routines", "POST", { name: "合成来源失效验收", prompt: "external write regression read only source revocation" });
+    assert.equal(created.status, 201);
+    const id = created.body.routine.id, route = `/api/personal/routines/${id}`;
+    const trial = await call(route + "/test", "POST", { revision: 1, confirmModelCost: true });
+    assert.equal(trial.status, 200);
+    const first = await until(async () => { const { body } = await call(route + "/test"); return body.test?.status === "completed" && body.test; });
+    const approved = await call(route + "/test/approve", "POST", { revision: trial.body.revision, runId: first.id, confirmResult: true });
+    assert.equal(approved.status, 200);
+    await fs.writeFile(gate, "synthetic source unavailable");
+    // Use the real minute/tick boundary, with at least 30 seconds to configure the isolated schedule.
+    const due = new Date(Math.floor((Date.now() + 90_000) / 60_000) * 60_000);
+    const enabled = await call(route + "/schedule", "PATCH", { revision: approved.body.routine.revision, enabled: true, confirmModelCost: true,
+      cadence: "daily", time: `${String(due.getUTCHours()).padStart(2, "0")}:${String(due.getUTCMinutes()).padStart(2, "0")}`, timeZone: "UTC" });
+    assert.equal(enabled.status, 200);
+    assert.equal(enabled.body.routine.personalSchedule.nextRunAt, due.toISOString());
+    const paused = await until(async () => {
+      const saved = JSON.parse(await fs.readFile(routineFile, "utf8"));
+      return saved.routines.find(item => item.id === id && item.personalSchedule?.lastResult?.status === "failed" && !item.personalSchedule.enabled);
+    }, Date.parse(due) - Date.now() + 70_000);
+    assert.equal(paused.personalSchedule.nextRunAt, null);
+    assert.equal(paused.personalTestApproval, null);
+    const failedRun = (await call(`/api/automations/runs?automationId=${id}&verifyLimit=0`)).body.runs.find(item => item.trigger === "personal-schedule");
+    assert.equal(failedRun.status, "failed"); assert.match(failedRun.error, /只读调用失败/); assert.equal(failedRun.usage.totalTokens, 130);
+    const saved = await fs.readFile(routineFile, "utf8"), claims = JSON.parse(saved).claims;
+    assert.equal(claims.length, 1); assert.equal(claims[0].status, "failed"); assert.equal(claims[0].runId, failedRun.id);
+    assert.equal(await starts(), 2, "一次试运行和一次真实调度领取，失败不能启动第二个计划回合");
+    await stopProcess(child); child = start(); await waitForOutput(child, /listening on/i);
+    assert.equal((await call("/api/codex/app-status?repoId=_personal")).body.auth.ok, true);
+    assert.equal(await fs.readFile(routineFile, "utf8"), saved, "重启不得改写已暂停流程及其失败领取记录");
+    assert.equal(await starts(), 2, "重启不得重复执行失败的原计划");
+    assert.match((await call(route + "/test")).body.test.reviewIssue, /不能复用旧结果/);
+    assert.equal((await call(route + "/test/approve", "POST", { revision: paused.revision, runId: first.id, confirmResult: true })).status, 409);
+    assert.equal((await call(route + "/schedule", "PATCH", { revision: paused.revision, enabled: true, confirmModelCost: true, cadence: "daily", time: "09:00", timeZone: "UTC" })).status, 409);
+    if (selectedCheck && process.argv.includes("--serve")) {
+      console.log(JSON.stringify({ url: `${base}/#/automations/_personal/${id}`, stateDirectory: state, rpcCapture: capture, failedRun: failedRun.id, stop: "SIGTERM this process; resume synthetic recovery checks and then close" }));
+      await new Promise(resolve => { process.once("SIGTERM", resolve); process.once("SIGINT", resolve); });
+    }
+    await fs.unlink(gate);
+    const retry = await call(route + "/test", "POST", { revision: paused.revision, confirmModelCost: true });
+    assert.equal(retry.status, 200);
+    const recovered = await until(async () => { const { body } = await call(route + "/test"); return body.test?.status === "completed" && body.test; });
+    assert.notEqual(recovered.id, first.id); assert.equal(recovered.reviewIssue, null);
+    const renewed = await call(route + "/test/approve", "POST", { revision: retry.body.revision, runId: recovered.id, confirmResult: true });
+    assert.equal(renewed.status, 200);
+    const later = new Date(Date.now() + 2 * 3600_000);
+    const restored = await call(route + "/schedule", "PATCH", { revision: renewed.body.routine.revision, enabled: true, confirmModelCost: true,
+      cadence: "daily", time: `${String(later.getUTCHours()).padStart(2, "0")}:${String(later.getUTCMinutes()).padStart(2, "0")}`, timeZone: "UTC" });
+    assert.equal(restored.status, 200); assert.equal(restored.body.routine.personalSchedule.enabled, true);
+    assert.equal(await starts(), 3, "恢复连接和启用计划不能额外隐式启动回合");
+    assert.equal((await call(route + "/schedule", "PATCH", { revision: restored.body.routine.revision, enabled: false })).status, 200);
+    assert.equal((await call(`/api/automations/runs?automationId=${id}&verifyLimit=0`)).body.runs.length, 3);
+    const result = { ok: true, routineId: id, scheduledAt: due.toISOString(), claimedAt: claims[0].claimedAt, pausedAt: claims[0].finishedAt,
+      failedRunId: failedRun.id, oneClaim: true, restartPreserved: true, oldApprovalRejected: true, newTrialApproved: true,
+      turnStartRequests: await starts(), simulatedCodex: true, realScheduler: true, realModelTurns: 0 };
+    const out = process.env.CODEX_CLOUD_UI_EVIDENCE_DIR;
+    if (out) { await fs.mkdir(out, { recursive: true }); await fs.writeFile(path.join(out, "result.json"), JSON.stringify(result, null, 2)); await fs.copyFile(routineFile, path.join(out, "routines-final.json")); await fs.copyFile(capture, path.join(out, "rpc.jsonl")); }
+    console.log(JSON.stringify({ personalScheduleSourceRecovery: result }));
   } finally { await stopProcess(child); await fs.rm(root, { recursive: true, force: true }); }
 });
 
