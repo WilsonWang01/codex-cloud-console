@@ -440,14 +440,17 @@ input.on("line", (line) => {
       const isReadOnly = requestText.includes("read only");
       const isTimeout = requestText.includes("timeout");
       const isFailure = requestText.includes("tool failure");
-      const item = { type: "mcpToolCall", id: "external-write-regression", server: "connected-calendar", tool: "create_event", status: "inProgress", readOnlyHint: requestText.includes("missing hint") ? null : isReadOnly, appContext: requestText.includes("no app context") ? null : { connectorId: "fixture-calendar", actionName: "create_event" } };
+      const item = { type: "mcpToolCall", id: "external-write-regression", server: "connected-calendar", tool: isReadOnly ? "list_events" : "create_event", status: "inProgress", readOnlyHint: requestText.includes("missing hint") ? null : isReadOnly, appContext: requestText.includes("no app context") ? null : { connectorId: "fixture-calendar", actionName: isReadOnly ? "list_events" : "create_event" } };
       send({ method: "item/started", params: { threadId: message.params?.threadId, turnId, item } }, 20);
       if (!isTimeout) {
-        send({ method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed" } } }, 65);
+        const receipt = { method: "item/completed", params: { threadId: message.params?.threadId, turnId, item: { ...item, status: isFailure ? "failed" : "completed", ...(requestText.includes("error receipt") ? { error: { message: "Synthetic authorization revoked: PRIVATE-DETAIL" } } : {}) } } };
+        send(receipt, 65);
+        if (requestText.includes("duplicate receipt")) send(receipt, 68);
+        if (isReadOnly) send({ method: "item/agentMessage/delta", params: { threadId: message.params?.threadId, turnId, delta: "模拟结果：来源读取完成" } }, 70);
         send({ method: "thread/tokenUsage/updated", params: {
           threadId: message.params?.threadId, turnId, tokenUsage: { total: { inputTokens: 100, outputTokens: 30 }, last: { inputTokens: 100, outputTokens: 30 } },
         } }, 75);
-        send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: "completed" } } }, 90);
+        send({ method: "turn/completed", params: { threadId: message.params?.threadId, turn: { id: turnId, status: requestText.includes("interrupted turn") ? "interrupted" : "completed" } } }, 90);
       }
     } else if (queueRegressionNext) {
       send({ method: "item/agentMessage/delta", params: {
@@ -3018,9 +3021,81 @@ await check("personal and work reuse authentication without sharing threads or s
       body: JSON.stringify({ revision: 2, runId: unknownTrialStatus.data.test.id, confirmResult: true }),
     });
     assert.equal(blockedUnknownApproval.response.status, 409);
+    for (const repoId of ["sample-app", "_personal"]) {
+      const interactive = await jsonRequest(base, "/api/chat", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repoId, message: "external write regression read only tool failure" }),
+      });
+      assert.equal(interactive.data.ok, true, "普通交互回合仍由用户和模型处理工具失败，不套用后台流程的失败策略");
+    }
+    for (const mode of ["tool failure duplicate receipt", "error receipt no app context", "success", "tool failure interrupted turn"]) {
+      const interruptCount = async () => (await fs.readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse).filter(request => request.method === "turn/interrupt").length;
+      const previousInterrupts = await interruptCount();
+      const created = await jsonRequest(base, "/api/personal/routines", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: `只读结果 ${mode}`, prompt: `external write regression read only ${mode}` }),
+      });
+      assert.equal(created.response.status, 201);
+      const id = created.data.routine.id;
+      const trial = await jsonRequest(base, `/api/personal/routines/${id}/test`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: 1, confirmModelCost: true }),
+      });
+      assert.equal(trial.response.status, 200, JSON.stringify(trial.data));
+      let observed;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        observed = await jsonRequest(base, `/api/personal/routines/${id}/test`);
+        if (["failed", "completed"].includes(observed.data.test?.status)) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      const success = mode === "success";
+      assert.equal(observed.data.test?.status, success ? "completed" : "failed", JSON.stringify(observed.data));
+      if (!success) assert.match(observed.data.test.error, /只读调用失败/);
+      assert.doesNotMatch(observed.data.test.error || "", /PRIVATE-DETAIL/);
+      const approval = await jsonRequest(base, `/api/personal/routines/${id}/test/approve`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: 2, runId: observed.data.test.id, confirmResult: true }),
+      });
+      assert.equal(approval.response.status, success ? 200 : 409);
+      const run = (await jsonRequest(base, `/api/automations/runs?automationId=${id}`)).data.runs.find(run => run.id === observed.data.test.id);
+      if (mode.includes("interrupted turn")) assert.equal(run.usage.status, "unknown");
+      else assert.equal(run.usage.totalTokens, 130, "已正常结束的原生回合仍须保留完整用量");
+      assert.equal(await interruptCount() - previousInterrupts, success ? 0 : 1);
+      if (success) {
+        const file = path.join(stateRoot, "automation-runs.json");
+        const saved = JSON.parse(await fs.readFile(file, "utf8"));
+        saved.runs.unshift({ ...saved.runs.find(item => item.id === run.id), id: run.id + "-schedule-failure", trigger: "personal-schedule", status: "failed",
+          threadId: null, turnId: null, sessionId: null, startedAt: new Date().toISOString(), error: "合成连接读取失败", usage: { status: "complete", source: "not-started", inputTokens: 0, outputTokens: 0, totalTokens: 0 } });
+        await fs.writeFile(file, JSON.stringify(saved));
+        assert.match((await jsonRequest(base, `/api/personal/routines/${id}/test`)).data.test.reviewIssue, /不能复用旧结果/);
+        assert.equal((await jsonRequest(base, `/api/personal/routines/${id}/test/approve`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ revision: approval.data.routine.revision, runId: observed.data.test.id, confirmResult: true }),
+        })).response.status, 409);
+        const retried = await jsonRequest(base, `/api/personal/routines/${id}/test`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ revision: approval.data.routine.revision, confirmModelCost: true }),
+        });
+        assert.equal(retried.response.status, 200);
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          observed = await jsonRequest(base, `/api/personal/routines/${id}/test`);
+          if (observed.data.test?.status === "completed") break;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        assert.notEqual(observed.data.test.id, run.id);
+        assert.equal(observed.data.test.reviewIssue, null);
+        assert.equal((await jsonRequest(base, `/api/personal/routines/${id}/test/approve`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ revision: retried.data.revision, runId: observed.data.test.id, confirmResult: true }),
+        })).response.status, 200);
+      }
+    }
     const { data: status } = await jsonRequest(base, "/api/status");
     assert.equal(status.codex.authenticated, true);
     assert.equal(status.repos.find((r) => r.id === "_personal").executionAvailable, true);
+    if (selectedCheck && process.argv.includes("--serve")) {
+      console.log(JSON.stringify({ url: base + "/#/automations/_personal", stateDirectory: stateRoot, rpcCapture: capturePath, stop: "SIGTERM this process" }));
+      await new Promise(resolve => { process.once("SIGTERM", resolve); process.once("SIGINT", resolve); });
+    }
   } finally {
     await stopProcess(child);
     await fs.rm(root, { recursive: true, force: true });

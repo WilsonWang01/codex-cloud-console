@@ -3361,6 +3361,7 @@ async function startTurnJob(repo, session, runtime, message, attachments = [], s
     job.unattendedPersonalSchedule = options.unattendedPersonalSchedule === true;
     job.unattendedApprovalDenied = false;
     job.reviewUnverifiedMcpCalls = options.reviewUnverifiedMcpCalls === true;
+    job.personalReadFailed = false;
     job.externalActionInterruptRequested = false;
     job.makeSessionActive = options.makeSessionActive !== false;
     job.requireExistingThread = options.requireExistingThread === true;
@@ -3807,6 +3808,13 @@ function handleAppServerNotification(rpcMessage) {
   if (rpcMessage.method === "item/completed") {
     const item = params.item || {};
     if (turnJob) turnJob.turnUsage.observeItem(item);
+    if (turnJob?.reviewUnverifiedMcpCalls && !turnJob.personalReadFailed && item.type === "mcpToolCall" &&
+      item.readOnlyHint === true && (item.status === "failed" || item.error)) {
+      turnJob.personalReadFailed = true;
+      turnJob.cancelRequested = true;
+      emitJobEvent(turnJob, "status", { text: "连接服务只读调用失败，正在中断个人流程；请检查连接授权并重新试运行" });
+      requestJobInterruption(turnJob).catch(() => null);
+    }
     if (turnJob && turnJob.externalWriteItems.has(item.id)) {
       const attempt = turnJob.externalWriteItems.get(item.id);
       attempt.status = item.status === "completed" && !item.error ? "completed" : "failed";
@@ -7335,7 +7343,7 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
           deliveryError = { code: "original_turn_unavailable", message: "原始回合读取失败，未保存可交付结果" };
         }
       }
-      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && !job.profileApprovalDenied && structuredOutput?.status !== "invalid" && !deliveryError;
+      let completed = result.ok && completion.satisfied && !unattendedApprovalDenied && !job.profileApprovalDenied && !job.personalReadFailed && structuredOutput?.status !== "invalid" && !deliveryError;
       const needsExternalReview = Boolean(result.externalActionReview);
       const personalWriteObserved = ["personal-test", "personal-schedule"].includes(options.trigger) && job.externalWriteItems.size > 0;
       const personalKnownWriteObserved = [...job.externalWriteItems.values()].some((item) => !item.unverifiedReadOnly);
@@ -7360,10 +7368,11 @@ async function startAppServerAutomationRun(automation, repo, options = {}) {
       const personalExternalActionError = personalKnownWriteObserved
         ? `检测到连接服务写入；请在对应服务核对结果，${personalActionDisposition}。`
         : `连接服务操作未声明只读；请核对是否造成外部修改，${personalActionDisposition}。`;
-      const canceled = !needsExternalReview && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
+      const canceled = !needsExternalReview && !job.personalReadFailed && job.cancelRequested && !result.ok && /cancel|interrupt/i.test(String(result.error || job.error || ""));
       const error = job.profileApprovalDenied ? "受限任务请求了额外权限或工具，已拒绝；请核对原任务，不会自动重跑。" : needsExternalReview ? result.externalActionReview.reason
         : personalWriteObserved ? personalExternalActionError
           : unattendedApprovalDenied ? "无人值守的个人计划请求人工确认，已拒绝并暂停。请调整任务后先试运行。"
+          : job.personalReadFailed ? `连接服务只读调用失败，${personalActionDisposition}。请检查连接授权并重新试运行。`
           : completed ? null : canceled ? "任务已中断；已完成的外部动作无法自动撤销。" : structuredOutput?.error?.message || deliveryError?.message || completion.error || result.error || job.error || "自动化任务失败";
       const diffStat = await diffStatForPath(worktreePath || repo.path).catch(() => "");
       await settleRun(
@@ -7709,8 +7718,11 @@ function personalRoutineReadOnlyPrompt(prompt) {
   return `按个人计划执行以下只读任务。不要发送消息、修改日历或其他第三方数据；需要写入时停下并报告给用户。\n\n${prompt}`;
 }
 
-function personalTestReviewIssue(run) {
+function personalTestReviewIssue(run, runs = []) {
   if (!run || run.status !== "completed") return "试运行尚未成功完成";
+  if (runs.some(item => item.automationId === run.automationId && item.trigger === "personal-schedule" &&
+    ["failed", "needs_reconciliation", "interrupted", "canceled"].includes(item.status) &&
+    Date.parse(item.startedAt) >= Date.parse(run.startedAt))) return "计划后续运行失败或中断，请检查连接授权并重新试运行，不能复用旧结果。";
   if (!automationRunDisplayText(run.summary, 700).trim()) return "试运行没有可审核的结果";
   if (String(run.diffStat || "").trim()) return "试运行修改了本地文件，请核对后重新测试";
   return null;
@@ -11243,12 +11255,13 @@ app.get("/api/personal/routines/:id/test", async (req, res) => {
   try {
     const routine = (await personalRoutinesStore.list()).find((item) => item.id === req.params.id && !item.archivedAt);
     if (!routine) return res.status(404).json({ ok: false, error: "个人流程不存在" });
-    const latest = (await readAutomationRuns()).runs.find((run) => run.automationId === routine.id && run.trigger === "personal-test");
+    const { runs } = await readAutomationRuns();
+    const latest = runs.find((run) => run.automationId === routine.id && run.trigger === "personal-test");
     res.setHeader("Cache-Control", "no-store");
     res.json({ ok: true, test: latest ? {
       id: latest.id, status: latest.status, startedAt: latest.startedAt, finishedAt: latest.finishedAt,
       summary: automationRunDisplayText(latest.summary, 700), error: automationRunDisplayText(latest.error, 520),
-      reviewIssue: latest.status === "completed" ? personalTestReviewIssue(latest) : null,
+      reviewIssue: latest.status === "completed" ? personalTestReviewIssue(latest, runs) : null,
       promptMatches: latest.personalTestPromptHash === personalRoutinePromptHash(routine.prompt),
       sessionId: latest.sessionId, threadId: latest.threadId,
     } : null });
@@ -11281,11 +11294,12 @@ app.post("/api/personal/routines/:id/test", async (req, res) => {
 app.post("/api/personal/routines/:id/test/approve", async (req, res) => {
   try {
     if (req.body?.confirmResult !== true) return res.status(428).json({ ok: false, error: "请先查看并确认试运行结果" });
-    const latest = (await readAutomationRuns()).runs.find((run) => run.automationId === req.params.id && run.trigger === "personal-test");
+    const { runs } = await readAutomationRuns();
+    const latest = runs.find((run) => run.automationId === req.params.id && run.trigger === "personal-test");
     if (!latest || latest.id !== req.body?.runId || latest.status !== "completed") {
       return res.status(409).json({ ok: false, error: "最近一次试运行尚未成功完成" });
     }
-    const issue = personalTestReviewIssue(latest);
+    const issue = personalTestReviewIssue(latest, runs);
     if (issue) return res.status(409).json({ ok: false, error: issue });
     const routine = await personalRoutinesStore.approveTest(req.params.id, {
       revision: req.body?.revision, runId: latest.id, promptHash: latest.personalTestPromptHash,

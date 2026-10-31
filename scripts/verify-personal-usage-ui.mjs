@@ -920,8 +920,8 @@ try {
   await page.getByRole("button", { name: "取消编辑" }).click();
   personalFacts[0].value = "删除前又被更新";
   personalFacts[0].revision += 1;
-  page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "删除 称呼" }).click();
+  await page.getByRole("dialog", { name: "删除个人事实", exact: true }).getByRole("button", { name: "确认删除", exact: true }).click();
   await page.getByText("删除前又被更新", { exact: true }).waitFor();
   assert.equal(personalFacts.length, 1, "stale delete must preserve the fact");
   await page.getByRole("button", { name: "编辑 称呼" }).click();
@@ -934,8 +934,8 @@ try {
   assert.equal(await page.getByRole("textbox", { name: "事实内容" }).inputValue(), "被删除后保留的草稿");
   await page.getByRole("button", { name: "添加事实" }).click();
   await page.getByText("被删除后保留的草稿", { exact: true }).waitFor();
-  page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "删除 称呼" }).click();
+  await page.getByRole("dialog", { name: "删除个人事实", exact: true }).getByRole("button", { name: "确认删除", exact: true }).click();
   await page.locator(".personal-fact-row").waitFor({ state: "detached" });
   assert.equal(personalFacts.length, 0);
   await page.setViewportSize({ width: 1280, height: 900 });
