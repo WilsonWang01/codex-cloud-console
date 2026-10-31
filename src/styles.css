@@ -6910,6 +6910,16 @@ pre {
 }
 
 @media (min-width: 821px) {
+  .app-shell:has(.session-content-grid) > .sidebar {
+    height: var(--app-visual-height, 100dvh);
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .app-shell:has(.session-content-grid) > .sidebar > * {
+    flex-shrink: 0;
+  }
+
   .session-content-grid {
     padding: 0;
     background: var(--surface);
@@ -7511,14 +7521,13 @@ pre {
   .queued-turn-banner .mini-action, .composer-busy-actions .mini-action { min-height: 44px; }
   .external-review-banner { flex-wrap: wrap; }
   .external-review-banner .mini-action { min-height: 44px; margin-left: 28px; }
-  .session-content-grid .composer-shell { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
+  .session-content-grid .composer-shell { display: flex; flex-direction: column; flex: 0 0 auto; min-height: 0; }
   .composer-notices { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
   .composer-notices:has(> .external-review-banner) { min-height: 64px; }
   .composer-notices:has(> .queued-turn-banner):not(:has(> .external-review-banner)) { min-height: 44px; }
   .composer-shell > .composer, .composer-shell > .composer-footer, .composer-shell > .attachment-strip, .composer-shell > .composer-busy-actions { flex-shrink: 0; }
-  /* Preserve the personal composer's controls; auxiliary content may scroll instead. */
-  .session-content-grid:has(.personal-scope-notice) .composer-shell { flex-shrink: 0; }
-  .session-content-grid:has(.personal-scope-notice) .composer-shell > :is(.composer-notices, .attachment-strip) { max-height: min(calc(var(--app-visual-height, 100dvh) * .15), 96px); overflow-y: auto; }
+  /* Preserve composer controls in both spaces; auxiliary content may scroll instead. */
+  .session-content-grid .composer-shell > :is(.composer-notices, .attachment-strip) { max-height: min(calc(var(--app-visual-height, 100dvh) * .15), 96px); overflow-y: auto; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer button { min-height: 44px; height: auto; }
   .session-content-grid:has(.personal-scope-notice) .composer-footer .footer-save-routine { width: 44px; min-width: 44px; }

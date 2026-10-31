@@ -135,6 +135,52 @@ try {
     await wait(() => chat.evaluate(node => node.scrollHeight - node.scrollTop - node.clientHeight < 2), "explicit jump did not reach latest output");
     assert.equal(await page.getByRole("button", { name: "有新进展", exact: false }).count(), 0);
     assert.equal(await composer.inputValue(), draft);
+
+    await page.goto(`${fixture.base}/#/project/work/thread/work-history`);
+    await wait(async () => page.url().endsWith("/thread/work-thread") && await chat.getAttribute("aria-busy") === "false" && await composer.isEnabled(), "work conversation did not become ready");
+    await page.getByText(control.a.text, { exact: true }).waitFor();
+    assert.equal(await composer.inputValue(), "合成工作草稿");
+    evidence.workViewports = [];
+    for (const size of [{ width: 390, height: 844 }, { width: 320, height: 480 }, { width: 844, height: 390 },
+      { width: 820, height: 900 }, { width: 821, height: 753 }, { width: 1024, height: 768 }, { width: 1280, height: 720 }]) {
+      await page.setViewportSize(size);
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const layout = await page.evaluate(() => {
+        const chat = document.querySelector(".chat-window"), panel = document.querySelector(".chat-panel");
+        const panelBox = panel.getBoundingClientRect();
+        const controls = [...document.querySelectorAll(".composer-shell textarea, .composer-shell button")].map(node => {
+          const box = node.getBoundingClientRect();
+          return { label: node.getAttribute("aria-label") || node.getAttribute("title") || node.textContent || node.tagName,
+            top: box.top, bottom: box.bottom, left: box.left, right: box.right, width: box.width, height: box.height };
+        }).filter(box => box.width > 0 && box.height > 0);
+        return { width: innerWidth, height: innerHeight, pageHeight: document.documentElement.scrollHeight,
+          pageWidth: document.documentElement.scrollWidth, panelBottom: panelBox.bottom,
+          chatHeight: chat.clientHeight, chatContentHeight: chat.scrollHeight, controls };
+      });
+      evidence.workViewports.push(layout);
+      assert.ok(layout.chatHeight > 0 && layout.chatContentHeight > layout.chatHeight, `工作长历史应在聊天区内滚动：${JSON.stringify(layout)}`);
+      assert.ok(layout.pageWidth <= size.width + 1 && layout.pageHeight <= size.height + 1, `工作聊天不能撑大页面：${JSON.stringify(layout)}`);
+      assert.ok(layout.controls.some(item => item.label === "上传截图或文件") && layout.controls.some(item => item.label === "发送消息"), "工作输入区应包含附件和发送控件");
+      for (const box of layout.controls) assert.ok(box.top >= 0 && box.bottom <= Math.min(size.height, layout.panelBottom) + 1 && box.left >= 0 && box.right <= size.width + 1,
+        `工作输入区的全部可见控件应位于面板和视口内：${JSON.stringify({ size, box, layout })}`);
+      if (size.width > 820) {
+        await page.locator(".sidebar .account-card").scrollIntoViewIfNeeded();
+        const account = await page.locator(".sidebar .account-card").boundingBox();
+        assert.ok(account && account.y >= 0 && account.y + account.height <= size.height + 1, "聊天侧栏独立滚动后仍应能查看底部账号");
+      }
+      await page.screenshot({ path: path.join(output, `work-${size.width}-${size.height}.png`), fullPage: true });
+    }
+    const workDraft = "合成工作离线恢复草稿，未发送。";
+    await composer.fill(workDraft);
+    await wait(async () => (await fixture.request("/api/chat/sessions?repoId=work")).body.sessions?.some(session => session.draft?.input === workDraft), "work draft was not persisted");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.reload();
+    await wait(async () => page.url().endsWith("/thread/work-thread") && await composer.isEnabled() && await composer.inputValue() === workDraft, "work reload lost the draft or native conversation");
+    await page.getByRole("button", { name: /^模型：GPT-6[- ]Sol$/ }).waitFor();
+    await page.getByRole("button", { name: "推理深度：中", exact: true }).waitFor();
+    const reloadedSend = await page.getByRole("button", { name: "发送消息", exact: true }).boundingBox();
+    assert.ok(reloadedSend && reloadedSend.y >= 0 && reloadedSend.y + reloadedSend.height <= 844, "工作聊天刷新后发送按钮仍应完整可见");
+    await page.screenshot({ path: path.join(output, "work-reloaded.png"), fullPage: true });
     const rpc = (await fs.readFile(fixture.rpcCapture, "utf8")).trim().split("\n").map(line => JSON.parse(line));
     assert.equal(rpc.some(item => ["turn/start", "thread/start", "mcpServer/tool/call", "feedback/upload", "command/exec"].includes(item.method)), false);
     assert.deepEqual(errors, []);
