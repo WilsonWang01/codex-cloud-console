@@ -37,6 +37,7 @@ jobs:
         run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:external-client:codex'
       - run: npm run verify:local
       - run: npm run verify:chat-reading:ui
+      - run: npm run verify:runtime:ui
       - run: npm run verify:personal-memory:quality
       - name: Verify deleted personal facts in current CLI (synthetic provider only)
         env:

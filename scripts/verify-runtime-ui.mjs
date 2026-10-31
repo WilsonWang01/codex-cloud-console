@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import vm from "node:vm";
 import ts from "typescript";
 import { chromium } from "playwright";
+import { personalFeedbackConsole } from "./fixtures/personal-feedback-console.mjs";
 
 const source = await fs.readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fixture = { Date };
@@ -26,11 +27,13 @@ let historyGate = null;
 let saveGate = null;
 const writes = [];
 const errors = [];
-const baseUrl = process.env.CODEX_CLOUD_UI_URL || "http://127.0.0.1:5174/";
 const out = new URL("../docs/research/acceptance/runtime-switch-2026-10-08/", import.meta.url);
 await fs.mkdir(out, { recursive: true });
-const browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
+const fixtureConsole = process.env.CODEX_CLOUD_UI_URL ? null : await personalFeedbackConsole();
+const baseUrl = process.env.CODEX_CLOUD_UI_URL || `${fixtureConsole.base}/`;
+let browser;
 try {
+  browser = await chromium.launch({ channel: process.env.CODEX_CLOUD_CHROME_CHANNEL || "chrome", headless: true });
   const context = await browser.newContext();
   await context.route("**/healthz", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(status.health) }));
   await context.route("**/api/**", async (route) => {
@@ -74,7 +77,10 @@ try {
     if (url.pathname === "/api/codex/thread-state") {
       const session = sessions.find((s) => s.id === url.searchParams.get("sessionId"));
       const value = session && Object.fromEntries(["model", "reasoning", "sandbox", "approval", "search"].map((key) => [key, session[key]]));
-      return send({ ok: true, source: "app-server", authoritative: true, repoId, sessionId: session?.id, runtime: value, config: {} });
+      const usage = { totalTokens: 12000, inputTokens: 10000, cachedInputTokens: 0, outputTokens: 2000, reasoningOutputTokens: 0 };
+      return send({ ok: true, source: "app-server", authoritative: true, repoId, sessionId: session?.id, runtime: value, config: {},
+        goal: repoId === "sample-app" ? { threadId: session?.codexSessionId, objective: "合成目标：核对结果，不执行外部动作", status: "active", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1 } : null,
+        tokenUsage: repoId === "sample-app" ? { total: usage, last: usage, modelContextWindow: 100000 } : null });
     }
     const draft = url.pathname.match(/^\/api\/chat\/sessions\/([^/]+)\/draft$/);
     if (draft) {
@@ -87,23 +93,24 @@ try {
   const page = await context.newPage();
   page.on("pageerror", (error) => errors.push(error.message));
   const settings = () => page.getByRole("button", { name: /^会话设置：/ });
+  const summarizedRuntime = (repoId) => repoId === "_personal" || page.viewportSize().width <= 820;
   const ready = async (repoId, n) => {
     await page.locator(`.session-current[data-session-id='${repoId}-${n}']`).waitFor();
     await page.getByLabel("同步会话中", { exact: true }).waitFor({ state: "hidden" });
     const expected = n === 1 ? "GPT-6 Sol" : "GPT-6 Luna";
-    if (repoId === "_personal") await settings().filter({ hasText: expected }).waitFor();
+    if (summarizedRuntime(repoId)) await settings().filter({ hasText: expected }).waitFor();
     else await page.getByRole("button", { name: `模型：${expected}`, exact: true }).waitFor();
   };
   const openModel = async (repoId) => {
-    if (repoId === "_personal") {
+    if (summarizedRuntime(repoId)) {
       await settings().click();
       await page.locator(".personal-session-settings").getByRole("button", { name: /模型/ }).click();
     } else await page.getByRole("button", { name: /^模型：/ }).click();
   };
   const assertLoading = async (repoId) => {
     await page.getByLabel("同步会话中", { exact: true }).waitFor();
-    if (repoId === "_personal") {
-      assert.equal(await settings().isDisabled(), true, "同步中的个人会话不能修改设置");
+    if (summarizedRuntime(repoId)) {
+      assert.equal(await settings().isDisabled(), true, "同步中的会话不能修改设置");
       assert.doesNotMatch(await settings().textContent(), /GPT|工作区写入|只读/);
     } else {
       for (const name of [/^模型：/, /^权限：/, /^推理深度：/]) {
@@ -126,6 +133,24 @@ try {
       historyGate.release.resolve();
       historyGate = null;
       await ready(repoId, 1);
+      if (repoId === "sample-app" && width <= 820) {
+        const before = writes.length;
+        for (const [name, heading] of [["工作区权限", "权限"], ["推理深度", "推理模式"], ["目标", "目标"], ["上下文", "状态"]]) {
+          await settings().click();
+          const entry = page.locator(".personal-session-settings").getByRole("button", { name: new RegExp(`^${name}`) });
+          await entry.waitFor();
+          const box = await entry.boundingBox();
+          assert.ok(box.width >= 44 && box.height >= 44, `${name}入口必须能触控`);
+          await entry.click();
+          await page.locator(".command-panel-head").getByText(heading, { exact: true }).waitFor();
+          await page.locator(".command-panel").getByRole("button", { name: "关闭面板", exact: true }).press("Escape");
+          await page.locator(".command-panel").waitFor({ state: "hidden" });
+        }
+        assert.equal(writes.length, before, "查看设置、目标和上下文不能保存或扩大权限");
+      } else if (repoId === "sample-app") {
+        await page.locator(".footer-goal-chip").waitFor();
+        await page.getByRole("button", { name: /^上下文：/ }).waitFor();
+      }
       await openModel(repoId);
       const before = writes.length;
       historyGate = { target: `${repoId}-thread-2`, started: deferred(), release: deferred() };
@@ -187,9 +212,10 @@ try {
   await page.evaluate(() => { location.hash = "/project/_personal/thread/_personal-thread-1"; });
   await ready("_personal", 1);
   assert.deepEqual(errors, []);
-  console.log(JSON.stringify({ ok: true, widths: [320, 390, 1280], spaces: ["personal", "work"], checks: ["加载时不显示旧模型/权限且设置禁用", "切换关闭已打开的旧设置", "目标会话加载后恢复设置", "旧保存响应不串到新会话", "刷新保留各自设置", "加载失败设置禁用且可恢复", "无页面错误或横向溢出"], screenshots: out.pathname }, null, 2));
+  console.log(JSON.stringify({ ok: true, widths: [320, 390, 1280], spaces: ["personal", "work"], checks: ["加载时不显示旧模型/权限且设置禁用", "切换关闭已打开的旧设置", "目标会话加载后恢复设置", "手机权限/推理/目标/上下文入口可触控且只查看不写入", "旧保存响应不串到新会话", "刷新保留各自设置", "加载失败设置禁用且可恢复", "无页面错误或横向溢出"], screenshots: out.pathname }, null, 2));
 } finally {
   historyGate?.release.resolve();
   saveGate?.release.resolve();
-  await browser.close();
+  await browser?.close();
+  await fixtureConsole?.stop();
 }
