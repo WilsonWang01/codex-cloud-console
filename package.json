@@ -81,6 +81,7 @@
     "verify:personal:ui": "node scripts/verify-personal-usage-ui.mjs",
     "verify:mail:ui": "node scripts/verify-personal-mail-ui.mjs",
     "verify:calendar:ui": "node scripts/verify-personal-calendar-ui.mjs",
+    "verify:calendar-accounts:ui": "node scripts/verify-personal-calendar-accounts-ui.mjs",
     "verify:runtime": "node scripts/verify-runtime-package.mjs",
     "verify:api": "node scripts/smoke-api.mjs",
     "verify:ui": "node scripts/smoke-ui.mjs",

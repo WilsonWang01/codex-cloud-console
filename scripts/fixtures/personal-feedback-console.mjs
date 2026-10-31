@@ -27,6 +27,8 @@ const threads=['a','b'].map(name=>({id:'feedback-thread-'+name,cwd:${JSON.string
 threads.push({id:'work-thread',cwd:${JSON.stringify(work)},name:'合成工作对话',createdAt:stamp,updatedAt:stamp});
 readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);fs.appendFileSync(${JSON.stringify(rpcCapture)},JSON.stringify(m)+'\\n');if(m.id==null)return;
 let result={};
+const calendar=(m.params?.threadId==='calendar-source-fixture'||m.method==='thread/start'&&m.params?.serviceName==='codex_cloud_calendar_source')?JSON.parse(fs.readFileSync(${JSON.stringify(control)},'utf8')).calendar:null;
+if(calendar&&m.method==='thread/start'&&m.params.serviceName==='codex_cloud_calendar_source')return process.stdout.write(JSON.stringify({id:m.id,result:{thread:{id:'calendar-source-fixture',ephemeral:true}}})+'\\n');
 if(m.method==='account/read')result={account:{type:'chatgpt',email:'synthetic@example.test',planType:'plus'},requiresOpenaiAuth:false};
 if(m.method==='model/list')result={data:[{id:'gpt-6-sol',model:'gpt-6-sol',displayName:'GPT-6 Sol',defaultReasoningEffort:'medium',supportedReasoningEfforts:[{reasoningEffort:'medium'}]},{id:'gpt-6-astra',model:'gpt-6-astra',displayName:'GPT-6 Astra',defaultReasoningEffort:'ultra',supportedReasoningEfforts:[{reasoningEffort:'ultra'}]}],nextCursor:null};
 if(m.method==='thread/list')result={data:threads.filter(t=>!m.params.cwd||m.params.cwd.includes(t.cwd)),nextCursor:null};
@@ -35,6 +37,10 @@ if(m.method==='thread/goal/get')result={goal:null};
 if(m.method==='config/read')result={config:{model:'gpt-6-sol',model_reasoning_effort:'medium'}};
 if(['app/list','mcpServerStatus/list','skills/list','experimentalFeature/list','permissionProfile/list'].includes(m.method))result={data:[],nextCursor:null};
 if(m.method==='app/installed')result={apps:[]};
+if(calendar&&m.params?.threadId==='calendar-source-fixture'){
+if(m.method==='mcpServerStatus/list')result={data:[{name:'codex_apps',httpOrigin:'https://chatgpt.com',tools:calendar.tools}],nextCursor:null};
+if(m.method==='app/installed')result={apps:[{id:'fixture-calendar',enabled:true,callable:true}]};
+}
 if(['turn/start','turn/steer','thread/start','thread/fork','thread/compact/start','mcpServer/tool/call','command/exec'].includes(m.method))return process.stdout.write(JSON.stringify({id:m.id,error:{code:-32000,message:'Feedback fixture refuses inference and tools'}})+'\\n');
 process.stdout.write(JSON.stringify({id:m.id,result})+'\\n');});
 `, { mode: 0o755 });
