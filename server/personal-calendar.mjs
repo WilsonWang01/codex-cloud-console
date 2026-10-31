@@ -64,8 +64,12 @@ export async function readTodayCalendar({ request, cwd, model = "gpt-6-sol", win
   return withPersonalSource({ request, cwd, model, prefix: "calendar", label: "日历", toolNames: ["google_calendar.search"],
     timeoutMs: calendarSourceLimits.timeoutMs, resultBytes: calendarSourceLimits.resultBytes, onThread, now }, async ({ server, tools, invoke }) => {
     const tool = tools["google_calendar.search"];
-    const accounts = new Set(Object.values(server.tools).filter(item => item._meta?.connector_id === tool._meta.connector_id).map(item => item._meta?.link_id));
-    if (accounts.size !== 1 || tool._meta.link_accounts != null && (!Array.isArray(tool._meta.link_accounts) || tool._meta.link_accounts.length !== 1 || tool._meta.link_accounts[0]?.link_id !== tool._meta.link_id)) throw fail("calendar_account_ambiguous", "连接了多个日历账号或来源无法确认，尚未选择来源，未自动读取任一账号", 409);
+    const connectedTools = Object.values(server.tools).filter(item => item._meta?.connector_id === tool._meta.connector_id);
+    const accounts = new Set(connectedTools.map(item => item._meta?.link_id));
+    if (accounts.size !== 1 || connectedTools.some(item => {
+      const links = item._meta?.link_accounts;
+      return links != null && (!Array.isArray(links) || links.length !== 1 || links[0]?.link_id !== tool._meta.link_id);
+    })) throw fail("calendar_account_ambiguous", "连接了多个日历账号或来源无法确认，尚未选择来源，未自动读取任一账号", 409);
     const args = { calendar_id: "primary", time_min: window.from, time_max: window.to, max_results: calendarSourceLimits.pageSize };
     const events = new Map(), seen = new Set();
     let next = null, pages = 0;

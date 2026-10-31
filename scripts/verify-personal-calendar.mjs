@@ -208,6 +208,44 @@ test("multiple linked calendars or invalid source identifiers require an explici
   assert.equal(consolidated.reads(), 0);
 });
 
+test("account ambiguity declared by another tool blocks calendar reads and preserves the prior snapshot", async () => {
+  for (const links of [[{ link_id: "account-1" }, { link_id: "account-2" }], [], [{ link_id: "account-2" }], {}]) {
+    const f = fixture(), old = await f.source.refresh("Asia/Shanghai");
+    f.advance(31000);
+    f.tools.data[0].tools["google_calendar.read_event"] = {
+      _meta: { connector_id: "calendar", link_id: "account-1", link_accounts: links },
+    };
+    const result = await f.source.refresh("Asia/Shanghai");
+    assert.equal(result.lastAttempt?.code, "calendar_account_ambiguous");
+    assert.equal(result.stale, true);
+    assert.deepEqual(result.snapshot, old.snapshot);
+    assert.equal(f.reads(), 1, "ambiguity must be rejected before another data read");
+    assert.equal(f.source.activeCount(), 0);
+    const reopened = createPersonalCalendarSource(f.options);
+    assert.equal((await reopened.snapshot("Asia/Shanghai")).stale, true);
+    f.tools.data[0].tools["google_calendar.read_event"]._meta.link_accounts = [{ link_id: "account-1" }];
+    f.advance(31000);
+    const recovered = await reopened.refresh("Asia/Shanghai");
+    assert.equal(recovered.stale, false);
+    assert.deepEqual(recovered.snapshot.items, old.snapshot.items);
+    assert.equal(f.reads(), 2, "restoring one consistent account still requires an explicit new refresh");
+  }
+});
+
+test("consistent calendar tools and unrelated multi-account connectors do not block the selected source", async () => {
+  const f = fixture();
+  f.tools.data[0].tools["google_calendar.read_event"] = {
+    _meta: { connector_id: "calendar", link_id: "account-1", link_accounts: [{ link_id: "account-1" }] },
+  };
+  f.tools.data[0].tools["gmail.read_email"] = {
+    _meta: { connector_id: "gmail", link_id: "mail-1", link_accounts: [{ link_id: "mail-1" }, { link_id: "mail-2" }] },
+  };
+  const result = await f.source.refresh("Asia/Shanghai");
+  assert.equal(result.stale, false);
+  assert.equal(result.snapshot.account.id, "account-1");
+  assert.equal(f.reads(), 1);
+});
+
 test("observed Calendar connector strings and web_link become verifiable sources without inventing an original time zone", async () => {
   const f = fixture();
   const observed = { id: "synthetic-observed-event", summary: "Codex Cloud 验收测试（自动清理）", status: "confirmed", start: "2026-10-23T15:50:00Z", end: "2026-10-23T15:55:00Z",
