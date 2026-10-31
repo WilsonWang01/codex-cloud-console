@@ -69,6 +69,7 @@ const LazyPersonalFacts = recoverableLazy(() => import("./PersonalFacts"));
 const LazyPersonalCommitments = recoverableLazy(() => import("./PersonalCommitments"));
 const LazyPersonalBrief = recoverableLazy(() => import("./PersonalBrief"));
 const LazyPersonalCalendar = recoverableLazy(() => import("./PersonalCalendar"));
+const LazyPersonalCalendarActions = recoverableLazy(() => import("./PersonalCalendarActions"));
 const LazyPersonalMail = recoverableLazy(() => import("./PersonalMail"));
 const LazyPersonalReminders = recoverableLazy(() => import("./PersonalReminders"));
 const LazyGitHubIssues = recoverableLazy(() => import("./GitHubIssues"));
@@ -6602,7 +6603,9 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   attentionBusy: string | null;
 }) {
   const [dueCount, setDueCount] = useState<number | null>(null);
+  const [calendarDecisionCount, setCalendarDecisionCount] = useState<number | null>(null);
   const updateDueCount = useCallback((count: number) => setDueCount(count), []);
+  const updateCalendarDecisionCount = useCallback((count: number | null) => setCalendarDecisionCount(count), []);
   const [recentFiles, setRecentFiles] = useState<Array<{ path: string; name: string; updatedAt: string }>>([]);
   const [filesError, setFilesError] = useState("");
   const [filesLoading, setFilesLoading] = useState(true);
@@ -6634,9 +6637,9 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
   const upcoming = status.automations.filter((item) => item.repoId === repo.id && item.enabled && Number.isFinite(Date.parse(item.nextRun))).sort((a, b) => Date.parse(a.nextRun) - Date.parse(b.nextRun)).slice(0, 3);
   const repeatable = status.automations.filter((item) => item.repoId === repo.id && item.personalRoutine).slice(0, 3);
   const recentRuns = (status.automationRuns || []).filter((run) => run.repoId === repo.id && run.finishedAt).sort((a, b) => Date.parse(b.finishedAt || "") - Date.parse(a.finishedAt || "")).slice(0, 3);
-  const decisionCount = approvalCount + queuedNeedsAttention.length + externalNeedsAttention.length + needsAttention.length;
-  const guideFirst = !decisionCount && dueCount === 0 && !running.length && !queuedInFlight.length && !goals.length && !upcoming.length && !repeatable.length && !recentFiles.length && !recentRuns.length && !filesLoading && !filesError;
-  const summary = decisionCount ? `${decisionCount} 项需要你处理` : dueCount ? `${dueCount} 项关注事项今天或此前到期` : running.length || queuedInFlight.length ? "任务正在继续处理" : dueCount === null || filesLoading ? "正在整理今日事项…" : "目前没有需要你决定的事项";
+  const decisionCount = approvalCount + queuedNeedsAttention.length + externalNeedsAttention.length + needsAttention.length + (calendarDecisionCount || 0);
+  const guideFirst = !decisionCount && dueCount === 0 && calendarDecisionCount === 0 && !running.length && !queuedInFlight.length && !goals.length && !upcoming.length && !repeatable.length && !recentFiles.length && !recentRuns.length && !filesLoading && !filesError;
+  const summary = decisionCount ? `${decisionCount} 项需要你处理` : dueCount ? `${dueCount} 项关注事项今天或此前到期` : running.length || queuedInFlight.length ? "任务正在继续处理" : dueCount === null || filesLoading ? "正在整理今日事项…" : calendarDecisionCount === null ? "日程提案尚未核对" : "目前没有需要你决定的事项";
   const guide = <PersonalAssistantGuide onChoose={onChooseTask} onConnect={onConnections} heading="可以交办" />;
   const runDetail = (run: AutomationRun) => `${run.status === "completed" ? "运行完成" : run.status === "failed" ? "运行失败" : run.status === "needs_reconciliation" ? "外部操作待核对" : ["canceled", "cancelled"].includes(run.status) ? runStatusLabel(run.status) : "运行已结束"} · ${new Date(run.finishedAt || "").toLocaleString()}`;
   return <div className="personal-page personal-today">
@@ -6648,6 +6651,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
     {decisionCount > 0 && <section className="personal-list-section personal-priority-section">
       <h2>需要你决定 <small>{decisionCount}</small></h2>
       {approvalCount > 0 && <PersonalActivityRow title={`${approvalCount} 项待确认请求`} detail="查看具体操作后再决定，离开页面不会自动批准" onClick={() => document.querySelector(".pending-approvals")?.scrollIntoView({ behavior: "smooth", block: "start" })} />}
+      {Boolean(calendarDecisionCount) && <PersonalActivityRow title={`${calendarDecisionCount} 条日程提案待核对`} detail="核对草稿或未确认的执行结果，不会自动创建或重试" onClick={() => document.querySelector(".calendar-actions")?.scrollIntoView({ behavior: "smooth", block: "start" })} />}
       {externalNeedsAttention.map((session) => <PersonalActivityRow key={`external:${session.id}`} title={`${sessionDisplayTitle(session)} · 外部操作待核对`} detail={`${session.externalActionReview!.server} / ${session.externalActionReview!.tool} · ${session.externalActionReview!.reason}`} onClick={() => onContinue(session.id)} />)}
       {queuedNeedsAttention.map((session) => <PersonalActivityRow key={`queue:${session.id}`} title={`${sessionDisplayTitle(session)} · 待核对`} detail={session.queuedTurn?.reason || "核对上一轮结果后，撤回消息或决定是否重发"} onClick={() => onContinue(session.id)} />)}
       {needsAttention.map((item) => {
@@ -6663,6 +6667,7 @@ function PersonalToday({ status, repo, approvalCount, authOk, sessions, onContin
     </section>}
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取变化…</p></section>}><LazyPersonalBrief refreshKey={status.generatedAt} onContinue={onContinue} /></Suspense>
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取日历记录…</p></section>}><LazyPersonalCalendar refreshKey={status.generatedAt} onChooseTask={onChooseTask} onConnections={onConnections} /></Suspense>
+    <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取日程提案…</p></section>}><LazyPersonalCalendarActions onContinue={onContinue} onDraft={onChooseTask} onPendingCountChange={updateCalendarDecisionCount} /></Suspense>
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取邮件记录…</p></section>}><LazyPersonalMail refreshKey={status.generatedAt} onChooseTask={onChooseTask} onConnections={onConnections} /></Suspense>
     {guideFirst && guide}
     <Suspense fallback={<section className="personal-list-section"><p className="personal-empty">正在读取关注事项…</p></section>}>
@@ -7025,6 +7030,8 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo, f
   const body = displayProjectMessageText(message.text || (message.streaming ? " " : "Codex 没有返回内容。"), repo);
   const attachments = messageTimelineAttachments(message, repo);
   const status = timelineStatusLabel(message.status);
+  const proposal = repo.kind === "personal" && message.details?.personalCalendarProposal && typeof message.details.personalCalendarProposal === "object"
+    ? message.details.personalCalendarProposal as Record<string, unknown> : null;
   return (
     <article data-chat-message-id={message.id} className={cx("chat-bubble", message.role, message.streaming && "streaming", meta.className)}>
       <span className="chat-avatar">{message.role === "user" ? <Sparkles size={16} /> : <Bot size={16} />}</span>
@@ -7035,6 +7042,7 @@ const ChatTimelineMessage = memo(function ChatTimelineMessage({ message, repo, f
           <small>{timeLabel(message.time)}</small>
         </strong>
         <ChatMessageText text={body} pre={meta.pre} streaming={message.streaming} />
+        {proposal?.available === true && typeof proposal.id === "string" && /^[a-f0-9-]{36}$/.test(proposal.id) && <a className="mini-action calendar-proposal-link" href="#/project/_personal/today"><ListTodo size={16} />查看日程提案</a>}
         <MessageAttachments attachments={attachments} />
         {onFeedback && message.turnId && <PersonalMessageFeedback message={{ id: message.id, turnId: message.turnId, text: message.text }}
           entry={feedbackEntry} disabled={Boolean(feedbackDisabled)} saving={Boolean(feedbackSaving)} error={feedbackError} onSave={onFeedback} />}

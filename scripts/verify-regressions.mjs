@@ -949,6 +949,39 @@ return original(url,{...options,port:${tls.address().port},ca:fs.readFileSync(${
   }
 });
 
+await check("trigger rate window rejects new keys while preserving original idempotent requests", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-trigger-window-"));
+  const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
+  const repo = path.join(cloudRoot, "workspace/sample-app");
+  for (const directory of [repo, stateRoot, bin]) await fs.mkdir(directory, { recursive: true });
+  await initializeGitFixture(repo);
+  const fake = await writeFakeCodex(root);
+  await fs.writeFile(path.join(bin, "codex"), `#!/bin/sh\nexec "${process.execPath}" "${fake}"\n`, { mode: 0o755 });
+  const port = await freePort(), base = `http://127.0.0.1:${port}`, windowMs = 5_000;
+  const headers = { "content-type": "application/json", "x-codex-cloud-token": "rate-fixture-token-123456" };
+  const server = spawn(process.execPath, [path.join(projectRoot, "server/index.mjs")], { cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], env: {
+    ...process.env, NODE_ENV: "production", HOST: "127.0.0.1", PORT: String(port), CODEX_CLOUD_ROOT: cloudRoot,
+    CODEX_STATE_ROOT: stateRoot, CODEX_HOME: path.join(root, ".codex"), CODEX_ALLOW_LOCAL_FALLBACK: "0",
+    CODEX_CLOUD_WEBHOOK_TOKEN: headers["x-codex-cloud-token"], CODEX_PERSONAL_MODE: "disabled",
+    CODEX_AUTOMATION_TRIGGER_RATE_MAX: "1", CODEX_AUTOMATION_TRIGGER_RATE_WINDOW_MS: String(windowMs), PATH: `${bin}:${process.env.PATH}`,
+  } });
+  const submit = key => jsonRequest(base, "/api/automations/sample-maintenance/webhook", { method: "POST",
+    headers: { ...headers, "idempotency-key": key }, body: JSON.stringify({ prompt: "synthetic isolated rate window", worktree: false }) });
+  try {
+    await waitForOutput(server, /listening on/);
+    const acceptedAt = Date.now(), first = await submit("rate-window-original-0001");
+    assert.equal(first.response.status, 200, JSON.stringify(first.data));
+    const replay = await submit("rate-window-original-0001");
+    assert.equal(replay.response.status, 200); assert.equal(replay.data.deduplicated, true); assert.equal(replay.data.run.id, first.data.run.id);
+    const rejected = await submit("rate-window-new-0002");
+    assert.equal(rejected.response.status, 429, JSON.stringify({ elapsedMs: Date.now() - acceptedAt, data: rejected.data }));
+    assert.match(rejected.data.error, /trigger rate limit exceeded/); assert.ok(Number(rejected.response.headers.get("retry-after")) >= 1);
+    await new Promise(resolve => setTimeout(resolve, windowMs + 100));
+    const expired = await submit("rate-window-new-0002");
+    assert.equal(expired.response.status, 200, JSON.stringify(expired.data)); assert.notEqual(expired.data.run.id, first.data.run.id);
+  } finally { await stopProcess(server); await fs.rm(root, { recursive: true, force: true }); }
+});
+
 await check("durable API queue survives lost responses and restart without repeating claimed work", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-durable-api-"));
   const cloudRoot = path.join(root, "cloud"), stateRoot = path.join(root, "state"), bin = path.join(root, "bin");
@@ -2610,7 +2643,7 @@ await check("personal and work reuse authentication without sharing threads or s
     assert.equal(starts[1].params.sandbox, "read-only");
     assert.equal(starts[1].params.config.features.memories, false);
     assert.equal(starts[0].params.dynamicTools, undefined);
-    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference", "personal_mail_draft"]);
+    assert.deepEqual(starts[1].params.dynamicTools.map(tool => tool.name), ["personal_memory_propose", "personal_facts_reference", "personal_mail_draft", "personal_calendar_propose"]);
     assert.match(starts[1].params.developerInstructions, /only this conversation/);
     const personalSessionId = sessions[1].sessionId;
     const writable = await jsonRequest(base, `/api/chat/sessions/${personalSessionId}/runtime`, {
@@ -4235,13 +4268,7 @@ await check("session sync failure preserves drafts and upload cleanup is verifie
     assert.equal(duplicateTrigger.response.status, 200);
     assert.equal(duplicateTrigger.data.deduplicated, true);
     assert.equal(duplicateTrigger.data.run?.id, firstTrigger.data.run.id);
-    const rateLimitedTrigger = await jsonRequest(baseUrl, "/api/automations/sample-maintenance/webhook", {
-      method: "POST",
-      headers: { ...triggerHeaders, "idempotency-key": "regression-idempotency-2" },
-      body: triggerBody,
-    });
-    assert.equal(rateLimitedTrigger.response.status, 429);
-    assert.ok(Number(rateLimitedTrigger.response.headers.get("retry-after")) >= 1);
+    // The independent rate-window fixture owns rejection/expiry; this mixed fixture keeps its short window.
     await new Promise((resolve) => setTimeout(resolve, 400));
     // Model completion precedes automation settlement and admission release.
     for (let attempt = 0; attempt < 50; attempt += 1) {

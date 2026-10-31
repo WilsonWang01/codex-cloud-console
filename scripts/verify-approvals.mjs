@@ -101,6 +101,7 @@ test("unattended personal schedules decline approvals before they enter the pend
   let brokerCalls = 0;
   const context = vm.createContext({
     personalSources: [{ ownsThread: () => false }, { ownsThread: () => false }],
+    personalCalendarActions: { ownsThread: () => false },
     findTurnJob: () => job,
     ownerFromParams: params => ({ turnId: params.turnId }),
     findCompactJob: () => null,
@@ -150,6 +151,7 @@ test("回合结束只关闭本次审批，旧审批和取消竞态不能继续�
   const source = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8");
   const job = { repoId: "repo", sessionId: "s", turnId: "turn" };
   const context = vm.createContext({ personalSources: [{ ownsThread: () => false }, { ownsThread: () => false }], ownerFromParams: () => ({ turnId: "turn" }),
+    personalCalendarActions: { ownsThread: () => false },
     findTurnJob: () => job, findCompactJob: () => null, recordAppServerRequestDecision: () => {}, declineAppServerRequest,
     approvalBroker: { request: async () => { job.cancelRequested = true; return { decision: "accept" }; } },
   });
@@ -161,7 +163,7 @@ test("个人邮件工具只进入当前已归属回合的草稿处理器，受�
   const source=fs.readFileSync(new URL("../server/index.mjs",import.meta.url),"utf8");
   const job={repo:{kind:"personal"},repoId:"_personal",sessionId:"session",threadId:"thread",turnId:"turn"};let calls=0;
   const store={};
-  const context=vm.createContext({personalSources:[],ownerFromParams:p=>({turnId:p.turnId}),findTurnJob:p=>p.threadId===job.threadId&&p.turnId===job.turnId?job:null,findCompactJob:()=>null,
+  const context=vm.createContext({personalSources:[],personalCalendarActions:{ownsThread:()=>false},ownerFromParams:p=>({turnId:p.turnId}),findTurnJob:p=>p.threadId===job.threadId&&p.turnId===job.turnId?job:null,findCompactJob:()=>null,
     recordAppServerRequestDecision:()=>{},declineAppServerRequest,personalMailDraftTool,personalMailDrafts:store,
     handlePersonalMailDraftCall:async(p,actual,actualStore)=>{assert.equal(actual,job);assert.equal(actualStore,store);assert.equal(p.tool,personalMailDraftTool.name);calls++;return{success:true};}});
   vm.runInContext(source.slice(source.indexOf("async function appServerRequestResult("),source.indexOf("\nfunction personalAppServerRequestResult(")),context);
@@ -169,6 +171,25 @@ test("个人邮件工具只进入当前已归属回合的草稿处理器，受�
   assert.equal((await context.appServerRequestResult("item/tool/call",params)).success,true);assert.equal(calls,1);
   await assert.rejects(context.appServerRequestResult("item/tool/call",{...params,turnId:"old"}),/不属于当前已确认/);assert.equal(calls,1);
   job.executionProfile={};assert.equal((await context.appServerRequestResult("item/tool/call",params)).success,false);assert.equal(calls,1);
+});
+
+test("日程动作所属线程只把既定人工表单交给审批，其他线程仍按回合归属拒绝", async () => {
+  const source = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8"), calls = [];
+  const context = vm.createContext({
+    personalSources: [{ ownsThread: () => false }], personalRepoId: "_personal",
+    personalCalendarActions: { ownsThread: id => id === "calendar-owned", canApprove: (method, params) => method === "mcpServer/elicitation/request" && params.serverName === "codex_apps" && params.mode === "form" },
+    findTurnJob: () => null, findCompactJob: () => null, ownerFromParams: () => ({}), recordAppServerRequestDecision() {}, declineAppServerRequest,
+    approvalBroker: { request: async (method, params, owner) => { calls.push({ method, params, owner }); return { action: "accept" }; } },
+  });
+  vm.runInContext(source.slice(source.indexOf("async function appServerRequestResult("), source.indexOf("\nfunction personalAppServerNotification(")), context);
+  const params = { threadId: "calendar-owned", serverName: "codex_apps", mode: "form" };
+  for (const handler of [context.appServerRequestResult, context.personalAppServerRequestResult]) {
+    assert.equal((await handler("mcpServer/elicitation/request", params)).action, "accept");
+    for (const patch of [{ mode: "url" }, { serverName: "other" }]) await assert.rejects(handler("mcpServer/elicitation/request", { ...params, ...patch }), /不允许扩权/);
+    await assert.rejects(handler("item/permissions/requestApproval", params), /不允许扩权/);
+  }
+  assert.equal((await context.appServerRequestResult("mcpServer/elicitation/request", { ...params, threadId: "unrelated" })).action, "decline");
+  assert.equal(calls.length, 2); assert.equal(calls.every(call => call.owner.repoId === "_personal" && call.params.threadId === "calendar-owned"), true);
 });
 
 test("immediate decline follows each supported app-server response shape", () => {

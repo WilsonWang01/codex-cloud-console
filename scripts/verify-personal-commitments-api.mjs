@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { waitForConsoleReady } from "./fixtures/console-ready.mjs";
 
 test("personal draft HTTP retries, restart and legacy migration preserve one unsent draft", { timeout: 20_000 }, async () => {
   const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -42,11 +43,7 @@ test("personal draft HTTP retries, restart and legacy migration preserve one uns
     });
     server.stdout.on("data", (chunk) => { logs += chunk; });
     server.stderr.on("data", (chunk) => { logs += chunk; });
-    for (let attempt = 0; attempt < 100 && !logs.includes("listening on"); attempt += 1) {
-      if (server.exitCode !== null) throw new Error(logs);
-      await new Promise((resolve) => setTimeout(resolve, 30));
-    }
-    assert.match(logs, /listening on/);
+    await waitForConsoleReady({ child: server, baseUrl: `http://127.0.0.1:${port}`, logs: () => logs, timeoutMs: 7_000 });
   };
   const request = async (route, method = "GET", body) => {
     const response = await fetch(`http://127.0.0.1:${port}${route}`, {

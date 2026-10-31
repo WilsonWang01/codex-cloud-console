@@ -570,6 +570,7 @@ function createHttpProxy() {
     headers["x-codex-cloud-request-id"] = requestId;
     const isModelApiRequest = req.method === "POST" && Boolean(modelApiProtocol(targetUrl.pathname));
     const isPersonalSourceRead = req.method === "POST" && ["/api/personal/calendar/refresh", "/api/personal/mail/accounts", "/api/personal/mail/refresh"].includes(targetUrl.pathname);
+    const isCalendarAction = req.method === "POST" && /^\/api\/personal\/calendar-proposals(?:\/[a-f0-9-]{36}\/(?:preview|rebind|check|execute))?\/?$/.test(targetUrl.pathname);
     const isClientApiRequest = isExternalApiPath(targetUrl.pathname);
     if (credentials.token && !isClientApiRequest) headers["x-codex-cloud-token"] = credentials.token;
     if (targetUrl.protocol === "https:" && credentials.password && !isClientApiRequest) headers.authorization = authHeader;
@@ -586,7 +587,7 @@ function createHttpProxy() {
       String(req.headers.accept || "").includes("text/event-stream");
     const shouldBufferResponse = canRetry && !isStreamingRequest;
     const upstreamAgent = targetUrl.protocol === "https:"
-      ? (isStreamingRequest || isModelApiRequest ? streamingHttpsAgent : upstreamHttpsAgent)
+      ? (isStreamingRequest || isModelApiRequest || isCalendarAction ? streamingHttpsAgent : upstreamHttpsAgent)
       : false;
     const isHealthRequest = targetUrl.pathname === "/healthz" || targetUrl.pathname === "/api/status";
     const maxRetries = isHealthRequest ? 0 : proxyGetRetryLimit;
@@ -625,7 +626,7 @@ function createHttpProxy() {
       const responseTimer = setTimeout(() => {
         if (responded) return;
         upstream?.destroy(new Error("upstream did not send headers in time"));
-      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : isModelApiRequest ? proxyModelApiHeaderTimeoutMs : isPersonalSourceRead ? Math.max(60_000, proxyHeaderTimeoutMs) : proxyHeaderTimeoutMs);
+      }, isHealthRequest ? proxyHealthHeaderTimeoutMs : isModelApiRequest ? proxyModelApiHeaderTimeoutMs : isCalendarAction ? Math.max(130_000, proxyHeaderTimeoutMs) : isPersonalSourceRead ? Math.max(60_000, proxyHeaderTimeoutMs) : proxyHeaderTimeoutMs);
 
       upstream = transport.request(
         {
