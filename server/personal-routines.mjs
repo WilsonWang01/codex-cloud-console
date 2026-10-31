@@ -214,6 +214,7 @@ export function createPersonalRoutinesStore(filePath) {
         ["failed", "needs_reconciliation", "interrupted", "canceled"].includes(status)) {
         routine.personalSchedule.enabled = false;
         routine.personalSchedule.nextRunAt = null;
+        routine.personalTestApproval = null;
       }
       return routine || null;
     }),

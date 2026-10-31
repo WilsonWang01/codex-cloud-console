@@ -49,6 +49,8 @@ test("schedule is opt-in, claims at most once, survives restart and pauses on fa
     const failed = await store.settleClaim(claim.runId, "failed", "auth unavailable");
     assert.equal(failed.personalSchedule.enabled, false);
     assert.equal(failed.personalSchedule.lastResult.status, "failed");
+    assert.equal(failed.personalTestApproval, null);
+    await assert.rejects(store.configureSchedule(routine.id, { revision: failed.revision, enabled: true, ...shanghai }), /试运行/);
     assert.equal(await store.claimDue(Date.parse("2026-09-29T01:00:15Z")), null);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
