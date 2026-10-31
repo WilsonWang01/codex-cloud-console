@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { CodexAppServerClient } from "../server/codex-app-server-client.mjs";
-import { profileThreadConfig, verifyProfileThread, profileSandbox } from "../server/automation-execution-profile.mjs";
+import { profileThreadConfig } from "../server/automation-execution-profile.mjs";
 import { personalDeveloperInstructions } from "../server/personal-runtime.mjs";
 import { createPersonalFactsStore, personalFactContextIssue } from "../server/personal-facts.mjs";
 import { personalMemoryTool, handlePersonalMemoryCall } from "../server/personal-memory.mjs";
@@ -13,19 +14,29 @@ import { personalFactReferenceTool, handlePersonalFactReferenceCall } from "../s
 import { createTurnUsageMeter } from "../server/run-usage.mjs";
 
 const live = process.argv.includes("--live");
-assert.ok(process.argv.slice(2).every(arg => arg === "--live"), "Only --live is supported");
+const deletionOnly = process.argv.includes("--deletion-only");
+assert.ok(process.argv.slice(2).every(arg => ["--live", "--deletion-only"].includes(arg)), "Unsupported quality-check option");
 if (live) assert.equal(process.env.CODEX_PERSONAL_LIVE_APPROVED, "1", "Live inference requires an explicit quota approval");
-const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", "--package=@openai/codex@0.157.1", "-c", "command -v codex"], { encoding: "utf8" }).trim();
+const expectedVersion = process.env.CODEX_SCHEMA_CLI_VERSION || "0.157.1";
+assert.ok(["0.157.1", "0.165.0"].includes(expectedVersion), "Use an explicitly verified CLI version");
+const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", `--package=@openai/codex@${expectedVersion}`, "-c", "command -v codex"], { encoding: "utf8" }).trim();
 const version = execFileSync(command, ["--version"], { encoding: "utf8" }).trim();
-assert.match(version, /^codex-cli 0\.157\.1$/);
+assert.equal(version, `codex-cli ${expectedVersion}`);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-quality-"));
 await fs.chmod(root, 0o700);
-const cwd = path.join(root, "workspace"), home = path.join(root, "home");
-await fs.mkdir(cwd); await fs.mkdir(home);
+const cwd = live ? process.env.CODEX_PERSONAL_LIVE_CWD : path.join(root, "workspace"), home = path.join(root, "home");
+assert.ok(cwd && path.isAbsolute(cwd), "Live checks require an existing trusted directory; never add project trust");
+if (!live) await fs.mkdir(cwd);
+await fs.mkdir(home);
+const configPath = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "config.toml");
+const configDigest = async () => crypto.createHash("sha256").update(await fs.readFile(configPath)).digest("hex");
+let beforeConfig;
 const store = createPersonalFactsStore(path.join(root, "synthetic-facts.json"));
 const report = { mode: live ? "live-inference-synthetic-data" : "loopback-synthetic-provider", cli: version,
-  model: "gpt-6-sol", effort: "medium", cases: [], modelTurnsStarted: 0, syntheticProviderRequests: 0,
+  model: "gpt-6-sol", effort: "medium", scenario: deletionOnly ? "deleted-fact-new-context" : "candidate-and-correction", cases: [], modelTurnsStarted: 0, syntheticProviderRequests: 0,
   thirdPartyBusinessCalls: 0, productionFactsWritten: 0, humanRatings: 0 };
+const features = { apps: false, plugins: false, remote_plugin: false, multi_agent: false, shell_tool: false, hooks: false, memories: false,
+  browser_use: false, browser_use_external: false, computer_use: false, image_generation: false, view_image: false, goals: false, sleep_tool: false, skip_host_skill_discovery: true };
 let client, active, providerError, timer;
 const provider = live ? null : http.createServer(async (req, res) => {
   try {
@@ -35,12 +46,14 @@ const provider = live ? null : http.createServer(async (req, res) => {
     assert.ok(active && ++active.providerRequests <= 2);
     const tool = active.kind === "candidate" ? personalMemoryTool : personalFactReferenceTool;
     assert.ok(JSON.stringify(data.tools || data.input).includes(tool.name));
+    const deleted = active.kind === "deleted-fact-new-context";
+    if (deleted) assert.deepEqual(active.snapshot.facts, []);
     if (active.providerRequests === 2) assert.ok(data.input.some(item => item.type === "function_call_output" && item.call_id === active.callId));
-    const output = active.providerRequests === 1
+    const output = active.providerRequests === 1 && !deleted
       ? [{ id: "fc_quality", type: "function_call", call_id: active.callId, name: tool.name, status: "completed",
         arguments: JSON.stringify(active.kind === "candidate" ? { label: "虚构饮品偏好", value: "虚构用户偏好无糖红茶", reason: "虚构用户明确提出长期偏好" } : { factIds: [active.snapshot.facts[0].id] }) }]
       : [{ id: "msg_quality", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", annotations: [],
-        text: active.kind === "candidate" ? "偏好候选已保存，请到个人设置确认，尚未生效。" : `按你的偏好，建议${active.expected}。这只是建议，没有订票。` }] }];
+        text: deleted ? "没有可用的已确认偏好资料，请补充你对园区交通的偏好，我再建议；尚未预约或付款。" : active.kind === "candidate" ? "偏好候选已保存，请到个人设置确认，尚未生效。" : `按你的偏好，建议${active.expected}。这只是建议，没有订票。` }] }];
     res.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
     const emit = (type, value) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
     emit("response.created", { response: { id: "quality-" + report.syntheticProviderRequests, status: "in_progress", output: [] } });
@@ -56,14 +69,21 @@ async function runCase(kind, prompt, expected = null) {
   const job = { kind: "turn", repo: { kind: "personal" }, sessionId: "synthetic-session", personalFactSnapshot: snapshot };
   active = { kind, snapshot, expected, callId: "quality-" + report.cases.length, providerRequests: 0, calls: [], meter: createTurnUsageMeter(), job, items: [] };
   const config = (await client.request("config/read", { cwd, includeLayers: false }, 15000)).config;
-  const thread = await client.request("thread/start", { cwd, model: report.model, ephemeral: true, approvalPolicy: "never", sandbox: "workspace-write",
-    config: profileThreadConfig(config, cwd), dynamicTools: [personalMemoryTool, personalFactReferenceTool],
-    developerInstructions: personalDeveloperInstructions({ sandbox: "read-only" }, snapshot.facts) +
-      "\nThis is a synthetic personal-assistant quality check. Use only the supplied conversation and personal tools. Do not call shell, files, network, search, delegation, scheduling, connectors or administration tools. Reply briefly in Chinese." }, 20000);
+  if (live) assert.equal(config.projects?.[cwd]?.trust_level, "trusted", "Use existing project trust; do not register a new directory");
+  const profile = profileThreadConfig(config, cwd);
+  const instructions = personalDeveloperInstructions({ sandbox: "read-only" }, snapshot.facts) +
+    "\nThis is a synthetic personal-assistant quality check. Use only the supplied conversation and personal tools. Do not call shell, files, network, search, delegation, scheduling, connectors or administration tools. Reply briefly in Chinese.";
+  if (kind === "deleted-fact-new-context") assert.doesNotMatch(instructions, /青岚|QX-731/);
+  const thread = await client.request("thread/start", { cwd, model: report.model, ephemeral: true, approvalPolicy: "never", sandbox: "read-only",
+    config: { ...profile, features: { ...profile.features, ...features } }, dynamicTools: [personalMemoryTool, personalFactReferenceTool],
+    developerInstructions: instructions }, 20000);
   assert.equal(thread.model, report.model);
   assert.equal(thread.thread.ephemeral, true, "Synthetic evidence must not be added to stored thread history");
   assert.equal(thread.modelProvider, live ? "openai" : "quality_fixture");
-  await verifyProfileThread((...args) => client.request(...args), thread, cwd);
+  assert.equal(thread.cwd, cwd); assert.equal(thread.approvalPolicy, "never"); assert.deepEqual(thread.sandbox, { type: "readOnly", networkAccess: false });
+  const connectors = await client.request("mcpServerStatus/list", { threadId: thread.thread.id, cursor: null, limit: 100, detail: "toolsAndAuthOnly" }, 15000);
+  assert.equal(connectors.nextCursor, null); assert.ok(Array.isArray(connectors.data) && connectors.data.length <= 100);
+  const names = new Set(); for (const entry of connectors.data) { assert.ok(typeof entry.name === "string" && !names.has(entry.name)); names.add(entry.name); assert.equal(entry.runtimeStatus, "disabled"); assert.deepEqual(entry.tools, {}); }
   job.threadId = thread.thread.id;
   const completed = new Promise((resolve, reject) => {
     timer = setTimeout(() => reject(new Error("Personal quality turn exceeded 120 seconds; no retry")), 120000);
@@ -72,18 +92,26 @@ async function runCase(kind, prompt, expected = null) {
   const started = Date.now();
   report.modelTurnsStarted++;
   const turn = await client.request("turn/start", { threadId: job.threadId, model: report.model, effort: report.effort,
-    approvalPolicy: "never", sandboxPolicy: profileSandbox(cwd), input: [{ type: "text", text: prompt }] }, 20000);
+    approvalPolicy: "never", sandboxPolicy: { type: "readOnly", networkAccess: false }, input: [{ type: "text", text: prompt }] }, 20000);
   job.turnId ||= turn.turn.id;
   const terminal = await completed; clearTimeout(timer); timer = null;
   assert.equal(terminal.id, job.turnId); assert.equal(terminal.status, "completed", JSON.stringify(terminal.error));
   const assistantText = active.items.filter(item => item.type === "agentMessage").map(item => item.text).join("\n");
   const forbidden = active.items.filter(item => !["reasoning", "agentMessage", "userMessage", "dynamicToolCall"].includes(item.type));
   const result = { kind, threadId: job.threadId, turnId: job.turnId, elapsedMs: Date.now() - started,
+    providedFacts: snapshot.context.facts, instructionsSha256: crypto.createHash("sha256").update(instructions).digest("hex"),
     assistantText, calls: active.calls, unexpectedItemTypes: forbidden.map(item => item.type), usage: active.meter.snapshot() };
   report.cases.push(result);
   assert.equal(providerError, undefined); assert.deepEqual(result.unexpectedItemTypes, []);
   assert.equal(result.usage.status, "complete", JSON.stringify(result.usage));
   assert.ok(assistantText.trim());
+  if (kind === "deleted-fact-new-context") {
+    assert.deepEqual(snapshot.facts, []); assert.deepEqual(active.calls, []);
+    assert.deepEqual((await store.snapshot()).facts, []); assert.deepEqual((await store.overview()).candidates, []);
+    assert.doesNotMatch(assistantText, /青岚|QX-731/);
+    assert.match(assistantText, /(?:没有|尚未|未提供|缺少|无法|不能|不清楚|不确定)[\s\S]*(?:资料|偏好)|(?:资料|偏好)[\s\S]*(?:没有|尚未|未提供|缺少|无法|不能|不清楚|不确定)/);
+    return { snapshot, threadId: job.threadId, result };
+  }
   assert.equal(active.calls.length, 1, "Exactly one relevant personal tool call is expected");
   assert.equal(active.calls[0].success, true);
   assert.equal(active.calls[0].tool, kind === "candidate" ? personalMemoryTool.name : personalFactReferenceTool.name);
@@ -101,8 +129,9 @@ async function runCase(kind, prompt, expected = null) {
 }
 
 try {
+  if (live) beforeConfig = await configDigest();
   if (provider) await new Promise(resolve => provider.listen(0, "127.0.0.1", resolve));
-  const args = ["app-server", "--listen", "stdio://", "-c", "features.plugins=false", "-c", "features.remote_plugin=false", "-c", "features.apps=false"];
+  const args = ["app-server", "--listen", "stdio://", "-c", "agents.enabled=false", ...Object.entries(features).flatMap(([name, value]) => ["-c", `features.${name}=${JSON.stringify(value)}`])];
   if (provider) args.push("-c", 'model_provider="quality_fixture"', "-c", 'model_providers.quality_fixture.name="Synthetic quality fixture"',
     "-c", `model_providers.quality_fixture.base_url="http://127.0.0.1:${provider.address().port}/v1"`,
     "-c", 'model_providers.quality_fixture.wire_api="responses"', "-c", "model_providers.quality_fixture.requires_openai_auth=false",
@@ -127,24 +156,35 @@ try {
     if (message.method === "turn/completed") active.finish?.(message.params.turn);
   });
   if (live) assert.ok((await client.request("account/read", {}, 15000)).account, "No existing login; no inference attempted");
-  await runCase("candidate", "这是虚构验收资料，不代表真实用户：我长期喜欢无糖红茶。请为这个偏好提出记忆候选，不要当作已经确认或记住，也不要调用其他工具。");
-  const candidate = (await store.overview()).candidates[0];
-  await store.reviewCandidate(candidate.id, { revision: candidate.revision, decision: "reject" });
-  assert.equal((await store.overview()).candidates[0].status, "rejected");
-  assert.deepEqual((await store.snapshot()).facts, []);
-  report.rejectedCandidateNotActive = true;
-  const fact = await store.create({ label: "虚构出行偏好", value: "虚构用户在市内短途交通中优先选择地铁。" });
-  const prompt = "只依据我已确认的个人资料，建议一种市内短途交通方式。不要查询线路、文件或外部服务，不要订票。";
-  const old = await runCase("original-fact", prompt, "地铁");
-  await store.update(fact.id, { revision: fact.revision, label: fact.label, value: "虚构用户已更正：市内短途交通优先选择公交车。" });
-  assert.match(personalFactContextIssue({ codexSessionId: old.threadId, personalFactContext: { ...old.snapshot.context, threadId: old.threadId } }, await store.snapshot()), /开启新上下文/);
-  report.oldContextRequiresRenewal = true;
-  const corrected = await runCase("corrected-fact-new-context", prompt, "公交");
-  assert.notEqual(corrected.threadId, old.threadId);
-  assert.deepEqual((await store.overview()).candidates.map(item => item.status), ["rejected"]);
+  if (deletionOnly) {
+    const fact = await store.create({ label: "虚构园区出行偏好", value: "虚构用户在合成园区短途出行时优先选择青岚环线 QX-731 接驳车。" });
+    const prompt = "只依据我已确认的个人资料，建议一种园区短途出行方式。不要查询线路、文件或外部服务，不要预约或付款。";
+    const old = await runCase("original-fact", prompt, "QX-731");
+    await store.remove(fact.id, { revision: fact.revision });
+    assert.match(personalFactContextIssue({ codexSessionId: old.threadId, personalFactContext: { ...old.snapshot.context, threadId: old.threadId } }, await store.snapshot()), /开启新上下文/);
+    report.oldContextRequiresRenewal = true;
+    const deleted = await runCase("deleted-fact-new-context", prompt);
+    assert.notEqual(deleted.threadId, old.threadId); report.deletedFactNotProvided = true;
+  } else {
+    await runCase("candidate", "这是虚构验收资料，不代表真实用户：我长期喜欢无糖红茶。请为这个偏好提出记忆候选，不要当作已经确认或记住，也不要调用其他工具。");
+    const candidate = (await store.overview()).candidates[0];
+    await store.reviewCandidate(candidate.id, { revision: candidate.revision, decision: "reject" });
+    assert.equal((await store.overview()).candidates[0].status, "rejected");
+    assert.deepEqual((await store.snapshot()).facts, []);
+    report.rejectedCandidateNotActive = true;
+    const fact = await store.create({ label: "虚构出行偏好", value: "虚构用户在市内短途交通中优先选择地铁。" });
+    const prompt = "只依据我已确认的个人资料，建议一种市内短途交通方式。不要查询线路、文件或外部服务，不要订票。";
+    const old = await runCase("original-fact", prompt, "地铁");
+    await store.update(fact.id, { revision: fact.revision, label: fact.label, value: "虚构用户已更正：市内短途交通优先选择公交车。" });
+    assert.match(personalFactContextIssue({ codexSessionId: old.threadId, personalFactContext: { ...old.snapshot.context, threadId: old.threadId } }, await store.snapshot()), /开启新上下文/);
+    report.oldContextRequiresRenewal = true;
+    const corrected = await runCase("corrected-fact-new-context", prompt, "公交");
+    assert.notEqual(corrected.threadId, old.threadId);
+    assert.deepEqual((await store.overview()).candidates.map(item => item.status), ["rejected"]);
+  }
   report.ok = true;
 } catch (error) {
-  report.ok = false; report.error = error.message;
+  report.ok = false; report.error = error.message; report.runtimeStderr = client?.status().stderrTail;
   if (active && !report.cases.some(item => item.turnId === active.job.turnId)) report.incompleteTurn = {
     kind: active.kind, threadId: active.job.threadId, turnId: active.job.turnId, calls: active.calls,
     usage: active.meter.snapshot(), itemTypes: active.items.map(item => item.type) };
@@ -153,11 +193,12 @@ try {
   clearTimeout(timer);
   if (!report.ok && active?.job.threadId && active?.job.turnId) await client?.request("turn/interrupt", { threadId: active.job.threadId, turnId: active.job.turnId }, 10000).catch(() => null);
   await client?.stop({ waitForExit: true });
+  if (live && beforeConfig) { report.sharedConfigUnchanged = beforeConfig === await configDigest(); if (!report.sharedConfigUnchanged) { report.ok = false; report.error = "Shared configuration changed; preserved without restoring an older file"; process.exitCode = 1; } }
   if (provider) { provider.closeAllConnections(); await new Promise(resolve => provider.close(resolve)); }
   const evidencePath = path.join(root, "evidence.json");
   await fs.writeFile(evidencePath, JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
-  console.log(JSON.stringify({ ok: report.ok, mode: report.mode, modelTurnsStarted: report.modelTurnsStarted,
+  console.log(JSON.stringify({ ok: report.ok, mode: report.mode, scenario: report.scenario, modelTurnsStarted: report.modelTurnsStarted,
     realModelTurnsStarted: live ? report.modelTurnsStarted : 0,
     cases: report.cases.map(({ kind, elapsedMs, usage }) => ({ kind, elapsedMs, usage })), error: report.error, evidencePath,
-    thirdPartyBusinessCalls: 0, productionFactsWritten: 0, humanRatings: 0 }));
+    thirdPartyBusinessCalls: 0, productionFactsWritten: 0, humanRatings: 0, ...(live ? { sharedConfigUnchanged: report.sharedConfigUnchanged } : {}) }));
 }

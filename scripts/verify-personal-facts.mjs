@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import test from "node:test";
+import { waitForConsoleReady } from "./fixtures/console-ready.mjs";
 import { createPersonalFactsStore, personalFactSnapshot, personalFactContextIssue, normalizePersonalFactContext } from "../server/personal-facts.mjs";
 import { personalDeveloperInstructions } from "../server/personal-runtime.mjs";
 
@@ -81,7 +82,7 @@ test("legacy facts acquire revisions only on a successful write; malformed stora
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
-test("personal fact HTTP mutations require the observed revision and preserve data on rejected requests", { timeout: 20_000 }, async () => {
+test("personal fact HTTP mutations require the observed revision and preserve data on rejected requests", { timeout: 30_000 }, async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-personal-facts-api-"));
   const state = path.join(root, "state");
   const work = path.join(root, "work");
@@ -108,11 +109,8 @@ test("personal fact HTTP mutations require the observed revision and preserve da
     return { status: response.status, body: await response.json() };
   };
   try {
-    for (let attempt = 0; attempt < 100 && !logs.includes("listening on"); attempt += 1) {
-      if (server.exitCode !== null) throw new Error(logs);
-      await new Promise((resolve) => setTimeout(resolve, 30));
-    }
-    assert.match(logs, /listening on/);
+    const readyMs = await waitForConsoleReady({ child: server, baseUrl: `http://127.0.0.1:${port}`, logs: () => logs });
+    process.stdout.write(`Personal facts API fixture ready in ${Math.round(readyMs)}ms.\n`);
     const created = await request("", "POST", { label: "习惯", value: "早睡" });
     assert.equal(created.status, 201);
     assert.equal(created.body.fact.revision, 1);
