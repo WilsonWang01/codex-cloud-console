@@ -1525,7 +1525,7 @@ async function upsertThreadNotificationSession(thread = {}, routeOwner = null) {
     return sessionSummary(updated);
   });
   if (updatedOwner) return updatedOwner;
-  const [summary] = await upsertAppServerThreads(repo, [thread], { pruneMissing: false });
+  const [summary] = await upsertAppServerThreads(repo, [thread]);
   return summary || null;
 }
 
@@ -1630,17 +1630,9 @@ function sessionSummary(item) {
   };
 }
 
-async function upsertAppServerThreads(repo, threads, options = {}) {
+async function upsertAppServerThreads(repo, threads) {
   return mutateChatStore((store) => {
-  const listedThreadIds = new Set((threads || []).map((thread) => String(thread?.id || "")).filter(Boolean));
-  if (options.pruneMissing) {
-    for (const session of Object.values(store.sessions)) {
-      if (session.repoId !== repo.id || !session.codexSessionId) continue;
-      const draft = normalizeChatDraft(session.draft);
-      if (listedThreadIds.has(session.codexSessionId) || session.queuedTurn || session.externalActionReview || draft.input.trim() || draft.attachments.length) continue;
-      delete store.sessions[session.id];
-    }
-  }
+  // Filtered, paged lists cannot establish deletion; explicit archive/delete handles removal.
   const mergedSessions = [];
   const byThreadId = new Map(
     Object.values(store.sessions)
@@ -1707,7 +1699,7 @@ async function upsertAppServerThreads(repo, threads, options = {}) {
 async function syncAppServerThreads(repo, options = {}) {
   const listed = await listAppServerThreads(repo, options);
   if (!listed.ok) return listed;
-  await upsertAppServerThreads(repo, listed.threads, { pruneMissing: true });
+  await upsertAppServerThreads(repo, listed.threads);
   return listed;
 }
 
