@@ -7279,7 +7279,7 @@ pre {
 .personal-brief-row > span { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
 .personal-brief-row strong { font-size: 14px; }
 .personal-brief-row small { color: var(--muted); font-size: 12px; }
-.personal-calendar .personal-section-heading { flex-wrap: wrap; }
+.personal-calendar .personal-section-heading, .calendar-actions .personal-section-heading { flex-wrap: wrap; }
 .personal-calendar h2 { display: flex; align-items: center; gap: 7px; }
 .personal-calendar .personal-section-actions { flex-wrap: wrap; }
 .personal-calendar > .mini-action { min-height: 44px; }

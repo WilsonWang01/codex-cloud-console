@@ -16,6 +16,11 @@ import { createPersonalCalendarActions } from "../server/personal-calendar-actio
 import { createCalendarActionFixture } from "./fixtures/calendar-action-runtime.mjs";
 
 // Real CLI and a loopback-only synthetic Responses provider; no account, external inference or connectors.
+const expectedVersion = process.env.CODEX_SCHEMA_CLI_VERSION || "0.157.1";
+assert.ok(["0.157.1", "0.165.0"].includes(expectedVersion), "Use an explicitly verified CLI version");
+const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", `--package=@openai/codex@${expectedVersion}`, "-c", "command -v codex"], { encoding: "utf8" }).trim();
+const version = execFileSync(command, ["--version"], { encoding: "utf8" }).trim();
+assert.equal(version, `codex-cli ${expectedVersion}`);
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-memory-protocol-"));
 const home = path.join(root, "codex-home"); await fs.mkdir(home);
 const references = process.argv.includes("--references");
@@ -45,8 +50,6 @@ const calendarStore = createCalendarProposalStore(calendarOptions);
 const calendarActions = createPersonalCalendarActions({ store: calendarStore, request: calendarFixture.request, context: () => ({ cwd: root, model: "gpt-6-sol" }) });
 const calendarDate = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10);
 const calendarInput = { form: { title: "合成原生日程草稿", description: "仅验证协议，不修改第三方日历", location: "", attendees: [], allDay: false, timeZone: "Asia/Shanghai", startLocal: calendarDate + "T10:00", endLocal: calendarDate + "T10:30" }, reason: "合成用户明确要求保存日程草稿" };
-const command = process.env.CODEX_SCHEMA_CLI_BINARY || execFileSync("npx", ["--no-install", "--package=@openai/codex@0.157.1", "-c", "command -v codex"], { encoding: "utf8" }).trim();
-assert.match(execFileSync(command, ["--version"], { encoding: "utf8" }), /codex-cli 0\.157\.1/);
 let requests = 0, calls = 0, providerError = null, registeredTools = null;
 const notifications = [];
 const provider = http.createServer(async (req, res) => {
@@ -137,6 +140,6 @@ try {
     assert.equal(calendarFixture.writes(), 0); assert.equal(calendarFixture.calls.some(call => ["google_calendar.search", "google_calendar.fetch", "google_calendar.read_event", "google_calendar.create_event"].includes(call.params?.tool)), false);
     assert.equal(requests, 2);
   }
-  console.log(JSON.stringify({ ok: true, cli: "0.157.1", dynamicToolPersisted: true, resumedAfterRestart: true, ...(calendar ? { calendarProposalSaved: true, proposalSourceSurvivedRestart: true, realCalendarWrites: 0 } : mailDrafts ? { mailDraftSaved:true,sourceAndReceiptSurvivedRestart:true,realMailReads:0,realMailWrites:0 } : references ? { referenceResultSurvivedRestart: true, receiptSource: "native-thread", referenceCalls: calls } : { candidateCalls: calls }), syntheticProviderRequests: requests, externalModelCalls: 0, credentials: "disposable-uncredentialed-home" }));
+  console.log(JSON.stringify({ ok: true, cli: expectedVersion, dynamicToolPersisted: true, resumedAfterRestart: true, ...(calendar ? { calendarProposalSaved: true, proposalSourceSurvivedRestart: true, realCalendarWrites: 0 } : mailDrafts ? { mailDraftSaved:true,sourceAndReceiptSurvivedRestart:true,realMailReads:0,realMailWrites:0 } : references ? { referenceResultSurvivedRestart: true, receiptSource: "native-thread", referenceCalls: calls } : { candidateCalls: calls }), syntheticProviderRequests: requests, externalModelCalls: 0, credentials: "disposable-uncredentialed-home" }));
 } catch (error) { console.error(JSON.stringify({ error: error.message, providerError, requests, calls, registered: JSON.stringify(registeredTools).includes(tool.name), notifications: notifications.slice(-12), stderr: client.status().stderrTail })); process.exitCode = 1; }
 finally { await client.stop({ waitForExit: true }); provider.closeAllConnections(); await new Promise(resolve => provider.close(resolve)); await fs.rm(root, { recursive: true, force: true }); }

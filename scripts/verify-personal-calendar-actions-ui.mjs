@@ -89,9 +89,13 @@ try {
   await page.reload(); await section.getByLabel("日程标题", { exact: true }).waitFor();
   assert.equal(await section.getByLabel("日程标题", { exact: true }).inputValue(), "合成日程：核对申请材料");
   const out = path.resolve(process.env.CODEX_CALENDAR_UI_OUTPUT || path.join(project, "docs/research/acceptance/p02-calendar-actions-20261024")); await fs.mkdir(out, { recursive: true });
+  const heading = section.getByRole("heading", { name: /^日程提案/ });
+  const singleLineHeight = (await heading.boundingBox()).height;
+  const assertHeadingFits = async width => assert.ok((await heading.boundingBox()).height <= singleLineHeight + 1, `日程标题被工具栏挤压：${width}px`);
   for (const [width, height] of [[1280, 900], [768, 900], [390, 640], [320, 640]]) {
     await page.setViewportSize({ width, height }); await section.scrollIntoViewIfNeeded();
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    await assertHeadingFits(width);
     for (const input of await section.locator("input, textarea, button").all()) { if (!await input.isVisible()) continue; const box = await input.boundingBox(); assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1 && box.height >= (await input.getAttribute("type") === "checkbox" ? 18 : 43)); }
     await section.locator("fieldset").screenshot({ path: path.join(out, `editor-${width}.png`) });
   }
@@ -172,6 +176,7 @@ try {
   for (const width of [1280, 390, 320]) {
     await page.setViewportSize({ width, height: width < 400 ? 640 : 900 }); await partial.scrollIntoViewIfNeeded();
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+    await assertHeadingFits(width);
     await partial.screenshot({ path: path.join(out, `partial-receipt-${width}.png`) });
   }
   await partial.getByRole("button", { name: "只读核验回执", exact: true }).click();

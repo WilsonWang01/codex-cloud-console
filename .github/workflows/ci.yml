@@ -55,6 +55,10 @@ jobs:
           CODEX_CALENDAR_UI_OUTPUT: ${{ runner.temp }}/calendar-proposals
       - run: npm run verify:mail-drafts:codex
       - run: npm run verify:personal-calendar:codex
+      - name: Verify current CLI personal calendar proposal and restart (no model)
+        env:
+          CODEX_SCHEMA_CLI_VERSION: 0.165.0
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:personal-calendar:codex'
       - run: npm run verify:external-client:codex -- --guards-only
       - run: npm run verify:external-client:codex -- --faults-only
       - name: Verify production CLI in-flight cancellation and restart
