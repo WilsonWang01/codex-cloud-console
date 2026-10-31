@@ -311,6 +311,49 @@ try {
     await page.reload();
     await page.getByText("用户核对后的合成出行偏好", { exact: true }).waitFor();
     await page.locator(".personal-facts").screenshot({ path: path.join(memoryOut, "accepted-after-reload.png") });
+    const removable = await factStore.create({ label: "合成删除版本核对", value: "仅删除本轮虚构资料" });
+    await page.getByRole("button", { name: "刷新个人事实", exact: true }).click();
+    await page.getByLabel("事实名称", { exact: true }).fill("未保存的输入");
+    await page.getByLabel("事实内容", { exact: true }).fill("删除其他事实不能清空这段草稿");
+    await page.getByRole("button", { name: "删除 合成删除版本核对", exact: true }).click();
+    const factDeletion = page.getByRole("dialog", { name: "删除个人事实", exact: true });
+    await factDeletion.waitFor();
+    assert.equal(await page.evaluate(() => document.activeElement?.textContent), "取消");
+    const beforeDeletion = await fs.readFile(path.join(state, "personal-facts.json"), "utf8");
+    for (const width of [1280, 768, 390, 320]) {
+      await page.setViewportSize({ width, height: width < 400 ? 640 : 900 });
+      const box = await factDeletion.boundingBox(); assert.ok(box && box.x >= 0 && box.x + box.width <= width + 1);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
+      for (const button of await factDeletion.getByRole("button").all()) assert.ok((await button.boundingBox()).height >= 44);
+      await factDeletion.screenshot({ path: path.join(memoryOut, `fact-delete-${width}.png`) });
+    }
+    await page.keyboard.press("Escape"); await factDeletion.waitFor({ state: "hidden" });
+    assert.equal(await fs.readFile(path.join(state, "personal-facts.json"), "utf8"), beforeDeletion);
+    await page.getByRole("button", { name: "删除 合成删除版本核对", exact: true }).click();
+    await factDeletion.getByRole("button", { name: "取消", exact: true }).click();
+    assert.equal(await fs.readFile(path.join(state, "personal-facts.json"), "utf8"), beforeDeletion);
+    await page.getByRole("button", { name: "删除 合成删除版本核对", exact: true }).click();
+    const changed = await fetch(`${base}api/personal/facts/${removable.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision: removable.revision, label: removable.label, value: "另一个页面已更新" }) });
+    assert.equal(changed.status, 200);
+    await factDeletion.getByRole("button", { name: "确认删除", exact: true }).click();
+    await page.getByRole("alert").getByText(/个人事实已在其他页面修改/).waitFor();
+    assert.equal((await factStore.list()).find(item => item.id === removable.id).value, "另一个页面已更新");
+    assert.equal(await page.getByLabel("事实内容", { exact: true }).inputValue(), "删除其他事实不能清空这段草稿");
+    await page.getByRole("button", { name: "删除 合成删除版本核对", exact: true }).click();
+    await factDeletion.getByRole("button", { name: "确认删除", exact: true }).click();
+    await page.getByRole("button", { name: "删除 合成删除版本核对", exact: true }).waitFor({ state: "hidden" });
+    assert.equal((await factStore.list()).some(item => item.id === removable.id), false);
+    assert.equal((await factStore.snapshot()).facts[0].value, "用户核对后的合成出行偏好");
+    assert.equal(await page.getByLabel("事实名称", { exact: true }).inputValue(), "未保存的输入");
+    const forgottenCandidate = await factStore.propose({ label: "合成可删除记忆", value: "仅本轮虚构偏好", reason: "确认后删除的显示检查" }, { ...memoryOrigin, callId: "forgotten" });
+    await factStore.reviewCandidate(forgottenCandidate.id, { revision: forgottenCandidate.revision, decision: "accept" });
+    await page.getByRole("button", { name: "刷新个人事实", exact: true }).click();
+    await page.getByRole("button", { name: "删除 合成可删除记忆", exact: true }).click();
+    await factDeletion.getByRole("button", { name: "确认删除", exact: true }).click();
+    await page.getByRole("button", { name: "删除 合成可删除记忆", exact: true }).waitFor({ state: "hidden" });
+    await page.locator(".personal-memory-candidates details > summary").click();
+    await page.locator(".personal-memory-candidates .personal-fact-row").filter({ hasText: "合成可删除记忆" }).getByText("已接受；对应事实已不在当前资料中", { exact: true }).waitFor();
+    assert.equal((await factStore.snapshot()).facts.length, 1);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.getByRole("button", { name: "工作", exact: true }).click();
     await page.getByRole("textbox", { name: "向云端 Codex 发送消息" }).waitFor();
@@ -331,6 +374,6 @@ try {
     assert.equal(rpc.some(message => ["turn/start", "turn/steer", "thread/compact/start", "thread/fork", "mcpServer/tool/call"].includes(message.method)), false);
     assert.equal(rpc.some(message => message.method === "thread/resume"), false, "拒绝跨空间导入不能先恢复或改写原线程");
     assert.deepEqual(errors, []);
-    console.log("PASS actual isolated backend/UI: ready-context mobile drafts and reload, personal/work thread aliases, exact new-context URL and preserved prior drafts, four widths/short screens, memory review/reload and stale input, cleanup keeps accepted fact; zero model or connector writes (candidates synthetically seeded)");
+    console.log("PASS actual isolated backend/UI: ready-context mobile drafts and reload, personal/work thread aliases, exact new-context URL and preserved prior drafts, four widths/short screens, memory review/reload and stale input, candidate cleanup keeps accepted fact, fact deletion cancel/Escape and revision conflict preserve input; zero model or connector writes (synthetic data)");
   }
 } finally { await stop(); }

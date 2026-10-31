@@ -38,6 +38,11 @@ jobs:
       - run: npm run verify:local
       - run: npm run verify:chat-reading:ui
       - run: npm run verify:personal-memory:quality
+      - name: Verify deleted personal facts in current CLI (synthetic provider only)
+        env:
+          CODEX_SCHEMA_CLI_VERSION: 0.165.0
+        run: npx --yes --package=@openai/codex@0.165.0 -c 'CODEX_SCHEMA_CLI_BINARY="$(command -v codex)" npm run verify:personal-memory:quality -- --deletion-only'
+      - run: npm run verify:personal-facts:ui
       - run: npm run verify:command-isolation:codex -- --catalog-only
       - run: npm run verify:mail-drafts:quality
       - run: npm run verify:mail:ui

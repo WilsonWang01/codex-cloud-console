@@ -571,6 +571,30 @@ test("官方会话活动采用 recencyAt，不把恢复或元数据写入当作�
   ]) assert.match(code, /appThreadActivityTime\(thread/);
 });
 
+test("目录过滤或分页缺失不删除已登记会话和草稿", async () => {
+  const repo = { id: "work", path: "/cloud/work" };
+  const store = { activeByRepo: { work: "automation" }, sessions: {
+    automation: { id: "automation", repoId: "work", codexSessionId: "thread-worktree", model: "chosen-model", reasoning: "high", messages: [], messageCount: 5, draft: { input: "", attachments: [] } },
+    older: { id: "older", repoId: "work", codexSessionId: "thread-older", draft: { input: "", attachments: [] } },
+    queued: { id: "queued", repoId: "work", codexSessionId: "thread-queued", queuedTurn: { id: "queue-1" }, draft: { input: "保留输入", attachments: [] } },
+    foreign: { id: "foreign", repoId: "personal", codexSessionId: "thread-personal" },
+  } };
+  const before = JSON.stringify(store);
+  let result = { ok: true, threads: [] };
+  const context = vm.createContext({
+    mutateChatStore: async mutate => mutate(store), listAppServerThreads: async () => result,
+    normalizeChatDraft: value => ({ input: "", attachments: [], ...value }), sessionSummary: item => item,
+  });
+  vm.runInContext(section(source, "async function upsertAppServerThreads(", "function scheduleRepoSessionSync("), context);
+  assert.equal((await context.syncAppServerThreads(repo)).ok, true);
+  assert.equal(JSON.stringify(store), before, "原生 thread/list 成功但未列出工作树/旧页，不能推断会话已删除");
+  result = { ok: false, error: "partial list", threads: [] };
+  assert.equal((await context.syncAppServerThreads(repo)).ok, false);
+  assert.equal(JSON.stringify(store), before);
+  await context.upsertAppServerThreads(repo, []);
+  assert.equal(JSON.stringify(store), before, "搜索/通知的增量列表同样不能删未返回项");
+});
+
 test("导入线程先只读核对归属，不能通过手动线程编号迁移其他空间的上下文", async () => {
   const repo = { id: "_personal", kind: "personal", path: "/cloud/personal" };
   let thread = { id: "thread-one", cwd: "/cloud/work" }, mutations = 0;
