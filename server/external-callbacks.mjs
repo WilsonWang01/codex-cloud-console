@@ -29,7 +29,7 @@ function targetUrl(value) {
 export async function readCallbackTargets(file, env = process.env) {
   if (!file) return callbackTargets([], env);
   if (typeof file !== "string" || !path.isAbsolute(file)) throw failure("target_config_invalid");
-  const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.size > 64 * 1024 || before.mode & 0o077) throw failure("target_config_invalid");

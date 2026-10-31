@@ -115,6 +115,19 @@ test("registry is operator-only, bounded and rejects unsafe URLs and insecure fi
   await assert.rejects(()=>readCallbackTargets(file,env),error=>error.code==="target_config_invalid"&&!error.message.includes("SHOULD-NOT-APPEAR"));
 }));
 
+test("registry rejects a named pipe without waiting for a writer or altering it", () => fixture(({root}) => {
+  const file=path.join(root,"callbacks.fifo"), moduleUrl=new URL("../server/external-callbacks.mjs",import.meta.url).href;
+  execFileSync("mkfifo",[file]); fs.chmodSync(file,0o600);
+  const before=fs.lstatSync(file);
+  execFileSync(process.execPath,["--input-type=module","--eval",`
+    import assert from 'node:assert/strict';
+    import { readCallbackTargets } from ${JSON.stringify(moduleUrl)};
+    await assert.rejects(readCallbackTargets(process.argv[1]), { code: 'target_config_invalid' });
+  `,file],{timeout:3000,stdio:"pipe"});
+  const after=fs.lstatSync(file);
+  assert(after.isFIFO()); assert.equal(after.ino,before.ino); assert.equal(after.mode,before.mode); assert.equal(after.mtimeMs,before.mtimeMs);
+}));
+
 test("public address policy rejects local, metadata, mapped, translation and special networks", () => {
   for(const address of ["0.1.2.3","10.0.0.1","100.100.100.200","127.0.0.1","169.254.169.254","172.31.0.1","192.168.1.1","192.0.0.9","192.0.2.1","198.18.0.1","198.51.100.1","203.0.113.1","224.0.0.1","255.255.255.255","::1","::ffff:8.8.8.8","64:ff9b::808:808","2001:db8::1","2002:0808:0808::1","3fff::1","fd00:ec2::254","fe80::1","ff02::1","bad",null]) assert.equal(publicCallbackAddress(address),false,String(address));
   for(const address of ["8.8.8.8","1.1.1.1","2001:4860:4860::8888","2606:4700:4700::1111"]) assert.equal(publicCallbackAddress(address),true,address);
