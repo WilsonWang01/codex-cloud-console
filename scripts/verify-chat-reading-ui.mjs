@@ -141,7 +141,8 @@ try {
     await page.getByText(control.a.text, { exact: true }).waitFor();
     assert.equal(await composer.inputValue(), "合成工作草稿");
     evidence.workViewports = [];
-    for (const size of [{ width: 390, height: 844 }, { width: 320, height: 480 }, { width: 844, height: 390 },
+    for (const size of [{ width: 390, height: 844 }, { width: 320, height: 480 }, { width: 360, height: 640 },
+      { width: 430, height: 932 }, { width: 768, height: 900 }, { width: 844, height: 390 },
       { width: 820, height: 900 }, { width: 821, height: 753 }, { width: 1024, height: 768 }, { width: 1280, height: 720 }]) {
       await page.setViewportSize(size);
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -151,6 +152,7 @@ try {
         const controls = [...document.querySelectorAll(".composer-shell textarea, .composer-shell button")].map(node => {
           const box = node.getBoundingClientRect();
           return { label: node.getAttribute("aria-label") || node.getAttribute("title") || node.textContent || node.tagName,
+            footer: Boolean(node.closest(".composer-footer")),
             top: box.top, bottom: box.bottom, left: box.left, right: box.right, width: box.width, height: box.height };
         }).filter(box => box.width > 0 && box.height > 0);
         return { width: innerWidth, height: innerHeight, pageHeight: document.documentElement.scrollHeight,
@@ -163,6 +165,21 @@ try {
       assert.ok(layout.controls.some(item => item.label === "上传截图或文件") && layout.controls.some(item => item.label === "发送消息"), "工作输入区应包含附件和发送控件");
       for (const box of layout.controls) assert.ok(box.top >= 0 && box.bottom <= Math.min(size.height, layout.panelBottom) + 1 && box.left >= 0 && box.right <= size.width + 1,
         `工作输入区的全部可见控件应位于面板和视口内：${JSON.stringify({ size, box, layout })}`);
+      if (size.width <= 820) for (const box of layout.controls.filter(item => item.footer)) {
+        assert.ok(box.width >= 44 && box.height >= 44, `手机工作设置入口应至少 44×44：${JSON.stringify({ size, box })}`);
+      }
+      if (size.width <= 820) {
+        const settings = page.getByRole("button", { name: /^会话设置：GPT-6 Sol.*推理深度中$/ });
+        await settings.click();
+        await page.getByRole("dialog", { name: "会话设置", exact: true }).waitFor();
+        await page.locator(".personal-session-settings").getByRole("button", { name: /^工作区权限/ }).click();
+        await page.locator(".command-panel-head").getByText("权限", { exact: true }).waitFor();
+        await wait(() => page.locator(".command-panel").evaluate(node => node.contains(document.activeElement)), "子面板应接管键盘焦点");
+        await page.keyboard.press("Escape");
+        await page.locator(".command-panel").waitFor({ state: "hidden" });
+        assert.equal(await settings.evaluate(node => node === document.activeElement), true, "关闭子面板后焦点应回到工作会话设置入口");
+        assert.equal(await composer.inputValue(), "合成工作草稿", "浏览设置不能覆盖未发送草稿");
+      }
       if (size.width > 820) {
         await page.locator(".sidebar .account-card").scrollIntoViewIfNeeded();
         const account = await page.locator(".sidebar .account-card").boundingBox();
@@ -176,8 +193,7 @@ try {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.reload();
     await wait(async () => page.url().endsWith("/thread/work-thread") && await composer.isEnabled() && await composer.inputValue() === workDraft, "work reload lost the draft or native conversation");
-    await page.getByRole("button", { name: /^模型：GPT-6[- ]Sol$/ }).waitFor();
-    await page.getByRole("button", { name: "推理深度：中", exact: true }).waitFor();
+    await page.getByRole("button", { name: /^会话设置：GPT-6[- ]Sol.*推理深度中$/ }).waitFor();
     const reloadedSend = await page.getByRole("button", { name: "发送消息", exact: true }).boundingBox();
     assert.ok(reloadedSend && reloadedSend.y >= 0 && reloadedSend.y + reloadedSend.height <= 844, "工作聊天刷新后发送按钮仍应完整可见");
     await page.screenshot({ path: path.join(output, "work-reloaded.png"), fullPage: true });

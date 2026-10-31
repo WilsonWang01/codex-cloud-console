@@ -2699,6 +2699,10 @@ h3 {
   padding: 0;
 }
 
+.footer-session-settings { min-width: 0; }
+.footer-session-settings > svg { flex-shrink: 0; }
+.footer-session-settings > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
 .composer-footer .footer-permission-chip.full-access {
   color: var(--warn);
   background: var(--warn-soft);
@@ -7528,9 +7532,11 @@ pre {
   .composer-shell > .composer, .composer-shell > .composer-footer, .composer-shell > .attachment-strip, .composer-shell > .composer-busy-actions { flex-shrink: 0; }
   /* Preserve composer controls in both spaces; auxiliary content may scroll instead. */
   .session-content-grid .composer-shell > :is(.composer-notices, .attachment-strip) { max-height: min(calc(var(--app-visual-height, 100dvh) * .15), 96px); overflow-y: auto; }
-  .session-content-grid:has(.personal-scope-notice) .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
-  .session-content-grid:has(.personal-scope-notice) .composer-footer button { min-height: 44px; height: auto; }
-  .session-content-grid:has(.personal-scope-notice) .composer-footer .footer-save-routine { width: 44px; min-width: 44px; }
+  .session-content-grid .composer-footer { display: flex; min-height: 44px; padding: 2px 3px 0; }
+  .session-content-grid .composer-footer-left { flex: 1; flex-wrap: nowrap; }
+  .session-content-grid .composer-footer button { min-width: 44px; min-height: 44px; height: auto; }
+  .session-content-grid .composer-footer .footer-session-settings { flex: 1; }
+  .session-content-grid .composer-footer :is(.footer-save-routine, .footer-command) { justify-content: center; width: 44px; min-width: 44px; padding: 0; }
   .command-panel-backdrop { display: block; position: fixed; inset: 0; z-index: 59; width: 100vw; height: var(--app-visual-height, 100dvh); padding: 0; border: 0; border-radius: 0; background: rgba(15, 23, 42, .22); }
   .command-panel { position: fixed; inset: 0; z-index: 60; width: 100vw; max-width: none; height: var(--app-visual-height, 100dvh); max-height: none; padding: 16px max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); border: 0; border-radius: 0; background: var(--surface); overscroll-behavior: contain; }
   .command-panel-head { position: sticky; top: -16px; z-index: 1; min-height: 44px; background: var(--surface); }
