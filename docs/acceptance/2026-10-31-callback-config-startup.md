@@ -23,8 +23,18 @@
 - `baseline.log`：旧实现真实超时，失败保留。
 - `targeted.log`：回调发送、持久接收和 MCP 共 27 项全部通过，0 失败/跳过，10.94 秒。
 - `startup.json` / `check-startup.mjs`：另以独立私有 HOME 直接启动实际 `server/index.mjs`；819ms 返回退出码 1、`target_config_invalid`，未进入监听，原管道保持、没有创建 CLI HOME 或调用模型。
-- `verify-local.log` / `local-summary-v2.json`：完整本地 409 项，406 通过、3 项 Linux 专属跳过、0 失败；20 组 HTTP 与独立 GitHub API 集成通过。首次汇总程序遗漏 JSON 的 `scope` 字段而解析失败，只修正取证程序并重读原日志，没有重跑测试或修改断言。差异检查及四文档的 286 个相对链接通过。
-- 准确候选/主线 CI 与最终提交状态见后续交付回执；未结束的检查不提前算作成功。
+- `verify-local.log` / `local-summary-v2.json`：完整本地 409 项，406 通过、3 项 Linux 专属跳过、0 失败；20 组 HTTP 与独立 GitHub API 集成通过。首次汇总程序遗漏 JSON 的 `scope` 字段而解析失败，只修正取证程序并重读原日志，没有重跑测试或修改断言。差异检查及最终四文档的 287 个相对链接通过。
+- 准确候选 `40e3aa9ede8eeddf7d7b32beaacdca3e9c843e02` 的 [CI 41178672525](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/41178672525)已完成：27 步全部成功、409/409、0 失败/跳过，新增 FIFO 检查实际执行通过。原始元数据、完整日志和严格解析回执分别为 `candidate-ci.json`、`candidate-ci.log`、`candidate-ci-verified.json`。
+
+## GitHub 交付回执
+
+[PR #57](https://github.com/WilsonWang01/codex-cloud-console/pull/57)已按准确候选头校验后合并，主线源码为 `5c8aef0fd8d8d09def57d13425f5712257a63370`；`git diff --quiet` 核对两者文件树完全一致。未改动另两个工作树，也未合并日程草稿 PR #52。
+
+准确主线 `5c8aef0fd8d8d09def57d13425f5712257a63370` 的 [CI 41179218753](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/41179218753)已完成：27 步全部成功、409/409、0 失败/跳过，新增 FIFO 检查实际执行通过。完整元数据/日志/严格回执为 `main-ci.json`、`main-ci.log`、`main-ci-verified.json`。两轮均包含当前 CLI 命令边界、材料/恢复、阅读/资料/邮件/日历 UI、原生 MCP 和运行包步骤；受控模型与连接器仍不代表新的真实生产业务动作。
+
+候选/主线进度读取和合并后 GraphQL 查询分别发生 EOF 网络中断；随后只读核对同一检查/PR，未把读取中断当作测试失败，没有重跑 CI、重复合并、修改网络安全设置或宣称根因修复。
+
+本节为源码合并后的文档回执，不改变运行时代码。文档提交若触发新的检查，其状态单独核对，不能把上述源码 CI 写成文档提交的准确检查结果。
 
 上一轮文档提交 `f1c5944` 的 [CI 41177606207](https://github.com/WilsonWang01/codex-cloud-console/actions/runs/41177606207)已独立核对完成：准确头、27 步、408/408、0 失败/跳过。此结果不替代本轮新增用例的 CI。
 
@@ -34,4 +44,4 @@
 
 生产回调仍需用户控制的确切 HTTPS 接收地址及具体通知授权。本轮不登记目标、开启公网端口、建立隧道或新增 AWS 资源；本地真实 TLS/故障链路不能替代公网目标的实际回执。
 
-未部署或重启 EC2、本机生产代理，正式仍为 `3066f57`；线上数据、任务、凭据和安全设置未参与本轮检查。M3-M5、固定 20 场景、实体手机、七天观察和用户评价的原门槛不变，原生 goal 保持 active，不宣称完成整体对标。
+未部署或重启 EC2、本机生产代理；最近一次已核实的正式源码为 `3066f57`，不是本轮新增的生产版本核对。线上数据、任务、凭据和安全设置未参与本轮检查。M3-M5、固定 20 场景、实体手机、七天观察和用户评价的原门槛不变，原生 goal 保持 active，不宣称完成整体对标。
