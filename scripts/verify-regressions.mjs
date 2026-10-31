@@ -314,6 +314,7 @@ input.on("line", (line) => {
     return send({ id: message.id, result: {} }, 250);
   }
   if (message.method === "thread/list") {
+    if (fsSync.existsSync(process.env.FAKE_CAPTURE_PATH + ".empty-thread-list")) return send({ id: message.id, result: { data: [], nextCursor: null } });
     const cwd = Array.isArray(message.params?.cwd) ? message.params.cwd.join(" ") : "";
     if (cwd.includes("sample-service")) return send({ id: message.id, result: { data: [], nextCursor: null } });
     return send({ id: message.id, error: { code: -32000, message: "injected thread/list failure" } });
@@ -1627,14 +1628,28 @@ await check("independent clients retrieve private exact-turn files and images af
       body: JSON.stringify({ ...input, attachments: [{ ...material, dataBase64: Buffer.from("changed").toString("base64") }, inputImage, inputPdf] }) });
     assert.equal(changedInput.response.status, 409);
     const internalRun = JSON.parse(await fs.readFile(path.join(stateRoot, "automation-runs.json"), "utf8")).runs.find(item => item.id === run.id);
+    const storedSessions = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
+    assert.ok(storedSessions[internalRun.sessionId]);
+    await fs.writeFile(capture + ".empty-thread-list", "filtered worktree is absent from repository listing\n");
+    const filtered = await jsonRequest(origin, "/api/codex/threads?repoId=sample-app", { headers: admin });
+    assert.equal(filtered.response.status, 200);
+    assert.deepEqual(filtered.data.threads, []);
+    assert.ok(filtered.data.sessions.some(item => item.id === internalRun.sessionId), "成功但经过目录过滤的列表不能移除自动化会话");
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions, storedSessions);
     await fs.unlink(path.join(internalRun.worktreePath, "results/report.md"));
     const imageBody = { model: "gpt-6-sol", prompt: "model api regression generated output", response_format: "b64_json" };
     const imageOptions = { method: "POST", headers: { ...headers, "idempotency-key": "file-images-0002" }, body: JSON.stringify(imageBody) };
     const image = await jsonRequest(origin, "/api/automations/sample-research/v1/images/generations", imageOptions);
     assert.equal(image.response.status, 200, JSON.stringify(image.data));
     assert.equal(image.data.data[0].revised_prompt, "图片输出验收");
+    const sessionsBeforeRestart = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
     await stopProcess(server);
     server = start(); await waitForOutput(server, /listening on/);
+    const filteredAfterRestart = await jsonRequest(origin, "/api/codex/threads?repoId=sample-app", { headers: admin });
+    assert.equal(filteredAfterRestart.response.status, 200);
+    assert.ok(filteredAfterRestart.data.sessions.some(item => item.id === internalRun.sessionId));
+    const sessionsAfterRestart = JSON.parse(await fs.readFile(path.join(stateRoot, "chat-history.json"), "utf8")).sessions;
+    for (const [sessionId, value] of Object.entries(sessionsBeforeRestart)) assert.deepEqual(sessionsAfterRestart[sessionId], value, "重启后仍保留原自动化会话、显式模型和草稿");
     const restored = await runExternalClient({ ...options, command: "download", runId: run.id, fileId: report.id });
     assert.deepEqual(restored.buffer, file.buffer);
     const python = await runCaptured("python3", [path.join(projectRoot, "scripts/external-client-example.py"), "download", "sample-research", run.id,
